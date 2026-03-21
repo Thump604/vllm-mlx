@@ -211,6 +211,7 @@ class BatchedEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+        self._text_engine = None  # AsyncEngineCore for text-only with TextModel
         self._text_generation_lock = asyncio.Lock()
 
         # System prompt KV cache (reduces repeated prefill across requests)
@@ -244,6 +245,11 @@ class BatchedEngine(BaseEngine):
             await self._start_mllm()
         else:
             await self._start_llm()
+
+        # Start the TextModel AsyncEngineCore if it was initialized
+        if self._text_engine is not None:
+            await self._text_engine.engine.start()
+            logger.info("TextModel AsyncEngineCore started (batched text inference)")
 
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
@@ -337,6 +343,35 @@ class BatchedEngine(BaseEngine):
                 logger.error(f"MTP TextModel build failed: {e}")
                 self._text_model = None
                 self._text_tokenizer = None
+
+        # Create AsyncEngineCore for batched text-only inference with TextModel
+        if self._text_model is not None and self._text_tokenizer is not None:
+            try:
+                from ..engine_core import AsyncEngineCore, EngineConfig
+                from ..scheduler import SchedulerConfig as TextSchedulerConfig
+
+                text_sched_config = TextSchedulerConfig(
+                    enable_prefix_cache=True,
+                    use_paged_cache=True,
+                )
+                text_engine_config = EngineConfig(
+                    model_name=self._model_name,
+                    scheduler_config=text_sched_config,
+                )
+                self._text_engine = AsyncEngineCore(
+                    model=self._text_model,
+                    tokenizer=self._text_tokenizer,
+                    config=text_engine_config,
+                )
+                logger.info(
+                    "TextModel AsyncEngineCore initialized "
+                    "(MTP=%s, prefix_cache=True, batching=True)",
+                    hasattr(self._text_model, "mtp")
+                    and self._text_model.mtp is not None,
+                )
+            except Exception as e:
+                logger.error(f"Failed to create TextModel AsyncEngineCore: {e}")
+                self._text_engine = None
 
         # Load SpecPrefill draft model (for TextModel path — sparse cache
         # is incompatible with MTP, so specprefill generates autoregressively)
@@ -440,6 +475,11 @@ class BatchedEngine(BaseEngine):
         if self._mllm_scheduler:
             await self._mllm_scheduler.stop()
             self._mllm_scheduler = None
+
+        if self._text_engine is not None:
+            await self._text_engine.stop()
+            self._text_engine.engine.close()
+            self._text_engine = None
 
         if self._engine:
             await self._engine.stop()
