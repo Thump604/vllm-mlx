@@ -13,6 +13,8 @@ LLM engine), so text-only requests must also be routed through it.
 
 import asyncio
 import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -211,7 +213,7 @@ class BatchedEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
-        self._text_engine = None  # AsyncEngineCore for text-only with TextModel  # Tokens in cached prefix
+        self._text_engine = None  # AsyncEngineCore for text-only with TextModel
 
     @property
     def model_name(self) -> str:
@@ -347,6 +349,8 @@ class BatchedEngine(BaseEngine):
                 text_sched_config = TextSchedulerConfig(
                     enable_prefix_cache=True,
                     use_paged_cache=True,
+                    enable_mtp=True,
+                    prefill_step_size=self._prefill_step_size,
                 )
                 text_engine_config = EngineConfig(
                     model_name=self._model_name,
@@ -907,8 +911,6 @@ class BatchedEngine(BaseEngine):
 
         # Per-request MTP routing: text-only → AsyncEngineCore[TextModel]
         if self._text_engine is not None and not _has_media_content(messages):
-            import os
-
             # Pop per-request specprefill overrides (from extra_body)
             specprefill_override = kwargs.pop("specprefill", None)
             specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
@@ -944,9 +946,6 @@ class BatchedEngine(BaseEngine):
                 temperature=temperature,
                 top_p=top_p,
             )
-
-            # Compute prefix boundary for cache efficiency
-            prefix_boundary = self._compute_prefix_boundary(messages, tools)
 
             # --- SpecPrefill: sparse prefill as preprocessing ---
             # When a draft model is loaded and the prompt exceeds the threshold,
@@ -985,8 +984,6 @@ class BatchedEngine(BaseEngine):
 
             if use_specprefill:
                 try:
-                    import time
-
                     t0 = time.monotonic()
                     # Score under lock (draft model is not thread-safe on Metal)
                     async with self._specprefill_lock:
@@ -1017,10 +1014,10 @@ class BatchedEngine(BaseEngine):
                     "Text-only request → AsyncEngineCore[TextModel] (batched, MTP)"
                 )
                 # Submit full text prompt to engine
+                # AsyncEngineCore handles prefix detection via LCP matching
                 request_id = await self._text_engine.add_request(
                     prompt=prompt,
                     sampling_params=sampling,
-                    prefix_boundary=prefix_boundary,
                 )
 
             # Stream outputs as GenerationOutput
@@ -1120,6 +1117,9 @@ class BatchedEngine(BaseEngine):
         elif self._engine:
             stats.update(self._engine.get_stats())
 
+        if self._text_engine is not None:
+            stats["text_engine"] = self._text_engine.get_stats()
+
         # SpecPrefill stats
         if self._draft_model is not None:
             stats["specprefill"] = {
@@ -1137,6 +1137,10 @@ class BatchedEngine(BaseEngine):
             return self._mllm_scheduler.vision_cache.get_stats()
         elif self._engine:
             return self._engine.get_cache_stats()
+        if self._text_engine is not None:
+            te_stats = self._text_engine.get_cache_stats()
+            if te_stats:
+                return te_stats
         return None
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
