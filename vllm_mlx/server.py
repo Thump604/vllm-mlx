@@ -73,7 +73,7 @@ from .api.models import (
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
-    FunctionCall,
+    FunctionCall,  # noqa: F401
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -84,7 +84,7 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
-    ToolCall,
+    ToolCall,  # noqa: F401
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
@@ -92,7 +92,6 @@ from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
     parse_json_output,
-    parse_tool_calls,
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
@@ -100,7 +99,12 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
-from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine  # noqa: F401
+from .response_processing import (
+    get_usage,
+    inject_json_instruction,
+    parse_tool_calls_with_parser,
+)
 from .server_state import (
     RateLimiter,
     ServerState,
@@ -213,90 +217,6 @@ def get_engine(request: Request) -> BaseEngine:
     """Get the loaded engine, raising error if not loaded."""
     state = _get_state(request)
     return _get_engine(state)
-
-
-def _parse_tool_calls_with_parser(
-    state: ServerState,
-    output_text: str,
-    request: ChatCompletionRequest | None = None,
-) -> tuple[str, list | None]:
-    """
-    Parse tool calls from model output using the configured parser.
-
-    If --enable-auto-tool-choice is set with --tool-call-parser, uses the
-    selected parser. Otherwise falls back to the generic parse_tool_calls.
-
-    Args:
-        state: ServerState instance
-        output_text: The model output text
-        request: The original request (for context)
-
-    Returns:
-        Tuple of (cleaned_text, tool_calls)
-    """
-    request_dict = request.model_dump() if request else None
-
-    # If auto tool choice is not enabled, use the generic parser
-    if not state.enable_auto_tool_choice or not state.tool_call_parser:
-        return parse_tool_calls(output_text, request_dict)
-
-    # Initialize parser if needed
-    if state.tool_parser_instance is None:
-        try:
-            parser_cls = ToolParserManager.get_tool_parser(state.tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = None
-            if state.engine is not None and hasattr(state.engine, "_tokenizer"):
-                tokenizer = state.engine._tokenizer
-            state.tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {state.tool_call_parser}")
-        except Exception as e:
-            logger.warning(
-                f"Failed to initialize tool parser '{state.tool_call_parser}': {e}"
-            )
-            logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text, request_dict)
-
-    # Use the configured parser
-    try:
-        # Reset parser state between requests
-        state.tool_parser_instance.reset()
-        result = state.tool_parser_instance.extract_tool_calls(output_text, request_dict)
-        if result.tools_called:
-            tool_calls = [
-                ToolCall(
-                    id=tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
-                    type="function",
-                    function=FunctionCall(
-                        name=tc["name"],
-                        arguments=tc["arguments"],
-                    ),
-                )
-                for tc in result.tool_calls
-            ]
-            return result.content or "", tool_calls
-        else:
-            # Fallback: specific parser didn't find tool calls,
-            # try generic parser which handles more formats (e.g. Nemotron XML)
-            return parse_tool_calls(output_text, request_dict)
-    except Exception as e:
-        logger.warning(f"Tool parser error: {e}")
-        return parse_tool_calls(output_text, request_dict)
-
-
-def get_usage(output: GenerationOutput) -> Usage:
-    """Extract usage metrics from GenerationOutput."""
-    total_prompt_tokens = (
-        output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
-    )
-    total_completion_tokens = (
-        output.completion_tokens if hasattr(output, "completion_tokens") else 0
-    )
-    return Usage(
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        total_tokens=total_prompt_tokens + total_completion_tokens,
-    )
 
 
 @app.get("/health")
@@ -1111,7 +1031,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
             # Inject JSON instruction into messages
-            messages = _inject_json_instruction(messages, json_instruction)
+            messages = inject_json_instruction(messages, json_instruction)
 
     # Prepare kwargs
     chat_kwargs = {
@@ -1167,7 +1087,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(state, output.text, request)
+    cleaned_text, tool_calls = parse_tool_calls_with_parser(state, output.text, request)
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
@@ -1208,38 +1128,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
-
-
-def _inject_json_instruction(messages: list, instruction: str) -> list:
-    """
-    Inject JSON instruction into messages.
-
-    If a system message exists, append to it. Otherwise, prepend a new system message.
-    """
-    messages = list(messages)  # Make a copy
-
-    # Find existing system message
-    system_idx = None
-    for i, msg in enumerate(messages):
-        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
-        if role == "system":
-            system_idx = i
-            break
-
-    if system_idx is not None:
-        # Append to existing system message
-        msg = messages[system_idx]
-        if isinstance(msg, dict):
-            existing = msg.get("content", "")
-            msg["content"] = f"{existing}\n\n{instruction}"
-        else:
-            existing = getattr(msg, "content", "") or ""
-            msg.content = f"{existing}\n\n{instruction}"
-    else:
-        # Prepend new system message
-        messages.insert(0, {"role": "system", "content": instruction})
-
-    return messages
 
 
 # =============================================================================
@@ -1334,7 +1222,7 @@ async def create_anthropic_message(
     )
 
     # Parse tool calls
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+    cleaned_text, tool_calls = parse_tool_calls_with_parser(
         state, output.text, openai_request
     )
 
@@ -1527,7 +1415,7 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    _, tool_calls = _parse_tool_calls_with_parser(state, accumulated_text, openai_request)
+    _, tool_calls = parse_tool_calls_with_parser(state, accumulated_text, openai_request)
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
@@ -1676,7 +1564,7 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
     if state.enable_auto_tool_choice and state.tool_call_parser:
-        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
+        # Initialize parser if needed (same as parse_tool_calls_with_parser)
         if state.tool_parser_instance is None:
             try:
                 parser_cls = ToolParserManager.get_tool_parser(state.tool_call_parser)
