@@ -44,10 +44,8 @@ import logging
 import os
 import secrets
 import tempfile
-import threading
 import time
 import uuid
-from collections import defaultdict
 from collections.abc import AsyncIterator
 
 import uvicorn
@@ -103,135 +101,59 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .server_state import (
+    RateLimiter,
+    ServerState,
+    get_engine as _get_engine,
+    load_embedding_model,
+    load_model as load_model_fn,
+    load_prefix_cache_from_disk,
+    resolve_temperature,
+    resolve_top_p,
+    save_prefix_cache_to_disk,
+)
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global engine instance
-_engine: BaseEngine | None = None
-_model_name: str | None = None
-_default_max_tokens: int = 32768
-_default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
-_default_temperature: float | None = None  # Set via --default-temperature
-_default_top_p: float | None = None  # Set via --default-top-p
 
-_FALLBACK_TEMPERATURE = 0.7
-_FALLBACK_TOP_P = 0.9
-
-
-def _resolve_temperature(request_value: float | None) -> float:
-    """Resolve temperature: request > CLI default > fallback."""
-    if request_value is not None:
-        return request_value
-    if _default_temperature is not None:
-        return _default_temperature
-    return _FALLBACK_TEMPERATURE
-
-
-def _resolve_top_p(request_value: float | None) -> float:
-    """Resolve top_p: request > CLI default > fallback."""
-    if request_value is not None:
-        return request_value
-    if _default_top_p is not None:
-        return _default_top_p
-    return _FALLBACK_TOP_P
-
-
-# Global MCP manager
-_mcp_manager = None
-_mcp_executor = None
-
-# Global embedding engine (lazy loaded)
-_embedding_engine = None
-_embedding_model_locked: str | None = None  # Set when --embedding-model is used
-
-# API key authentication
-_api_key: str | None = None
-_auth_warning_logged: bool = False
-
-# Reasoning parser (for models like Qwen3, DeepSeek-R1)
-_reasoning_parser = None  # ReasoningParser instance when enabled
-
-# Tool calling configuration
-_enable_auto_tool_choice: bool = False
-_tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
-_tool_parser_instance = None  # Instantiated parser
-
-
-def _load_prefix_cache_from_disk() -> None:
-    """Load prefix cache from disk during startup."""
-    try:
-        d = _get_cache_dir()
-        logger.info(f"[lifespan] Loading prefix cache from {d}")
-        loaded = _engine.load_cache_from_disk(d)
-        if loaded > 0:
-            logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
-        else:
-            logger.info("[lifespan] No prefix cache entries found on disk")
-    except Exception as e:
-        logger.warning(f"[lifespan] Failed to load cache from disk: {e}", exc_info=True)
-
-
-def _save_prefix_cache_to_disk() -> None:
-    """Save prefix cache to disk during shutdown."""
-    try:
-        d = _get_cache_dir()
-        logger.info(f"[lifespan] Saving prefix cache to {d}")
-        saved = _engine.save_cache_to_disk(d)
-        if saved:
-            logger.info(f"[lifespan] Saved prefix cache to {d}")
-        else:
-            logger.info("[lifespan] No cache to save")
-    except Exception as e:
-        logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
-
-
-def _get_cache_dir() -> str:
-    """Get cache persistence directory based on model name."""
-    # Use global _model_name which is always a string, set during load_model()
-    model_name = _model_name if _model_name else "default"
-    logger.info(
-        f"[_get_cache_dir] _model_name={_model_name!r} type={type(_model_name)}"
-    )
-    # Sanitize model name for filesystem
-    safe_name = str(model_name).replace("/", "--").replace("\\", "--")
-    cache_dir = os.path.join(
-        os.path.expanduser("~"), ".cache", "vllm-mlx", "prefix_cache", safe_name
-    )
-    logger.info(f"[_get_cache_dir] cache_dir={cache_dir!r}")
-    return cache_dir
+def _get_state(request_or_app) -> ServerState:
+    """Extract ServerState from a Request or FastAPI app."""
+    if hasattr(request_or_app, "app"):
+        return request_or_app.app.state.server
+    return request_or_app.state.server
 
 
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
-    global _engine, _mcp_manager
+    state: ServerState = app.state.server
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
-    if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
-        await _engine.start()
+    if state.engine is not None and hasattr(state.engine, "_loaded") and not state.engine._loaded:
+        await state.engine.start()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
-    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
-        _load_prefix_cache_from_disk()
+    if state.engine is not None and hasattr(state.engine, "load_cache_from_disk"):
+        load_prefix_cache_from_disk(state)
 
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
     if mcp_config:
-        await init_mcp(mcp_config)
+        await init_mcp(app, mcp_config)
 
     yield
 
     # Shutdown: Save cache to disk BEFORE stopping engine
-    if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
-        _save_prefix_cache_to_disk()
+    if state.engine is not None and hasattr(state.engine, "save_cache_to_disk"):
+        save_prefix_cache_to_disk(state)
 
     # Shutdown: Close MCP connections and stop engine
-    if _mcp_manager is not None:
-        await _mcp_manager.stop()
+    if state.mcp_manager is not None:
+        await state.mcp_manager.stop()
         logger.info("MCP manager stopped")
-    if _engine is not None:
-        await _engine.stop()
+    if state.engine is not None:
+        await state.engine.stop()
         logger.info("Engine stopped")
 
 
@@ -245,59 +167,15 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 
-class RateLimiter:
-    """Simple in-memory rate limiter using sliding window."""
-
-    def __init__(self, requests_per_minute: int = 60, enabled: bool = False):
-        self.requests_per_minute = requests_per_minute
-        self.enabled = enabled
-        self.window_size = 60.0  # 1 minute window
-        self._requests: dict[str, list[float]] = defaultdict(list)
-        self._lock = threading.Lock()
-
-    def is_allowed(self, client_id: str) -> tuple[bool, int]:
-        """
-        Check if request is allowed for client.
-
-        Returns:
-            (is_allowed, retry_after_seconds)
-        """
-        if not self.enabled:
-            return True, 0
-
-        current_time = time.time()
-        window_start = current_time - self.window_size
-
-        with self._lock:
-            # Clean old requests outside window
-            self._requests[client_id] = [
-                t for t in self._requests[client_id] if t > window_start
-            ]
-
-            # Check rate limit
-            if len(self._requests[client_id]) >= self.requests_per_minute:
-                # Calculate retry-after
-                oldest = min(self._requests[client_id])
-                retry_after = int(oldest + self.window_size - current_time) + 1
-                return False, max(1, retry_after)
-
-            # Record this request
-            self._requests[client_id].append(current_time)
-            return True, 0
-
-
-# Global rate limiter (disabled by default)
-_rate_limiter = RateLimiter(requests_per_minute=60, enabled=False)
-
-
 async def check_rate_limit(request: Request):
     """Rate limiting dependency."""
+    state = _get_state(request)
     # Use API key as client ID if available, otherwise use IP
     client_id = request.headers.get(
         "Authorization", request.client.host if request.client else "unknown"
     )
 
-    allowed, retry_after = _rate_limiter.is_allowed(client_id)
+    allowed, retry_after = state.rate_limiter.is_allowed(client_id)
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -306,37 +184,41 @@ async def check_rate_limit(request: Request):
         )
 
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def verify_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """Verify API key if authentication is enabled."""
-    global _auth_warning_logged
+    state = _get_state(request)
 
-    if _api_key is None:
+    if state.api_key is None:
         # Log warning once about running without authentication
-        if not _auth_warning_logged:
+        if not state.auth_warning_logged:
             logger.warning(
                 "SECURITY WARNING: Server running without API key authentication. "
                 "Anyone can access the API. Use --api-key to enable authentication."
             )
-            _auth_warning_logged = True
+            state.auth_warning_logged = True
         return True  # No auth required
 
     if credentials is None:
         raise HTTPException(status_code=401, detail="API key required")
     # Use constant-time comparison to prevent timing attacks
-    if not secrets.compare_digest(credentials.credentials, _api_key):
+    if not secrets.compare_digest(credentials.credentials, state.api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
 
 
-def get_engine() -> BaseEngine:
+def get_engine(request: Request) -> BaseEngine:
     """Get the loaded engine, raising error if not loaded."""
-    if _engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return _engine
+    state = _get_state(request)
+    return _get_engine(state)
 
 
 def _parse_tool_calls_with_parser(
-    output_text: str, request: ChatCompletionRequest | None = None
+    state: ServerState,
+    output_text: str,
+    request: ChatCompletionRequest | None = None,
 ) -> tuple[str, list | None]:
     """
     Parse tool calls from model output using the configured parser.
@@ -345,33 +227,32 @@ def _parse_tool_calls_with_parser(
     selected parser. Otherwise falls back to the generic parse_tool_calls.
 
     Args:
+        state: ServerState instance
         output_text: The model output text
         request: The original request (for context)
 
     Returns:
         Tuple of (cleaned_text, tool_calls)
     """
-    global _tool_parser_instance
-
     request_dict = request.model_dump() if request else None
 
     # If auto tool choice is not enabled, use the generic parser
-    if not _enable_auto_tool_choice or not _tool_call_parser:
+    if not state.enable_auto_tool_choice or not state.tool_call_parser:
         return parse_tool_calls(output_text, request_dict)
 
     # Initialize parser if needed
-    if _tool_parser_instance is None:
+    if state.tool_parser_instance is None:
         try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+            parser_cls = ToolParserManager.get_tool_parser(state.tool_call_parser)
             # Get tokenizer from engine if available
             tokenizer = None
-            if _engine is not None and hasattr(_engine, "_tokenizer"):
-                tokenizer = _engine._tokenizer
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            if state.engine is not None and hasattr(state.engine, "_tokenizer"):
+                tokenizer = state.engine._tokenizer
+            state.tool_parser_instance = parser_cls(tokenizer)
+            logger.info(f"Initialized tool call parser: {state.tool_call_parser}")
         except Exception as e:
             logger.warning(
-                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+                f"Failed to initialize tool parser '{state.tool_call_parser}': {e}"
             )
             logger.warning("Falling back to generic parser")
             return parse_tool_calls(output_text, request_dict)
@@ -379,8 +260,8 @@ def _parse_tool_calls_with_parser(
     # Use the configured parser
     try:
         # Reset parser state between requests
-        _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        state.tool_parser_instance.reset()
+        result = state.tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tool_calls = [
                 ToolCall(
@@ -403,145 +284,6 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
-def _detect_native_tool_support() -> bool:
-    """
-    Detect if the active tool parser supports native tool format.
-
-    Native format means role="tool" messages and tool_calls fields
-    are preserved instead of being converted to text.
-
-    Returns:
-        True if native format should be preserved
-    """
-    if not _enable_auto_tool_choice or not _tool_call_parser:
-        return False
-
-    try:
-        parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-        return parser_cls.supports_native_format()
-    except KeyError:
-        # Parser not found - this is a configuration error, log as error
-        logger.error(
-            f"Tool parser '{_tool_call_parser}' not found. "
-            f"Available parsers: {ToolParserManager.list_registered()}"
-        )
-        return False
-    except Exception as e:
-        # Unexpected error during detection
-        logger.warning(f"Failed to detect native tool support: {e}")
-        return False
-
-
-def load_embedding_model(
-    model_name: str | None,
-    *,
-    lock: bool = False,
-    reuse_existing: bool = True,
-) -> None:
-    """Load or reuse the embedding model engine when configured."""
-    global _embedding_engine, _embedding_model_locked
-
-    if not model_name:
-        return
-
-    if lock:
-        _embedding_model_locked = model_name
-
-    if (
-        reuse_existing
-        and _embedding_engine is not None
-        and _embedding_engine.model_name == model_name
-    ):
-        return
-
-    from .embedding import EmbeddingEngine
-
-    _embedding_engine = EmbeddingEngine(model_name)
-    _embedding_engine.load()
-
-
-def load_model(
-    model_name: str,
-    use_batching: bool = False,
-    scheduler_config=None,
-    stream_interval: int = 1,
-    max_tokens: int = 32768,
-    force_mllm: bool = False,
-    mtp: bool = False,
-    specprefill_enabled: bool = False,
-    specprefill_draft_model_path: str | None = None,
-    specprefill_threshold: int = 8192,
-    specprefill_keep_pct: float = 0.3,
-):
-    """
-    Load a model (auto-detects MLLM vs LLM).
-
-    Args:
-        model_name: HuggingFace model name or local path
-        use_batching: Use continuous batching (BatchedEngine) vs simple mode (SimpleEngine)
-        scheduler_config: Scheduler config for batched mode
-        stream_interval: Tokens to batch before streaming (batched mode only)
-        max_tokens: Default max tokens for generation
-        force_mllm: Force loading as MLLM even if not auto-detected
-        mtp: Enable native MTP speculative decoding (per-request routing in both engines)
-        specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
-        specprefill_draft_model_path: Path to draft model for SpecPrefill scoring
-        specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
-        specprefill_keep_pct: Fraction of tokens to keep during sparse prefill
-    """
-    global _engine, _model_name, _default_max_tokens, _tool_parser_instance
-
-    _default_max_tokens = max_tokens
-    _model_name = model_name
-    # Reset tool parser instance when model is reloaded (tokenizer may change)
-    _tool_parser_instance = None
-
-    if force_mllm:
-        logger.info("Force MLLM mode enabled via --mllm flag")
-
-    if use_batching:
-        logger.info(f"Loading model with BatchedEngine: {model_name}")
-        _engine = BatchedEngine(
-            model_name=model_name,
-            scheduler_config=scheduler_config,
-            stream_interval=stream_interval,
-            force_mllm=force_mllm,
-            mtp=mtp,
-            specprefill_enabled=specprefill_enabled,
-            specprefill_draft_model_path=specprefill_draft_model_path,
-            specprefill_threshold=specprefill_threshold,
-            specprefill_keep_pct=specprefill_keep_pct,
-        )
-        # BatchedEngine will be started in lifespan (uvicorn's event loop)
-        # Just log for now
-        logger.info(f"Model loaded (batched mode): {model_name}")
-    else:
-        logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(
-            model_name=model_name,
-            force_mllm=force_mllm,
-            mtp=mtp,
-            specprefill_enabled=specprefill_enabled,
-            specprefill_draft_model_path=specprefill_draft_model_path,
-            specprefill_threshold=specprefill_threshold,
-            specprefill_keep_pct=specprefill_keep_pct,
-        )
-        # Start SimpleEngine synchronously (no background loop)
-        # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_engine.start())
-        model_type = "MLLM" if _engine.is_mllm else "LLM"
-        logger.info(f"{model_type} model loaded (simple mode): {model_name}")
-
-    # Set native tool format support on the engine (thread-safe via instance property)
-    _engine.preserve_native_tool_format = _detect_native_tool_support()
-    if _engine.preserve_native_tool_format:
-        logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
-
-    logger.info(f"Default max tokens: {_default_max_tokens}")
-
-
 def get_usage(output: GenerationOutput) -> Usage:
     """Extract usage metrics from GenerationOutput."""
     total_prompt_tokens = (
@@ -558,44 +300,46 @@ def get_usage(output: GenerationOutput) -> Usage:
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Health check endpoint."""
+    state = _get_state(request)
     mcp_info = None
-    if _mcp_manager is not None:
+    if state.mcp_manager is not None:
         connected = sum(
-            1 for s in _mcp_manager.get_server_status() if s.state.value == "connected"
+            1 for s in state.mcp_manager.get_server_status() if s.state.value == "connected"
         )
-        total = len(_mcp_manager.get_server_status())
+        total = len(state.mcp_manager.get_server_status())
         mcp_info = {
             "enabled": True,
             "servers_connected": connected,
             "servers_total": total,
-            "tools_available": len(_mcp_manager.get_all_tools()),
+            "tools_available": len(state.mcp_manager.get_all_tools()),
         }
 
-    engine_stats = _engine.get_stats() if _engine else {}
+    engine_stats = state.engine.get_stats() if state.engine else {}
 
     return {
         "status": "healthy",
-        "model_loaded": _engine is not None,
-        "model_name": _model_name,
-        "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
+        "model_loaded": state.engine is not None,
+        "model_name": state.model_name,
+        "model_type": "mllm" if (state.engine and state.engine.is_mllm) else "llm",
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
 
 
 @app.get("/v1/status")
-async def status():
+async def status(request: Request):
     """Real-time status with per-request details for debugging and monitoring."""
-    if _engine is None:
+    state = _get_state(request)
+    if state.engine is None:
         return {"status": "not_loaded", "model": None, "requests": []}
 
-    stats = _engine.get_stats()
+    stats = state.engine.get_stats()
 
     return {
         "status": "running" if stats.get("running") else "stopped",
-        "model": _model_name,
+        "model": state.model_name,
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -654,11 +398,12 @@ async def clear_cache():
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
-async def list_models() -> ModelsResponse:
+async def list_models(request: Request) -> ModelsResponse:
     """List available models."""
+    state = _get_state(request)
     models = []
-    if _model_name:
-        models.append(ModelInfo(id=_model_name))
+    if state.model_name:
+        models.append(ModelInfo(id=state.model_name))
     return ModelsResponse(data=models)
 
 
@@ -671,7 +416,7 @@ async def list_models() -> ModelsResponse:
     "/v1/embeddings",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
 )
-async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
+async def create_embeddings(request: EmbeddingRequest, raw_request: Request) -> EmbeddingResponse:
     """
     Create embeddings for the given input text(s).
 
@@ -717,7 +462,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
     - mlx-community/bge-large-en-v1.5-4bit (best for English)
     - Any BERT/XLM-RoBERTa/ModernBERT model from HuggingFace
     """
-    global _embedding_engine
+    state = _get_state(raw_request)
 
     try:
         # Resolve model name
@@ -725,21 +470,21 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         # If an embedding model was pre-configured at startup, only allow that model
         if (
-            _embedding_model_locked is not None
-            and model_name != _embedding_model_locked
+            state.embedding_model_locked is not None
+            and model_name != state.embedding_model_locked
         ):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Embedding model '{model_name}' is not available. "
-                    f"This server was started with --embedding-model {_embedding_model_locked}. "
-                    f"Only '{_embedding_model_locked}' can be used for embeddings. "
+                    f"This server was started with --embedding-model {state.embedding_model_locked}. "
+                    f"Only '{state.embedding_model_locked}' can be used for embeddings. "
                     f"Restart the server with a different --embedding-model to use '{model_name}'."
                 ),
             )
 
         # Lazy-load or swap embedding engine
-        load_embedding_model(model_name, lock=False, reuse_existing=True)
+        load_embedding_model(state, model_name, lock=False, reuse_existing=True)
 
         # Normalise input to list
         texts = request.input if isinstance(request.input, list) else [request.input]
@@ -750,10 +495,10 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         start_time = time.perf_counter()
 
         # Count tokens for usage reporting
-        prompt_tokens = _embedding_engine.count_tokens(texts)
+        prompt_tokens = state.embedding_engine.count_tokens(texts)
 
         # Generate embeddings (batch)
-        embeddings = _embedding_engine.embed(texts)
+        embeddings = state.embedding_engine.embed(texts)
 
         elapsed = time.perf_counter() - start_time
         logger.info(
@@ -796,13 +541,14 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
 
 @app.get("/v1/mcp/tools", dependencies=[Depends(verify_api_key)])
-async def list_mcp_tools() -> MCPToolsResponse:
+async def list_mcp_tools(request: Request) -> MCPToolsResponse:
     """List all available MCP tools."""
-    if _mcp_manager is None:
+    state = _get_state(request)
+    if state.mcp_manager is None:
         return MCPToolsResponse(tools=[], count=0)
 
     tools = []
-    for tool in _mcp_manager.get_all_tools():
+    for tool in state.mcp_manager.get_all_tools():
         tools.append(
             MCPToolInfo(
                 name=tool.full_name,
@@ -816,20 +562,21 @@ async def list_mcp_tools() -> MCPToolsResponse:
 
 
 @app.get("/v1/mcp/servers", dependencies=[Depends(verify_api_key)])
-async def list_mcp_servers() -> MCPServersResponse:
+async def list_mcp_servers(request: Request) -> MCPServersResponse:
     """Get status of all MCP servers."""
-    if _mcp_manager is None:
+    state = _get_state(request)
+    if state.mcp_manager is None:
         return MCPServersResponse(servers=[])
 
     servers = []
-    for status in _mcp_manager.get_server_status():
+    for status_info in state.mcp_manager.get_server_status():
         servers.append(
             MCPServerInfo(
-                name=status.name,
-                state=status.state.value,
-                transport=status.transport.value,
-                tools_count=status.tools_count,
-                error=status.error,
+                name=status_info.name,
+                state=status_info.state.value,
+                transport=status_info.transport.value,
+                tools_count=status_info.tools_count,
+                error=status_info.error,
             )
         )
 
@@ -837,14 +584,15 @@ async def list_mcp_servers() -> MCPServersResponse:
 
 
 @app.post("/v1/mcp/execute", dependencies=[Depends(verify_api_key)])
-async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
+async def execute_mcp_tool(request: MCPExecuteRequest, raw_request: Request) -> MCPExecuteResponse:
     """Execute an MCP tool."""
-    if _mcp_manager is None:
+    state = _get_state(raw_request)
+    if state.mcp_manager is None:
         raise HTTPException(
             status_code=503, detail="MCP not configured. Start server with --mcp-config"
         )
 
-    result = await _mcp_manager.execute_tool(
+    result = await state.mcp_manager.execute_tool(
         request.tool_name,
         request.arguments,
     )
@@ -861,13 +609,9 @@ async def execute_mcp_tool(request: MCPExecuteRequest) -> MCPExecuteResponse:
 # Audio Endpoints
 # =============================================================================
 
-# Global audio engines (lazy loaded)
-_stt_engine = None
-_tts_engine = None
-
-
 @app.post("/v1/audio/transcriptions", dependencies=[Depends(verify_api_key)])
 async def create_transcription(
+    request: Request,
     file: UploadFile,
     model: str = "whisper-large-v3",
     language: str | None = None,
@@ -882,7 +626,7 @@ async def create_transcription(
     - whisper-medium, whisper-small (lighter)
     - parakeet-tdt-0.6b-v2 (English, fastest)
     """
-    global _stt_engine
+    state = _get_state(request)
 
     try:
         from .audio.stt import STTEngine  # Lazy import - optional feature
@@ -899,9 +643,9 @@ async def create_transcription(
         model_name = model_map.get(model, model)
 
         # Load engine if needed
-        if _stt_engine is None or _stt_engine.model_name != model_name:
-            _stt_engine = STTEngine(model_name)
-            _stt_engine.load()
+        if state.stt_engine is None or state.stt_engine.model_name != model_name:
+            state.stt_engine = STTEngine(model_name)
+            state.stt_engine.load()
 
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
@@ -910,7 +654,7 @@ async def create_transcription(
             tmp_path = tmp.name
 
         try:
-            result = _stt_engine.transcribe(tmp_path, language=language)
+            result = state.stt_engine.transcribe(tmp_path, language=language)
         finally:
             os.unlink(tmp_path)
 
@@ -935,6 +679,7 @@ async def create_transcription(
 
 @app.post("/v1/audio/speech", dependencies=[Depends(verify_api_key)])
 async def create_speech(
+    request: Request,
     model: str = "kokoro",
     input: str = "",
     voice: str = "af_heart",
@@ -950,7 +695,7 @@ async def create_speech(
     - vibevoice (realtime)
     - voxcpm (Chinese/English)
     """
-    global _tts_engine
+    state = _get_state(request)
 
     try:
         from .audio.tts import TTSEngine  # Lazy import - optional feature
@@ -967,12 +712,12 @@ async def create_speech(
         model_name = model_map.get(model, model)
 
         # Load engine if needed
-        if _tts_engine is None or _tts_engine.model_name != model_name:
-            _tts_engine = TTSEngine(model_name)
-            _tts_engine.load()
+        if state.tts_engine is None or state.tts_engine.model_name != model_name:
+            state.tts_engine = TTSEngine(model_name)
+            state.tts_engine.load()
 
-        audio = _tts_engine.generate(input, voice=voice, speed=speed)
-        audio_bytes = _tts_engine.to_bytes(audio, format=response_format)
+        audio = state.tts_engine.generate(input, voice=voice, speed=speed)
+        audio_bytes = state.tts_engine.to_bytes(audio, format=response_format)
 
         content_type = (
             "audio/wav" if response_format == "wav" else f"audio/{response_format}"
@@ -1190,7 +935,8 @@ async def _wait_with_disconnect(
 )
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
-    engine = get_engine()
+    state = _get_state(raw_request)
+    engine = _get_engine(state)
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -1207,7 +953,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_completion(engine, prompts[0], request),
+                stream_completion(state, engine, prompts[0], request),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -1215,7 +961,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     # Non-streaming response with timing and timeout
     start_time = time.perf_counter()
-    timeout = request.timeout or _default_timeout
+    timeout = request.timeout or state.default_timeout
     choices = []
     total_completion_tokens = 0
     total_prompt_tokens = 0
@@ -1224,9 +970,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         output = await _wait_with_disconnect(
             engine.generate(
                 prompt=prompt,
-                max_tokens=request.max_tokens or _default_max_tokens,
-                temperature=_resolve_temperature(request.temperature),
-                top_p=_resolve_top_p(request.top_p),
+                max_tokens=request.max_tokens or state.default_max_tokens,
+                temperature=resolve_temperature(state, request.temperature),
+                top_p=resolve_top_p(state, request.top_p),
                 stop=request.stop,
             ),
             raw_request,
@@ -1310,7 +1056,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     }
     ```
     """
-    engine = get_engine()
+    state = _get_state(raw_request)
+    engine = _get_engine(state)
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
@@ -1368,9 +1115,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Prepare kwargs
     chat_kwargs = {
-        "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": _resolve_temperature(request.temperature),
-        "top_p": _resolve_top_p(request.top_p),
+        "max_tokens": request.max_tokens or state.default_max_tokens,
+        "temperature": resolve_temperature(state, request.temperature),
+        "top_p": resolve_top_p(state, request.top_p),
     }
 
     # Add multimodal content
@@ -1395,7 +1142,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                stream_chat_completion(state, engine, messages, request, **chat_kwargs),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -1403,7 +1150,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Non-streaming response with timing and timeout
     start_time = time.perf_counter()
-    timeout = request.timeout or _default_timeout
+    timeout = request.timeout or state.default_timeout
 
     output = await _wait_with_disconnect(
         engine.chat(messages=messages, **chat_kwargs),
@@ -1420,13 +1167,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(state, output.text, request)
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
-    if _reasoning_parser and not tool_calls:
+    if state.reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+        reasoning_text, cleaned_text = state.reasoning_parser.extract_reasoning(
             text_to_parse
         )
 
@@ -1512,7 +1259,8 @@ async def create_anthropic_message(
 
     Supports both streaming and non-streaming modes.
     """
-    engine = get_engine()
+    state = _get_state(request)
+    engine = _get_engine(state)
 
     # Parse the raw body to handle Anthropic request format
     body = await request.json()
@@ -1543,7 +1291,7 @@ async def create_anthropic_message(
     if anthropic_request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                _stream_anthropic_messages(state, engine, openai_request, anthropic_request),
                 request,
             ),
             media_type="text/event-stream",
@@ -1560,7 +1308,7 @@ async def create_anthropic_message(
     )
 
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": openai_request.max_tokens or state.default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
     }
@@ -1569,7 +1317,7 @@ async def create_anthropic_message(
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     start_time = time.perf_counter()
-    timeout = _default_timeout
+    timeout = state.default_timeout
 
     output = await _wait_with_disconnect(
         engine.chat(messages=messages, **chat_kwargs),
@@ -1587,7 +1335,7 @@ async def create_anthropic_message(
 
     # Parse tool calls
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, openai_request
+        state, output.text, openai_request
     )
 
     # Clean output text
@@ -1637,7 +1385,8 @@ async def count_anthropic_tokens(request: Request):
     """
     body = await request.json()
 
-    engine = get_engine()
+    state = _get_state(request)
+    engine = _get_engine(state)
     tokenizer = engine.tokenizer
 
     total_tokens = 0
@@ -1696,6 +1445,7 @@ async def count_anthropic_tokens(request: Request):
 
 
 async def _stream_anthropic_messages(
+    state: ServerState,
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
@@ -1717,7 +1467,7 @@ async def _stream_anthropic_messages(
     )
 
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": openai_request.max_tokens or state.default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
     }
@@ -1777,7 +1527,7 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+    _, tool_calls = _parse_tool_calls_with_parser(state, accumulated_text, openai_request)
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
@@ -1844,6 +1594,7 @@ async def _stream_anthropic_messages(
 
 
 async def stream_completion(
+    state: ServerState,
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
@@ -1851,9 +1602,9 @@ async def stream_completion(
     """Stream completion response."""
     async for output in engine.stream_generate(
         prompt=prompt,
-        max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=_resolve_temperature(request.temperature),
-        top_p=_resolve_top_p(request.top_p),
+        max_tokens=request.max_tokens or state.default_max_tokens,
+        temperature=resolve_temperature(state, request.temperature),
+        top_p=resolve_top_p(state, request.top_p),
         stop=request.stop,
     ):
         data = {
@@ -1877,6 +1628,7 @@ async def stream_completion(
 
 
 async def stream_chat_completion(
+    state: ServerState,
     engine: BaseEngine,
     messages: list,
     request: ChatCompletionRequest,
@@ -1903,12 +1655,12 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
+    is_thinking_model = "nemotron" in request.model.lower() and not state.reasoning_parser
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
+    if state.reasoning_parser:
+        state.reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -1919,25 +1671,24 @@ async def stream_chat_completion(
     last_output = None
 
     # Tool call streaming state
-    global _tool_parser_instance
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    if _enable_auto_tool_choice and _tool_call_parser:
+    if state.enable_auto_tool_choice and state.tool_call_parser:
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
-        if _tool_parser_instance is None:
+        if state.tool_parser_instance is None:
             try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                parser_cls = ToolParserManager.get_tool_parser(state.tool_call_parser)
                 tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+                if state.engine is not None and hasattr(state.engine, "_tokenizer"):
+                    tokenizer = state.engine._tokenizer
+                state.tool_parser_instance = parser_cls(tokenizer)
+                logger.info(f"Initialized tool call parser: {state.tool_call_parser}")
             except Exception as e:
                 logger.warning(f"Failed to init tool parser for streaming: {e}")
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
+        if state.tool_parser_instance is not None:
+            tool_parser = state.tool_parser_instance
             tool_parser.reset()
 
     # Stream content
@@ -1952,10 +1703,10 @@ async def stream_chat_completion(
             completion_tokens = output.completion_tokens
 
         # Use reasoning parser if enabled
-        if _reasoning_parser and delta_text:
+        if state.reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            delta_msg = state.reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, delta_text
             )
 
@@ -2119,20 +1870,20 @@ async def stream_chat_completion(
 # =============================================================================
 
 
-async def init_mcp(config_path: str):
+async def init_mcp(app_instance: FastAPI, config_path: str):
     """Initialize MCP manager from config file."""
-    global _mcp_manager, _mcp_executor
+    state: ServerState = app_instance.state.server
 
     try:
         from vllm_mlx.mcp import MCPClientManager, ToolExecutor, load_mcp_config
 
         config = load_mcp_config(config_path)
-        _mcp_manager = MCPClientManager(config)
-        await _mcp_manager.start()
+        state.mcp_manager = MCPClientManager(config)
+        await state.mcp_manager.start()
 
-        _mcp_executor = ToolExecutor(_mcp_manager)
+        state.mcp_executor = ToolExecutor(state.mcp_manager)
 
-        logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
+        logger.info(f"MCP initialized with {len(state.mcp_manager.get_all_tools())} tools")
 
     except ImportError:
         logger.error("MCP SDK not installed. Install with: pip install mcp")
@@ -2257,19 +2008,18 @@ Examples:
 
     args = parser.parse_args()
 
-    # Set global configuration
-    global _api_key, _default_timeout, _rate_limiter
-    global _default_temperature, _default_top_p
-    _api_key = args.api_key
-    _default_timeout = args.timeout
+    # Create server state
+    state = ServerState()
+    state.api_key = args.api_key
+    state.default_timeout = args.timeout
     if args.default_temperature is not None:
-        _default_temperature = args.default_temperature
+        state.default_temperature = args.default_temperature
     if args.default_top_p is not None:
-        _default_top_p = args.default_top_p
+        state.default_top_p = args.default_top_p
 
     # Configure rate limiter
     if args.rate_limit > 0:
-        _rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+        state.rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
         logger.info(
             f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
         )
@@ -2278,7 +2028,7 @@ Examples:
     logger.info("=" * 60)
     logger.info("SECURITY CONFIGURATION")
     logger.info("=" * 60)
-    if _api_key:
+    if state.api_key:
         logger.info("  Authentication: ENABLED (API key required)")
     else:
         logger.warning("  Authentication: DISABLED - Use --api-key to enable")
@@ -2295,18 +2045,21 @@ Examples:
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
-        global _reasoning_parser
         from .reasoning import get_parser
 
         parser_cls = get_parser(args.reasoning_parser)
-        _reasoning_parser = parser_cls()
+        state.reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
 
+    # Attach state to app before loading models
+    app.state.server = state
+
     # Pre-load embedding model if specified
-    load_embedding_model(args.embedding_model, lock=True)
+    load_embedding_model(state, args.embedding_model, lock=True)
 
     # Load model before starting server
-    load_model(
+    load_model_fn(
+        state,
         args.model,
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,

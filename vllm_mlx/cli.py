@@ -24,10 +24,14 @@ def serve_command(args):
 
     import uvicorn
 
-    # Import unified server
-    from . import server
     from .scheduler import SchedulerConfig
-    from .server import RateLimiter, app, load_model
+    from .server import app
+    from .server_state import (
+        RateLimiter,
+        ServerState,
+        load_embedding_model,
+        load_model,
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -37,27 +41,30 @@ def serve_command(args):
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
 
+    # Create server state
+    state = ServerState()
+
     # Configure server security settings
-    server._api_key = args.api_key
-    server._default_timeout = args.timeout
+    state.api_key = args.api_key
+    state.default_timeout = args.timeout
     if args.rate_limit > 0:
-        server._rate_limiter = RateLimiter(
+        state.rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
         )
 
     # Configure tool calling
     if args.enable_auto_tool_choice and args.tool_call_parser:
-        server._enable_auto_tool_choice = True
-        server._tool_call_parser = args.tool_call_parser
+        state.enable_auto_tool_choice = True
+        state.tool_call_parser = args.tool_call_parser
     else:
-        server._enable_auto_tool_choice = False
-        server._tool_call_parser = None
+        state.enable_auto_tool_choice = False
+        state.tool_call_parser = None
 
     # Configure generation defaults
     if args.default_temperature is not None:
-        server._default_temperature = args.default_temperature
+        state.default_temperature = args.default_temperature
     if args.default_top_p is not None:
-        server._default_top_p = args.default_top_p
+        state.default_top_p = args.default_top_p
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -65,7 +72,7 @@ def serve_command(args):
             from .reasoning import get_parser
 
             parser_cls = get_parser(args.reasoning_parser)
-            server._reasoning_parser = parser_cls()
+            state.reasoning_parser = parser_cls()
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -80,7 +87,7 @@ def serve_command(args):
             )
             sys.exit(1)
     else:
-        server._reasoning_parser = None
+        state.reasoning_parser = None
 
     # Security summary at startup
     print("=" * 60)
@@ -113,10 +120,13 @@ def serve_command(args):
         print(f"MCP config: {args.mcp_config}")
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
+    # Attach state to app
+    app.state.server = state
+
     # Pre-load embedding model if specified
     if args.embedding_model:
         print(f"Pre-loading embedding model: {args.embedding_model}")
-        server.load_embedding_model(args.embedding_model, lock=True)
+        load_embedding_model(state, args.embedding_model, lock=True)
         print(f"Embedding model loaded: {args.embedding_model}")
 
     # Build scheduler config for batched mode
@@ -191,6 +201,7 @@ def serve_command(args):
 
     # Load model with unified server
     load_model(
+        state,
         args.model,
         use_batching=args.continuous_batching,
         scheduler_config=scheduler_config,
@@ -783,6 +794,8 @@ Examples:
             "auto",
             "mistral",
             "qwen",
+            "qwen3_xml",
+            "qwen3.5",
             "qwen3_coder",
             "llama",
             "hermes",

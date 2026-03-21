@@ -574,17 +574,24 @@ class TestAPIKeyVerification:
     def test_verify_api_key_rejects_invalid(self):
         """Test that invalid API key is rejected with 401."""
         import asyncio
+        from unittest.mock import MagicMock
+
         from fastapi import HTTPException
         from fastapi.security import HTTPAuthorizationCredentials
 
-        # Import and set up the module
         import vllm_mlx.server as server
+        from vllm_mlx.server_state import ServerState
 
-        original_key = server._api_key
+        # Create a state with a known API key and attach to app
+        state = ServerState(api_key="valid-secret-key")
+        original_state = getattr(server.app.state, "server", None)
 
         try:
-            # Set a known API key
-            server._api_key = "valid-secret-key"
+            server.app.state.server = state
+
+            # Create a mock request that references our app
+            mock_request = MagicMock()
+            mock_request.app = server.app
 
             # Create mock credentials with invalid key
             credentials = HTTPAuthorizationCredentials(
@@ -594,26 +601,35 @@ class TestAPIKeyVerification:
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
+                    server.verify_api_key(mock_request, credentials)
                 )
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
         finally:
-            server._api_key = original_key
+            if original_state is not None:
+                server.app.state.server = original_state
 
     def test_verify_api_key_accepts_valid(self):
         """Test that valid API key is accepted."""
         import asyncio
+        from unittest.mock import MagicMock
+
         from fastapi.security import HTTPAuthorizationCredentials
 
         import vllm_mlx.server as server
+        from vllm_mlx.server_state import ServerState
 
-        original_key = server._api_key
+        # Create a state with a known API key and attach to app
+        state = ServerState(api_key="valid-secret-key")
+        original_state = getattr(server.app.state, "server", None)
 
         try:
-            # Set a known API key
-            server._api_key = "valid-secret-key"
+            server.app.state.server = state
+
+            # Create a mock request that references our app
+            mock_request = MagicMock()
+            mock_request.app = server.app
 
             # Create mock credentials with valid key
             credentials = HTTPAuthorizationCredentials(
@@ -622,12 +638,13 @@ class TestAPIKeyVerification:
 
             # Should not raise any exception
             result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
+                server.verify_api_key(mock_request, credentials)
             )
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:
-            server._api_key = original_key
+            if original_state is not None:
+                server.app.state.server = original_state
 
 
 class TestRateLimiterHTTPResponse:
