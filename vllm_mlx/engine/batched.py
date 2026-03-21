@@ -909,9 +909,9 @@ class BatchedEngine(BaseEngine):
         if self._text_engine is not None and not _has_media_content(messages):
             import os
 
-            # Pop specprefill kwargs (discarded for now — Task 5 wires them up)
-            kwargs.pop("specprefill", None)
-            kwargs.pop("specprefill_keep_pct", None)
+            # Pop per-request specprefill overrides (from extra_body)
+            specprefill_override = kwargs.pop("specprefill", None)
+            specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
 
             # Read enable_thinking from env (consistent with MLLM and old text path)
             enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
@@ -948,14 +948,80 @@ class BatchedEngine(BaseEngine):
             # Compute prefix boundary for cache efficiency
             prefix_boundary = self._compute_prefix_boundary(messages, tools)
 
-            logger.info("Text-only request → AsyncEngineCore[TextModel] (batched, MTP)")
+            # --- SpecPrefill: sparse prefill as preprocessing ---
+            # When a draft model is loaded and the prompt exceeds the threshold,
+            # score tokens with the draft model and submit only the selected
+            # token IDs to AsyncEngineCore. This reduces TTFT 2-3x on large
+            # prompts by skipping unimportant tokens during prefill.
+            _SPECPREFILL_MAX_TOKENS = 196608
+            use_specprefill = False
+            if self._draft_model is not None:
+                if specprefill_override is True:
+                    use_specprefill = True
+                elif specprefill_override is None and self._specprefill_enabled:
+                    use_specprefill = True
+                # specprefill_override=False explicitly disables
 
-            # Submit to AsyncEngineCore
-            request_id = await self._text_engine.add_request(
-                prompt=prompt,
-                sampling_params=sampling,
-                prefix_boundary=prefix_boundary,
-            )
+            if use_specprefill:
+                tokens = self._text_tokenizer.encode(prompt)
+                n_tokens = len(tokens)
+
+                # Threshold check (skip when force-enabled via per-request override)
+                if (
+                    specprefill_override is not True
+                    and n_tokens <= self._specprefill_threshold
+                ):
+                    use_specprefill = False
+
+                # Upper bound: cap to avoid draft model OOM
+                if use_specprefill and n_tokens > _SPECPREFILL_MAX_TOKENS:
+                    logger.warning(
+                        "SpecPrefill: prompt %d tokens exceeds max %d, "
+                        "falling back to normal path",
+                        n_tokens,
+                        _SPECPREFILL_MAX_TOKENS,
+                    )
+                    use_specprefill = False
+
+            if use_specprefill:
+                try:
+                    import time
+
+                    t0 = time.monotonic()
+                    # Score under lock (draft model is not thread-safe on Metal)
+                    async with self._specprefill_lock:
+                        sparse_tokens = await asyncio.to_thread(
+                            self._run_specprefill_scoring, tokens, specprefill_keep_pct
+                        )
+                    t_total = time.monotonic() - t0
+                    logger.info(
+                        "SpecPrefill preprocessing: %d → %d tokens in %.1fs",
+                        n_tokens,
+                        len(sparse_tokens),
+                        t_total,
+                    )
+                    # Submit sparse token IDs to engine (skip prefix cache —
+                    # sparse tokens break the prefix alignment invariant)
+                    request_id = await self._text_engine.add_request(
+                        prompt=sparse_tokens,
+                        sampling_params=sampling,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "SpecPrefill failed, falling back to normal path: %s", e
+                    )
+                    use_specprefill = False
+
+            if not use_specprefill:
+                logger.info(
+                    "Text-only request → AsyncEngineCore[TextModel] (batched, MTP)"
+                )
+                # Submit full text prompt to engine
+                request_id = await self._text_engine.add_request(
+                    prompt=prompt,
+                    sampling_params=sampling,
+                    prefix_boundary=prefix_boundary,
+                )
 
             # Stream outputs as GenerationOutput
             async for output in self._text_engine.stream_outputs(request_id):
@@ -1002,6 +1068,33 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    def _run_specprefill_scoring(
+        self, tokens: list[int], keep_pct_override: float | None = None
+    ) -> list[int]:
+        """Score tokens with draft model and return selected token IDs.
+
+        Runs synchronously (called via asyncio.to_thread). The draft model
+        scores token importance using attention weights, then select_chunks
+        picks the most important contiguous chunks to keep.
+
+        Args:
+            tokens: Full prompt token IDs to score.
+            keep_pct_override: Per-request override for fraction of tokens to keep.
+
+        Returns:
+            List of selected token IDs (subset of input, preserving order).
+        """
+        from ..specprefill import score_tokens, select_chunks
+
+        importance = score_tokens(
+            self._draft_model,
+            tokens,
+            prefill_step_size=getattr(self, "_prefill_step_size", 2048),
+        )
+        effective_keep = keep_pct_override or self._specprefill_keep_pct
+        selected = select_chunks(importance, keep_pct=effective_keep)
+        return [tokens[i] for i in selected.tolist()]
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
