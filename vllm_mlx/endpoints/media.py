@@ -57,7 +57,9 @@ router = APIRouter()
 
 
 @router.post("/v1/embeddings")
-async def create_embeddings(request: EmbeddingRequest, raw_request: Request) -> EmbeddingResponse:
+async def create_embeddings(
+    request: EmbeddingRequest, raw_request: Request
+) -> EmbeddingResponse:
     """
     Create embeddings for the given input text(s).
 
@@ -373,7 +375,9 @@ async def list_mcp_servers(request: Request) -> MCPServersResponse:
 
 
 @router.post("/v1/mcp/execute")
-async def execute_mcp_tool(request: MCPExecuteRequest, raw_request: Request) -> MCPExecuteResponse:
+async def execute_mcp_tool(
+    request: MCPExecuteRequest, raw_request: Request
+) -> MCPExecuteResponse:
     """Execute an MCP tool."""
     state = _get_state(raw_request)
     if state.mcp_manager is None:

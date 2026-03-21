@@ -107,7 +107,9 @@ class ServerState:
 
     # Tool calling configuration
     enable_auto_tool_choice: bool = False
-    tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
+    tool_call_parser: str | None = (
+        None  # Parser name: auto, mistral, qwen, llama, hermes
+    )
     tool_parser_instance: object | None = None  # Instantiated parser
 
     # Rate limiter

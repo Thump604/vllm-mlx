@@ -76,15 +76,18 @@ def _get_request_engine(request: Request) -> BaseEngine:
 # Import auth dependencies lazily to avoid circular imports.
 # They are registered as router-level dependencies below.
 
+
 def _verify_api_key_dep():
     """Return the verify_api_key dependency from the parent server module."""
     from ..server import verify_api_key
+
     return verify_api_key
 
 
 def _check_rate_limit_dep():
     """Return the check_rate_limit dependency from the parent server module."""
     from ..server import check_rate_limit
+
     return check_rate_limit
 
 
@@ -622,7 +625,9 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower() and not state.reasoning_parser
+    is_thinking_model = (
+        "nemotron" in request.model.lower() and not state.reasoning_parser
+    )
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream

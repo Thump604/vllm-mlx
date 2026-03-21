@@ -110,7 +110,9 @@ async def create_anthropic_message(
     if anthropic_request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(state, engine, openai_request, anthropic_request),
+                _stream_anthropic_messages(
+                    state, engine, openai_request, anthropic_request
+                ),
                 request,
             ),
             media_type="text/event-stream",
@@ -357,7 +359,9 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    _, tool_calls = parse_tool_calls_with_parser(state, accumulated_text, openai_request)
+    _, tool_calls = parse_tool_calls_with_parser(
+        state, accumulated_text, openai_request
+    )
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"

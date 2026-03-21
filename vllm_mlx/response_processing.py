@@ -74,7 +74,9 @@ def parse_tool_calls_with_parser(
     try:
         # Reset parser state between requests
         state.tool_parser_instance.reset()
-        result = state.tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        result = state.tool_parser_instance.extract_tool_calls(
+            output_text, request_dict
+        )
         if result.tools_called:
             tool_calls = [
                 ToolCall(

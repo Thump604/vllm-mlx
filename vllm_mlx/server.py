@@ -49,7 +49,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
-from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic  # noqa: F401
+from .api.anthropic_adapter import (
+    anthropic_to_openai,
+    openai_to_anthropic,
+)  # noqa: F401
 from .api.anthropic_models import AnthropicRequest  # noqa: F401
 from .api.models import (
     AssistantMessage,  # noqa: F401
@@ -116,7 +119,12 @@ from .endpoints.media import (  # noqa: F401 — re-export for backwards compat
     list_voices,
 )
 from .endpoints.media import router as media_router
-from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine  # noqa: F401
+from .engine import (
+    BaseEngine,
+    BatchedEngine,
+    GenerationOutput,
+    SimpleEngine,
+)  # noqa: F401
 from .response_processing import (
     inject_json_instruction as _inject_json_instruction,  # noqa: F401 — re-export for test compat
     parse_tool_calls_with_parser,  # noqa: F401 — re-export for backwards compat
@@ -147,7 +155,11 @@ async def lifespan(app: FastAPI):
     state: ServerState = app.state.server
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
-    if state.engine is not None and hasattr(state.engine, "_loaded") and not state.engine._loaded:
+    if (
+        state.engine is not None
+        and hasattr(state.engine, "_loaded")
+        and not state.engine._loaded
+    ):
         await state.engine.start()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
@@ -257,7 +269,9 @@ async def health(request: Request):
     mcp_info = None
     if state.mcp_manager is not None:
         connected = sum(
-            1 for s in state.mcp_manager.get_server_status() if s.state.value == "connected"
+            1
+            for s in state.mcp_manager.get_server_status()
+            if s.state.value == "connected"
         )
         total = len(state.mcp_manager.get_server_status())
         mcp_info = {
@@ -384,7 +398,9 @@ async def init_mcp(app_instance: FastAPI, config_path: str):
 
         state.mcp_executor = ToolExecutor(state.mcp_manager)
 
-        logger.info(f"MCP initialized with {len(state.mcp_manager.get_all_tools())} tools")
+        logger.info(
+            f"MCP initialized with {len(state.mcp_manager.get_all_tools())} tools"
+        )
 
     except ImportError:
         logger.error("MCP SDK not installed. Install with: pip install mcp")
@@ -520,7 +536,9 @@ Examples:
 
     # Configure rate limiter
     if args.rate_limit > 0:
-        state.rate_limiter = RateLimiter(requests_per_minute=args.rate_limit, enabled=True)
+        state.rate_limiter = RateLimiter(
+            requests_per_minute=args.rate_limit, enabled=True
+        )
         logger.info(
             f"Rate limiting enabled: {args.rate_limit} requests/minute per client"
         )
