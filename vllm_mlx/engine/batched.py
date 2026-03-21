@@ -784,16 +784,21 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
-        # Per-request MTP routing: text-only → TextModel, media → MLLM
-        if self._text_model is not None and not _has_media_content(messages):
-            return await self._chat_text_model(
+        # Per-request MTP routing: text-only → AsyncEngineCore[TextModel]
+        if self._text_engine is not None and not _has_media_content(messages):
+            last_chunk = None
+            async for chunk in self.stream_chat(
                 messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 tools=tools,
                 **kwargs,
-            )
+            ):
+                last_chunk = chunk
+            if last_chunk is not None:
+                return last_chunk
+            return GenerationOutput(text="", finish_reason="stop")
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
@@ -909,17 +914,70 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
-        # Per-request MTP routing: text-only → TextModel, media → MLLM
-        if self._text_model is not None and not _has_media_content(messages):
-            async for output in self._stream_chat_text_model(
-                messages,
-                max_tokens=max_tokens,
+        # Per-request MTP routing: text-only → AsyncEngineCore[TextModel]
+        if self._text_engine is not None and not _has_media_content(messages):
+            import os
+
+            # Pop specprefill kwargs (discarded for now — Task 5 wires them up)
+            kwargs.pop("specprefill", None)
+            kwargs.pop("specprefill_keep_pct", None)
+
+            # Read enable_thinking from env (consistent with MLLM and old text path)
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+            # Apply chat template using the text tokenizer
+            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if enable_thinking:
+                template_kwargs["enable_thinking"] = True
+            template_tools = convert_tools_for_template(tools) if tools else None
+            if template_tools:
+                template_kwargs["tools"] = template_tools
+
+            try:
+                prompt = self._text_tokenizer.apply_chat_template(
+                    messages, **template_kwargs
+                )
+            except TypeError:
+                template_kwargs.pop("tools", None)
+                template_kwargs.pop("enable_thinking", None)
+                prompt = self._text_tokenizer.apply_chat_template(
+                    messages, **template_kwargs
+                )
+
+            # Build sampling params for AsyncEngineCore
+            from ..request import SamplingParams
+
+            sampling = SamplingParams(
+                max_tokens=max_tokens or 4096,
                 temperature=temperature,
                 top_p=top_p,
-                tools=tools,
-                **kwargs,
-            ):
-                yield output
+            )
+
+            # Compute prefix boundary for cache efficiency
+            prefix_boundary = self._compute_prefix_boundary(messages, tools)
+
+            logger.info("Text-only request → AsyncEngineCore[TextModel] (batched, MTP)")
+
+            # Submit to AsyncEngineCore
+            request_id = await self._text_engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling,
+                prefix_boundary=prefix_boundary,
+            )
+
+            # Stream outputs as GenerationOutput
+            async for output in self._text_engine.stream_outputs(request_id):
+                yield GenerationOutput(
+                    text=output.output_text,
+                    new_text=output.new_text,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    finished=output.finished,
+                    finish_reason=output.finish_reason,
+                )
+                if output.finished:
+                    break
             return
 
         # Extract images/videos from messages (OpenAI multimodal format)
