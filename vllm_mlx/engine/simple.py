@@ -447,6 +447,39 @@ class SimpleEngine(BaseEngine):
         raw_output = bool(kwargs.pop("raw_output", False))
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
+        # PR #222: mlx-lm non-streaming chat with tools can stall indefinitely
+        # on some local models, while the streaming path completes normally.
+        # Reuse the streaming implementation and aggregate its final state so
+        # both chat APIs share the same tool-capable execution path.
+        if tools and not self._is_mllm:
+            final_output = GenerationOutput(text="")
+            stream_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                stream_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            async for output in self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **stream_kwargs,
+            ):
+                final_output = output
+            text = clean_output_text(final_output.text)
+            try:
+                tokens = self._model.tokenizer.encode(text, add_special_tokens=False)
+            except TypeError:
+                tokens = self._model.tokenizer.encode(text)
+            return GenerationOutput(
+                text=text,
+                tokens=tokens,
+                prompt_tokens=final_output.prompt_tokens,
+                completion_tokens=final_output.completion_tokens,
+                finish_reason=final_output.finish_reason,
+            )
+
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -454,8 +487,6 @@ class SimpleEngine(BaseEngine):
             if self._is_mllm:
                 # For MLLM, use the chat method which handles images/videos
                 # Run in thread pool to allow asyncio timeout to work
-                if chat_template_kwargs:
-                    kwargs["chat_template_kwargs"] = chat_template_kwargs
                 output = await asyncio.to_thread(
                     self._model.chat,
                     messages=messages,

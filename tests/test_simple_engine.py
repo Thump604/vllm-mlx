@@ -12,6 +12,10 @@ class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
     @pytest.fixture
+    def anyio_backend(self):
+        return "asyncio"
+
+    @pytest.fixture
     def mock_model(self):
         """Create a mock model that tracks concurrent calls."""
         model = MagicMock()
@@ -115,6 +119,60 @@ class TestSimpleEngineConcurrency:
             assert mock_llm_model._max_concurrent == 1, (
                 f"Expected max concurrent to be 1, but got {mock_llm_model._max_concurrent}. "
                 "The lock is not working correctly."
+            )
+
+    @pytest.mark.anyio
+    async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
+        """Tool-enabled non-stream chat should use the streaming path."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="partial",
+                tokens=[],
+                prompt_tokens=11,
+                completion_tokens=1,
+                finish_reason=None,
+                finished=False,
+            )
+            yield MagicMock(
+                text="<|im_end|><tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>",
+                tokens=[],
+                prompt_tokens=11,
+                completion_tokens=4,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+            engine._model.tokenizer.encode = MagicMock(return_value=[7, 8, 9])
+            engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "run pwd"}],
+                max_tokens=16,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+
+            assert output.text.startswith("<tool_call>")
+            assert output.tokens == [7, 8, 9]
+            assert output.prompt_tokens == 11
+            assert output.completion_tokens == 4
+            assert output.finish_reason == "stop"
+            mock_llm_model.chat.assert_not_called()
+            engine._model.tokenizer.encode.assert_called_once_with(
+                output.text, add_special_tokens=False
             )
 
     @pytest.mark.anyio
