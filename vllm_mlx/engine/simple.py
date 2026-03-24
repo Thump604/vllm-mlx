@@ -474,7 +474,7 @@ class SimpleEngine(BaseEngine):
                 tokens = self._model.tokenizer.encode(text)
             return GenerationOutput(
                 text=text,
-                tokens=tokens,
+                tokens=list(final_output.tokens),
                 prompt_tokens=final_output.prompt_tokens,
                 completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
