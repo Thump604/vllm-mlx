@@ -454,6 +454,8 @@ class SimpleEngine(BaseEngine):
             if self._is_mllm:
                 # For MLLM, use the chat method which handles images/videos
                 # Run in thread pool to allow asyncio timeout to work
+                if chat_template_kwargs:
+                    kwargs["chat_template_kwargs"] = chat_template_kwargs
                 output = await asyncio.to_thread(
                     self._model.chat,
                     messages=messages,
@@ -534,6 +536,8 @@ class SimpleEngine(BaseEngine):
             and not _has_media_content(messages)
         ):
             logger.info("Text-only request → LLM path (MTP=True)")
+            if chat_template_kwargs:
+                kwargs["chat_template_kwargs"] = chat_template_kwargs
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
@@ -558,6 +562,9 @@ class SimpleEngine(BaseEngine):
 
                 # Run stream_chat in thread pool since it's synchronous
                 def run_stream():
+                    local_kwargs = dict(kwargs)
+                    if chat_template_kwargs:
+                        local_kwargs["chat_template_kwargs"] = chat_template_kwargs
                     return list(
                         self._model.stream_chat(
                             messages=messages,
@@ -565,7 +572,7 @@ class SimpleEngine(BaseEngine):
                             temperature=temperature,
                             top_p=top_p,
                             tools=template_tools,
-                            **kwargs,
+                            **local_kwargs,
                         )
                     )
 
@@ -842,7 +849,7 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.sample_utils import make_sampler
 
         # Per-request template/specprefill overrides (from extra_body)
-        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
 
@@ -855,7 +862,7 @@ class SimpleEngine(BaseEngine):
             "tokenize": False,
             "add_generation_prompt": True,
         }
-        if isinstance(chat_template_kwargs, dict):
+        if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
         template_kwargs.setdefault("enable_thinking", enable_thinking)
         if tools:
