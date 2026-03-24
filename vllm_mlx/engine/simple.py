@@ -445,6 +445,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         raw_output = bool(kwargs.pop("raw_output", False))
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -460,6 +461,7 @@ class SimpleEngine(BaseEngine):
                     temperature=temperature,
                     top_p=top_p,
                     tools=template_tools,
+                    chat_template_kwargs=chat_template_kwargs,
                     **kwargs,
                 )
                 text = output.text if raw_output else clean_output_text(output.text)
@@ -479,6 +481,7 @@ class SimpleEngine(BaseEngine):
                     temperature=temperature,
                     top_p=top_p,
                     tools=template_tools,
+                    chat_template_kwargs=chat_template_kwargs,
                     **kwargs,
                 )
                 text = output.text if raw_output else clean_output_text(output.text)
@@ -518,6 +521,8 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -594,12 +599,12 @@ class SimpleEngine(BaseEngine):
 
             enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
             enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
-            chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+            chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
             }
-            if isinstance(chat_template_kwargs, dict):
+            if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
             template_kwargs.setdefault("enable_thinking", enable_thinking)
             if template_tools:
@@ -609,7 +614,7 @@ class SimpleEngine(BaseEngine):
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:
                 # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking"]:
+                for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)

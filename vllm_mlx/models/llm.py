@@ -265,6 +265,7 @@ class MLXLanguageModel:
         temperature: float = 0.7,
         top_p: float = 0.9,
         tools: list | None = None,
+        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -295,6 +296,8 @@ class MLXLanguageModel:
             # Add tools if provided and supported
             if tools:
                 template_kwargs["tools"] = tools
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
 
             try:
                 prompt = self.tokenizer.apply_chat_template(
@@ -302,8 +305,10 @@ class MLXLanguageModel:
                     **template_kwargs,
                 )
             except TypeError:
-                # Tokenizer doesn't support tools parameter
-                del template_kwargs["tools"]
+                # Tokenizer doesn't support all requested template kwargs
+                template_kwargs.pop("tools", None)
+                for key in (chat_template_kwargs or {}).keys():
+                    template_kwargs.pop(key, None)
                 prompt = self.tokenizer.apply_chat_template(
                     messages,
                     **template_kwargs,
