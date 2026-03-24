@@ -784,7 +784,7 @@ class BatchedEngine(BaseEngine):
                 },
                 chat_template_kwargs,
             )
-            if tools:
+            if tools and "tools" not in template_kwargs:
                 template_kwargs["tools"] = tools
             # Pass enable_thinking from env (set by runtime_patches from mode.json)
             import os
@@ -797,11 +797,10 @@ class BatchedEngine(BaseEngine):
                     messages, **template_kwargs
                 )
             except TypeError as e:
-                # Some templates don't accept 'tools'; retry without them.
+                # Some templates don't accept extra kwargs; retry without them.
                 logger.debug(f"Chat template TypeError, retrying without extras: {e}")
-                for key in ["tools"]:
-                    if key in template_kwargs:
-                        del template_kwargs[key]
+                for key in ["tools", *(chat_template_kwargs or {}).keys()]:
+                    template_kwargs.pop(key, None)
                 return template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
@@ -1153,13 +1152,14 @@ class BatchedEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
-            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         return await self.generate(
@@ -1173,7 +1173,10 @@ class BatchedEngine(BaseEngine):
         )
 
     def _compute_prefix_boundary(
-        self, messages: list[dict[str, Any]], tools: list[dict] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Compute token count for the shared prefix across message variations.
 
@@ -1195,7 +1198,11 @@ class BatchedEngine(BaseEngine):
             template_tools = convert_tools_for_template(tools) if tools else None
 
             # Tokenize the real prompt
-            real_prompt = self._apply_chat_template(messages, template_tools)
+            real_prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=chat_template_kwargs,
+            )
 
             # Build a dummy variant with different last user content
             dummy_messages = list(messages)
@@ -1203,7 +1210,11 @@ class BatchedEngine(BaseEngine):
                 **messages[last_user_idx],
                 "content": "XXXXXXXXXX",
             }
-            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+            dummy_prompt = self._apply_chat_template(
+                dummy_messages,
+                template_tools,
+                chat_template_kwargs=chat_template_kwargs,
+            )
 
             tokenizer = self.tokenizer
             if hasattr(tokenizer, "tokenizer"):
@@ -1401,17 +1412,22 @@ class BatchedEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
-            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        prefix_boundary = self._compute_prefix_boundary(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
 

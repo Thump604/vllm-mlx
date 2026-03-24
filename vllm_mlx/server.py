@@ -1539,7 +1539,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         if request.video_max_frames:
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
-    # SpecPrefill: per-request overrides
+    # SpecPrefill: per-request overrides (our _resolve_request_field
+    # handles both top-level fields and extra_body fallback, which is
+    # a superset of the direct-access pattern PR #218 used. chat_template_kwargs
+    # forwarding is handled above via _resolve_chat_template_kwargs.)
     specprefill = _resolve_request_field(request, "specprefill", None)
     if specprefill is not None:
         chat_kwargs["specprefill"] = specprefill

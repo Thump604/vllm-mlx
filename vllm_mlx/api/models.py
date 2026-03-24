@@ -174,6 +174,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
@@ -185,8 +187,6 @@ class ChatCompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # OpenAI client compatibility: server-specific extensions
     extra_body: dict[str, Any] | None = None
-    # Optional chat template controls (merged with extra_body.chat_template_kwargs)
-    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class AssistantMessage(BaseModel):
