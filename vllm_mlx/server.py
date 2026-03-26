@@ -895,10 +895,12 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                     }
                 )
             elif item_type == "reasoning":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Responses reasoning input items are not supported on this backend",
+                parts = item.get("content", [])
+                reasoning_text = "\n".join(
+                    p.get("text", "") for p in parts if isinstance(p, dict)
                 )
+                if reasoning_text:
+                    messages.append({"role": "assistant", "content": reasoning_text})
             else:
                 logger.info(
                     "Skipping unsupported Responses input item type %r", item_type
@@ -941,10 +943,9 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                 }
             )
         elif isinstance(item, ResponseReasoningItem):
-            raise HTTPException(
-                status_code=400,
-                detail="Responses reasoning input items are not supported on this backend",
-            )
+            reasoning_text = "\n".join(part.text for part in (item.content or []))
+            if reasoning_text:
+                messages.append({"role": "assistant", "content": reasoning_text})
         else:
             logger.info(
                 "Skipping unsupported Responses input item type %r",
