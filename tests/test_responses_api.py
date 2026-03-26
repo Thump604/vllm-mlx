@@ -4,6 +4,7 @@
 import platform
 import sys
 from types import SimpleNamespace
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,7 +34,7 @@ def server_state():
 
     srv._engine = None
     srv._model_name = "test-model"
-    srv._responses_store = {}
+    srv._responses_store = OrderedDict()
     srv._api_key = None
 
     try:

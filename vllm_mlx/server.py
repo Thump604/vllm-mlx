@@ -48,7 +48,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -272,7 +272,8 @@ _reasoning_parser_name: str | None = None
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Test override hook; production builds fresh parsers
-_responses_store: dict[str, dict] = {}
+_responses_store: OrderedDict[str, dict] = OrderedDict()
+_RESPONSES_STORE_MAX_SIZE: int = 1000
 
 
 @dataclass
@@ -1225,6 +1226,8 @@ async def _run_responses_request(
             "messages": copy.deepcopy(persisted_messages),
             "response": response_object.model_copy(deep=True),
         }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
 
     return response_object, persisted_messages
 
@@ -1617,6 +1620,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             "messages": copy.deepcopy(persisted_messages),
             "response": response_object.model_copy(deep=True),
         }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
 
     yield _responses_sse_event(
         "response.completed",
@@ -1629,198 +1634,6 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
     data = payload.model_dump_json() if isinstance(payload, BaseModel) else json.dumps(payload)
     return f"event: {event_type}\ndata: {data}\n\n"
 
-
-async def _stream_response_object(response: ResponseObject) -> AsyncIterator[str]:
-    """Stream a completed response object as OpenAI-style SSE events."""
-    sequence = 1
-    in_progress = response.model_copy(deep=True)
-    in_progress.status = "in_progress"
-    in_progress.usage = None
-    in_progress.output = []
-
-    yield _responses_sse_event(
-        "response.created",
-        ResponseCreatedEvent(sequence_number=sequence, response=in_progress),
-    )
-    sequence += 1
-    yield _responses_sse_event(
-        "response.in_progress",
-        ResponseInProgressEvent(sequence_number=sequence, response=in_progress),
-    )
-    sequence += 1
-
-    for output_index, item in enumerate(response.output):
-        if isinstance(item, ResponseReasoningItem):
-            item_id = item.id or _new_response_item_id("rs")
-            in_progress_item = item.model_copy(update={"id": item_id, "status": "in_progress"})
-            yield _responses_sse_event(
-                "response.output_item.added",
-                ResponseOutputItemAddedEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=in_progress_item,
-                ),
-            )
-            sequence += 1
-            part = item.content[0] if item.content else ResponseReasoningTextPart(text="")
-            yield _responses_sse_event(
-                "response.content_part.added",
-                ResponseContentPartAddedEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    part=ResponseReasoningTextPart(text=""),
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.reasoning_text.delta",
-                ResponseReasoningTextDeltaEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    delta=part.text,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.reasoning_text.done",
-                ResponseReasoningTextDoneEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    text=part.text,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.content_part.done",
-                ResponseContentPartDoneEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    part=part,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.output_item.done",
-                ResponseOutputItemDoneEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=item,
-                ),
-            )
-            sequence += 1
-            continue
-
-        if isinstance(item, ResponseMessageItem):
-            item_id = item.id or _new_response_item_id("msg")
-            in_progress_item = item.model_copy(update={"id": item_id, "status": "in_progress", "content": []})
-            text_part = item.content[0] if isinstance(item.content, list) and item.content else ResponseTextContentPart(type="output_text", text="")
-            yield _responses_sse_event(
-                "response.output_item.added",
-                ResponseOutputItemAddedEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=in_progress_item,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.content_part.added",
-                ResponseContentPartAddedEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    part=ResponseTextContentPart(type="output_text", text=""),
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.output_text.delta",
-                ResponseOutputTextDeltaEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    delta=text_part.text,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.output_text.done",
-                ResponseOutputTextDoneEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    text=text_part.text,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.content_part.done",
-                ResponseContentPartDoneEvent(
-                    sequence_number=sequence,
-                    item_id=item_id,
-                    output_index=output_index,
-                    content_index=0,
-                    part=text_part,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.output_item.done",
-                ResponseOutputItemDoneEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=item,
-                ),
-            )
-            sequence += 1
-            continue
-
-        if isinstance(item, ResponseFunctionCallItem):
-            in_progress_item = item.model_copy(update={"status": "in_progress"})
-            yield _responses_sse_event(
-                "response.output_item.added",
-                ResponseOutputItemAddedEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=in_progress_item,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.function_call_arguments.delta",
-                ResponseFunctionCallArgumentsDeltaEvent(
-                    sequence_number=sequence,
-                    item_id=item.id or _new_response_item_id("fc"),
-                    output_index=output_index,
-                    delta=item.arguments,
-                ),
-            )
-            sequence += 1
-            yield _responses_sse_event(
-                "response.output_item.done",
-                ResponseOutputItemDoneEvent(
-                    sequence_number=sequence,
-                    output_index=output_index,
-                    item=item,
-                ),
-            )
-            sequence += 1
-
-    yield _responses_sse_event(
-        "response.completed",
-        ResponseCompletedEvent(sequence_number=sequence, response=response),
-    )
 
 
 def _detect_native_tool_support(profile: ServingProfile) -> bool:
