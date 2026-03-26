@@ -468,10 +468,6 @@ class SimpleEngine(BaseEngine):
             ):
                 final_output = output
             text = clean_output_text(final_output.text)
-            try:
-                tokens = self._model.tokenizer.encode(text, add_special_tokens=False)
-            except TypeError:
-                tokens = self._model.tokenizer.encode(text)
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
