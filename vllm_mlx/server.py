@@ -991,10 +991,7 @@ def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatComplet
             detail="Responses text.format.type='json_object' is not supported on this backend",
         )
     if request.reasoning is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Responses reasoning configuration is not supported on this backend",
-        )
+        logger.debug("Ignoring reasoning configuration (not supported on this backend)")
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
     messages = _responses_input_to_chat_messages(request)
