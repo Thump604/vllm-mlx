@@ -919,6 +919,7 @@ class BatchedEngine(BaseEngine):
 
         return GenerationOutput(
             text=text,
+            tokens=output.output_token_ids,
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
