@@ -8,7 +8,7 @@ integrating with vLLM's model execution system.
 
 import logging
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Union
 
 logger = logging.getLogger(__name__)
 
@@ -175,23 +175,25 @@ class MLXLanguageModel:
 
     def stream_generate(
         self,
-        prompt: str,
+        prompt: Union[str, "mx.array", list[int]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        prompt_cache=None,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
 
         Args:
-            prompt: Input prompt text
+            prompt: Input prompt text, token array, or token id list
             max_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature (0 = greedy)
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Penalty for repeating tokens
             stop: List of stop sequences
+            prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
 
         Yields:
             StreamingOutput for each generated token
@@ -205,7 +207,10 @@ class MLXLanguageModel:
         sampler = self._create_sampler(temperature, top_p)
 
         # Count prompt tokens once upfront
-        num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        if isinstance(prompt, str):
+            num_prompt_tokens = len(self.tokenizer.encode(prompt))
+        else:
+            num_prompt_tokens = len(prompt)
 
         token_count = 0
         accumulated_text = ""
@@ -213,6 +218,8 @@ class MLXLanguageModel:
         mtp_kwargs = {}
         if self._mtp:
             mtp_kwargs["mtp"] = True
+        if prompt_cache is not None:
+            mtp_kwargs["prompt_cache"] = prompt_cache
 
         for response in stream_generate(
             self.model,
