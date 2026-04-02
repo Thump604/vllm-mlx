@@ -715,38 +715,35 @@ class SimpleEngine(BaseEngine):
                         t_prefill,
                     )
 
-                    # Phase 4: Generate via stream_generate
+                    # Phase 4: Generate via engine's standard pipelined path
+                    # (PR #248 fix — replaces manual model() + mx.eval loop
+                    # which produced ~0.3 tok/s due to missing kernel pipelining)
                     sampler = make_sampler(temp=temperature, top_p=top_p)
-                    y0 = sampler(logits[:, -1, :])
-                    mx.eval(y0)
-
-                    # y0 was sampled from Phase 3 logits but stream_generate
-                    # consumes it as "prompt", so prepend its text
-                    y0_text = tokenizer.decode([y0.item()])
+                    first_token_id = sampler(logits[:, -1, :]).item()
+                    first_text = tokenizer.decode([first_token_id])
                     eos_id = tokenizer.eos_token_id
+
                     results = [
                         SimpleNamespace(
-                            text=y0_text,
-                            finish_reason=(
-                                "stop" if y0.item() == eos_id else None
-                            ),
+                            text=first_text,
+                            finish_reason="stop" if first_token_id == eos_id else None,
                         )
                     ]
 
-                    if y0.item() != eos_id:
-                        for resp in mlx_stream_generate(
-                            model,
-                            tokenizer,
-                            prompt=y0.reshape(-1),
+                    if first_token_id != eos_id:
+                        for chunk in self._model.stream_generate(
+                            prompt=mx.array([first_token_id]),
                             max_tokens=max_tokens - 1,
-                            sampler=sampler,
+                            temperature=temperature,
+                            top_p=top_p,
+                            stop=stop,
                             prompt_cache=cache,
-                            prefill_step_size=self._prefill_step_size,
                         ):
+                            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                             results.append(
                                 SimpleNamespace(
-                                    text=resp.text,
-                                    finish_reason=resp.finish_reason,
+                                    text=new_text,
+                                    finish_reason=getattr(chunk, "finish_reason", None),
                                 )
                             )
 
@@ -1187,47 +1184,41 @@ class SimpleEngine(BaseEngine):
                         effective_keep,
                     )
 
-                    # Phase 4: Generate with MTP via stream_generate
-                    y0 = sampler(logits[:, -1, :])
-                    mx.eval(y0)
+                    # Phase 4: Generate via mlx_lm pipelined path (PR #248)
+                    # Local extension: preserve MTP cache setup and mtp=True
+                    # + logits_processors kwargs (upstream's version drops
+                    # them because upstream's _stream_generate_text does not
+                    # support MTP; our local build uses it for Qwen 3.5 122B
+                    # MTP and relies on these parameters).
+                    eos_id = self._text_tokenizer.eos_token_id
+                    first_token_id = sampler(logits[:, -1, :]).item()
+                    first_text = self._text_tokenizer.decode([first_token_id])
 
-                    # Build cache with MTP entries
+                    # Build cache with MTP entries (local extension)
                     if hasattr(model, "make_mtp_cache"):
                         gen_cache = list(bc) + list(model.make_mtp_cache())
                     else:
                         gen_cache = list(bc)
 
-                    # y0 was sampled from Phase 3 logits but stream_generate
-                    # consumes it as "prompt", so prepend its text
-                    y0_text = self._text_tokenizer.decode([y0.item()])
-                    eos_id = self._text_tokenizer.eos_token_id
                     results = [
                         SimpleNamespace(
-                            text=y0_text,
-                            finish_reason=(
-                                "stop" if y0.item() == eos_id else None
-                            ),
+                            text=first_text,
+                            finish_reason="stop" if first_token_id == eos_id else None,
                         )
                     ]
 
-                    if y0.item() != eos_id:
+                    if first_token_id != eos_id:
                         for resp in mlx_stream_generate(
                             model,
                             self._text_tokenizer,
-                            prompt=y0.reshape(-1),
+                            prompt=mx.array([first_token_id]),
                             max_tokens=max_tokens - 1,
                             sampler=sampler,
                             logits_processors=logits_processors,
                             mtp=True,
                             prompt_cache=gen_cache,
-                            prefill_step_size=self._prefill_step_size,
                         ):
-                            results.append(
-                                SimpleNamespace(
-                                    text=resp.text,
-                                    finish_reason=resp.finish_reason,
-                                )
-                            )
+                            results.append(resp)
 
                     return results
 
