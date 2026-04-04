@@ -42,8 +42,17 @@ import math
 
 import mlx.core as mx
 
+import mlx_lm.models.cache as _cache_mod
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
+
+# Use unpatched make_prompt_cache for draft model cache creation.
+# The KV quantize runtime patch replaces make_prompt_cache globally,
+# but the draft model's tiny KV cache doesn't need quantization and
+# QuantizedSDPACache lacks the .keys attribute needed for scoring.
+_make_draft_cache = getattr(
+    _cache_mod, "_original_make_prompt_cache", make_prompt_cache
+)
 
 # ===========================================================================
 # Step 1: Token importance scoring (draft model)
@@ -64,10 +73,10 @@ class _AttentionCapture:
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor or _qwen35_extract_queries
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, **kwargs):
         queries = self._query_extractor(self._original, x, cache)
         self._query_buffer[self._buf_idx].append(queries)
-        return self._original(x, mask=mask, cache=cache)
+        return self._original(x, mask=mask, cache=cache, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
@@ -106,6 +115,21 @@ def _llama_extract_queries(attn, x, cache=None):
     )
     queries = attn.q_proj(x)
     queries = queries.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
+    if cache is not None:
+        queries = attn.rope(queries, offset=cache.offset)
+    else:
+        queries = attn.rope(queries)
+    return queries
+
+
+def _gemma4_extract_queries(attn, x, cache=None):
+    """Extract post-RoPE queries from Gemma 4 attention (q_norm + partial RoPE).
+
+    Gemma 4: q_proj → reshape → q_norm → RoPE. Scale=1.0 (QK norms absorb it).
+    """
+    B, L, D = x.shape
+    queries = attn.q_proj(x).reshape(B, L, attn.n_heads, -1)
+    queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
     if cache is not None:
         queries = attn.rope(queries, offset=cache.offset)
     else:
@@ -227,6 +251,9 @@ def _compute_importance(
         if not captures:
             continue
         cache = attn_caches[layer_i]
+        # Skip caches without keys (e.g. _OffsetCache for KV-shared layers)
+        if not hasattr(cache, "keys") or cache.keys is None:
+            continue
         prompt_keys = cache.keys[..., :n_prompt, :]
         # Skip layers with windowed/rotating caches that don't span
         # the full prompt (e.g., GPT-OSS sliding_attention with 128-token window).
@@ -310,7 +337,11 @@ def score_tokens(
 
     # Auto-detect query extractor if not specified
     if query_extractor is None:
-        if hasattr(attn_obj, "q_norm"):
+        if hasattr(attn_obj, "v_norm"):
+            # Gemma 4: q_norm + v_norm, no gate split
+            query_extractor = _gemma4_extract_queries
+        elif hasattr(attn_obj, "q_norm"):
+            # Qwen3.5: q_norm + gate split (q_proj output is 2x wider)
             query_extractor = _qwen35_extract_queries
         elif not hasattr(attn_obj, "rope"):
             # No RoPE attribute → Nemotron-H style (content-based attention)
@@ -318,8 +349,8 @@ def score_tokens(
         else:
             query_extractor = _llama_extract_queries
 
-    # Phase 1: Prefill
-    cache = make_prompt_cache(model)
+    # Phase 1: Prefill (use unpatched cache to avoid KV quantization on draft)
+    cache = _make_draft_cache(model)
     logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
 
     # Phase 2: Lookahead decode with query capture

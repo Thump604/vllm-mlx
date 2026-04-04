@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 
+from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -198,12 +200,16 @@ class MLLMScheduler:
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
 
+        # Per-request streaming detokenizers for UTF-8-safe incremental decode
+        self._detokenizer_pool: Dict[str, Any] = {}
+
         # Output queues for async streaming
         self.output_queues: Dict[str, asyncio.Queue] = {}
 
         # Async processing control
         self._running = False
         self._processing_task: Optional[asyncio.Task] = None
+        self._gpu_lock = None
 
         # Memory management: periodic mx.clear_cache() to free Metal buffer pool
         self._step_count = 0
@@ -447,12 +453,42 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
 
-            # Decode the new token
-            new_text = tokenizer.decode([response.token])
+            # Decode the new token using streaming detokenizer (UTF-8 safe)
+            if request_id not in self._detokenizer_pool:
+                if hasattr(tokenizer, "detokenizer"):
+                    detok = tokenizer.detokenizer
+                else:
+                    detok = NaiveStreamingDetokenizer(tokenizer)
+                detok.reset()
+                self._detokenizer_pool[request_id] = detok
+            detok = self._detokenizer_pool[request_id]
+            detok.add_token(response.token)
+            new_text = detok.last_segment
 
             # Create output
             output = RequestOutput(
@@ -475,8 +511,13 @@ class MLLMScheduler:
                 output.finish_reason = response.finish_reason
                 finished_ids.add(request_id)
 
-                # Decode full output
-                output.output_text = tokenizer.decode(request.output_tokens)
+                # Finalize streaming detokenizer and get full output
+                detok = self._detokenizer_pool.pop(request_id, None)
+                if detok is not None:
+                    detok.finalize()
+                    output.output_text = detok.text
+                else:
+                    output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
 
@@ -608,13 +649,29 @@ class MLLMScheduler:
 
         logger.info("MLLM Scheduler stopped")
 
+    def set_gpu_lock(self, lock) -> None:
+        """Set the shared GPU lock used by text and MLLM schedulers."""
+        self._gpu_lock = lock
+
     async def _process_loop(self) -> None:
         """Main async processing loop."""
         while self._running:
             try:
                 if self.has_requests():
                     # Run one step
-                    self.step()
+                    if self._gpu_lock is not None:
+                        async with self._gpu_lock:
+                            worker = asyncio.ensure_future(asyncio.to_thread(self.step))
+                            try:
+                                await asyncio.shield(worker)
+                            except asyncio.CancelledError:
+                                try:
+                                    await worker
+                                except Exception:
+                                    pass
+                                raise
+                    else:
+                        self.step()
                     # Yield to other tasks
                     await asyncio.sleep(0)
                 else:
@@ -765,12 +822,19 @@ class MLLMScheduler:
         }
 
         if self.batch_generator is not None:
-            batch_stats = self.batch_generator.stats()
-            stats["batch_generator"] = batch_stats.to_dict()
-            # Add vision embedding cache stats from batch generator
-            stats["vision_embedding_cache"] = (
-                self.batch_generator.get_vision_cache_stats()
-            )
+            try:
+                batch_stats = self.batch_generator.stats()
+                stats["batch_generator"] = batch_stats.to_dict()
+            except Exception as exc:
+                logger.warning("Failed to collect MLLM batch stats: %s", exc)
+                stats["batch_generator"] = {"error": str(exc)}
+            try:
+                stats["vision_embedding_cache"] = (
+                    self.batch_generator.get_vision_cache_stats()
+                )
+            except Exception as exc:
+                logger.warning("Failed to collect vision cache stats: %s", exc)
+                stats["vision_embedding_cache"] = {"error": str(exc)}
 
         if self.vision_cache:
             stats["vision_cache"] = self.vision_cache.get_stats()

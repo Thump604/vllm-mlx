@@ -11,15 +11,74 @@ MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
 LLM engine), so text-only requests must also be routed through it.
 """
 
+import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..message_utils import _normalize_messages
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "image",
+        "video",
+        "audio",
+    }
+)
+
+
+def _has_media_content(messages: list) -> bool:
+    """Check if any message contains media content (images, video, audio)."""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _MEDIA_TYPES:
+                    return True
+    return False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_any_media(
+    messages: list[dict[str, Any]],
+    images: list[str] | None = None,
+    videos: list[str] | None = None,
+) -> bool:
+    """Check both message content parts and top-level media parameters."""
+    return bool(images or videos) or _has_media_content(messages)
+
+
+def _collect_stop_tokens(tokenizer: Any) -> set[int]:
+    """Collect EOS/stop token IDs from tokenizer variants."""
+    actual_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    stop_tokens: set[int] = set()
+
+    for attr in ("eos_token_id", "eos_token_ids"):
+        value = getattr(actual_tokenizer, attr, None)
+        if value is None:
+            continue
+        if isinstance(value, (list, set, tuple)):
+            stop_tokens.update(int(token) for token in value if token is not None)
+        else:
+            stop_tokens.add(int(value))
+
+    return stop_tokens
 
 
 def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
@@ -40,9 +99,9 @@ def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
         for item in content:
             # Handle Pydantic models
             if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
+                item = item.model_dump()
             elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
+                item = item.dict()
 
             if not isinstance(item, dict):
                 continue
@@ -137,6 +196,12 @@ class BatchedEngine(BaseEngine):
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
+        mtp: bool = False,
+        prefill_step_size: int | None = None,
+        specprefill_enabled: bool = False,
+        specprefill_draft_model_path: str | None = None,
+        specprefill_threshold: int = 8192,
+        specprefill_keep_pct: float = 0.3,
     ):
         """
         Initialize the batched engine.
@@ -147,12 +212,29 @@ class BatchedEngine(BaseEngine):
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
             force_mllm: Force loading as MLLM even if not auto-detected
+            mtp: Enable MTP per-request routing (text-only → TextModel, media → MLLM)
+            prefill_step_size: Chunk size for prompt prefill (default 2048)
+            specprefill_enabled: Enable SpecPrefill sparse prefill
+            specprefill_draft_model_path: Draft model directory name under ~/ai-models/mlx_models/
+            specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default 8192)
+            specprefill_keep_pct: Fraction of tokens to keep (default 0.3)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._mtp = mtp
+        self._prefill_step_size = prefill_step_size or 2048
+
+        # SpecPrefill configuration
+        self._specprefill_enabled = specprefill_enabled
+        self._specprefill_draft_model_path = specprefill_draft_model_path
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_lock = asyncio.Lock()
+        self._gpu_lock = asyncio.Lock()
+        self._draft_model = None
 
         self._model = None
         self._processor = None  # For MLLM
@@ -161,6 +243,21 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
+
+        # Per-request routing state (MLLM+MTP mode)
+        self._text_model = None
+        self._text_tokenizer = None
+        self._text_scheduler = None
+        self._text_generation_lock = asyncio.Lock()
+        self._text_scheduler_route_enabled = _env_flag(
+            "VLLM_MLX_ENABLE_TEXT_BATCH_SCHEDULER_CANARY",
+            _env_flag("VLLM_MLX_ENABLE_TEXT_BATCH_SCHEDULER", False),
+        )
+
+        # System prompt KV cache (reduces repeated prefill across requests)
+        self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
+        self._system_kv_hash = None  # Hash of system prefix text
+        self._system_kv_token_count = 0  # Tokens in cached prefix
 
     @property
     def model_name(self) -> str:
@@ -233,6 +330,7 @@ class BatchedEngine(BaseEngine):
             processor=self._processor,
             config=mllm_config,
         )
+        self._mllm_scheduler.set_gpu_lock(self._gpu_lock)
         await self._mllm_scheduler.start()
 
         logger.info(
@@ -240,6 +338,122 @@ class BatchedEngine(BaseEngine):
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
             f"completion_batch={completion_batch_size}"
         )
+
+        # Build TextModel for per-request routing (text-only → mlx_lm, media → MLLM).
+        # Needed when:
+        # - MTP is enabled (text-only gets MTP speedup)
+        # - SpecPrefill is enabled (text-only gets sparse prefill)
+        # - TextBatchScheduler canary routing is enabled (text-only foundation path)
+        if (
+            self._mtp
+            or self._specprefill_enabled
+            or self._text_scheduler_route_enabled
+        ):
+            try:
+                from ..text_model_from_vlm import build_text_model
+
+                self._text_model = build_text_model(
+                    self._mllm_instance.model, self._model_name
+                )
+                if self._text_model is not None:
+                    # Get tokenizer from the MLLM instance (same model, shared tokenizer)
+                    self._text_tokenizer = self._mllm_instance.get_tokenizer()
+
+                    # Apply Qwen3.5 eos_token fix (matches SimpleEngine pattern)
+                    if "qwen3" in self._model_name.lower():
+                        self._text_tokenizer.eos_token = "<|im_end|>"
+                        self._text_tokenizer.eos_token_id = (
+                            self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                        )
+
+                    # Check if TextModel actually has MTP
+                    has_mtp = (
+                        hasattr(self._text_model, "mtp")
+                        and self._text_model.mtp is not None
+                    )
+                    if has_mtp:
+                        logger.info(
+                            "BatchedEngine MLLM+MTP routing: "
+                            "text-only → TextModel (MTP), media → MLLM"
+                        )
+                    elif self._specprefill_enabled:
+                        logger.info(
+                            "BatchedEngine text routing: "
+                            "text-only → TextModel (SpecPrefill, no MTP), media → MLLM"
+                        )
+                    elif self._text_scheduler_route_enabled:
+                        logger.info(
+                            "BatchedEngine text routing: "
+                            "text-only → TextModel (TextBatchScheduler canary), media → MLLM"
+                        )
+                    else:
+                        logger.warning(
+                            "TextModel built but no MTP head and SpecPrefill disabled — "
+                            "text-only won't benefit from routing"
+                        )
+                        self._text_model = None
+                        self._text_tokenizer = None
+            except Exception as e:
+                logger.error(f"TextModel build failed: {e}")
+                self._text_model = None
+                self._text_tokenizer = None
+
+        # Load SpecPrefill draft model (for TextModel path — after sparse
+        # prefill, decode uses stream_generate with MTP for full throughput)
+        if self._specprefill_enabled and self._specprefill_draft_model_path:
+            try:
+                from pathlib import Path
+
+                from mlx_lm import load as mlx_lm_load
+
+                draft_path = str(
+                    Path.home()
+                    / "ai-models"
+                    / "mlx_models"
+                    / self._specprefill_draft_model_path
+                )
+                self._draft_model, _ = mlx_lm_load(draft_path)
+                logger.info(
+                    "SpecPrefill draft model loaded: %s (threshold=%d, keep=%.0f%%)",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception as e:
+                logger.warning("Failed to load SpecPrefill draft model: %s", e)
+                self._specprefill_enabled = False
+                self._draft_model = None
+
+        if self._text_model is not None and self._text_tokenizer is not None:
+            try:
+                from ..text_batch_scheduler import TextBatchScheduler
+
+                self._text_scheduler = TextBatchScheduler(
+                    model=self._text_model,
+                    tokenizer=self._text_tokenizer,
+                    gpu_lock=self._gpu_lock,
+                    stop_tokens=_collect_stop_tokens(self._text_tokenizer),
+                    draft_model=self._draft_model,
+                    enable_mtp=self._mtp
+                    and hasattr(self._text_model, "mtp_forward"),
+                    prefill_step_size=self._prefill_step_size,
+                    specprefill_threshold=self._specprefill_threshold,
+                    specprefill_keep_pct=self._specprefill_keep_pct,
+                )
+                if self._text_scheduler_route_enabled:
+                    await self._text_scheduler.start()
+                    logger.info(
+                        "TextBatchScheduler started for canary routing: mtp=%s",
+                        self._mtp,
+                    )
+                else:
+                    logger.info(
+                        "TextBatchScheduler prepared with route disabled; "
+                        "serial text path remains the production default"
+                    )
+            except Exception as e:
+                logger.error("TextBatchScheduler init failed: %s", e)
+                self._text_scheduler = None
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
@@ -312,8 +526,37 @@ class BatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
+        # Load SpecPrefill draft model (LLM text-only path)
+        if self._specprefill_enabled and self._specprefill_draft_model_path:
+            try:
+                from pathlib import Path
+
+                from mlx_lm import load as mlx_lm_load
+
+                draft_path = str(
+                    Path.home()
+                    / "ai-models"
+                    / "mlx_models"
+                    / self._specprefill_draft_model_path
+                )
+                self._draft_model, _ = mlx_lm_load(draft_path)
+                logger.info(
+                    "SpecPrefill draft model loaded: %s (threshold=%d, keep=%.0f%%)",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception as e:
+                logger.warning("Failed to load SpecPrefill draft model: %s", e)
+                self._specprefill_enabled = False
+                self._draft_model = None
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        if self._text_scheduler:
+            await self._text_scheduler.stop()
+            self._text_scheduler = None
+
         if self._mllm_scheduler:
             await self._mllm_scheduler.stop()
             self._mllm_scheduler = None
@@ -327,8 +570,31 @@ class BatchedEngine(BaseEngine):
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
+        self._text_model = None
+        self._text_tokenizer = None
+        self._draft_model = None
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
         self._loaded = False
         logger.info("BatchedEngine stopped")
+
+    def _should_use_text_scheduler(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+    ) -> bool:
+        """Gate the foundation scheduler to a safe canary subset."""
+        if not self._text_scheduler_route_enabled:
+            return False
+        if self._text_scheduler is None or self._text_model is None:
+            return False
+        if _has_any_media(messages, images, videos):
+            return False
+        return True
 
     def _apply_chat_template(
         self,
@@ -369,6 +635,10 @@ class BatchedEngine(BaseEngine):
             }
             if tools:
                 template_kwargs["tools"] = tools
+            # Pass enable_thinking from env (set by runtime_patches from mode.json)
+            import os
+            if os.environ.get("VLLM_MLX_ENABLE_THINKING", "").lower() in ("1", "true"):
+                template_kwargs["enable_thinking"] = True
 
             try:
                 return template_applicator.apply_chat_template(
@@ -612,6 +882,42 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Normalize messages before any path (developer->system, merge consecutive)
+        messages = _normalize_messages(messages)
+
+        # Per-request MTP routing: text-only → TextModel, media → MLLM
+        if self._should_use_text_scheduler(
+            messages,
+            tools=tools,
+            images=images,
+            videos=videos,
+        ):
+            logger.info("Text-only request → TextBatchScheduler [non-streaming]")
+            last_output = None
+            async for output in self._text_scheduler.submit(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            ):
+                last_output = output
+
+            if last_output is not None:
+                return last_output
+            return GenerationOutput(text="", finish_reason="stop")
+
+        if self._text_model is not None and not _has_any_media(messages, images, videos):
+            return await self._chat_text_model(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            )
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -723,6 +1029,40 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Normalize messages before any path (developer->system, merge consecutive)
+        messages = _normalize_messages(messages)
+
+        # Per-request MTP routing: text-only → TextModel, media → MLLM
+        if self._should_use_text_scheduler(
+            messages,
+            tools=tools,
+            images=images,
+            videos=videos,
+        ):
+            logger.info("Text-only request → TextBatchScheduler [streaming]")
+            async for output in self._text_scheduler.submit(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            ):
+                yield output
+            return
+
+        if self._text_model is not None and not _has_any_media(messages, images, videos):
+            async for output in self._stream_chat_text_model(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            ):
+                yield output
+            return
+
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
@@ -755,6 +1095,524 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
+    async def _chat_text_model(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """Non-streaming text-only generation via mlx_lm TextModel with MTP.
+
+        Collects all streaming output into a single GenerationOutput.
+        Used when MLLM+MTP routing is active and the request has no media.
+        """
+        logger.info("Text-only request → TextModel (MTP) [non-streaming]")
+        accumulated_text = ""
+        last_chunk = None
+        async for chunk in self._stream_chat_text_model(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=tools,
+            **kwargs,
+        ):
+            accumulated_text = chunk.text
+            last_chunk = chunk
+        if last_chunk is not None:
+            return GenerationOutput(
+                text=accumulated_text,
+                prompt_tokens=last_chunk.prompt_tokens,
+                completion_tokens=last_chunk.completion_tokens,
+                finish_reason=last_chunk.finish_reason,
+            )
+        return GenerationOutput(text="", finish_reason="stop")
+
+    async def _stream_chat_text_model(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Streaming text-only generation via mlx_lm TextModel with MTP.
+
+        Used when MLLM+MTP routing is active and the request has no media.
+        Runs the full generation in a single thread to maintain Metal safety.
+
+        System prompt KV caching: on the first request, prefills system tokens
+        and snapshots backbone KV state. Subsequent requests with the same
+        system prompt restore the snapshot and only prefill the suffix tokens.
+
+        SpecPrefill: when a draft model is loaded and the prompt exceeds the
+        threshold, uses attention-based sparse prefill for faster TTFT.
+        Composes with system KV cache (sparse-prefill only the suffix when
+        cache hits). Falls back to normal path on any error.
+        """
+        import hashlib
+        import os
+
+        import mlx.core as mx
+        from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_sampler
+
+        # Per-request specprefill overrides (from extra_body)
+        specprefill_override = kwargs.pop("specprefill", None)
+        specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+
+        # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
+        enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+        enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+
+        # Deep-convert messages AND tools to pure dicts (Pydantic models in
+        # tool_calls/parameters cause Jinja ".items()" errors in chat templates)
+        import json
+
+        messages = json.loads(json.dumps(messages, default=str))
+        if tools:
+            tools = json.loads(json.dumps(tools, default=str))
+
+        # Apply chat template
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": enable_thinking,
+        }
+        if tools:
+            template_kwargs["tools"] = tools
+
+        try:
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+        except (TypeError, Exception) as e:
+            # Template may reject tools= or enable_thinking=, or tools format
+            # may not match template expectations — retry without tools
+            logger.debug("Chat template error, retrying without tools: %s", e)
+            template_kwargs.pop("tools", None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = self._text_tokenizer.apply_chat_template(
+                messages, **template_kwargs
+            )
+
+        # Build sampler
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        max_tokens = max_tokens or 4096
+
+        # Check MTP support — used by all generation paths below
+        _has_mtp = hasattr(self._text_model, "mtp_forward")
+
+        # --- System KV cache: find system prefix boundary ---
+        # Detect template format and find first user turn marker.
+        # ChatML (Qwen 3.5): <|im_start|>user
+        # Gemma 4: <|turn>user
+        _USER_MARKERS = ("<|im_start|>user", "<|turn>user")
+        marker_pos = -1
+        for _um in _USER_MARKERS:
+            marker_pos = prompt.find(_um)
+            if marker_pos > 0:
+                break
+        if marker_pos > 0:
+            system_prefix = prompt[:marker_pos]
+            suffix = prompt[marker_pos:]
+            prefix_hash = hashlib.sha256(system_prefix.encode()).hexdigest()[:16]
+        else:
+            system_prefix = None
+            suffix = prompt
+            prefix_hash = None
+
+        # Check for cache hit
+        cache_hit = (
+            prefix_hash is not None
+            and prefix_hash == self._system_kv_hash
+            and self._system_kv_snapshot is not None
+        )
+
+        if cache_hit:
+            logger.info(
+                "Text-only request → TextModel (MTP) [streaming, system KV cache HIT: "
+                "reusing %d cached tokens, hash=%s]",
+                self._system_kv_token_count,
+                prefix_hash,
+            )
+        else:
+            logger.info("Text-only request → TextModel (MTP) [streaming]")
+
+        prefill_step_size = self._prefill_step_size
+
+        # --- SpecPrefill decision ---
+        # Determine whether to use specprefill for this request.
+        # Must be decided before entering the generation lock so we can
+        # tokenize and check the threshold outside the critical section.
+        _SPECPREFILL_MAX_TOKENS = 196608
+        use_specprefill = False
+        if self._draft_model is not None:
+            if specprefill_override is True:
+                use_specprefill = True
+            elif specprefill_override is None and self._specprefill_enabled:
+                use_specprefill = True
+            # specprefill_override=False explicitly disables
+
+        # Tokenize to determine token count for specprefill threshold check.
+        # We need this for both specprefill and normal paths anyway.
+        sp_tokens = None  # tokens to score (suffix or full prompt)
+        sp_offset = 0  # position offset for sparse_prefill
+        sp_n_total = 0  # total prompt tokens (for logging / threshold)
+
+        if use_specprefill:
+            if cache_hit:
+                # Score only the suffix — system prefix is already cached
+                sp_tokens = self._text_tokenizer.encode(suffix)
+                sp_offset = self._system_kv_token_count
+                sp_n_total = sp_offset + len(sp_tokens)
+            else:
+                # Score the full prompt
+                sp_tokens = self._text_tokenizer.encode(prompt)
+                sp_offset = 0
+                sp_n_total = len(sp_tokens)
+
+            n_sp_tokens = len(sp_tokens)
+
+            # Threshold check (skip when force-enabled via per-request override)
+            if (
+                specprefill_override is not True
+                and n_sp_tokens <= self._specprefill_threshold
+            ):
+                use_specprefill = False
+
+            # Upper bound: cap to avoid draft model OOM
+            if use_specprefill and n_sp_tokens > _SPECPREFILL_MAX_TOKENS:
+                logger.warning(
+                    "SpecPrefill: prompt %d tokens exceeds max %d, "
+                    "falling back to normal path",
+                    n_sp_tokens,
+                    _SPECPREFILL_MAX_TOKENS,
+                )
+                use_specprefill = False
+
+        # Run under generation lock, all tokens in single thread (Metal safety)
+        # CRITICAL: use asyncio.shield to prevent cancellation from releasing
+        # the lock while to_thread worker is still executing Metal ops.
+        # Without shield, CancelledError propagates through 'async with',
+        # releasing the lock while the background thread is mid-eval.
+        # Next request acquires the freed lock -> two threads hit Metal
+        # concurrently -> SIGABRT (tryCoalescingPreviousComputeCommandEncoder).
+        # See: vllm-mlx PR #220, mlx issue #3216.
+        async with self._text_generation_lock:
+
+            def _run_with_cache():
+                if use_specprefill:
+                    try:
+                        return _run_specprefill()
+                    except Exception as e:
+                        logger.error(
+                            "SpecPrefill failed, falling back to normal path: %s", e
+                        )
+                        # Fall through to normal path
+                if cache_hit:
+                    return _run_cache_hit()
+                else:
+                    return _run_cache_miss()
+
+            def _run_specprefill():
+                """Score tokens, sparse prefill, generate with MTP.
+
+                Composes with system KV cache: when cache_hit, restores the
+                system KV snapshot first, then sparse-prefills only the suffix
+                tokens with position_offset = system_kv_token_count.
+
+                After Phase 3 (sparse prefill), the cache is fully materialized
+                with _OffsetAdjustedRoPE installed. Phase 4 hands off to
+                stream_generate for MTP-enabled decode at full throughput.
+                """
+                import time
+                from types import SimpleNamespace
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    score_tokens,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                # Build target cache (optionally restore system KV snapshot)
+                target_cache = make_prompt_cache(self._text_model)
+                if cache_hit:
+                    for layer_idx, snapshot_state in enumerate(
+                        self._system_kv_snapshot
+                    ):
+                        if layer_idx < len(target_cache):
+                            target_cache[layer_idx].state = snapshot_state
+                    mx.eval([c.state for c in target_cache if hasattr(c, "state")])
+
+                try:
+                    # Phase 1: Score with draft model
+                    t0 = time.monotonic()
+                    importance = score_tokens(
+                        self._draft_model,
+                        sp_tokens,
+                        prefill_step_size=prefill_step_size,
+                    )
+                    t_score = time.monotonic() - t0
+
+                    # Phase 2: Select important chunks
+                    effective_keep = (
+                        specprefill_keep_pct_override or self._specprefill_keep_pct
+                    )
+                    selected = select_chunks(importance, keep_pct=effective_keep)
+                    n_selected = selected.shape[0]
+                    n_scored = len(sp_tokens)
+
+                    # Phase 3: Sparse prefill on target model
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        self._text_model,
+                        sp_tokens,
+                        selected,
+                        target_cache,
+                        step_size=prefill_step_size,
+                        position_offset=sp_offset,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill: scored %d tokens in %.1fs, "
+                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
+                        "(offset=%d, effective_keep=%.2f)",
+                        n_scored,
+                        t_score,
+                        n_selected,
+                        n_scored,
+                        n_selected / n_scored * 100,
+                        t_prefill,
+                        sp_offset,
+                        effective_keep,
+                    )
+
+                    # Phase 4: Generate with MTP via stream_generate
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
+
+                    # Build cache with MTP entries
+                    if hasattr(self._text_model, "make_mtp_cache"):
+                        gen_cache = list(target_cache) + list(
+                            self._text_model.make_mtp_cache()
+                        )
+                    else:
+                        gen_cache = list(target_cache)
+
+                    # y0 was sampled from Phase 3 logits but stream_generate
+                    # consumes it as "prompt", so prepend its text
+                    y0_text = self._text_tokenizer.decode([y0.item()])
+                    eos_id = self._text_tokenizer.eos_token_id
+                    results = [
+                        SimpleNamespace(
+                            text=y0_text,
+                            finish_reason=(
+                                "stop" if y0.item() == eos_id else None
+                            ),
+                        )
+                    ]
+
+                    if y0.item() != eos_id:
+                        for resp in mlx_stream_generate(
+                            self._text_model,
+                            self._text_tokenizer,
+                            prompt=y0.reshape(-1),
+                            max_tokens=max_tokens - 1,
+                            sampler=sampler,
+                            mtp=_has_mtp,
+                            prompt_cache=gen_cache,
+                            prefill_step_size=prefill_step_size,
+                        ):
+                            results.append(
+                                SimpleNamespace(
+                                    text=resp.text,
+                                    finish_reason=resp.finish_reason,
+                                )
+                            )
+
+                    return results, sp_n_total
+
+                finally:
+                    cleanup_rope(self._text_model)
+
+            def _run_cache_hit():
+                """Restore system KV snapshot, prefill only suffix, generate."""
+                # Restore cached KV state into a fresh cache
+                restored_cache = make_prompt_cache(self._text_model)
+                for layer_idx, snapshot_state in enumerate(self._system_kv_snapshot):
+                    if layer_idx < len(restored_cache):
+                        restored_cache[layer_idx].state = snapshot_state
+                mx.eval([c.state for c in restored_cache if hasattr(c, "state")])
+
+                # Tokenize just the suffix and generate with the primed cache.
+                # stream_generate accepts mx.array prompt (skips tokenization)
+                # and prompt_cache is forwarded to mtp_generate_step.
+                suffix_tokens = self._text_tokenizer.encode(suffix)
+                suffix_array = mx.array(suffix_tokens)
+                n_suffix = len(suffix_tokens)
+
+                logger.info(
+                    "System KV cache HIT: prefilling %d suffix tokens "
+                    "(skipped %d cached tokens)",
+                    n_suffix,
+                    self._system_kv_token_count,
+                )
+
+                results = []
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=suffix_array,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    mtp=_has_mtp,
+                    num_draft_tokens=1,
+                    prompt_cache=restored_cache,
+                    prefill_step_size=prefill_step_size,
+                ):
+                    results.append(resp)
+                return results, self._system_kv_token_count + len(suffix_tokens)
+
+            def _run_cache_miss():
+                """Full prefill + generation, then snapshot system KV for next time."""
+                results = []
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    mtp=_has_mtp,
+                    num_draft_tokens=1,
+                    prefill_step_size=prefill_step_size,
+                ):
+                    results.append(resp)
+
+                # Snapshot system KV for next request (if we found a system prefix)
+                if prefix_hash is not None and system_prefix is not None:
+                    try:
+                        _snapshot_system_kv()
+                    except Exception as e:
+                        logger.warning("Failed to snapshot system KV cache: %s", e)
+
+                # Get total prompt token count from generation response
+                prompt_tokens = 0
+                if results and hasattr(results[0], "prompt_tokens"):
+                    prompt_tokens = results[0].prompt_tokens
+                return results, prompt_tokens
+
+            def _snapshot_system_kv():
+                """Prefill just the system prefix on a fresh cache and save snapshot."""
+                snapshot_cache = make_prompt_cache(self._text_model)
+                prefix_tokens = self._text_tokenizer.encode(system_prefix)
+                prefix_ids = mx.array(prefix_tokens)
+
+                # Chunked prefill of system prefix
+                for i in range(0, prefix_ids.size, prefill_step_size):
+                    chunk = prefix_ids[i : i + prefill_step_size]
+                    self._text_model(chunk[None], cache=snapshot_cache)
+                    mx.eval([c.state for c in snapshot_cache if hasattr(c, "state")])
+
+                # Save snapshot: deep copy of each cache layer's state
+                self._system_kv_snapshot = []
+                for c in snapshot_cache:
+                    state = c.state
+                    if getattr(c, "_use_fused_sdpa", False):
+                        # QuantizedSDPACache: state is nested tuples
+                        # ((packed, scales, biases), (packed, scales, biases))
+                        k_tuple, v_tuple = state
+                        self._system_kv_snapshot.append((
+                            tuple(mx.array(t) for t in k_tuple),
+                            tuple(mx.array(t) for t in v_tuple),
+                        ))
+                    elif isinstance(state, tuple) and len(state) == 2:
+                        # KVCache: (keys, values) — copy to detach from cache
+                        keys, values = state
+                        self._system_kv_snapshot.append(
+                            (mx.array(keys), mx.array(values))
+                        )
+                    elif isinstance(state, list):
+                        # ArraysCache: list of arrays (Mamba/hybrid)
+                        self._system_kv_snapshot.append(
+                            [mx.array(a) if a is not None else None for a in state]
+                        )
+                    else:
+                        # Unknown cache type — store as-is
+                        self._system_kv_snapshot.append(state)
+
+                self._system_kv_token_count = len(prefix_tokens)
+                self._system_kv_hash = prefix_hash
+
+                def _entry_bytes(x):
+                    if hasattr(x, "nbytes"):
+                        return x.nbytes
+                    elif isinstance(x, (tuple, list)):
+                        return sum(_entry_bytes(i) for i in x if i is not None)
+                    return 0
+
+                cache_bytes = sum(_entry_bytes(e) for e in self._system_kv_snapshot)
+                logger.info(
+                    "System KV cache: stored %d-token snapshot " "(%.1f MB), hash=%s",
+                    len(prefix_tokens),
+                    cache_bytes / 1e6,
+                    prefix_hash,
+                )
+
+            _task = asyncio.ensure_future(asyncio.to_thread(_run_with_cache))
+            try:
+                result = await asyncio.shield(_task)
+            except asyncio.CancelledError:
+                # Shield was pierced by outer cancellation. Wait for the
+                # Metal worker to finish before releasing the lock.
+                try:
+                    await _task
+                except Exception:
+                    pass
+                raise
+            all_resps, prompt_token_count = result
+
+        # Yield results as GenerationOutput
+        accumulated_text = ""
+        token_count = 0
+        finished = False
+        for i, resp in enumerate(all_resps):
+            token_count += 1
+            new_text = resp.text if hasattr(resp, "text") else str(resp)
+            accumulated_text += new_text
+
+            is_last = i == len(all_resps) - 1
+            finished = is_last or token_count >= max_tokens
+
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text=new_text,
+                prompt_tokens=prompt_token_count,
+                completion_tokens=token_count,
+                finished=finished,
+                finish_reason="stop" if finished else None,
+            )
+
+            if finished:
+                break
+
+        if not finished:
+            yield GenerationOutput(
+                text=accumulated_text,
+                new_text="",
+                prompt_tokens=prompt_token_count,
+                completion_tokens=token_count,
+                finished=True,
+                finish_reason="length",
+            )
+
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         stats = {
@@ -762,22 +1620,88 @@ class BatchedEngine(BaseEngine):
             "model_name": self._model_name,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
+            "running": self._loaded,
             "stream_interval": self._stream_interval,
+            "text_scheduler_route_enabled": self._text_scheduler_route_enabled,
+            "num_running": 0,
+            "num_waiting": 0,
+            "num_requests_processed": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
         }
 
         if self._mllm_scheduler:
-            mllm_stats = self._mllm_scheduler.get_stats()
-            stats["mllm_scheduler"] = mllm_stats
-            # Promote Metal memory stats to top-level for /v1/status
-            for key in (
-                "metal_active_memory_gb",
-                "metal_peak_memory_gb",
-                "metal_cache_memory_gb",
-            ):
-                if key in mllm_stats:
-                    stats[key] = mllm_stats[key]
+            try:
+                mllm_stats = self._mllm_scheduler.get_stats()
+                stats["mllm_scheduler"] = mllm_stats
+                # Promote Metal memory stats to top-level for /v1/status
+                for key in (
+                    "metal_active_memory_gb",
+                    "metal_peak_memory_gb",
+                    "metal_cache_memory_gb",
+                ):
+                    if key in mllm_stats:
+                        stats[key] = mllm_stats[key]
+                stats["num_running"] += int(mllm_stats.get("num_running", 0))
+                stats["num_waiting"] += int(mllm_stats.get("num_waiting", 0))
+                stats["num_requests_processed"] += int(
+                    mllm_stats.get("num_requests_processed", 0)
+                )
+                stats["total_prompt_tokens"] += int(
+                    mllm_stats.get("total_prompt_tokens", 0)
+                )
+                stats["total_completion_tokens"] += int(
+                    mllm_stats.get("total_completion_tokens", 0)
+                )
+            except Exception as exc:
+                logger.warning("Failed to collect MLLM scheduler stats: %s", exc)
+                stats["mllm_scheduler"] = {"error": str(exc)}
         elif self._engine:
             stats.update(self._engine.get_stats())
+
+        # SpecPrefill stats
+        if self._draft_model is not None:
+            stats["specprefill"] = {
+                "enabled": self._specprefill_enabled,
+                "draft_model": self._specprefill_draft_model_path,
+                "threshold": self._specprefill_threshold,
+                "keep_pct": self._specprefill_keep_pct,
+            }
+
+        if self._text_scheduler:
+            try:
+                text_stats = self._text_scheduler.get_stats()
+                stats["text_scheduler"] = text_stats
+                stats["num_running"] += int(text_stats.get("active_requests", 0))
+                stats["num_waiting"] += int(
+                    text_stats.get("pending_requests", 0)
+                ) + int(text_stats.get("deferred_requests", 0))
+                stats["num_requests_processed"] += int(
+                    text_stats.get("num_requests_processed", 0)
+                )
+                stats["total_prompt_tokens"] += int(
+                    text_stats.get("total_prompt_tokens", 0)
+                )
+                stats["total_completion_tokens"] += int(
+                    text_stats.get("total_completion_tokens", 0)
+                )
+            except Exception as exc:
+                logger.warning("Failed to collect text scheduler stats: %s", exc)
+                stats["text_scheduler"] = {"error": str(exc)}
+
+        # System KV cache stats
+        if self._system_kv_snapshot is not None:
+            cache_bytes = 0
+            for entry in self._system_kv_snapshot:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    cache_bytes += entry[0].nbytes + entry[1].nbytes
+                elif isinstance(entry, list):
+                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+            stats["system_kv_cache"] = {
+                "tokens": self._system_kv_token_count,
+                "hash": self._system_kv_hash,
+                "memory_mb": round(cache_bytes / 1e6, 1),
+            }
 
         return stats
 

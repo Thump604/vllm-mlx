@@ -342,7 +342,13 @@ def get_engine() -> BaseEngine:
 
 
 def _validate_model_name(request_model: str) -> None:
-    """Validate that the request model name matches the served model."""
+    """Validate that the request model name matches the served model.
+
+    Accepts 'default' as an alias for the loaded model (used by lm_eval's
+    local-chat-completions backend which sends model='default').
+    """
+    if request_model == "default":
+        return
     if _model_name and request_model != _model_name:
         raise HTTPException(
             status_code=404,
@@ -370,6 +376,14 @@ def _parse_tool_calls_with_parser(
     global _tool_parser_instance
 
     request_dict = request.model_dump() if request else None
+
+    # tool_choice="none" means never return tool calls — skip all parsing
+    if request is not None:
+        tool_choice = getattr(request, "tool_choice", None)
+        if tool_choice is None and request_dict:
+            tool_choice = request_dict.get("tool_choice")
+        if tool_choice == "none":
+            return output_text, None
 
     # If auto tool choice is not enabled, use the generic parser
     if not _enable_auto_tool_choice or not _tool_call_parser:
@@ -526,6 +540,12 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            mtp=mtp,
+            prefill_step_size=prefill_step_size,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_draft_model_path=specprefill_draft_model,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -573,6 +593,31 @@ def get_usage(output: GenerationOutput) -> Usage:
     )
 
 
+def _json_safe(value, depth: int = 0):
+    if depth >= 8:
+        return repr(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item, depth + 1) for item in value]
+    if hasattr(value, "to_dict"):
+        try:
+            return _json_safe(value.to_dict(), depth + 1)
+        except Exception:
+            return repr(value)
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            return repr(value)
+    return repr(value)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -589,7 +634,11 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
-    engine_stats = _engine.get_stats() if _engine else {}
+    try:
+        engine_stats = _json_safe(_engine.get_stats()) if _engine else {}
+    except Exception as exc:
+        logger.exception("Failed to collect health engine stats")
+        engine_stats = {"engine_type": "unknown", "error": str(exc)}
 
     return {
         "status": "healthy",
@@ -607,11 +656,24 @@ async def status():
     if _engine is None:
         return {"status": "not_loaded", "model": None, "requests": []}
 
-    stats = _engine.get_stats()
+    try:
+        stats = _json_safe(_engine.get_stats())
+    except Exception as exc:
+        logger.exception("Failed to collect engine status")
+        return {
+            "status": "degraded",
+            "model": _model_name,
+            "engine_type": None,
+            "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
+            "error": str(exc),
+            "requests": [],
+        }
 
     return {
         "status": "running" if stats.get("running") else "stopped",
         "model": _model_name,
+        "engine_type": stats.get("engine_type"),
+        "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
         "uptime_s": round(stats.get("uptime_seconds", 0), 1),
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
@@ -627,6 +689,7 @@ async def status():
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
+        "engine": stats,
         "requests": stats.get("requests", []),
     }
 
@@ -1216,6 +1279,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     logger.info(
         f"[REQUEST] POST /v1/completions stream={request.stream} "
         f"max_tokens={request.max_tokens} temp={request.temperature} "
+        f"top_p={request.top_p} top_k={request.top_k} min_p={request.min_p} "
+        f"presence_penalty={request.presence_penalty} "
+        f"repetition_penalty={request.repetition_penalty} "
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
@@ -1242,6 +1308,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 max_tokens=request.max_tokens or _default_max_tokens,
                 temperature=_resolve_temperature(request.temperature),
                 top_p=_resolve_top_p(request.top_p),
+                top_k=request.top_k or 0,
+                min_p=request.min_p or 0.0,
+                presence_penalty=request.presence_penalty or 0.0,
+                repetition_penalty=request.repetition_penalty or 1.0,
                 stop=request.stop,
             ),
             raw_request,
@@ -1343,7 +1413,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     logger.info(
         f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
         f"model={request.model!r} max_tokens={request.max_tokens} "
-        f"temp={request.temperature} msgs={n_msgs} roles={msg_roles} "
+        f"temp={request.temperature} top_p={request.top_p} "
+        f"top_k={request.top_k} min_p={request.min_p} "
+        f"presence_penalty={request.presence_penalty} "
+        f"repetition_penalty={request.repetition_penalty} "
+        f"msgs={n_msgs} roles={msg_roles} "
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
@@ -1404,6 +1478,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
+        "top_k": request.top_k or 0,
+        "min_p": request.min_p or 0.0,
+        "presence_penalty": request.presence_penalty or 0.0,
+        "repetition_penalty": request.repetition_penalty or 1.0,
+        "stop": request.stop,
     }
 
     # Add multimodal content
@@ -1422,7 +1501,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
     # Add tools if provided
-    if request.tools:
+    if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
@@ -1491,6 +1570,354 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         usage=Usage(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
+            total_tokens=output.prompt_tokens + output.completion_tokens,
+        ),
+    )
+
+
+# =============================================================================
+# Responses API (/v1/responses) — translation layer
+# =============================================================================
+
+
+def _responses_input_to_messages(request):
+    """Translate Responses API input + instructions to chat messages."""
+    messages = []
+
+    # instructions → system message
+    if request.instructions:
+        messages.append({"role": "system", "content": request.instructions})
+
+    inp = request.input
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for item in inp:
+            item_dict = item if isinstance(item, dict) else item.model_dump(exclude_none=True)
+            item_type = item_dict.get("type", "message")
+
+            if item_type == "message":
+                role = item_dict.get("role", "user")
+                content = item_dict.get("content", "")
+                # Content can be string or array of parts
+                if isinstance(content, list):
+                    # Translate input_text → text content parts
+                    parts = []
+                    for part in content:
+                        p = part if isinstance(part, dict) else (
+                            part.model_dump(exclude_none=True) if hasattr(part, "model_dump") else {"type": "text", "text": str(part)}
+                        )
+                        ptype = p.get("type", "")
+                        if ptype == "input_text":
+                            parts.append({"type": "text", "text": p.get("text", "")})
+                        elif ptype == "input_image":
+                            parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": p.get("image_url", ""), "detail": p.get("detail", "auto")},
+                            })
+                        else:
+                            parts.append(p)
+                    messages.append({"role": role, "content": parts})
+                else:
+                    messages.append({"role": role, "content": content})
+
+            elif item_type == "function_call_output":
+                # Tool result
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item_dict.get("call_id", ""),
+                    "content": item_dict.get("output", ""),
+                })
+
+            elif item_type == "function_call":
+                # Previous assistant tool call (for context)
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item_dict.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": item_dict.get("name", ""),
+                            "arguments": item_dict.get("arguments", "{}"),
+                        },
+                    }],
+                })
+    return messages
+
+
+def _responses_tools_to_chat(tools):
+    """Translate Responses API tool format (flat) to chat completions format (nested)."""
+    if not tools:
+        return None
+    result = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            result.append({
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {}),
+                },
+            })
+        # Skip non-function tools (web_search, etc.) — not supported
+    return result or None
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_response(raw_request: Request):
+    """
+    OpenAI Responses API — translates to chat/completions internally.
+
+    Accepts the Responses API format (input, instructions, max_output_tokens)
+    and returns the Responses API response format (output items, output_text).
+    Supports both streaming and non-streaming.
+    """
+    from .api.models import (
+        ResponseFunctionCall,
+        ResponseObject,
+        ResponseOutputMessage,
+        ResponseOutputText,
+        ResponseReasoningItem,
+        ResponsesRequest,
+        ResponseUsage,
+    )
+
+    body = await raw_request.json()
+    request = ResponsesRequest(**body)
+    _validate_model_name(request.model)
+
+    logger.info(
+        f"[REQUEST] POST /v1/responses stream={request.stream} "
+        f"model={request.model!r} max_output_tokens={request.max_output_tokens}"
+    )
+
+    # Translate to chat completions format
+    messages = _responses_input_to_messages(request)
+    tools = _responses_tools_to_chat(request.tools)
+
+    # Build a ChatCompletionRequest-compatible call
+    from .api.models import ChatCompletionRequest, Message
+
+    chat_messages = []
+    for m in messages:
+        if isinstance(m, dict):
+            chat_messages.append(Message(**{k: v for k, v in m.items() if k in Message.model_fields}))
+        else:
+            chat_messages.append(m)
+
+    chat_request = ChatCompletionRequest(
+        model=request.model,
+        messages=chat_messages,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_output_tokens,
+        stream=False,
+        tools=tools,
+        tool_choice=request.tool_choice,
+    )
+
+    if request.stream:
+        # Streaming responses
+        chat_request.stream = True
+
+        async def _stream_responses():
+            resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+            msg_id = f"msg_{uuid.uuid4().hex[:16]}"
+            seq = 0
+
+            # response.created
+            created_resp = ResponseObject(
+                id=resp_id, model=_model_name, status="in_progress",
+                temperature=request.temperature, top_p=request.top_p,
+                max_output_tokens=request.max_output_tokens,
+                instructions=request.instructions,
+            )
+            yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': created_resp.model_dump(), 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # output_item.added (message)
+            msg_item = ResponseOutputMessage(id=msg_id, status="in_progress", content=[
+                ResponseOutputText(text=""),
+            ])
+            yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'item': msg_item.model_dump(), 'output_index': 0, 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # content_part.added
+            yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}, 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # Stream text deltas from chat completions engine
+            engine = get_engine()
+            chat_kwargs = {
+                "max_tokens": request.max_output_tokens or _default_max_tokens,
+                "temperature": _resolve_temperature(request.temperature),
+                "top_p": _resolve_top_p(request.top_p),
+                "stop": getattr(request, "stop", None),
+            }
+            if tools and request.tool_choice != "none":
+                chat_kwargs["tools"] = convert_tools_for_template(tools)
+
+            full_text = ""
+            prompt_tokens = 0
+            completion_tokens = 0
+
+            # Convert messages to dicts for engine
+            msg_dicts = []
+            for m in messages:
+                if isinstance(m, dict):
+                    msg_dicts.append(m)
+                elif hasattr(m, "model_dump"):
+                    msg_dicts.append(m.model_dump(exclude_none=True))
+                else:
+                    msg_dicts.append(dict(m))
+
+            async for chunk in engine.stream_chat(
+                messages=msg_dicts, **chat_kwargs
+            ):
+                new_text = chunk.new_text if hasattr(chunk, "new_text") else ""
+                if new_text:
+                    full_text += new_text
+                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': new_text, 'sequence_number': seq})}\n\n"
+                    seq += 1
+                if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens:
+                    prompt_tokens = chunk.prompt_tokens
+                if hasattr(chunk, "completion_tokens") and chunk.completion_tokens:
+                    completion_tokens = chunk.completion_tokens
+
+            # output_text.done
+            yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': full_text, 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # content_part.done
+            yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_text, 'annotations': []}, 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # output_item.done
+            msg_item.status = "completed"
+            msg_item.content = [ResponseOutputText(text=full_text)]
+            yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'item': msg_item.model_dump(), 'output_index': 0, 'sequence_number': seq})}\n\n"
+            seq += 1
+
+            # response.completed
+            total_tokens = prompt_tokens + completion_tokens
+            completed_resp = ResponseObject(
+                id=resp_id, model=_model_name, status="completed",
+                output=[msg_item.model_dump()],
+                output_text=full_text,
+                temperature=request.temperature, top_p=request.top_p,
+                max_output_tokens=request.max_output_tokens,
+                instructions=request.instructions,
+                usage=ResponseUsage(
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                ),
+            )
+            yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed_resp.model_dump(), 'sequence_number': seq})}\n\n"
+
+        return StreamingResponse(
+            _stream_responses(),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming: call chat completion and translate response
+    engine = get_engine()
+    chat_kwargs = {
+        "max_tokens": request.max_output_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "stop": getattr(request, "stop", None),
+    }
+    if tools and request.tool_choice != "none":
+        chat_kwargs["tools"] = convert_tools_for_template(tools)
+
+    msg_dicts = []
+    for m in messages:
+        if isinstance(m, dict):
+            msg_dicts.append(m)
+        elif hasattr(m, "model_dump"):
+            msg_dicts.append(m.model_dump(exclude_none=True))
+        else:
+            msg_dicts.append(dict(m))
+
+    timeout = _default_timeout
+    output = await _wait_with_disconnect(
+        engine.chat(messages=msg_dicts, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return Response(status_code=499)
+
+    # Parse tool calls and reasoning
+    # Skip tool parsing when no tools requested (avoids NoneType warnings)
+    if tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    else:
+        cleaned_text, tool_calls = output.text, None
+    reasoning_text = None
+    if _reasoning_parser and not tool_calls:
+        text_to_parse = cleaned_text or output.text
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(text_to_parse)
+
+    # Build output items
+    output_items = []
+
+    # Reasoning item (if present)
+    if reasoning_text:
+        output_items.append(ResponseReasoningItem(
+            summary=[{"type": "summary_text", "text": reasoning_text}],
+        ).model_dump())
+
+    # Tool calls
+    if tool_calls:
+        for tc in tool_calls:
+            output_items.append(ResponseFunctionCall(
+                call_id=tc.id,
+                name=tc.function.name,
+                arguments=tc.function.arguments,
+            ).model_dump())
+    else:
+        # Text message
+        final_text = clean_output_text(cleaned_text) if cleaned_text else (output.text or "")
+        output_items.append(ResponseOutputMessage(
+            content=[ResponseOutputText(text=final_text)],
+        ).model_dump())
+
+    output_text = ""
+    for item in output_items:
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    output_text += part.get("text", "")
+
+    # Determine status
+    status = "completed"
+    incomplete_details = None
+    if output.finish_reason == "length":
+        status = "incomplete"
+        incomplete_details = {"reason": "max_output_tokens"}
+
+    return ResponseObject(
+        model=_model_name,
+        status=status,
+        output=output_items,
+        output_text=output_text,
+        incomplete_details=incomplete_details,
+        instructions=request.instructions,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_output_tokens=request.max_output_tokens,
+        tools=request.tools or [],
+        tool_choice=request.tool_choice,
+        usage=ResponseUsage(
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
             total_tokens=output.prompt_tokens + output.completion_tokens,
         ),
     )
@@ -1598,9 +2025,14 @@ async def create_anthropic_message(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "stop": openai_request.stop,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     start_time = time.perf_counter()
@@ -1755,9 +2187,14 @@ async def _stream_anthropic_messages(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "top_k": openai_request.top_k or 0,
+        "min_p": openai_request.min_p or 0.0,
+        "presence_penalty": openai_request.presence_penalty or 0.0,
+        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "stop": openai_request.stop,
     }
 
-    if openai_request.tools:
+    if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     # Emit message_start
@@ -1889,6 +2326,10 @@ async def stream_completion(
         max_tokens=request.max_tokens or _default_max_tokens,
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
+        top_k=request.top_k or 0,
+        min_p=request.min_p or 0.0,
+        presence_penalty=request.presence_penalty or 0.0,
+        repetition_penalty=request.repetition_penalty or 1.0,
         stop=request.stop,
     ):
         data = {
@@ -1961,7 +2402,8 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    if _enable_auto_tool_choice and _tool_call_parser:
+    tool_choice = getattr(request, "tool_choice", None)
+    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
             try:
@@ -2000,16 +2442,82 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
+            reasoning = delta_msg.reasoning
+            content_delta = delta_msg.content
+
+            # Pipe content through tool parser (reasoning + tool coexistence)
+            if tool_parser and content_delta:
+                if not tool_markup_possible and "<" not in content_delta:
+                    tool_accumulated_text += content_delta
+                    # No tool markup yet, emit content + reasoning normally
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_delta
+                    request_dict = request.model_dump() if request else None
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_delta,
+                        request=request_dict,
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup - suppress content, emit reasoning only
+                        if reasoning:
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=_model_name,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            reasoning=reasoning,
+                                        ),
+                                        finish_reason=output.finish_reason if output.finished else None,
+                                    )
+                                ],
+                                usage=get_usage(output) if output.finished else None,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=_model_name,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"],
+                                        reasoning=reasoning,
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Tool parser returned content (not tool calls)
+                    content_delta = tool_result.get("content", "")
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
-                            content=delta_msg.content,
-                            reasoning=delta_msg.reasoning,
+                            content=content_delta if content_delta else None,
+                            reasoning=reasoning,
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (output.finish_reason if output.finished else None)
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
@@ -2041,8 +2549,10 @@ async def stream_chat_completion(
                         tool_markup_possible = True
                     tool_previous = tool_accumulated_text
                     tool_accumulated_text += delta_text
+                    request_dict = request.model_dump() if request else None
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
+                        tool_previous, tool_accumulated_text, delta_text,
+                        request=request_dict,
                     )
 
                     if tool_result is None:
