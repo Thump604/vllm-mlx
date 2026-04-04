@@ -369,7 +369,7 @@ class SimpleEngine(BaseEngine):
             ):
                 prompt_tokens = (
                     chunk.prompt_tokens
-                    if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                    if hasattr(chunk, "prompt_tokens")
                     else prompt_tokens
                 )
                 completion_tokens += 1
@@ -449,6 +449,7 @@ class SimpleEngine(BaseEngine):
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    top_p=top_p,
                     tools=template_tools,
                     **kwargs,
                 )
@@ -472,20 +473,9 @@ class SimpleEngine(BaseEngine):
                     **kwargs,
                 )
                 text = clean_output_text(output.text)
-                # Count prompt tokens from the full templated prompt
-                tokenizer = self._model.tokenizer
-                template_kwargs = {
-                    "tokenize": True,
-                    "add_generation_prompt": True,
-                }
-                if template_tools:
-                    template_kwargs["tools"] = template_tools
-                prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
-                prompt_token_count = len(prompt_ids)
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,
-                    prompt_tokens=prompt_token_count,
                     completion_tokens=len(output.tokens),
                     finish_reason=output.finish_reason,
                 )
@@ -559,6 +549,7 @@ class SimpleEngine(BaseEngine):
                             messages=messages,
                             max_tokens=max_tokens,
                             temperature=temperature,
+                            top_p=top_p,
                             tools=template_tools,
                             **kwargs,
                         )
@@ -589,9 +580,11 @@ class SimpleEngine(BaseEngine):
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            # Disable thinking mode for coder models since it interferes
-            # with tool call parsing (tags leak as raw text).
-            enable_thinking = "coder" not in self._model_name.lower()
+            # Read enable_thinking from env (set by runtime_patches from mode.json)
+            import os
+
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -636,10 +629,11 @@ class SimpleEngine(BaseEngine):
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
 
         Scores token importance with the draft model, sparse-prefills the target
-        model, then generates autoregressively. Falls back to normal generation
-        on any error.
+        model, then generates via stream_generate. Falls back to normal
+        generation on any error.
         """
         import mlx.core as mx
+        from mlx_lm import stream_generate as mlx_stream_generate
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
@@ -709,38 +703,40 @@ class SimpleEngine(BaseEngine):
                         t_prefill,
                     )
 
-                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    # Phase 4: Generate via stream_generate
                     sampler = make_sampler(temp=temperature, top_p=top_p)
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
+
+                    # y0 was sampled from Phase 3 logits but stream_generate
+                    # consumes it as "prompt", so prepend its text
+                    y0_text = tokenizer.decode([y0.item()])
                     eos_id = tokenizer.eos_token_id
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
-
-                    results = []
-                    generated_ids = []
-                    prev_decoded = ""
-
-                    for _ in range(max_tokens):
-                        tok_id = y.item()
-                        generated_ids.append(tok_id)
-
-                        decoded = tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded) :]
-                        prev_decoded = decoded
-
-                        is_eos = tok_id == eos_id
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason="stop" if is_eos else None,
-                            )
+                    results = [
+                        SimpleNamespace(
+                            text=y0_text,
+                            finish_reason=(
+                                "stop" if y0.item() == eos_id else None
+                            ),
                         )
+                    ]
 
-                        if is_eos:
-                            break
-
-                        logits = model(y.reshape(1, -1), cache=cache)
-                        y = sampler(logits[:, -1, :])
-                        mx.eval(y)
+                    if y0.item() != eos_id:
+                        for resp in mlx_stream_generate(
+                            model,
+                            tokenizer,
+                            prompt=y0.reshape(-1),
+                            max_tokens=max_tokens - 1,
+                            sampler=sampler,
+                            prompt_cache=cache,
+                            prefill_step_size=self._prefill_step_size,
+                        ):
+                            results.append(
+                                SimpleNamespace(
+                                    text=resp.text,
+                                    finish_reason=resp.finish_reason,
+                                )
+                            )
 
                     return results
 
@@ -860,8 +856,25 @@ class SimpleEngine(BaseEngine):
                 messages, **template_kwargs
             )
 
-        # Build sampler
-        sampler = make_sampler(temp=temperature, top_p=top_p)
+        # Build sampler with full Unsloth params
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            top_k=kwargs.get("top_k", 0),
+            min_p=kwargs.get("min_p", 0.0),
+        )
+        # Build logits processors for penalties
+        logits_processors = None
+        _presence = kwargs.get("presence_penalty", 0.0)
+        _repetition = kwargs.get("repetition_penalty", 1.0)
+        if _presence != 0.0 or _repetition != 1.0:
+            from mlx_lm.sample_utils import make_logits_processors
+
+            logits_processors = make_logits_processors(
+                repetition_penalty=_repetition if _repetition != 1.0 else None,
+                presence_penalty=_presence if _presence != 0.0 else None,
+            )
+            logits_processors = logits_processors if logits_processors else None
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -1084,6 +1097,7 @@ class SimpleEngine(BaseEngine):
                 gen_kwargs = dict(
                     max_tokens=max_tokens,
                     sampler=sampler,
+                    logits_processors=logits_processors,
                     mtp=True,
                     prefill_step_size=self._prefill_step_size,
                 )
@@ -1100,7 +1114,7 @@ class SimpleEngine(BaseEngine):
                 return results
 
             def _run_specprefill(model, bc):
-                """Score tokens, sparse prefill, generate without MTP."""
+                """Score tokens, sparse prefill, generate with MTP."""
                 from types import SimpleNamespace
 
                 from ..specprefill import (
@@ -1158,39 +1172,47 @@ class SimpleEngine(BaseEngine):
                         effective_keep,
                     )
 
-                    # Phase 4: Generate (simple autoregressive, no MTP)
+                    # Phase 4: Generate with MTP via stream_generate
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
+
+                    # Build cache with MTP entries
+                    if hasattr(model, "make_mtp_cache"):
+                        gen_cache = list(bc) + list(model.make_mtp_cache())
+                    else:
+                        gen_cache = list(bc)
+
+                    # y0 was sampled from Phase 3 logits but stream_generate
+                    # consumes it as "prompt", so prepend its text
+                    y0_text = self._text_tokenizer.decode([y0.item()])
                     eos_id = self._text_tokenizer.eos_token_id
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
-
-                    results = []
-                    generated_ids = []
-                    prev_decoded = ""
-
-                    for _ in range(max_tokens):
-                        tok_id = y.item()
-                        generated_ids.append(tok_id)
-
-                        # Incremental text decode
-                        decoded = self._text_tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded) :]
-                        prev_decoded = decoded
-
-                        is_eos = tok_id == eos_id
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason="stop" if is_eos else None,
-                            )
+                    results = [
+                        SimpleNamespace(
+                            text=y0_text,
+                            finish_reason=(
+                                "stop" if y0.item() == eos_id else None
+                            ),
                         )
+                    ]
 
-                        if is_eos:
-                            break
-
-                        # Next token
-                        logits = model(y.reshape(1, -1), cache=bc)
-                        y = sampler(logits[:, -1, :])
-                        mx.eval(y)
+                    if y0.item() != eos_id:
+                        for resp in mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=y0.reshape(-1),
+                            max_tokens=max_tokens - 1,
+                            sampler=sampler,
+                            logits_processors=logits_processors,
+                            mtp=True,
+                            prompt_cache=gen_cache,
+                            prefill_step_size=self._prefill_step_size,
+                        ):
+                            results.append(
+                                SimpleNamespace(
+                                    text=resp.text,
+                                    finish_reason=resp.finish_reason,
+                                )
+                            )
 
                     return results
 

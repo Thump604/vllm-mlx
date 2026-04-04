@@ -54,9 +54,11 @@ from .llama_tool_parser import LlamaToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
+from .qwen3_xml_tool_parser import Qwen3XMLToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 
 __all__ = [
     # Base classes
@@ -73,6 +75,7 @@ __all__ = [
     "KimiToolParser",
     "GraniteToolParser",
     "NemotronToolParser",
+    "Qwen3XMLToolParser",
     "xLAMToolParser",
     "FunctionaryToolParser",
     "Glm47ToolParser",

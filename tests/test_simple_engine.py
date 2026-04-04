@@ -4,6 +4,7 @@
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 
@@ -14,6 +15,7 @@ class TestSimpleEngineConcurrency:
     def mock_model(self):
         """Create a mock model that tracks concurrent calls."""
         model = MagicMock()
+        model.model = model
         model.tokenizer = MagicMock()
         model.tokenizer.encode = MagicMock(return_value=[1, 2, 3])
 
@@ -65,7 +67,7 @@ class TestSimpleEngineConcurrency:
         model.chat = MagicMock(side_effect=chat_side_effect)
         return model
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_generate(self, mock_model):
         """Test that the lock prevents concurrent generate calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -89,7 +91,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_chat(self, mock_llm_model):
         """Test that the lock prevents concurrent chat calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -115,7 +117,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -178,7 +180,7 @@ class TestSimpleEngineConcurrency:
             result = await stream_task
             assert len(result) == 3, f"Expected 3 chunks, got {len(result)}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_initialization_creates_lock(self):
         """Test that SimpleEngine creates a lock on initialization."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -189,7 +191,7 @@ class TestSimpleEngineConcurrency:
             assert hasattr(engine, "_generation_lock")
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
         """Test that concurrent requests complete (may be in any order due to lock)."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -211,3 +213,88 @@ class TestSimpleEngineConcurrency:
             assert len(results) == 3
             for result in results:
                 assert result.text == "test response"
+
+    @pytest.mark.anyio
+    async def test_specprefill_phase4_uses_stream_generate(self):
+        """SpecPrefill decode must route through mlx_lm.stream_generate, not model()."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class DummyModel:
+            def __init__(self):
+                self.model = self
+                self.tokenizer = MagicMock()
+                self.stream_generate = MagicMock()
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError(
+                    "manual model() decode should not run in Phase 4"
+                )
+
+        model = DummyModel()
+        model.tokenizer.bos_token = None
+        model.tokenizer.eos_token_id = 0
+        model.tokenizer.encode.return_value = [11, 12, 13, 14]
+        model.tokenizer.decode.side_effect = lambda toks: "".join(
+            chr(64 + tok) for tok in toks
+        )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine(
+                "test-model",
+                specprefill_enabled=True,
+                specprefill_threshold=1,
+                specprefill_keep_pct=0.5,
+            )
+            engine._model = model
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+
+            def fake_sampler(logits):
+                return mx.array([1], dtype=mx.int32)
+
+            def fake_stream_generate(
+                _model,
+                _tokenizer,
+                *,
+                prompt,
+                max_tokens,
+                sampler,
+                prompt_cache,
+                prefill_step_size,
+            ):
+                assert _model is model
+                assert _tokenizer is model.tokenizer
+                assert prompt.tolist() == [1]
+                assert max_tokens == 2
+                assert sampler is fake_sampler
+                assert prompt_cache == ["cache"]
+                assert prefill_step_size == engine._prefill_step_size
+                yield SimpleNamespace(text="B", finish_reason="stop")
+
+            with (
+                patch("mlx_lm.sample_utils.make_sampler", return_value=fake_sampler),
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=["cache"]),
+                patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+                patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.5])),
+                patch(
+                    "vllm_mlx.specprefill.select_chunks",
+                    return_value=mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.sparse_prefill",
+                    return_value=mx.zeros((1, 1, 8)),
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                chunks = []
+                async for chunk in engine.stream_generate(
+                    prompt="hello",
+                    max_tokens=3,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    chunks.append(chunk.new_text)
+
+        assert chunks == ["A", "B"]

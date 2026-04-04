@@ -17,6 +17,9 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
+    r"<\|channel\>|<channel\|>|<\|turn\>|<turn\|>|"
+    r"<\|tool_call\>|<tool_call\|>|<\|tool\>|<tool\|>|"
+    r"<\|tool_response\>|<tool_response\|>|<\|think\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
 
@@ -171,9 +174,9 @@ def _content_to_text(content) -> str:
         parts = []
         for item in content:
             if hasattr(item, "model_dump"):
-                item = item.model_dump(exclude_none=True)
+                item = item.model_dump()
             elif hasattr(item, "dict"):
-                item = {k: v for k, v in item.dict().items() if v is not None}
+                item = item.dict()
             if isinstance(item, dict) and item.get("type") == "text":
                 parts.append(item.get("text", ""))
         return "\n".join(parts)
@@ -316,9 +319,9 @@ def extract_multimodal_content(
             for item in content:
                 # Handle both Pydantic models and dicts
                 if hasattr(item, "model_dump"):
-                    item = item.model_dump(exclude_none=True)
+                    item = item.model_dump()
                 elif hasattr(item, "dict"):
-                    item = {k: v for k, v in item.dict().items() if v is not None}
+                    item = item.dict()
 
                 item_type = item.get("type", "")
 
