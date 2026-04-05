@@ -723,6 +723,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -737,7 +739,11 @@ class BatchedEngine(BaseEngine):
             )
 
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=(
+                    output.output_text
+                    if raw_output
+                    else clean_output_text(output.output_text)
+                ),
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -758,7 +764,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = output.output_text if raw_output else clean_output_text(output.output_text)
 
         return GenerationOutput(
             text=text,
@@ -797,6 +803,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -810,8 +818,16 @@ class BatchedEngine(BaseEngine):
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
-                    new_text=output.new_text,
+                    text=(
+                        output.output_text
+                        if raw_output
+                        else clean_output_text(output.output_text)
+                    ),
+                    new_text=(
+                        output.new_text
+                        if raw_output
+                        else clean_output_text(output.new_text)
+                    ),
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
@@ -837,11 +853,13 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            text = output.output_text if raw_output else clean_output_text(output.output_text)
 
             yield GenerationOutput(
                 text=text,
-                new_text=output.new_text,
+                new_text=(
+                    output.new_text if raw_output else clean_output_text(output.new_text)
+                ),
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,

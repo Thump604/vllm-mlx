@@ -437,6 +437,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -453,7 +455,7 @@ class SimpleEngine(BaseEngine):
                     tools=template_tools,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = output.text if raw_output else clean_output_text(output.text)
                 return GenerationOutput(
                     text=text,
                     prompt_tokens=output.prompt_tokens,
@@ -472,7 +474,7 @@ class SimpleEngine(BaseEngine):
                     tools=template_tools,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = output.text if raw_output else clean_output_text(output.text)
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,
