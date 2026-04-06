@@ -30,6 +30,74 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+def _validate_caches_mergeable(per_request_caches: List[List[Any]]) -> None:
+    """Validate that all cache layers support merge() for batch creation."""
+    for layer_idx, layer_cache in enumerate(per_request_caches[0]):
+        if not hasattr(layer_cache, "merge"):
+            raise ValueError(
+                f"MLLM continuous batching requires mergeable cache types "
+                f"but layer {layer_idx} has {type(layer_cache).__name__} "
+                f"which lacks a merge() method."
+            )
+
+
+def _normalize_cache_for_merge(layer_cache: Any) -> Any:
+    """Trim rotating caches to their retained temporal window before merge()."""
+    try:
+        from mlx_lm.models.cache import RotatingKVCache
+    except ImportError:
+        return layer_cache
+
+    if not isinstance(layer_cache, RotatingKVCache):
+        return layer_cache
+    if layer_cache.keys is None or layer_cache.values is None:
+        return layer_cache
+
+    retained = layer_cache.size()
+    current = layer_cache.keys.shape[2]
+    if retained <= 0 or current <= retained:
+        return layer_cache
+
+    ordered_keys = layer_cache._temporal_order(layer_cache.keys)
+    ordered_values = layer_cache._temporal_order(layer_cache.values)
+
+    normalized = RotatingKVCache(max_size=layer_cache.max_size, keep=layer_cache.keep)
+    normalized.keys = mx.contiguous(ordered_keys[..., -retained:, :])
+    normalized.values = mx.contiguous(ordered_values[..., -retained:, :])
+    normalized.offset = layer_cache.offset
+    normalized._idx = retained
+
+    logger.info(
+        "Normalized %s for merge: offset=%s retained=%s tensor_len=%s",
+        type(layer_cache).__name__,
+        layer_cache.offset,
+        retained,
+        current,
+    )
+
+    return normalized
+
+
+def _flatten_token_ids(input_ids: Optional[mx.array]) -> List[int]:
+    """Convert request input IDs into a flat Python token list."""
+    if input_ids is None:
+        return []
+
+    tokens = input_ids.tolist()
+    if not isinstance(tokens, list):
+        return [int(tokens)]
+
+    flattened: List[int] = []
+    stack: List[Any] = list(tokens)
+    while stack:
+        item = stack.pop(0)
+        if isinstance(item, list):
+            stack = list(item) + stack
+        else:
+            flattened.append(int(item))
+    return flattened
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -47,9 +115,17 @@ class MLLMBatchRequest:
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    top_k: int = 0
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    stop_token_ids: List[int] = field(default_factory=list)
+    sampler: Optional[Callable[[mx.array], mx.array]] = None
+    logits_processors: Optional[List[Callable[[List[int], mx.array], mx.array]]] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
+    prompt_token_ids: List[int] = field(default_factory=list)
     pixel_values: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None
     image_grid_thw: Optional[mx.array] = None
@@ -214,15 +290,37 @@ def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
         left_padding: Padding amounts for left-padded prompts
 
     Returns:
-        List of BatchKVCache objects for each layer
+        List of batch-aware cache objects for each layer
     """
-    from mlx_lm.models.cache import BatchKVCache, KVCache
+    from mlx_lm.models.cache import (
+        ArraysCache,
+        BatchKVCache,
+        BatchRotatingKVCache,
+        CacheList,
+        KVCache,
+        RotatingKVCache,
+    )
 
     def to_batch_cache(c):
-        if isinstance(c, KVCache):
+        if type(c) is KVCache:
             return BatchKVCache(left_padding)
+        elif isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        elif isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError(
+                    "RotatingKVCache with keep tokens is not supported "
+                    "in MLLM continuous batching."
+                )
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, CacheList):
+            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         else:
-            raise ValueError(f"{type(c)} does not yet support batching")
+            raise ValueError(
+                f"MLLM continuous batching does not support {type(c).__name__}. "
+                f"Supported: KVCache, ArraysCache, RotatingKVCache, CacheList."
+            )
 
     if hasattr(model, "make_cache"):
         cache = model.make_cache()
@@ -361,6 +459,30 @@ class MLLMBatchGenerator:
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
+
+    @staticmethod
+    def _request_context_tokens(request: MLLMBatchRequest) -> List[int]:
+        """Return prompt+generated tokens for request-scoped penalties."""
+        if not request.prompt_token_ids and request.input_ids is not None:
+            request.prompt_token_ids = _flatten_token_ids(request.input_ids)
+        tokens = list(request.prompt_token_ids)
+        if request.output_tokens:
+            tokens.extend(int(token) for token in request.output_tokens)
+        return tokens
+
+    def _sample_request(
+        self, request: MLLMBatchRequest, logits: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        """Apply request-specific processors and sampler to one row of logits."""
+        if request.logits_processors:
+            context_tokens = self._request_context_tokens(request)
+            for processor in request.logits_processors:
+                logits = processor(context_tokens, logits)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampler = request.sampler or self.sampler
+        sampled = sampler(logprobs)
+        return sampled, logprobs
 
     def close(self) -> None:
         """Release resources and reset wired limit."""
@@ -516,6 +638,7 @@ class MLLMBatchGenerator:
         )
 
         request.input_ids = inputs.get("input_ids")
+        request.prompt_token_ids = _flatten_token_ids(request.input_ids)
         request.pixel_values = inputs.get("pixel_values")
         request.attention_mask = inputs.get("attention_mask")
 
@@ -622,14 +745,13 @@ class MLLMBatchGenerator:
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
-        # Guard against excessive memory usage during cache merge.
-        # Each token in the batch requires KV entries across all layers.
+        # Log large prompts for monitoring instead of hard-failing here.
         max_batch_tokens = self.prefill_step_size * len(requests)
         if total_prompt_tokens > max_batch_tokens:
-            raise ValueError(
-                f"Total prompt tokens ({total_prompt_tokens}) exceeds safe limit "
-                f"({max_batch_tokens}) for {len(requests)} requests. "
-                f"Reduce prompt length or batch size."
+            logger.warning(
+                f"Large batch prefill: {total_prompt_tokens} tokens "
+                f"(step_size={self.prefill_step_size}, requests={len(requests)}). "
+                f"Processing may be slow."
             )
 
         # Run vision encoding for each request with its own KVCache.
@@ -650,10 +772,7 @@ class MLLMBatchGenerator:
 
                 # Extract last token logits and sample
                 last_logits = logits[:, -1, :]
-                logprobs = last_logits - mx.logsumexp(
-                    last_logits, axis=-1, keepdims=True
-                )
-                sampled = self.sampler(logprobs)
+                sampled, logprobs = self._sample_request(req, last_logits)
 
                 mx.eval(sampled, logprobs)
 
@@ -662,26 +781,18 @@ class MLLMBatchGenerator:
 
             per_request_caches.append(request_cache)
 
-        # Merge per-request KVCaches into a single BatchKVCache.
-        # KVCache.merge() creates a BatchKVCache with proper left-padding
-        # alignment, so all requests share a single batched cache for
-        # subsequent generation steps.
-        from mlx_lm.models.cache import KVCache
-
-        sample_cache = per_request_caches[0][0]
-        if not isinstance(sample_cache, KVCache):
-            raise ValueError(
-                f"MLLM continuous batching requires standard KVCache but got "
-                f"{type(sample_cache).__name__}. Disable --kv-cache-quantization "
-                f"when using multimodal models with --continuous-batching."
-            )
+        _validate_caches_mergeable(per_request_caches)
+        normalized_caches = [
+            [_normalize_cache_for_merge(layer_cache) for layer_cache in request_cache]
+            for request_cache in per_request_caches
+        ]
 
         try:
             batch_cache = [
-                per_request_caches[0][layer_idx].merge(
-                    [c[layer_idx] for c in per_request_caches]
+                normalized_caches[0][layer_idx].merge(
+                    [c[layer_idx] for c in normalized_caches]
                 )
-                for layer_idx in range(len(per_request_caches[0]))
+                for layer_idx in range(len(normalized_caches[0]))
             ]
         except Exception as e:
             logger.error(
@@ -706,7 +817,10 @@ class MLLMBatchGenerator:
         )
 
     def _step(
-        self, input_tokens: mx.array, cache: List[Any]
+        self,
+        input_tokens: mx.array,
+        cache: List[Any],
+        requests: List[MLLMBatchRequest],
     ) -> Tuple[mx.array, List[mx.array]]:
         """
         Run one generation step through the language model.
@@ -714,6 +828,7 @@ class MLLMBatchGenerator:
         Args:
             input_tokens: Input tokens [batch_size, 1] or [batch_size]
             cache: BatchKVCache for the language model
+            requests: Active requests aligned with the batch rows
 
         Returns:
             Tuple of (sampled tokens, logprobs list)
@@ -733,11 +848,19 @@ class MLLMBatchGenerator:
 
         logits = logits[:, -1, :]
 
-        # Sample
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
+        sampled_rows: List[mx.array] = []
+        logprobs: List[mx.array] = []
+        for i, request in enumerate(requests):
+            sampled, row_logprobs = self._sample_request(request, logits[i : i + 1, :])
+            sampled_rows.append(sampled)
+            logprobs.append(row_logprobs.squeeze(0))
 
-        return sampled, list(logprobs)
+        sampled_tokens = (
+            sampled_rows[0]
+            if len(sampled_rows) == 1
+            else mx.concatenate(sampled_rows, axis=0)
+        )
+        return sampled_tokens, logprobs
 
     def _next(self) -> List[MLLMBatchResponse]:
         """
@@ -775,8 +898,8 @@ class MLLMBatchGenerator:
             return []
 
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
-        mx.async_eval(batch.y, batch.logprobs)
+        batch.y, batch.logprobs = self._step(y[:, None], batch.cache, batch.requests)
+        mx.async_eval(batch.y, *batch.logprobs)
 
         y = y.tolist()
         toc = time.perf_counter()
@@ -809,7 +932,7 @@ class MLLMBatchGenerator:
             finish_reason = None
             cache_fn = None
 
-            if token in self.stop_tokens:
+            if token in self.stop_tokens or token in req.stop_token_ids:
                 finish_reason = "stop"
                 end_idx.append(i)
             elif num_tok >= max_tok:

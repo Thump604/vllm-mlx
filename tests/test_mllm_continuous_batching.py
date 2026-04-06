@@ -90,6 +90,11 @@ class TestMLLMBatchRequest:
         assert req.max_tokens == 256
         assert req.temperature == 0.7
         assert req.top_p == 0.9
+        assert req.top_k == 0
+        assert req.min_p == 0.0
+        assert req.presence_penalty == 0.0
+        assert req.repetition_penalty == 1.0
+        assert req.stop_token_ids == []
         assert req.output_tokens == []
 
 
@@ -225,6 +230,90 @@ class TestMLLMBatchStats:
         assert stats.prompt_tps == 0
         assert stats.generation_tps == 0
 
+    def test_normalize_rotating_cache_for_merge(self):
+        """Trim oversized rotating-cache tensors before batch merge."""
+        from mlx_lm.models.cache import RotatingKVCache
+        from vllm_mlx.mllm_batch_generator import _normalize_cache_for_merge
+
+        cache = RotatingKVCache(max_size=1024, keep=0)
+        cache.keys = mx.arange(1452, dtype=mx.float32).reshape(1, 1, 1452, 1)
+        cache.values = (mx.arange(1452, dtype=mx.float32) + 1).reshape(1, 1, 1452, 1)
+        cache.offset = 1452
+        cache._idx = 1452
+
+        normalized = _normalize_cache_for_merge(cache)
+
+        assert normalized.offset == 1452
+        assert normalized.size() == 1024
+        assert normalized.keys.shape == (1, 1, 1024, 1)
+        assert normalized.values.shape == (1, 1, 1024, 1)
+
+        merged = normalized.merge([normalized])
+        assert merged.keys.shape == (1, 1, 1024, 1)
+        assert merged.values.shape == (1, 1, 1024, 1)
+        assert merged.offset.tolist() == [1452]
+
+
+class TestMLLMBatchGeneratorSampling:
+    """Tests for request-scoped sampling on the MLLM path."""
+
+    def test_step_uses_request_specific_samplers_and_processors(self):
+        """Each active request should apply its own processors and sampler."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        generator = MLLMBatchGenerator(MagicMock(), MagicMock(), enable_vision_cache=False)
+        generator.language_model = MagicMock(
+            return_value=mx.array(
+                [
+                    [[0.2, 0.1, 0.0]],
+                    [[0.0, 0.1, 0.2]],
+                ],
+                dtype=mx.float32,
+            )
+        )
+
+        seen_contexts = []
+
+        def processor_a(tokens, logits):
+            seen_contexts.append(("a", list(tokens)))
+            return mx.array([[0.0, 10.0, 0.0]], dtype=logits.dtype)
+
+        def processor_b(tokens, logits):
+            seen_contexts.append(("b", list(tokens)))
+            return mx.array([[10.0, 0.0, 0.0]], dtype=logits.dtype)
+
+        req_a = MLLMBatchRequest(
+            uid=0,
+            request_id="req-a",
+            prompt="hello",
+            input_ids=mx.array([11, 12]),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            logits_processors=[processor_a],
+        )
+        req_a.output_tokens = [21]
+
+        req_b = MLLMBatchRequest(
+            uid=1,
+            request_id="req-b",
+            prompt="world",
+            input_ids=mx.array([31]),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            logits_processors=[processor_b],
+        )
+
+        sampled, logprobs = generator._step(
+            mx.array([5, 6], dtype=mx.int32),
+            cache=[],
+            requests=[req_a, req_b],
+        )
+
+        assert sampled.tolist() == [1, 0]
+        assert seen_contexts == [("a", [11, 12, 21]), ("b", [31])]
+        assert logprobs[0].shape[-1] == 3
+        assert logprobs[1].shape[-1] == 3
+
+        generator.close()
+
 
 class TestMLLMSchedulerConfig:
     """Tests for MLLMSchedulerConfig."""
@@ -278,6 +367,70 @@ class TestMLLMRequest:
         assert req.images == ["image.jpg"]
         assert req.status == RequestStatus.WAITING
         assert req.output_text == ""
+
+    def test_add_request_preserves_full_sampling_params(self):
+        """Scheduler should retain the full sampling config for MLLM requests."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        scheduler = MLLMScheduler(MagicMock(), MagicMock())
+        request_id = scheduler.add_request(
+            prompt="Describe this image",
+            max_tokens=64,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.05,
+            presence_penalty=1.5,
+            repetition_penalty=1.1,
+            stop=["DONE"],
+            stop_token_ids=[42],
+            request_id="req-full",
+        )
+
+        req = scheduler.requests[request_id]
+        assert req.sampling_params.max_tokens == 64
+        assert req.sampling_params.temperature == 1.0
+        assert req.sampling_params.top_p == 0.95
+        assert req.sampling_params.top_k == 20
+        assert req.sampling_params.min_p == 0.05
+        assert req.sampling_params.presence_penalty == 1.5
+        assert req.sampling_params.repetition_penalty == 1.1
+        assert req.sampling_params.stop == ["DONE"]
+        assert req.sampling_params.stop_token_ids == [42]
+
+    def test_schedule_waiting_builds_request_scoped_sampling_components(self):
+        """Scheduled batch requests should carry their own sampler/processors."""
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        scheduler = MLLMScheduler(MagicMock(), MagicMock())
+        captured_batch_reqs = []
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.insert.side_effect = (
+            lambda reqs: captured_batch_reqs.extend(reqs) or [99]
+        )
+
+        scheduler.add_request(
+            prompt="Describe this image",
+            top_k=20,
+            min_p=0.05,
+            presence_penalty=1.5,
+            repetition_penalty=1.2,
+            stop_token_ids=[7, 9],
+            request_id="req-scheduled",
+        )
+
+        scheduled = scheduler._schedule_waiting()
+
+        assert [req.request_id for req in scheduled] == ["req-scheduled"]
+        assert len(captured_batch_reqs) == 1
+        batch_req = captured_batch_reqs[0]
+        assert batch_req.top_k == 20
+        assert batch_req.min_p == 0.05
+        assert batch_req.presence_penalty == 1.5
+        assert batch_req.repetition_penalty == 1.2
+        assert batch_req.stop_token_ids == [7, 9]
+        assert callable(batch_req.sampler)
+        assert batch_req.logits_processors is not None
 
 
 class TestMLLMSchedulerOutput:

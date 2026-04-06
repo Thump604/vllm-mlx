@@ -752,6 +752,8 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                stop=stop or [],
+                **kwargs,
             )
 
             text = output.output_text if raw_output else clean_output_text(output.output_text)
@@ -827,6 +829,8 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                stop=stop or [],
+                **kwargs,
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):

@@ -26,7 +26,7 @@ import uuid
 import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
@@ -41,6 +41,41 @@ from .request import RequestOutput, RequestStatus, SamplingParams
 from .mllm_cache import MLLMCacheManager
 
 logger = logging.getLogger(__name__)
+
+
+def _build_sampler(
+    sampling_params: SamplingParams,
+) -> Callable[[mx.array], mx.array]:
+    """Create a sampler that matches the request's full sampling signature."""
+    from mlx_lm.sample_utils import make_sampler
+
+    return make_sampler(
+        temp=sampling_params.temperature,
+        top_p=sampling_params.top_p,
+        top_k=sampling_params.top_k,
+        min_p=sampling_params.min_p,
+    )
+
+
+def _build_logits_processors(
+    sampling_params: SamplingParams,
+) -> Optional[List[Callable]]:
+    """Create request-specific penalty processors for MLLM generation."""
+    from mlx_lm.sample_utils import make_logits_processors
+
+    processors = make_logits_processors(
+        repetition_penalty=(
+            sampling_params.repetition_penalty
+            if sampling_params.repetition_penalty != 1.0
+            else None
+        ),
+        presence_penalty=(
+            sampling_params.presence_penalty
+            if sampling_params.presence_penalty != 0.0
+            else None
+        ),
+    )
+    return processors or None
 
 
 @dataclass
@@ -246,18 +281,13 @@ class MLLMScheduler:
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
         if self.batch_generator is None:
-            from mlx_lm.sample_utils import make_sampler
-
-            # Default sampler (can be overridden per-request in future)
-            sampler = make_sampler(temp=0.7, top_p=0.9)
-
             self.batch_generator = MLLMBatchGenerator(
                 model=self.model,
                 processor=self.processor,
                 mm_processor=self.mm_processor,
                 max_tokens=self.config.default_max_tokens,
                 stop_tokens=self.stop_tokens,
-                sampler=sampler,
+                sampler=_build_sampler(SamplingParams()),
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
@@ -295,10 +325,20 @@ class MLLMScheduler:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
+        stop = kwargs.get("stop") or []
+        if isinstance(stop, str):
+            stop = [stop]
+
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.get("top_k", 0) or 0,
+            min_p=kwargs.get("min_p", 0.0) or 0.0,
+            presence_penalty=kwargs.get("presence_penalty", 0.0) or 0.0,
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0) or 1.0,
+            stop=stop,
+            stop_token_ids=list(kwargs.get("stop_token_ids") or []),
         )
 
         request = MLLMRequest(
@@ -403,6 +443,13 @@ class MLLMScheduler:
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
+                top_k=request.sampling_params.top_k,
+                min_p=request.sampling_params.min_p,
+                presence_penalty=request.sampling_params.presence_penalty,
+                repetition_penalty=request.sampling_params.repetition_penalty,
+                stop_token_ids=list(request.sampling_params.stop_token_ids or []),
+                sampler=_build_sampler(request.sampling_params),
+                logits_processors=_build_logits_processors(request.sampling_params),
             )
             batch_requests.append(batch_req)
 
