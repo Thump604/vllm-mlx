@@ -107,6 +107,31 @@ class TestQwen3Parser:
         assert reasoning is None
         assert content == output
 
+    def test_plaintext_reasoning_with_final_answer(self, parser):
+        """Plaintext scaffolding should be split into reasoning and final content."""
+        output = (
+            "Thinking Process:\n\n"
+            "1. Analyze the question.\n\n"
+            "2. Compare the trade-offs.\n\n"
+            "The answer is SSE because it keeps the transport simpler."
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is not None
+        assert "Analyze the question" in reasoning
+        assert content == "The answer is SSE because it keeps the transport simpler."
+
+    def test_plaintext_reasoning_with_draft_marker(self, parser):
+        """Draft markers should preserve the final prose answer."""
+        output = (
+            "Thinking Process:\n\n"
+            "1. Gather evidence.\n\n"
+            "**Draft:** The production priority is deterministic state management."
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is not None
+        assert "Gather evidence" in reasoning
+        assert content == "The production priority is deterministic state management."
+
     def test_only_start_tag_no_reasoning(self, parser):
         """Qwen3 requires both tags - missing end tag means no reasoning."""
         output = "<think>Started thinking but never finished"
