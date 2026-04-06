@@ -135,6 +135,18 @@ class MLLMOutput:
     completion_tokens: int = 0
 
 
+def _coerce_enable_thinking(value: object | None) -> bool:
+    """Resolve thinking mode from explicit kwargs or environment."""
+    if value is None:
+        env = os.environ.get("VLLM_MLX_ENABLE_THINKING")
+        if env is None:
+            return True
+        return str(env).lower() not in {"0", "false", "no"}
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "no"}
+    return bool(value)
+
+
 def is_base64_image(s: str) -> bool:
     """Check if string is base64-encoded image data."""
     return s.startswith("data:image/") or (
@@ -751,8 +763,14 @@ class MLXMultimodalLM:
         return self.model.language_model
 
     def get_tokenizer(self):
-        """Get the text tokenizer (not the multimodal processor)."""
-        return self.processor.tokenizer
+        """Get the text tokenizer (not the multimodal processor).
+
+        Some processors (e.g. GemmaTokenizer) ARE the tokenizer directly,
+        while others (e.g. Qwen3 processor) wrap it as .tokenizer.
+        """
+        if hasattr(self.processor, "tokenizer"):
+            return self.processor.tokenizer
+        return self.processor
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process image inputs and return local file paths."""
@@ -1169,7 +1187,7 @@ class MLXMultimodalLM:
             formatted_prompt,
             all_images if all_images else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
@@ -1281,7 +1299,7 @@ class MLXMultimodalLM:
             formatted_prompt,
             all_images if all_images else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             **kwargs,
         ):
             yield chunk
@@ -1314,7 +1332,7 @@ class MLXMultimodalLM:
             self.load()
 
         from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import get_chat_template
+        from mlx_vlm.generate import apply_chat_template
 
         # Extract text and images from messages
         # Build chat_messages for multi-turn support WITH proper image tokens per message
@@ -1328,6 +1346,10 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", None) or {})
+        enable_thinking = _coerce_enable_thinking(
+            kwargs.pop("enable_thinking", chat_template_kwargs.get("enable_thinking"))
+        )
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1404,8 +1426,9 @@ class MLXMultimodalLM:
             # Add video frame count to image count for this message
             msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
 
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
+            # Preserve plain-string messages for text-only turns. Gemma 4 in
+            # particular performs better when text-only system/user history is
+            # not wrapped in multimodal content-part arrays.
             if msg_text or msg_image_count > 0:
                 if role == "user" and msg_image_count > 0:
                     # User message WITH images - build content array with image tokens FIRST
@@ -1416,19 +1439,8 @@ class MLXMultimodalLM:
                         {"type": "text", "text": msg_text, "content": msg_text}
                     )
                     chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
                 else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+                    chat_messages.append({"role": role, "content": msg_text})
 
         # Process images
         all_images = []
@@ -1448,14 +1460,15 @@ class MLXMultimodalLM:
             )
 
         # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
+        template_extra_kwargs = dict(chat_template_kwargs)
         if tools:
             template_extra_kwargs["tools"] = tools
+        template_extra_kwargs.setdefault("enable_thinking", enable_thinking)
 
         try:
-            # Use get_chat_template directly since messages are already properly formatted
-            formatted_prompt = get_chat_template(
+            formatted_prompt = apply_chat_template(
                 self.processor,
+                self.model.config,
                 chat_messages,
                 add_generation_prompt=True,
                 **template_extra_kwargs,
@@ -1577,17 +1590,24 @@ class MLXMultimodalLM:
             except Exception:
                 prompt_cache = None
 
+        # Only pass kwargs that mlx_vlm.generate_step actually accepts
+        _vlm_kwargs = {}
+        for k in ("top_k", "min_p", "top_p", "repetition_penalty", "repetition_context_size",
+                   "logit_bias", "max_kv_size", "kv_bits", "kv_group_size",
+                   "sampler", "logits_processors", "prefill_step_size"):
+            if k in kwargs:
+                _vlm_kwargs[k] = kwargs[k]
         result = generate(
             self.model,
             self.processor,
             formatted_prompt,
             all_images if all_images else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             verbose=False,
             prompt_cache=prompt_cache,
-            skip_prompt_processing=skip_prompt_processing,
-            **kwargs,
+            enable_thinking=enable_thinking,
+            **_vlm_kwargs,
         )
 
         # Store KV cache for future reuse (on cache miss)
@@ -1702,7 +1722,7 @@ class MLXMultimodalLM:
 
         try:
             from mlx_vlm import stream_generate
-            from mlx_vlm.prompt_utils import get_chat_template
+            from mlx_vlm.generate import apply_chat_template
         except ImportError:
             # Fallback to non-streaming if stream_generate not available
             output = self.chat(
@@ -1724,6 +1744,10 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", None) or {})
+        enable_thinking = _coerce_enable_thinking(
+            kwargs.pop("enable_thinking", chat_template_kwargs.get("enable_thinking"))
+        )
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -1811,17 +1835,8 @@ class MLXMultimodalLM:
                         {"type": "text", "text": msg_text, "content": msg_text}
                     )
                     chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
                 else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+                    chat_messages.append({"role": role, "content": msg_text})
 
         all_images = []
         if all_image_urls:
@@ -1829,13 +1844,15 @@ class MLXMultimodalLM:
         all_images.extend(all_video_frames)
 
         # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
+        template_extra_kwargs = dict(chat_template_kwargs)
         if tools:
             template_extra_kwargs["tools"] = tools
+        template_extra_kwargs.setdefault("enable_thinking", enable_thinking)
 
         try:
-            formatted_prompt = get_chat_template(
+            formatted_prompt = apply_chat_template(
                 self.processor,
+                self.model.config,
                 chat_messages,
                 add_generation_prompt=True,
                 **template_extra_kwargs,
@@ -1889,8 +1906,9 @@ class MLXMultimodalLM:
             formatted_prompt,
             all_images if all_images else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             prompt_cache=prompt_cache,
+            enable_thinking=enable_thinking,
             **kwargs,
         ):
             token_count += 1

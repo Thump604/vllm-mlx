@@ -3,6 +3,7 @@
 
 import platform
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,116 @@ class TestMLLMHelperFunctions:
         assert is_url("http://example.com/video.mp4")
         assert not is_url("/path/to/file.jpg")
         assert not is_url("data:image/png;base64,AAAA")
+
+
+class TestMLLMThinkingPropagation:
+    """Unit tests for thinking-mode propagation in MLLM chat paths."""
+
+    @staticmethod
+    def _build_model():
+        from types import SimpleNamespace
+
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        model = MLXMultimodalLM.__new__(MLXMultimodalLM)
+        model._loaded = True
+        model._video_native = False
+        model._cache_manager = None
+        model.processor = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda text: [1, 2, 3]))
+        model.model = SimpleNamespace(config={"model_type": "gemma4"}, language_model=None)
+        model.model_name = "test-model"
+        return model
+
+    def test_chat_passes_enable_thinking_to_template_and_generate(self, monkeypatch):
+        from types import SimpleNamespace
+
+        calls = {}
+
+        def fake_generate(*args, **kwargs):
+            calls["generate"] = kwargs
+            return SimpleNamespace(text="ok", prompt_tokens=12, generation_tokens=3)
+
+        def fake_apply_chat_template(processor, config, prompt, add_generation_prompt=True, **kwargs):
+            calls["template"] = {
+                "processor": processor,
+                "config": config,
+                "prompt": prompt,
+                "add_generation_prompt": add_generation_prompt,
+                "kwargs": kwargs,
+            }
+            return "FORMATTED"
+
+        fake_root = types.ModuleType("mlx_vlm")
+        fake_root.generate = fake_generate
+        fake_generate_mod = types.ModuleType("mlx_vlm.generate")
+        fake_generate_mod.apply_chat_template = fake_apply_chat_template
+        fake_models = types.ModuleType("mlx_vlm.models")
+        fake_cache = types.ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *_args, **_kwargs: None
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate_mod)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        model = self._build_model()
+        output = model.chat(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+            ],
+            max_tokens=32,
+            temperature=1.0,
+            top_p=0.95,
+            chat_template_kwargs={"enable_thinking": True, "foo": "bar"},
+        )
+
+        assert output.text == "ok"
+        assert calls["template"]["kwargs"]["enable_thinking"] is True
+        assert calls["template"]["kwargs"]["foo"] == "bar"
+        assert calls["generate"]["enable_thinking"] is True
+        assert calls["generate"]["top_p"] == 0.95
+
+    def test_stream_chat_uses_env_thinking_default(self, monkeypatch):
+        monkeypatch.setenv("VLLM_MLX_ENABLE_THINKING", "false")
+        calls = {}
+
+        def fake_stream_generate(*args, **kwargs):
+            calls["stream_generate"] = kwargs
+            yield types.SimpleNamespace(text="chunk", prompt_tokens=9)
+
+        def fake_apply_chat_template(processor, config, prompt, add_generation_prompt=True, **kwargs):
+            calls["template"] = kwargs
+            return "FORMATTED"
+
+        fake_root = types.ModuleType("mlx_vlm")
+        fake_root.stream_generate = fake_stream_generate
+        fake_generate_mod = types.ModuleType("mlx_vlm.generate")
+        fake_generate_mod.apply_chat_template = fake_apply_chat_template
+        fake_models = types.ModuleType("mlx_vlm.models")
+        fake_cache = types.ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *_args, **_kwargs: None
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate_mod)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        model = self._build_model()
+        chunks = list(
+            model.stream_chat(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
+                max_tokens=16,
+                temperature=0.7,
+            )
+        )
+
+        assert chunks[0].text == "chunk"
+        assert calls["template"]["enable_thinking"] is False
+        assert calls["stream_generate"]["enable_thinking"] is False
 
 
 class TestVideoFrameExtraction:
