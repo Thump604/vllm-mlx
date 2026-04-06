@@ -717,7 +717,9 @@ class MLLMBatchGenerator:
             return output.logits
         return output
 
-    def _process_prompts(self, requests: List[MLLMBatchRequest]) -> MLLMBatch:
+    def _process_prompts(
+        self, requests: List[MLLMBatchRequest]
+    ) -> Tuple[Optional[MLLMBatch], List[MLLMBatchRequest]]:
         """
         Process a batch of requests through vision encoding and initial prefill.
 
@@ -726,31 +728,60 @@ class MLLMBatchGenerator:
         2. Run vision encoding per-request with individual KVCache objects
         3. Merge individual caches into a BatchKVCache for generation
 
+        Requests whose preprocessing raises (e.g. malformed image data
+        rejected by PIL or the model's image processor) are isolated in
+        ``failed_requests`` so the caller can drain them via synthetic error
+        responses instead of the whole batch raising and the scheduler
+        process loop retrying the same bad input indefinitely.
+
         Args:
             requests: Requests to process
 
         Returns:
-            MLLMBatch ready for generation
+            Tuple of (MLLMBatch of successfully preprocessed requests or
+            None if every request in this slice failed, list of requests
+            whose preprocessing raised).
         """
         from mlx_lm.models.cache import make_prompt_cache
 
         tic = time.perf_counter()
 
-        # Preprocess all requests
+        # Preprocess all requests. Per-request try/except isolates bad
+        # image data so one malformed input does not poison the whole
+        # batch or cause the outer scheduler process loop to retry the
+        # same failing input forever.
+        valid_requests: List[MLLMBatchRequest] = []
+        failed_requests: List[MLLMBatchRequest] = []
         for req in requests:
-            self._preprocess_request(req)
+            try:
+                self._preprocess_request(req)
+            except Exception as e:
+                logger.warning(
+                    f"Preprocessing failed for request {req.request_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                failed_requests.append(req)
+                continue
+            valid_requests.append(req)
+
+        if not valid_requests:
+            # Every request in this slice failed preprocessing; the caller
+            # drains them via synthetic error responses.
+            self._stats.prompt_time += time.perf_counter() - tic
+            return None, failed_requests
 
         total_prompt_tokens = sum(
-            req.input_ids.size if req.input_ids is not None else 1 for req in requests
+            req.input_ids.size if req.input_ids is not None else 1
+            for req in valid_requests
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
         # Log large prompts for monitoring instead of hard-failing here.
-        max_batch_tokens = self.prefill_step_size * len(requests)
+        max_batch_tokens = self.prefill_step_size * len(valid_requests)
         if total_prompt_tokens > max_batch_tokens:
             logger.warning(
                 f"Large batch prefill: {total_prompt_tokens} tokens "
-                f"(step_size={self.prefill_step_size}, requests={len(requests)}). "
+                f"(step_size={self.prefill_step_size}, requests={len(valid_requests)}). "
                 f"Processing may be slow."
             )
 
@@ -762,7 +793,7 @@ class MLLMBatchGenerator:
         all_logprobs = []
         per_request_caches = []
 
-        for req in requests:
+        for req in valid_requests:
             # Create a fresh KVCache for this request's language model prefill
             request_cache = make_prompt_cache(self.language_model)
 
@@ -805,15 +836,18 @@ class MLLMBatchGenerator:
 
         self._stats.prompt_time += time.perf_counter() - tic
 
-        return MLLMBatch(
-            uids=[req.uid for req in requests],
-            request_ids=[req.request_id for req in requests],
-            y=y,
-            logprobs=all_logprobs,
-            max_tokens=[req.max_tokens for req in requests],
-            num_tokens=[0] * len(requests),
-            cache=batch_cache,
-            requests=requests,
+        return (
+            MLLMBatch(
+                uids=[req.uid for req in valid_requests],
+                request_ids=[req.request_id for req in valid_requests],
+                y=y,
+                logprobs=all_logprobs,
+                max_tokens=[req.max_tokens for req in valid_requests],
+                num_tokens=[0] * len(valid_requests),
+                cache=batch_cache,
+                requests=valid_requests,
+            ),
+            failed_requests,
         )
 
     def _step(
@@ -874,6 +908,7 @@ class MLLMBatchGenerator:
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
+        error_responses: List[MLLMBatchResponse] = []
 
         # Only start a new batch when there is no active batch generating.
         # Per-request KV caches are created during vision encoding and then
@@ -887,15 +922,39 @@ class MLLMBatchGenerator:
                 self.active_batch = None
                 return []
 
-            new_batch = self._process_prompts(requests)
+            # Always take ownership of this slice, whether preprocessing
+            # succeeds or fails. Leaving failed requests on the queue
+            # causes the scheduler process loop to retry the same failing
+            # input indefinitely.
             self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+
+            new_batch, failed_requests = self._process_prompts(requests)
+
+            # Synthesize error responses for requests whose preprocessing
+            # raised so the scheduler can drain them through its existing
+            # ``finish_reason == "error"`` branch in
+            # MLLMScheduler._process_batch_responses.
+            for req in failed_requests:
+                error_responses.append(
+                    MLLMBatchResponse(
+                        uid=req.uid,
+                        request_id=req.request_id,
+                        token=0,
+                        logprobs=mx.array([]),
+                        finish_reason="error",
+                        prompt_cache=None,
+                    )
+                )
+
             self.active_batch = new_batch
-            prompt_processing = True
+            prompt_processing = new_batch is not None
 
         # Generate next token for active batch
         batch = self.active_batch
         if batch is None:
-            return []
+            # No valid batch this step — surface any synthetic error
+            # responses we built so the scheduler cleans up failed requests.
+            return error_responses
 
         y, logprobs = batch.y, batch.logprobs
         batch.y, batch.logprobs = self._step(y[:, None], batch.cache, batch.requests)
@@ -909,10 +968,12 @@ class MLLMBatchGenerator:
         else:
             self._stats.generation_time += toc - tic
 
-        # Build responses and track finished
+        # Build responses and track finished. Error responses for failed
+        # preprocessing are emitted first so the scheduler cleans them up
+        # alongside any in-flight generation tokens in this step.
         keep_idx = []
         end_idx = []
-        responses = []
+        responses: List[MLLMBatchResponse] = list(error_responses)
 
         for i, (token, uid, request_id, num_tok, max_tok, req) in enumerate(
             zip(
@@ -963,7 +1024,8 @@ class MLLMBatchGenerator:
             else:
                 self.active_batch = None
 
-        self._stats.generation_tokens += len(responses)
+        # Count only real token responses, not the synthetic error ones.
+        self._stats.generation_tokens += len(responses) - len(error_responses)
         return responses
 
     def next(self) -> List[MLLMBatchResponse]:

@@ -257,6 +257,66 @@ class TestMLLMBatchStats:
 class TestMLLMBatchGeneratorSampling:
     """Tests for request-scoped sampling on the MLLM path."""
 
+    def test_preprocess_failure_yields_error_response_and_drains_queue(self):
+        """A request whose preprocessing raises must not be retried forever.
+
+        Regression test for the MLLM scheduler retry loop: before the fix,
+        when `_preprocess_request` raised (e.g. PIL rejecting a malformed
+        image), `_process_prompts` propagated the exception, `_next`
+        never trimmed `unprocessed_requests`, and the outer scheduler
+        process loop retried the same failing input indefinitely.
+
+        Expected behavior after the fix:
+        - `_process_prompts` catches the per-request exception and returns
+          `(None, [failed_req])`.
+        - `_next` always trims `unprocessed_requests`.
+        - `_next` emits exactly one synthetic `MLLMBatchResponse` with
+          `finish_reason="error"` so the scheduler can drain the failed
+          request via its existing error-handling branch.
+        """
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        generator = MLLMBatchGenerator(MagicMock(), MagicMock(), enable_vision_cache=False)
+
+        # Force preprocessing to fail with the same error shape PIL raises
+        # on malformed 1x1 greyscale PNGs.
+        def boom(request):
+            raise ValueError(
+                "Failed to process inputs with error: "
+                "Cannot handle this data type: (1, 1, 1), |u1"
+            )
+
+        generator._preprocess_request = boom  # type: ignore[method-assign]
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="req-bad-image",
+            prompt="describe",
+            images=["<malformed-png-b64>"],
+        )
+
+        # _process_prompts should isolate the failure.
+        batch, failed = generator._process_prompts([req])
+        assert batch is None
+        assert failed == [req]
+
+        # Now exercise the _next() path, which owns queue ownership and
+        # error-response emission.
+        generator.unprocessed_requests = [req]
+        responses = generator._next()
+
+        assert len(responses) == 1
+        assert responses[0].uid == 0
+        assert responses[0].request_id == "req-bad-image"
+        assert responses[0].finish_reason == "error"
+
+        # Queue must be drained; without this the scheduler would retry
+        # the same bad input forever.
+        assert generator.unprocessed_requests == []
+        assert generator.active_batch is None
+
+        generator.close()
+
     def test_step_uses_request_specific_samplers_and_processors(self):
         """Each active request should apply its own processors and sampler."""
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
