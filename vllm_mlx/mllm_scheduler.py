@@ -256,27 +256,24 @@ class MLLMScheduler:
         self.total_completion_tokens = 0
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
-        stop_tokens = set()
-        tokenizer = (
-            self.processor.tokenizer
-            if hasattr(self.processor, "tokenizer")
-            else self.processor
-        )
+        """Resolve the canonical stop-token set from model.config.eos_token_id.
 
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            if isinstance(tokenizer.eos_token_id, list):
-                stop_tokens.update(tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(tokenizer.eos_token_id)
-
-        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
-            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(tokenizer.eos_token_ids)
-            else:
-                stop_tokens.add(tokenizer.eos_token_ids)
-
-        return stop_tokens
+        This is the same training-time list mlx_vlm.generate reads (declared
+        in the model's config.json / generation_config.json). For Gemma 4
+        this list is [<eos>, <turn|>, <|tool_response>] — the tokenizer's
+        scalar eos_token_id only carries <eos>, which is why scheduler
+        stop-token resolution must come from the model config, not the
+        tokenizer alias.
+        """
+        eos = getattr(self.model.config, "eos_token_id", None)
+        if eos is None:
+            raise ValueError(
+                f"Model {type(self.model).__name__} has no eos_token_id in "
+                f"its config; cannot determine generation stop tokens."
+            )
+        if isinstance(eos, (list, tuple, set)):
+            return {int(t) for t in eos}
+        return {int(eos)}
 
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""

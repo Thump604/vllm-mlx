@@ -170,149 +170,151 @@ def test_chat_with_top_level_images_stays_off_text_scheduler():
     asyncio.run(_run())
 
 
-def test_gemma_text_chat_routes_through_text_scheduler():
-    """Gemma text-only chat now flows through TextBatchScheduler."""
+def test_hybrid_cache_text_chat_routes_through_serial_mllm_instance():
+    """Hybrid-cache models (e.g. Gemma 4 RotatingKVCache) bypass MLLM
+    continuous batching due to vllm-mlx #159 and route text-only chat
+    through the serial _mllm_instance.chat path."""
     async def _run():
-        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
-        engine._text_model = MagicMock()
+        engine._has_hybrid_cache = True
+        engine._mllm_instance = MagicMock()
+        engine._mllm_instance.chat = MagicMock(
+            return_value=MagicMock(
+                text="OK",
+                finish_reason="stop",
+                prompt_tokens=21,
+                completion_tokens=2,
+            )
+        )
+        engine._text_scheduler = FakeTextScheduler()
         engine._text_scheduler_route_enabled = True
-        engine._text_scheduler = FakeTextScheduler(
-            outputs=[
-                GenerationOutput(
-                    text="gemma",
-                    new_text="gemma",
-                    prompt_tokens=4,
-                    completion_tokens=1,
-                    finished=True,
-                    finish_reason="stop",
-                )
-            ]
+        engine._text_model = MagicMock()  # would normally enable text scheduler
+
+        output = await engine.chat(
+            [{"role": "user", "content": "Reply OK"}],
+            max_tokens=64,
+            temperature=1.0,
+            top_p=0.95,
         )
 
-        output = await engine.chat([{"role": "user", "content": "hello"}], max_tokens=32)
-
-        assert output.text == "gemma"
-        assert len(engine._text_scheduler.calls) == 1
+        assert output.text == "OK"
+        assert output.finish_reason == "stop"
+        assert output.prompt_tokens == 21
+        assert output.completion_tokens == 2
+        engine._mllm_instance.chat.assert_called_once()
+        # Hybrid cache route bypasses the text scheduler entirely.
+        assert engine._text_scheduler.calls == []
 
     asyncio.run(_run())
 
 
-def test_gemma_text_chat_forwards_raw_output_kwarg():
-    """Gemma text-only chat forwards raw_output to the text scheduler."""
+def test_hybrid_cache_text_chat_forwards_kwargs_to_mllm_instance():
+    """Hybrid-cache route must forward sampling and template kwargs."""
     async def _run():
-        raw_text = "<|channel>thought\nplan<channel|>Final answer"
-        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
-        engine._text_model = MagicMock()
+        engine._has_hybrid_cache = True
+        engine._mllm_instance = MagicMock()
+        engine._mllm_instance.chat = MagicMock(
+            return_value=MagicMock(
+                text="OK",
+                finish_reason="stop",
+                prompt_tokens=21,
+                completion_tokens=2,
+            )
+        )
+
+        await engine.chat(
+            [{"role": "user", "content": "Reply OK"}],
+            max_tokens=128,
+            temperature=1.0,
+            top_p=0.95,
+            chat_template_kwargs={"enable_thinking": False},
+            raw_output=True,
+        )
+
+        engine._mllm_instance.chat.assert_called_once()
+        kwargs = engine._mllm_instance.chat.call_args.kwargs
+        assert kwargs["max_tokens"] == 128
+        assert kwargs["temperature"] == 1.0
+        assert kwargs["top_p"] == 0.95
+        assert kwargs.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert kwargs.get("raw_output") is True
+
+    asyncio.run(_run())
+
+
+def test_hybrid_cache_text_stream_chat_routes_through_serial_mllm_instance():
+    """Hybrid-cache stream_chat path pumps the synchronous mlx_vlm
+    stream_chat generator through an asyncio queue and yields
+    GenerationOutput chunks back to the caller."""
+    async def _run():
+        engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._has_hybrid_cache = True
+        engine._mllm_instance = MagicMock()
+
+        def _stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="O",
+                prompt_tokens=15,
+                completion_tokens=1,
+                finish_reason=None,
+            )
+            yield MagicMock(
+                text="OK",
+                prompt_tokens=15,
+                completion_tokens=2,
+                finish_reason="stop",
+            )
+
+        engine._mllm_instance.stream_chat = MagicMock(side_effect=_stream_chat)
+        engine._text_scheduler = FakeTextScheduler()
         engine._text_scheduler_route_enabled = True
-        engine._text_scheduler = FakeTextScheduler(
-            outputs=[
-                GenerationOutput(
-                    text=raw_text,
-                    new_text=raw_text,
-                    prompt_tokens=4,
-                    completion_tokens=2,
-                    finished=True,
-                    finish_reason="stop",
-                )
-            ]
+        engine._text_model = MagicMock()
+
+        outputs = []
+        async for output in engine.stream_chat(
+            [{"role": "user", "content": "Say OK"}],
+            max_tokens=64,
+            temperature=1.0,
+            top_p=0.95,
+        ):
+            outputs.append((output.text, output.new_text, output.finished))
+
+        assert outputs == [
+            ("O", "O", False),
+            ("OK", "K", True),
+        ]
+        engine._mllm_instance.stream_chat.assert_called_once()
+        assert engine._text_scheduler.calls == []
+
+    asyncio.run(_run())
+
+
+def test_hybrid_cache_routes_only_text_only_requests():
+    """Image requests on hybrid-cache models still go through MLLMScheduler."""
+    async def _run():
+        engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._has_hybrid_cache = True
+        engine._mllm_instance = MagicMock()
+        engine._mllm_instance.chat = MagicMock()
+        engine._apply_chat_template = MagicMock(return_value="prompt")  # type: ignore[method-assign]
+        engine.generate = AsyncMock(  # type: ignore[method-assign]
+            return_value=GenerationOutput(text="vision", finish_reason="stop")
         )
 
         output = await engine.chat(
-            [{"role": "user", "content": "hello"}],
-            max_tokens=32,
-            raw_output=True,
+            [{"role": "user", "content": "describe this"}],
+            images=["/tmp/image.png"],
         )
 
-        assert output.text == raw_text
-        _, kwargs = engine._text_scheduler.calls[0]
-        assert kwargs.get("raw_output") is True
-
-    asyncio.run(_run())
-
-
-def test_gemma_text_stream_chat_routes_through_text_scheduler():
-    """Gemma text-only stream_chat flows through TextBatchScheduler."""
-    async def _run():
-        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
-        engine._loaded = True
-        engine._text_model = MagicMock()
-        engine._text_scheduler_route_enabled = True
-        engine._text_scheduler = FakeTextScheduler(
-            outputs=[
-                GenerationOutput(
-                    text="gem",
-                    new_text="gem",
-                    prompt_tokens=4,
-                    completion_tokens=1,
-                    finished=False,
-                ),
-                GenerationOutput(
-                    text="gemma",
-                    new_text="ma",
-                    prompt_tokens=4,
-                    completion_tokens=2,
-                    finished=True,
-                    finish_reason="stop",
-                ),
-            ]
-        )
-
-        outputs = []
-        async for output in engine.stream_chat(
-            [{"role": "user", "content": "hello"}],
-            max_tokens=32,
-        ):
-            outputs.append(output.text)
-
-        assert outputs == ["gem", "gemma"]
-        assert len(engine._text_scheduler.calls) == 1
-
-    asyncio.run(_run())
-
-
-def test_gemma_text_stream_chat_forwards_raw_output_kwarg():
-    """Gemma text-only stream_chat forwards raw_output to the text scheduler."""
-    async def _run():
-        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
-        engine._loaded = True
-        engine._text_model = MagicMock()
-        engine._text_scheduler_route_enabled = True
-        engine._text_scheduler = FakeTextScheduler(
-            outputs=[
-                GenerationOutput(
-                    text="<|channel>thought\n",
-                    new_text="<|channel>thought\n",
-                    prompt_tokens=4,
-                    completion_tokens=1,
-                    finished=False,
-                ),
-                GenerationOutput(
-                    text="<|channel>thought\nplan<channel|>Final answer",
-                    new_text="plan<channel|>Final answer",
-                    prompt_tokens=4,
-                    completion_tokens=2,
-                    finished=True,
-                    finish_reason="stop",
-                ),
-            ]
-        )
-
-        outputs = []
-        async for output in engine.stream_chat(
-            [{"role": "user", "content": "hello"}],
-            max_tokens=32,
-            raw_output=True,
-        ):
-            outputs.append(output.text)
-
-        assert outputs == [
-            "<|channel>thought\n",
-            "<|channel>thought\nplan<channel|>Final answer",
-        ]
-        _, kwargs = engine._text_scheduler.calls[0]
-        assert kwargs.get("raw_output") is True
+        assert output.text == "vision"
+        # Hybrid cache gate must NOT fire for image requests.
+        engine._mllm_instance.chat.assert_not_called()
+        engine.generate.assert_awaited_once()
 
     asyncio.run(_run())
 

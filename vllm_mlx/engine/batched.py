@@ -265,6 +265,13 @@ class BatchedEngine(BaseEngine):
             _env_flag("VLLM_MLX_ENABLE_TEXT_BATCH_SCHEDULER", False),
         )
 
+        # Hybrid cache detection: models that use RotatingKVCache (e.g.
+        # Gemma 4 sliding-window) cannot use MLLM continuous batching
+        # because BatchRotatingKVCache.merge does not preserve per-token
+        # context across decode steps. Tracked upstream as vllm-mlx #159.
+        # Set after model load by _detect_hybrid_cache().
+        self._has_hybrid_cache = False
+
         # System prompt KV cache (reduces repeated prefill across requests)
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
@@ -314,6 +321,17 @@ class BatchedEngine(BaseEngine):
 
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
+
+        # Detect hybrid-cache architectures (e.g. Gemma 4 sliding-window).
+        # See _has_hybrid_cache field for upstream issue and rationale.
+        self._has_hybrid_cache = self._detect_hybrid_cache()
+        if self._has_hybrid_cache:
+            logger.warning(
+                "Hybrid cache detected (RotatingKVCache layers): text-only "
+                "requests will route through the serial mlx_vlm.generate "
+                "path via _mllm_instance.chat. Image requests still use "
+                "MLLM continuous batching. Tracked upstream: vllm-mlx #159."
+            )
 
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
@@ -606,6 +624,33 @@ class BatchedEngine(BaseEngine):
         if _has_any_media(messages, images, videos):
             return False
         return True
+
+    def _detect_hybrid_cache(self) -> bool:
+        """Return True if the model has any sliding-window (Rotating) cache layers.
+
+        Hybrid cache architectures (e.g. Gemma 4 sliding-window) cannot use
+        the MLLM continuous batching path because BatchRotatingKVCache.merge
+        does not preserve per-token context across decode steps. The result
+        is that the model emits its first token then loops on it forever.
+        Tracked upstream as vllm-mlx #159.
+
+        When True, BatchedEngine.chat / stream_chat must route text-only
+        requests through the serial _mllm_instance.chat / stream_chat path
+        which uses mlx_vlm.generate directly.
+        """
+        if self._model is None:
+            return False
+        lm = getattr(self._model, "language_model", self._model)
+        if not hasattr(lm, "make_cache"):
+            return False
+        try:
+            from mlx_lm.models.cache import RotatingKVCache
+
+            sample_cache = lm.make_cache()
+        except Exception as e:
+            logger.warning("Hybrid cache detection failed: %s", e)
+            return False
+        return any(isinstance(c, RotatingKVCache) for c in sample_cache)
 
     def _apply_chat_template(
         self,
@@ -913,6 +958,37 @@ class BatchedEngine(BaseEngine):
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
 
+        # Hybrid cache models (e.g. Gemma 4 sliding-window) cannot use the
+        # MLLM continuous batching path due to upstream cache merge bug
+        # (vllm-mlx #159). Route text-only requests through the serial
+        # mlx_vlm.generate path which handles per-step decode correctly.
+        if (
+            self._has_hybrid_cache
+            and self._mllm_instance is not None
+            and not _has_any_media(messages, images, videos)
+        ):
+            logger.info(
+                "Hybrid cache route: text-only request → _mllm_instance.chat (serial)"
+            )
+            # MLLMMultimodalLM.chat is synchronous and CPU/GPU-bound; run in
+            # a worker thread under the GPU lock so the event loop stays responsive.
+            async with self._gpu_lock:
+                mllm_output = await asyncio.to_thread(
+                    self._mllm_instance.chat,
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=tools,
+                    **kwargs,
+                )
+            return GenerationOutput(
+                text=mllm_output.text,
+                prompt_tokens=mllm_output.prompt_tokens,
+                completion_tokens=mllm_output.completion_tokens,
+                finish_reason=mllm_output.finish_reason,
+            )
+
         # Per-request MTP routing: text-only → TextModel, media → MLLM
         if self._should_use_text_scheduler(
             messages,
@@ -1063,6 +1139,66 @@ class BatchedEngine(BaseEngine):
 
         # Normalize messages before any path (developer->system, merge consecutive)
         messages = _normalize_messages(messages)
+
+        # Hybrid cache models (e.g. Gemma 4 sliding-window) cannot use the
+        # MLLM continuous batching path due to upstream cache merge bug
+        # (vllm-mlx #159). Route text-only requests through the serial
+        # mlx_vlm.stream_generate path which handles per-step decode correctly.
+        # MLLMMultimodalLM.stream_chat is a synchronous generator; pump it
+        # into the asyncio loop via a queue + worker thread under the GPU lock.
+        if (
+            self._has_hybrid_cache
+            and self._mllm_instance is not None
+            and not _has_any_media(messages, images, videos)
+        ):
+            logger.info(
+                "Hybrid cache route: text-only request → "
+                "_mllm_instance.stream_chat (serial)"
+            )
+
+            async with self._gpu_lock:
+                loop = asyncio.get_running_loop()
+                queue: asyncio.Queue = asyncio.Queue()
+                _SENTINEL = object()
+
+                def _producer() -> None:
+                    try:
+                        for chunk in self._mllm_instance.stream_chat(
+                            messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            tools=tools,
+                            **kwargs,
+                        ):
+                            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                    except Exception as e:
+                        loop.call_soon_threadsafe(queue.put_nowait, e)
+                    finally:
+                        loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+                producer_fut = loop.run_in_executor(None, _producer)
+                last_text = ""
+                try:
+                    while True:
+                        chunk = await queue.get()
+                        if chunk is _SENTINEL:
+                            break
+                        if isinstance(chunk, Exception):
+                            raise chunk
+                        new_text = (chunk.text or "")[len(last_text):]
+                        last_text = chunk.text or last_text
+                        yield GenerationOutput(
+                            text=chunk.text or "",
+                            new_text=new_text,
+                            prompt_tokens=chunk.prompt_tokens,
+                            completion_tokens=chunk.completion_tokens,
+                            finished=chunk.finish_reason is not None,
+                            finish_reason=chunk.finish_reason,
+                        )
+                finally:
+                    await producer_fut
+            return
 
         # Per-request MTP routing: text-only → TextModel, media → MLLM
         if self._should_use_text_scheduler(
