@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.engine.batched import BatchedEngine
+from vllm_mlx.request import RequestOutput
 
 
 class FakeTextScheduler:
@@ -165,6 +166,243 @@ def test_chat_with_top_level_images_stays_off_text_scheduler():
         assert engine._text_scheduler.calls == []
         engine.generate.assert_awaited_once()
         assert engine.generate.await_args.kwargs["images"] == ["/tmp/image.png"]
+
+    asyncio.run(_run())
+
+
+def test_gemma_text_chat_routes_through_text_scheduler():
+    """Gemma text-only chat now flows through TextBatchScheduler."""
+    async def _run():
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_scheduler_route_enabled = True
+        engine._text_scheduler = FakeTextScheduler(
+            outputs=[
+                GenerationOutput(
+                    text="gemma",
+                    new_text="gemma",
+                    prompt_tokens=4,
+                    completion_tokens=1,
+                    finished=True,
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+        output = await engine.chat([{"role": "user", "content": "hello"}], max_tokens=32)
+
+        assert output.text == "gemma"
+        assert len(engine._text_scheduler.calls) == 1
+
+    asyncio.run(_run())
+
+
+def test_gemma_text_chat_forwards_raw_output_kwarg():
+    """Gemma text-only chat forwards raw_output to the text scheduler."""
+    async def _run():
+        raw_text = "<|channel>thought\nplan<channel|>Final answer"
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_scheduler_route_enabled = True
+        engine._text_scheduler = FakeTextScheduler(
+            outputs=[
+                GenerationOutput(
+                    text=raw_text,
+                    new_text=raw_text,
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+        output = await engine.chat(
+            [{"role": "user", "content": "hello"}],
+            max_tokens=32,
+            raw_output=True,
+        )
+
+        assert output.text == raw_text
+        _, kwargs = engine._text_scheduler.calls[0]
+        assert kwargs.get("raw_output") is True
+
+    asyncio.run(_run())
+
+
+def test_gemma_text_stream_chat_routes_through_text_scheduler():
+    """Gemma text-only stream_chat flows through TextBatchScheduler."""
+    async def _run():
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_scheduler_route_enabled = True
+        engine._text_scheduler = FakeTextScheduler(
+            outputs=[
+                GenerationOutput(
+                    text="gem",
+                    new_text="gem",
+                    prompt_tokens=4,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                GenerationOutput(
+                    text="gemma",
+                    new_text="ma",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+
+        outputs = []
+        async for output in engine.stream_chat(
+            [{"role": "user", "content": "hello"}],
+            max_tokens=32,
+        ):
+            outputs.append(output.text)
+
+        assert outputs == ["gem", "gemma"]
+        assert len(engine._text_scheduler.calls) == 1
+
+    asyncio.run(_run())
+
+
+def test_gemma_text_stream_chat_forwards_raw_output_kwarg():
+    """Gemma text-only stream_chat forwards raw_output to the text scheduler."""
+    async def _run():
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_scheduler_route_enabled = True
+        engine._text_scheduler = FakeTextScheduler(
+            outputs=[
+                GenerationOutput(
+                    text="<|channel>thought\n",
+                    new_text="<|channel>thought\n",
+                    prompt_tokens=4,
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                GenerationOutput(
+                    text="<|channel>thought\nplan<channel|>Final answer",
+                    new_text="plan<channel|>Final answer",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+
+        outputs = []
+        async for output in engine.stream_chat(
+            [{"role": "user", "content": "hello"}],
+            max_tokens=32,
+            raw_output=True,
+        ):
+            outputs.append(output.text)
+
+        assert outputs == [
+            "<|channel>thought\n",
+            "<|channel>thought\nplan<channel|>Final answer",
+        ]
+        _, kwargs = engine._text_scheduler.calls[0]
+        assert kwargs.get("raw_output") is True
+
+    asyncio.run(_run())
+
+
+def test_generate_forwards_full_sampling_params_to_mllm_scheduler():
+    async def _run():
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._mllm_scheduler = AsyncMock()
+        engine._mllm_scheduler.generate.return_value = RequestOutput(
+            request_id="req-1",
+            output_text="gemma",
+            prompt_tokens=9,
+            completion_tokens=3,
+            finished=True,
+            finish_reason="stop",
+        )
+
+        output = await engine.generate(
+            prompt="hello",
+            max_tokens=32,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            repetition_penalty=1.0,
+            stop=["DONE"],
+        )
+
+        assert output.text == "gemma"
+        kwargs = engine._mllm_scheduler.generate.await_args.kwargs
+        assert kwargs["top_k"] == 20
+        assert kwargs["min_p"] == 0.0
+        assert kwargs["presence_penalty"] == 1.5
+        assert kwargs["repetition_penalty"] == 1.0
+        assert kwargs["stop"] == ["DONE"]
+
+    asyncio.run(_run())
+
+
+def test_stream_generate_forwards_full_sampling_params_to_mllm_scheduler():
+    async def _run():
+        engine = BatchedEngine("gemma-4-26B-A4B-it-6bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._mllm_scheduler = MagicMock()
+        engine._mllm_scheduler.add_request_async = AsyncMock(return_value="req-1")
+
+        async def _stream_outputs(_request_id):
+            yield RequestOutput(
+                request_id="req-1",
+                output_text="A",
+                new_text="A",
+                prompt_tokens=4,
+                completion_tokens=1,
+                finished=False,
+            )
+            yield RequestOutput(
+                request_id="req-1",
+                output_text="AB",
+                new_text="B",
+                prompt_tokens=4,
+                completion_tokens=2,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        engine._mllm_scheduler.stream_outputs = _stream_outputs
+
+        outputs = []
+        async for output in engine.stream_generate(
+            prompt="hello",
+            max_tokens=32,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            repetition_penalty=1.0,
+            stop=["DONE"],
+        ):
+            outputs.append(output.text)
+
+        assert outputs == ["A", "AB"]
+        kwargs = engine._mllm_scheduler.add_request_async.await_args.kwargs
+        assert kwargs["top_k"] == 20
+        assert kwargs["min_p"] == 0.0
+        assert kwargs["presence_penalty"] == 1.5
+        assert kwargs["repetition_penalty"] == 1.0
+        assert kwargs["stop"] == ["DONE"]
 
     asyncio.run(_run())
 
