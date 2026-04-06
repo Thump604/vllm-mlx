@@ -2,6 +2,7 @@
 """Tests for building mlx_lm TextModel from mlx_vlm-loaded weights."""
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,10 @@ VLM_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-VLM-MTP-8bit
 # Text-only MTP model (no vision tower — can't test VLM loading)
 TEXT_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-8bit"
 
+# Real non-Qwen MLLM config on disk for the architecture-gate regression test.
+# Only the config.json is needed; the test never touches the weights.
+GEMMA_MLLM_PATH = Path.home() / "ai-models/mlx_models/gemma-4-26B-A4B-it-5bit"
+
 
 def test_build_text_model_no_config():
     """Returns None when model path has no config.json."""
@@ -25,6 +30,36 @@ def test_build_text_model_none_vlm():
     """Returns None when vlm_model is None."""
     result = build_text_model(None, TEXT_MTP_MODEL)
     assert result is None
+
+
+@pytest.mark.skipif(
+    not (GEMMA_MLLM_PATH / "config.json").exists(),
+    reason="Gemma 4 26B config not on disk",
+)
+def test_build_text_model_skips_non_qwen_family(caplog):
+    """Non-Qwen MLLM families must architecture-gate to None, not silently
+    swallow a crash from the qwen3_5 import.
+
+    The qwen3_5 TextModel/TextModelArgs only know how to map a Qwen 3.5 family
+    config schema. Feeding Gemma 4 (or any other family) into them crashes
+    inside Qwen3NextMLP.__init__ with ZeroDivisionError because the foreign
+    config lacks Qwen-specific keys (e.g. shared_expert_intermediate_size).
+    Catching that crash in an `except Exception` block and logging an ERROR is
+    not the right shape — every restart prints a spurious error to stderr and
+    the call site loses any visibility into why text routing was disabled.
+    Architecture-gate at the top of build_text_model instead.
+    """
+    sentinel = object()  # non-None so we get past the vlm_model is None guard
+    with caplog.at_level(logging.DEBUG, logger="vllm_mlx.text_model_from_vlm"):
+        result = build_text_model(sentinel, GEMMA_MLLM_PATH)
+
+    assert result is None
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not error_records, (
+        "build_text_model must architecture-gate non-Qwen models early, not "
+        "rely on the except backstop. Got ERROR logs: "
+        f"{[r.getMessage() for r in error_records]}"
+    )
 
 
 @pytest.mark.skipif(not VLM_MTP_MODEL.exists(), reason="VLM+MTP model not on disk")

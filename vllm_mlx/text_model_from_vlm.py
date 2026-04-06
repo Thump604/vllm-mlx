@@ -60,7 +60,16 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         model_path: Path to the model directory (contains config.json + safetensors)
 
     Returns:
-        mlx_lm TextModel with MTP support, or None on failure.
+        mlx_lm TextModel with MTP support, or None on failure or unsupported family.
+
+    Notes:
+        Only supports the Qwen 3.5 family (qwen3_5, qwen3_5_moe and their *_text
+        variants). Other MLLM families (Gemma 4, Nemotron H) return None without
+        attempting to import qwen3_5 — feeding their config.json into the Qwen
+        TextModelArgs schema would crash inside Qwen3NextMLP.__init__ (e.g.
+        ZeroDivisionError on Gemma 4 because shared_expert_intermediate_size is
+        absent). The matching call sites in engine/simple.py and engine/batched.py
+        already treat None as "no text routing"; the MLLM path remains usable.
     """
     if vlm_model is None:
         return None
@@ -72,6 +81,23 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     try:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
+
+        # Architecture gate: only Qwen 3.5 family configs map cleanly into
+        # mlx_lm.models.qwen3_5.TextModelArgs. Bail out before the import for
+        # everything else so we don't rely on the except-Exception backstop
+        # below to swallow a ZeroDivisionError on every restart.
+        text_model_type = (text_config.get("model_type") or "").lower()
+        top_model_type = (config.get("model_type") or "").lower()
+        if not (
+            text_model_type.startswith("qwen3_5")
+            or top_model_type.startswith("qwen3_5")
+        ):
+            logger.info(
+                "build_text_model: skipping model_type=%r "
+                "(only Qwen 3.5 family is supported)",
+                text_model_type or top_model_type or "<unknown>",
+            )
+            return None
 
         # Always import from qwen3_5 — TextModel and TextModelArgs handle both
         # dense and MoE natively (MTPDecoderLayer auto-selects SparseMoeBlock

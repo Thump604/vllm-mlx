@@ -628,16 +628,37 @@ class BatchedEngine(BaseEngine):
     def _detect_hybrid_cache(self) -> bool:
         """Return True if the model has any sliding-window (Rotating) cache layers.
 
-        Hybrid cache architectures (e.g. Gemma 4 sliding-window) cannot use
-        the MLLM continuous batching path because BatchRotatingKVCache.merge
-        does not preserve per-token context across decode steps. The result
-        is that the model emits its first token then loops on it forever.
-        Tracked upstream as vllm-mlx #159.
+        Originally added as a safety net: when hybrid-cache architectures
+        (e.g. Gemma 4 sliding-window) hit the MLLM continuous-batching path
+        through BatchRotatingKVCache, the model emitted its first sampled
+        token then looped on it until max_tokens. The root cause is in
+        mlx_vlm/models/gemma4/language.py: the local `offset` variable was
+        a reference to cache.offset (an mx.array on this path) and got
+        silently mutated in place by BatchRotatingKVCache._update_in_place
+        between the K-rope and Q-rope calls, leaving the query at position
+        N+1 while the key was at N. Fix is shipped as a file_overlay on
+        mlx_vlm/models/gemma4/language.py: `offset = cache.offset + 0`.
 
-        When True, BatchedEngine.chat / stream_chat must route text-only
+        When True, BatchedEngine.chat / stream_chat routes text-only
         requests through the serial _mllm_instance.chat / stream_chat path
-        which uses mlx_vlm.generate directly.
+        which uses mlx_vlm.generate directly. This is preserved as a
+        defensive fallback for any future hybrid-cache breakage.
+
+        Set VLLM_MLX_DISABLE_HYBRID_CACHE_GATE=1 to force this method to
+        return False so hybrid models go through continuous batching. This
+        is the desired production state now that the local mlx_vlm fix is
+        in place; the env var preserves an explicit on/off knob in case the
+        fix needs to be temporarily disabled or audited.
         """
+        if os.environ.get("VLLM_MLX_DISABLE_HYBRID_CACHE_GATE") == "1":
+            logger.info(
+                "VLLM_MLX_DISABLE_HYBRID_CACHE_GATE=1 set: hybrid-cache "
+                "fallback gate is bypassed. Hybrid models (e.g. Gemma 4) will "
+                "use the BatchedEngine continuous-batching path. This requires "
+                "the local mlx_vlm/models/gemma4/language.py `cache.offset + 0` "
+                "snapshot fix to be in place (see patches/MANIFEST.yaml)."
+            )
+            return False
         if self._model is None:
             return False
         lm = getattr(self._model, "language_model", self._model)
