@@ -89,6 +89,10 @@ def _register_builtin_parsers():
 
     register_parser("gemma4", Gemma4ReasoningParser)
 
+    from .super_v3_parser import SuperV3ReasoningParser
+
+    register_parser("super_v3", SuperV3ReasoningParser)
+
 
 # Register built-in parsers on module load
 _register_builtin_parsers()
