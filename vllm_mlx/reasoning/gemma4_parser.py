@@ -21,9 +21,18 @@ TURN_START_TOKEN = "<|turn>"
 TURN_END_TOKEN = "<turn|>"
 TOOL_CALL_START_TOKEN = "<|tool_call>"
 TOOL_CALL_END_TOKEN = "<tool_call|>"
+_START_TOKEN_VARIANTS = (
+    START_TOKEN,
+    "<|channel>thought",
+    "<|channel>-thought\n",
+    "<|channel>-thought",
+)
 
 _CONTROL_TOKENS = (
     START_TOKEN,
+    "<|channel>thought",
+    "<|channel>-thought\n",
+    "<|channel>-thought",
     END_TOKEN,
     TURN_START_TOKEN,
     TURN_END_TOKEN,
@@ -41,6 +50,7 @@ _CONTROL_TOKEN_RE = re.compile(
 _CONTROL_LINE_RE = re.compile(r"(?m)^[ \t]*(?://)?thought[ \t]*$")
 _INLINE_THOUGHT_SUFFIX_RE = re.compile(r"(?m)//thought[ \t]*$")
 _BLANK_LINE_RE = re.compile(r"\n{3,}")
+_START_PREFIX_RE = re.compile(r"^<\|channel>\s*-?\s*thought(?:\n)?", re.IGNORECASE)
 
 
 class Gemma4ReasoningParser(ReasoningParser):
@@ -62,11 +72,15 @@ class Gemma4ReasoningParser(ReasoningParser):
         if not text:
             return None, None
 
+        start_match = _START_PREFIX_RE.match(text)
+        if start_match:
+            return self._extract_reasoning_prefixed(text, start_match.end())
+
+        if self._looks_like_partial_reasoning_prefix(text):
+            return None, None
+
         # Gemma reasoning is only valid when the completion begins with the
         # thought channel. Later thought/channel fragments are control leakage.
-        if text.startswith(START_TOKEN):
-            return self._extract_reasoning_prefixed(text)
-
         return None, self._extract_visible_content(text)
 
     def extract_reasoning_streaming(
@@ -97,11 +111,14 @@ class Gemma4ReasoningParser(ReasoningParser):
     def _extract_reasoning_prefixed(
         self,
         text: str,
+        start_len: int,
     ) -> tuple[str | None, str | None]:
-        after_start = text[len(START_TOKEN):]
+        after_start = text[start_len:]
         if END_TOKEN not in after_start:
             reasoning = self._clean_reasoning_text(after_start)
-            return reasoning or None, None
+            if reasoning:
+                return reasoning, None
+            return None, None
 
         reasoning_text, _, remaining = after_start.partition(END_TOKEN)
         reasoning = self._clean_reasoning_text(reasoning_text)
@@ -173,6 +190,12 @@ class Gemma4ReasoningParser(ReasoningParser):
                 if token.startswith(suffix) and suffix != token:
                     return text[:-suffix_len]
         return text
+
+    @staticmethod
+    def _looks_like_partial_reasoning_prefix(text: str) -> bool:
+        if not text or not text.startswith("<"):
+            return False
+        return any(token.startswith(text) for token in _START_TOKEN_VARIANTS)
 
     @staticmethod
     def _suffix_delta(previous: str | None, current: str | None) -> str | None:

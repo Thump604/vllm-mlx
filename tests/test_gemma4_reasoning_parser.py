@@ -63,6 +63,15 @@ def test_extract_reasoning_handles_incomplete_reasoning_block():
     assert content is None
 
 
+def test_extract_reasoning_suppresses_partial_empty_thought_prefix():
+    parser = Gemma4ReasoningParser()
+
+    reasoning, content = parser.extract_reasoning("<|channel>thought")
+
+    assert reasoning is None
+    assert content is None
+
+
 def test_streaming_suppresses_partial_turn_fragments():
     parser = Gemma4ReasoningParser()
     previous_text = ""
@@ -101,6 +110,42 @@ def test_streaming_emits_reasoning_then_content():
 
     assert "".join(reasoning_parts) == "step"
     assert "".join(content_parts) == "FINAL"
+
+
+def test_streaming_suppresses_empty_thought_prefix_without_newline():
+    parser = Gemma4ReasoningParser()
+    previous_text = ""
+    current_text = ""
+    reasoning_parts = []
+    content_parts = []
+
+    for chunk in ("<|channel>", "thought", END_TOKEN, "VISIBLE", TURN_END_TOKEN):
+        previous_text = current_text
+        current_text += chunk
+        delta = parser.extract_reasoning_streaming(previous_text, current_text, chunk)
+        if delta and delta.reasoning:
+            reasoning_parts.append(delta.reasoning)
+        if delta and delta.content:
+            content_parts.append(delta.content)
+
+    assert reasoning_parts == []
+    assert "".join(content_parts) == "VISIBLE"
+
+
+def test_streaming_suppresses_hyphenated_empty_thought_prefix():
+    parser = Gemma4ReasoningParser()
+    previous_text = ""
+    current_text = ""
+    content_parts = []
+
+    for chunk in ("<|channel>-", "thought", END_TOKEN, "VISIBLE", TURN_END_TOKEN):
+        previous_text = current_text
+        current_text += chunk
+        delta = parser.extract_reasoning_streaming(previous_text, current_text, chunk)
+        if delta and delta.content:
+            content_parts.append(delta.content)
+
+    assert "".join(content_parts) == "VISIBLE"
 
 
 def test_clean_output_text_strips_gemma_control_tokens():
