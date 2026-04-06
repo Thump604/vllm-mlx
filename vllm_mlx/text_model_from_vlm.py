@@ -22,6 +22,36 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
+def _resolve_quantization_recipe(
+    path: str,
+    quantization: dict[str, Any],
+    all_weight_names: set[str],
+) -> dict[str, Any] | bool:
+    """Return per-module quantization params for an extracted text layer."""
+    if f"{path}.scales" not in all_weight_names:
+        return False
+
+    recipe = {
+        "group_size": quantization.get("group_size", 64),
+        "bits": quantization.get("bits", 8),
+        "mode": quantization.get("mode", "affine"),
+    }
+
+    for key in (path, f"language_model.{path}"):
+        override = quantization.get(key)
+        if isinstance(override, dict):
+            recipe.update(
+                {
+                    k: override[k]
+                    for k in ("group_size", "bits", "mode")
+                    if k in override
+                }
+            )
+            break
+
+    return recipe
+
+
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
@@ -61,21 +91,18 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
 
-        # Quantize the TextModel skeleton to match source weights.
-        # Use a predicate that only quantizes layers that have .scales in source.
-        # This prevents quantizing layers like mtp.fc which are BF16.
+        # Quantize the TextModel skeleton to match source weights, while
+        # honoring any per-layer overrides from config.json.
         quantization = text_config.get("quantization", config.get("quantization", None))
         if quantization is not None:
 
             def _class_predicate(path, module):
                 if not hasattr(module, "to_quantized"):
                     return False
-                return f"{path}.scales" in all_weight_names
+                return _resolve_quantization_recipe(path, quantization, all_weight_names)
 
             nn.quantize(
                 text_model,
-                group_size=quantization.get("group_size", 64),
-                bits=quantization.get("bits", 8),
                 class_predicate=_class_predicate,
             )
 
