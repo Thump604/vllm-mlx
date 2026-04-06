@@ -55,6 +55,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _merge_template_kwargs(
+    base_kwargs: dict[str, Any],
+    chat_template_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge request-level template kwargs with engine defaults."""
+    merged = dict(base_kwargs)
+    if isinstance(chat_template_kwargs, dict):
+        merged.update(chat_template_kwargs)
+    return merged
+
+
 def _has_any_media(
     messages: list[dict[str, Any]],
     images: list[str] | None = None,
@@ -601,6 +612,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -629,16 +641,20 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm and num_images > 0:
                 messages = self._prepare_mllm_messages(messages)
 
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-            }
+            template_kwargs = _merge_template_kwargs(
+                {
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                },
+                chat_template_kwargs,
+            )
             if tools:
                 template_kwargs["tools"] = tools
             # Pass enable_thinking from env (set by runtime_patches from mode.json)
             import os
-            if os.environ.get("VLLM_MLX_ENABLE_THINKING", "").lower() in ("1", "true"):
-                template_kwargs["enable_thinking"] = True
+            if "enable_thinking" not in template_kwargs:
+                if os.environ.get("VLLM_MLX_ENABLE_THINKING", "").lower() in ("1", "true"):
+                    template_kwargs["enable_thinking"] = True
 
             try:
                 return template_applicator.apply_chat_template(
@@ -723,6 +739,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -736,8 +754,9 @@ class BatchedEngine(BaseEngine):
                 top_p=top_p,
             )
 
+            text = output.output_text if raw_output else clean_output_text(output.output_text)
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -758,7 +777,7 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = output.output_text if raw_output else clean_output_text(output.output_text)
 
         return GenerationOutput(
             text=text,
@@ -797,6 +816,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -809,9 +830,11 @@ class BatchedEngine(BaseEngine):
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
+                text = output.output_text if raw_output else clean_output_text(output.output_text)
+                new_text = output.new_text if raw_output else clean_output_text(output.new_text)
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
-                    new_text=output.new_text,
+                    text=text,
+                    new_text=new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
@@ -837,11 +860,12 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            text = output.output_text if raw_output else clean_output_text(output.output_text)
+            new_text = output.new_text if raw_output else clean_output_text(output.new_text)
 
             yield GenerationOutput(
                 text=text,
-                new_text=output.new_text,
+                new_text=new_text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
@@ -908,7 +932,10 @@ class BatchedEngine(BaseEngine):
                 return last_output
             return GenerationOutput(text="", finish_reason="stop")
 
-        if self._text_model is not None and not _has_any_media(messages, images, videos):
+        if (
+            self._text_model is not None
+            and not _has_any_media(messages, images, videos)
+        ):
             return await self._chat_text_model(
                 messages,
                 max_tokens=max_tokens,
@@ -932,6 +959,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
         )
 
         return await self.generate(
@@ -1051,7 +1079,10 @@ class BatchedEngine(BaseEngine):
                 yield output
             return
 
-        if self._text_model is not None and not _has_any_media(messages, images, videos):
+        if (
+            self._text_model is not None
+            and not _has_any_media(messages, images, videos)
+        ):
             async for output in self._stream_chat_text_model(
                 messages,
                 max_tokens=max_tokens,
@@ -1077,6 +1108,7 @@ class BatchedEngine(BaseEngine):
             messages,
             template_tools,
             num_images=len(all_images),
+            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
         )
 
         # Compute prefix boundary for cache
@@ -1162,7 +1194,8 @@ class BatchedEngine(BaseEngine):
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
-        # Per-request specprefill overrides (from extra_body)
+        # Per-request template/specprefill overrides (from extra_body)
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
 
@@ -1179,11 +1212,14 @@ class BatchedEngine(BaseEngine):
             tools = json.loads(json.dumps(tools, default=str))
 
         # Apply chat template
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
-        }
+        template_kwargs = _merge_template_kwargs(
+            {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
+            },
+            chat_template_kwargs,
+        )
         if tools:
             template_kwargs["tools"] = tools
 

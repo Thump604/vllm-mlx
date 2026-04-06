@@ -437,6 +437,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -453,7 +455,7 @@ class SimpleEngine(BaseEngine):
                     tools=template_tools,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = output.text if raw_output else clean_output_text(output.text)
                 return GenerationOutput(
                     text=text,
                     prompt_tokens=output.prompt_tokens,
@@ -472,7 +474,7 @@ class SimpleEngine(BaseEngine):
                     tools=template_tools,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = output.text if raw_output else clean_output_text(output.text)
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,
@@ -585,11 +587,14 @@ class SimpleEngine(BaseEngine):
 
             enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
             enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+            chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
             }
+            if isinstance(chat_template_kwargs, dict):
+                template_kwargs.update(chat_template_kwargs)
+            template_kwargs.setdefault("enable_thinking", enable_thinking)
             if template_tools:
                 template_kwargs["tools"] = template_tools
 
@@ -827,7 +832,8 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
-        # Per-request specprefill overrides (from extra_body)
+        # Per-request template/specprefill overrides (from extra_body)
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
 
@@ -839,8 +845,10 @@ class SimpleEngine(BaseEngine):
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
         }
+        if isinstance(chat_template_kwargs, dict):
+            template_kwargs.update(chat_template_kwargs)
+        template_kwargs.setdefault("enable_thinking", enable_thinking)
         if tools:
             template_kwargs["tools"] = tools
 

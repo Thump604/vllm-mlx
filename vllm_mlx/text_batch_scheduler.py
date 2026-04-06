@@ -253,7 +253,12 @@ class TextBatchScheduler:
         repetition_penalty = float(kwargs.pop("repetition_penalty", 1.0) or 1.0)
         frequency_penalty = float(kwargs.pop("frequency_penalty", 0.0) or 0.0)
 
-        prompt = self._apply_chat_template(messages, tools=tools)
+        chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
+        prompt = self._apply_chat_template(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         token_ids = self._encode_text(prompt)
         prefix_boundary = self._compute_prefix_boundary(messages, tools, token_ids)
 
@@ -398,6 +403,7 @@ class TextBatchScheduler:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> str:
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
         enable_thinking = enable_thinking_env.lower() in {"true", "1", "yes"}
@@ -409,8 +415,10 @@ class TextBatchScheduler:
         template_kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": enable_thinking,
         }
+        if isinstance(chat_template_kwargs, dict):
+            template_kwargs.update(chat_template_kwargs)
+        template_kwargs.setdefault("enable_thinking", enable_thinking)
         if tools:
             template_kwargs["tools"] = tools
 

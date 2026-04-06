@@ -141,6 +141,30 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_request_field(request: ChatCompletionRequest, field_name: str, default):
+    """Resolve request fields with OpenAI-compatible extra_body fallback."""
+    value = getattr(request, field_name, None)
+    if value is not None:
+        return value
+    extra_body = request.extra_body or {}
+    extra_value = extra_body.get(field_name)
+    if extra_value is not None:
+        return extra_value
+    return default
+
+
+def _resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, object]:
+    """Merge top-level and extra_body chat template kwargs."""
+    merged: dict[str, object] = {}
+    extra_body = request.extra_body or {}
+    extra_kwargs = extra_body.get("chat_template_kwargs")
+    if isinstance(extra_kwargs, dict):
+        merged.update(extra_kwargs)
+    if request.chat_template_kwargs:
+        merged.update(request.chat_template_kwargs)
+    return merged
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -1475,15 +1499,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Prepare kwargs
     chat_kwargs = {
-        "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": _resolve_temperature(request.temperature),
-        "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
-        "repetition_penalty": request.repetition_penalty or 1.0,
+        "max_tokens": _resolve_request_field(request, "max_tokens", _default_max_tokens),
+        "temperature": _resolve_temperature(_resolve_request_field(request, "temperature", None)),
+        "top_p": _resolve_top_p(_resolve_request_field(request, "top_p", None)),
+        "top_k": _resolve_request_field(request, "top_k", 0) or 0,
+        "min_p": _resolve_request_field(request, "min_p", 0.0) or 0.0,
+        "presence_penalty": _resolve_request_field(request, "presence_penalty", 0.0) or 0.0,
+        "repetition_penalty": _resolve_request_field(request, "repetition_penalty", 1.0) or 1.0,
         "stop": request.stop,
     }
+
+    chat_template_kwargs = _resolve_chat_template_kwargs(request)
+    if chat_template_kwargs:
+        chat_kwargs["chat_template_kwargs"] = chat_template_kwargs
+    chat_kwargs["raw_output"] = True
 
     # Add multimodal content
     if has_media:
@@ -1495,10 +1524,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
     # SpecPrefill: per-request overrides
-    if request.specprefill is not None:
-        chat_kwargs["specprefill"] = request.specprefill
-    if request.specprefill_keep_pct is not None:
-        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    specprefill = _resolve_request_field(request, "specprefill", None)
+    if specprefill is not None:
+        chat_kwargs["specprefill"] = specprefill
+    specprefill_keep_pct = _resolve_request_field(request, "specprefill_keep_pct", None)
+    if specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = specprefill_keep_pct
 
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
@@ -1538,9 +1569,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
-        )
+        try:
+            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+                text_to_parse,
+                request=request,
+            )
+        except TypeError:
+            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+                text_to_parse
+            )
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
@@ -1832,6 +1869,7 @@ async def create_response(raw_request: Request):
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "stop": getattr(request, "stop", None),
+        "raw_output": True,
     }
     if tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(tools)
@@ -1863,7 +1901,13 @@ async def create_response(raw_request: Request):
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(text_to_parse)
+        try:
+            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+                text_to_parse,
+                request=chat_request,
+            )
+        except TypeError:
+            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(text_to_parse)
 
     # Build output items
     output_items = []
@@ -2030,6 +2074,7 @@ async def create_anthropic_message(
         "presence_penalty": openai_request.presence_penalty or 0.0,
         "repetition_penalty": openai_request.repetition_penalty or 1.0,
         "stop": openai_request.stop,
+        "raw_output": True,
     }
 
     if openai_request.tools and openai_request.tool_choice != "none":
@@ -2361,6 +2406,7 @@ async def stream_chat_completion(
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     start_time = time.perf_counter()
+    kwargs["raw_output"] = True
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage

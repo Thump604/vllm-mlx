@@ -152,6 +152,44 @@ class TestChatCompletionRequest:
         assert request.video_fps == 2.0
         assert request.video_max_frames == 16
 
+    def test_request_with_extra_body_and_template_kwargs(self):
+        """Request model should preserve OpenAI extra_body extensions."""
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            extra_body={"top_k": 20, "chat_template_kwargs": {"enable_thinking": True}},
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+
+        assert request.extra_body["top_k"] == 20
+        assert request.extra_body["chat_template_kwargs"]["enable_thinking"] is True
+        assert request.chat_template_kwargs["force_nonempty_content"] is True
+
+    def test_request_field_resolution_prefers_top_level(self):
+        """Top-level request fields should override extra_body fallbacks."""
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            _resolve_chat_template_kwargs,
+            _resolve_request_field,
+        )
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            top_k=40,
+            extra_body={"top_k": 20, "chat_template_kwargs": {"enable_thinking": True}},
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+
+        assert _resolve_request_field(request, "top_k", 0) == 40
+        assert _resolve_chat_template_kwargs(request) == {
+            "enable_thinking": True,
+            "force_nonempty_content": True,
+        }
+
 
 class TestCompletionRequest:
     """Test CompletionRequest model."""
