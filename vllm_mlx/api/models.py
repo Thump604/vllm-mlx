@@ -11,6 +11,7 @@ These models define the request and response schemas for:
 
 import time
 import uuid
+from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -158,6 +159,10 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stream_options: StreamOptions | None = (
@@ -178,6 +183,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # OpenAI client compatibility: server-specific extensions
+    extra_body: dict[str, Any] | None = None
+    # Optional chat template controls (merged with extra_body.chat_template_kwargs)
+    chat_template_kwargs: dict[str, Any] | None = None
 
 
 class AssistantMessage(BaseModel):

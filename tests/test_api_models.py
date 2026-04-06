@@ -274,6 +274,19 @@ class TestChatCompletion:
         assert req.tools is not None
         assert req.timeout == 30.0
 
+    def test_request_accepts_extra_body_and_chat_template_kwargs(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+            extra_body={"top_k": 20, "chat_template_kwargs": {"enable_thinking": True}},
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        assert req.extra_body == {
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+        assert req.chat_template_kwargs == {"force_nonempty_content": True}
+
     def test_mllm_request_params(self):
         req = ChatCompletionRequest(
             model="test-model",
