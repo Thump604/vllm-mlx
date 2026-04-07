@@ -328,8 +328,15 @@ class SimpleEngine(BaseEngine):
                 ):
                     use_specprefill = False
 
-                # Upper bound: cap to avoid draft model OOM
-                _SPECPREFILL_MAX_TOKENS = 65536
+                # Upper bound: cap to avoid draft model KV OOM on very long prompts.
+                # Matches BatchedEngine cap (196608 = 192K). Sized for the paper's
+                # 2B draft (1.5 GB KV at 128K, cf. specprefill.tex Section 4.2) and
+                # the 4B VLM draft (~3-4 GB KV at 128K). On 128 GB unified memory
+                # with a 122B target resident (~100 GB), both drafts fit at 128K+
+                # with headroom. Paper's 128K claim (5.45x at keep=0.2) requires
+                # this cap to be >= 131072; 196608 provides a 1.5x safety margin
+                # and keeps SimpleEngine consistent with BatchedEngine.
+                _SPECPREFILL_MAX_TOKENS = 196608
                 if use_specprefill and n_tokens > _SPECPREFILL_MAX_TOKENS:
                     logger.warning(
                         "SpecPrefill: prompt %d tokens exceeds max %d, "
