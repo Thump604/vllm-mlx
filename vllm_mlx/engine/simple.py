@@ -1282,14 +1282,22 @@ class SimpleEngine(BaseEngine):
                 "keep_pct": self._specprefill_keep_pct,
             }
 
-        # System KV cache stats
+        # System KV cache stats. Snapshot entries can be plain (keys, values)
+        # tuples for KVCache, lists for ArraysCache, or nested tuples for
+        # QuantizedSDPACache (((packed, scales, biases), (packed, scales,
+        # biases))). Walk recursively so every backing array is counted
+        # regardless of cache shape.
         if self._system_kv_snapshot is not None:
-            cache_bytes = 0
-            for entry in self._system_kv_snapshot:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    cache_bytes += entry[0].nbytes + entry[1].nbytes
-                elif isinstance(entry, list):
-                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+            def _entry_bytes(x):
+                if hasattr(x, "nbytes"):
+                    return x.nbytes
+                if isinstance(x, (tuple, list)):
+                    return sum(_entry_bytes(i) for i in x if i is not None)
+                return 0
+
+            cache_bytes = sum(
+                _entry_bytes(e) for e in self._system_kv_snapshot
+            )
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,

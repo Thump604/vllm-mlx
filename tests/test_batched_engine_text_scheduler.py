@@ -443,3 +443,64 @@ def test_get_stats_survives_text_scheduler_failure():
     stats = engine.get_stats()
 
     assert stats["text_scheduler"]["error"] == "boom"
+
+
+def test_get_stats_handles_quantized_kv_snapshot():
+    """Regression: get_stats() must walk nested-tuple QuantizedSDPACache
+    snapshots without crashing on entry[0].nbytes.
+
+    A QuantizedSDPACache snapshot entry is shaped
+    ((packed, scales, biases), (packed, scales, biases)) — i.e. entry[0] is
+    itself a 3-tuple of mlx arrays, not a single mlx array. The previous
+    code path raised
+        AttributeError: 'tuple' object has no attribute 'nbytes'
+    on the very first request once a system prefix had been snapshotted on
+    a model with --kv-quantize, which left /v1/status reporting
+    'status: degraded' on Qwen 3.5 122B.
+    """
+    engine = _make_engine()
+    engine._mllm_scheduler = None
+    engine._text_scheduler = None
+
+    class _Arr:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    # Two layers of QuantizedSDPACache state:
+    # entry = (k_tuple, v_tuple) where each tuple is (packed, scales, biases)
+    quant_layer_a = (
+        (_Arr(1024), _Arr(64), _Arr(64)),
+        (_Arr(1024), _Arr(64), _Arr(64)),
+    )
+    quant_layer_b = (
+        (_Arr(2048), _Arr(128), _Arr(128)),
+        (_Arr(2048), _Arr(128), _Arr(128)),
+    )
+    # Mix in a plain KVCache layer (single (keys, values) tuple) and an
+    # ArraysCache layer (list of arrays) so the recursive helper covers all
+    # three shapes _snapshot_system_kv() can store.
+    plain_layer = (_Arr(4096), _Arr(4096))
+    list_layer = [_Arr(8192), None, _Arr(8192)]
+
+    engine._system_kv_snapshot = [
+        quant_layer_a,
+        quant_layer_b,
+        plain_layer,
+        list_layer,
+    ]
+    engine._system_kv_token_count = 128
+    engine._system_kv_hash = "deadbeef"
+
+    stats = engine.get_stats()
+
+    assert "system_kv_cache" in stats
+    assert stats["system_kv_cache"]["tokens"] == 128
+    assert stats["system_kv_cache"]["hash"] == "deadbeef"
+    # Total backing bytes:
+    # quant_layer_a: 2 * (1024 + 64 + 64) = 2304
+    # quant_layer_b: 2 * (2048 + 128 + 128) = 4608
+    # plain_layer:   2 * 4096                = 8192
+    # list_layer:    2 * 8192                = 16384
+    # total                                  = 31488 bytes -> 0.0 MB rounded
+    expected_bytes = 2304 + 4608 + 8192 + 16384
+    assert stats["system_kv_cache"]["memory_mb"] == round(expected_bytes / 1e6, 1)
