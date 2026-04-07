@@ -375,6 +375,700 @@ class TestMLLMBatchGeneratorSampling:
         generator.close()
 
 
+class TestMLLMBatchGeneratorChunkedPrefill:
+    """Tests for chunked prefill in ``MLLMBatchGenerator._run_vision_encoding``.
+
+    Regression cover for the Session 84 Gemma 4 long-context fix: a single
+    256K-token forward pass on the MLLM path was hitting Metal OOM and
+    600s client timeouts at 128K. The fix splits text-only prefill into
+    ``prefill_step_size``-sized chunks while preserving the per-request
+    cache identity, and forces evaluation of cache state between chunks
+    so the activation graph cannot grow unbounded across the loop.
+
+    Vision (``pixel_values is not None``) requests must NOT be chunked
+    because image-token placeholders need to share the same forward pass
+    as their pixels for ``masked_scatter`` inside ``get_input_embeddings``.
+    """
+
+    def _build_generator(self, prefill_step_size=1024):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator(
+            MagicMock(),
+            MagicMock(),
+            enable_vision_cache=False,
+            prefill_step_size=prefill_step_size,
+        )
+        return generator
+
+    def _make_fake_cache(self, n_layers=2):
+        """Build a list of fake cache layers exposing a ``state`` property
+        so the chunked prefill loop can call ``mx.eval([c.state for ...])``.
+        """
+
+        class _FakeCacheLayer:
+            def __init__(self):
+                self._state = mx.array([0], dtype=mx.int32)
+
+            @property
+            def state(self):
+                return self._state
+
+        return [_FakeCacheLayer() for _ in range(n_layers)]
+
+    def test_short_text_only_prefill_uses_single_call(self):
+        """Inputs <= prefill_step_size go through a single ``self.model`` call."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(prefill_step_size=1024)
+        last_logits = mx.zeros((1, 512, 8), dtype=mx.float32)
+        model_mock = MagicMock(return_value=last_logits)
+        gen.model = model_mock
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-short",
+            prompt="hi",
+            input_ids=mx.zeros(512, dtype=mx.int32),
+        )
+
+        cache = self._make_fake_cache()
+        out = gen._run_vision_encoding(req, cache=cache)
+
+        assert model_mock.call_count == 1
+        called_input = model_mock.call_args_list[0].args[0]
+        assert called_input.shape == (1, 512)
+        assert model_mock.call_args_list[0].kwargs.get("cache") is cache
+        assert req.vision_encoded is True
+        assert mx.array_equal(out, last_logits).item()
+
+        gen.close()
+
+    def test_long_text_only_prefill_chunks_with_shared_cache(self):
+        """Text-only inputs > prefill_step_size are split into chunks; the
+        cache identity is preserved across calls and only the first chunk
+        receives any vision-related kwargs. Returned logits == last chunk."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(prefill_step_size=1024)
+
+        chunk_outputs = [
+            mx.zeros((1, 1024, 8), dtype=mx.float32),
+            mx.ones((1, 476, 8), dtype=mx.float32),
+        ]
+        call_log = []
+
+        def model_call(input_ids, **kwargs):
+            call_log.append(
+                {
+                    "input_ids_shape": input_ids.shape,
+                    "cache_arg": kwargs.get("cache"),
+                    "kwargs_no_cache": {
+                        k: v for k, v in kwargs.items() if k != "cache"
+                    },
+                }
+            )
+            return chunk_outputs[len(call_log) - 1]
+
+        model_mock = MagicMock(side_effect=model_call)
+        gen.model = model_mock
+
+        cache = self._make_fake_cache()
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-long",
+            prompt="needle",
+            input_ids=mx.zeros(1500, dtype=mx.int32),
+        )
+
+        out = gen._run_vision_encoding(req, cache=cache)
+
+        assert len(call_log) == 2
+        # Chunk 0 covers tokens [0:1024], chunk 1 covers tokens [1024:1500].
+        assert call_log[0]["input_ids_shape"] == (1, 1024)
+        assert call_log[1]["input_ids_shape"] == (1, 476)
+        # Both calls share the SAME cache list object so KV state accumulates.
+        assert call_log[0]["cache_arg"] is cache
+        assert call_log[1]["cache_arg"] is cache
+        # Subsequent chunks must NOT carry vision kwargs (otherwise the
+        # vision tower would re-run on every chunk and the chunked path
+        # would be no faster than the original single-shot call).
+        for forbidden in ("pixel_values", "attention_mask", "image_grid_thw"):
+            assert forbidden not in call_log[1]["kwargs_no_cache"]
+        # The returned logits are the LAST chunk's output (only those matter
+        # for first-token sampling).
+        assert mx.array_equal(out, chunk_outputs[1]).item()
+        assert req.vision_encoded is True
+
+        gen.close()
+
+    def test_long_text_only_prefill_handles_3_chunks(self):
+        """Verifies the chunk loop handles inputs that require 3+ chunks."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(prefill_step_size=1024)
+
+        chunk_outputs = [
+            mx.zeros((1, 1024, 4), dtype=mx.float32),
+            mx.ones((1, 1024, 4), dtype=mx.float32),
+            mx.full((1, 200, 4), 7.0, dtype=mx.float32),
+        ]
+        call_log = []
+
+        def model_call(input_ids, **kwargs):
+            call_log.append(input_ids.shape)
+            return chunk_outputs[len(call_log) - 1]
+
+        gen.model = MagicMock(side_effect=model_call)
+        cache = self._make_fake_cache()
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-3chunks",
+            prompt="long needle",
+            input_ids=mx.zeros(2248, dtype=mx.int32),  # 1024 + 1024 + 200
+        )
+
+        out = gen._run_vision_encoding(req, cache=cache)
+
+        assert call_log == [(1, 1024), (1, 1024), (1, 200)]
+        assert mx.array_equal(out, chunk_outputs[2]).item()
+
+        gen.close()
+
+    def test_image_request_skips_chunking(self):
+        """Requests with pixel_values must NOT be chunked; image-token
+        placeholders need to stay in the same forward pass as their pixels
+        so masked_scatter inside get_input_embeddings can do its job."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(prefill_step_size=1024)
+        model_mock = MagicMock(
+            return_value=mx.zeros((1, 1500, 8), dtype=mx.float32)
+        )
+        gen.model = model_mock
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-img",
+            prompt="describe",
+            input_ids=mx.zeros(1500, dtype=mx.int32),
+            pixel_values=mx.zeros((1, 3, 32, 32), dtype=mx.float32),
+        )
+
+        gen._run_vision_encoding(req, cache=None)
+
+        # Single forward call carrying pixel_values.
+        assert model_mock.call_count == 1
+        kwargs = model_mock.call_args_list[0].kwargs
+        assert "pixel_values" in kwargs
+
+        gen.close()
+
+    def test_chunk_boundary_exactly_on_step_size(self):
+        """Inputs exactly equal to prefill_step_size still take a single call."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(prefill_step_size=1024)
+        model_mock = MagicMock(
+            return_value=mx.zeros((1, 1024, 4), dtype=mx.float32)
+        )
+        gen.model = model_mock
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-exact",
+            prompt="exact",
+            input_ids=mx.zeros(1024, dtype=mx.int32),
+        )
+
+        gen._run_vision_encoding(req, cache=self._make_fake_cache())
+
+        assert model_mock.call_count == 1
+
+        gen.close()
+
+
+class TestMLLMBatchGeneratorSpecPrefill:
+    """Tests for SpecPrefill integration on the MLLM batch generator path.
+
+    Session 84 Fix 2: text-only long-context requests on the MLLM
+    scheduler path can route through cooperative SpecPrefill (draft
+    scoring + sparse prefill) to cut the bulk of the prefill work,
+    matching what the text scheduler already does for non-MLLM models.
+
+    Eligibility rules:
+    - draft_model must be plumbed through BatchedEngine -> MLLMScheduler
+      -> MLLMBatchGenerator (None disables the path)
+    - specprefill_threshold + keep_pct must be set
+    - request must be text-only (pixel_values is None) so vision-token
+      placeholders are not dropped from the keep mask
+    - input_ids length must exceed specprefill_threshold
+
+    The result must be processed as a SOLO batch because the wrapped
+    cache produced by sparse prefill carries a per-request RoPE
+    adjustment that does not safely co-merge with dense-path caches.
+    """
+
+    def _build_generator(self, *, draft_model=None, threshold=None, keep_pct=None):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        return MLLMBatchGenerator(
+            MagicMock(),
+            MagicMock(),
+            enable_vision_cache=False,
+            prefill_step_size=1024,
+            draft_model=draft_model,
+            specprefill_threshold=threshold,
+            specprefill_keep_pct=keep_pct,
+        )
+
+    def test_eligibility_requires_draft_model(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(threshold=512, keep_pct=0.3)
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-no-draft",
+            prompt="x",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+        assert gen._qualifies_for_specprefill(req) is False
+        gen.close()
+
+    def test_eligibility_requires_text_only(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(
+            draft_model=MagicMock(), threshold=512, keep_pct=0.3
+        )
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-img",
+            prompt="x",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+            pixel_values=mx.zeros((1, 3, 8, 8), dtype=mx.float32),
+        )
+        assert gen._qualifies_for_specprefill(req) is False
+        gen.close()
+
+    def test_eligibility_requires_above_threshold(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(
+            draft_model=MagicMock(), threshold=4096, keep_pct=0.3
+        )
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-short",
+            prompt="x",
+            input_ids=mx.zeros(1024, dtype=mx.int32),
+        )
+        assert gen._qualifies_for_specprefill(req) is False
+        gen.close()
+
+    def test_eligibility_passes_for_long_text_only_with_draft(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(
+            draft_model=MagicMock(), threshold=512, keep_pct=0.3
+        )
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-long",
+            prompt="x",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+        assert gen._qualifies_for_specprefill(req) is True
+        gen.close()
+
+    def test_eligibility_capped_at_specprefill_max_input(self):
+        """Inputs above ``specprefill_max_input`` must fall through to
+        the dense path. The cap is the macOS GPU watchdog workaround
+        for the manual_rope_proportional path on the target VLM at
+        very long prompts (Session 84 Fix 2 — 256K crashes the sparse
+        path on Gemma 4 26B regardless of target_chunk_size)."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        gen = MLLMBatchGenerator(
+            MagicMock(),
+            MagicMock(),
+            enable_vision_cache=False,
+            prefill_step_size=1024,
+            draft_model=MagicMock(),
+            specprefill_threshold=512,
+            specprefill_keep_pct=0.5,
+            specprefill_max_input=4096,
+        )
+
+        below_cap = MLLMBatchRequest(
+            uid=0,
+            request_id="r-below",
+            prompt="x",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+        at_cap = MLLMBatchRequest(
+            uid=1,
+            request_id="r-at",
+            prompt="x",
+            input_ids=mx.zeros(4096, dtype=mx.int32),
+        )
+        above_cap = MLLMBatchRequest(
+            uid=2,
+            request_id="r-above",
+            prompt="x",
+            input_ids=mx.zeros(8192, dtype=mx.int32),
+        )
+
+        assert gen._qualifies_for_specprefill(below_cap) is True
+        # Equal to cap is allowed (we use ``> max``, not ``>=``).
+        assert gen._qualifies_for_specprefill(at_cap) is True
+        assert gen._qualifies_for_specprefill(above_cap) is False
+
+        gen.close()
+
+    def test_eligibility_no_cap_when_max_input_none(self):
+        """Setting ``specprefill_max_input=None`` disables the cap.
+        Used for tests/benchmarks that want to exercise the sparse
+        path at any size."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        gen = MLLMBatchGenerator(
+            MagicMock(),
+            MagicMock(),
+            enable_vision_cache=False,
+            draft_model=MagicMock(),
+            specprefill_threshold=512,
+            specprefill_keep_pct=0.5,
+            specprefill_max_input=None,
+        )
+        huge = MLLMBatchRequest(
+            uid=0,
+            request_id="r-huge",
+            prompt="x",
+            input_ids=mx.zeros(1_000_000, dtype=mx.int32),
+        )
+        assert gen._qualifies_for_specprefill(huge) is True
+        gen.close()
+
+    def test_run_specprefill_drives_session_to_completion(self, monkeypatch):
+        """``_run_specprefill_for_request`` should construct a
+        cooperative session against the runtime's draft + target model,
+        drive ``step()`` until done, and return the session's logits +
+        wrapped cache."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+        import vllm_mlx.mllm_batch_generator as mbg
+
+        constructed = []
+        steps_called = [0]
+        cleanup_called = [0]
+        fake_logits = mx.zeros((1, 1, 16), dtype=mx.float32)
+        fake_cache = [object(), object()]
+
+        class _FakeSession:
+            def __init__(self, **kwargs):
+                constructed.append(kwargs)
+                self._done = False
+
+            @property
+            def is_done(self):
+                return self._done
+
+            def step(self):
+                steps_called[0] += 1
+                if steps_called[0] >= 2:
+                    self._done = True
+                return self._done
+
+            def finalize(self):
+                from vllm_mlx.cooperative_specprefill import (
+                    CooperativeSpecPrefillResult,
+                )
+
+                return CooperativeSpecPrefillResult(
+                    logits=fake_logits,
+                    cache=fake_cache,
+                    cache_token_count=512,
+                    selected_token_count=512,
+                )
+
+            def cleanup(self):
+                cleanup_called[0] += 1
+
+        monkeypatch.setattr(mbg, "CooperativeSpecPrefillSession", _FakeSession)
+
+        draft_mock = MagicMock(name="draft_model")
+        gen = self._build_generator(
+            draft_model=draft_mock, threshold=512, keep_pct=0.3
+        )
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-long",
+            prompt="needle",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+
+        logits, wrapped_cache = gen._run_specprefill_for_request(req)
+
+        assert len(constructed) == 1
+        kwargs = constructed[0]
+        assert kwargs["draft_model"] is draft_mock
+        assert kwargs["model"] is gen.model
+        assert kwargs["keep_pct"] == 0.3
+        # Tokens should be a Python list, not an mx.array, per session API.
+        assert isinstance(kwargs["tokens"], list)
+        assert len(kwargs["tokens"]) == 2048
+
+        assert steps_called[0] >= 2
+        assert cleanup_called[0] == 1
+        assert mx.array_equal(logits, fake_logits).item()
+        assert wrapped_cache is fake_cache
+
+        gen.close()
+
+    def test_run_specprefill_unwraps_language_model_output(self, monkeypatch):
+        """Gemma 4 / Qwen 3.5 VLM language models return a wrapper
+        object whose ``.logits`` attribute is the actual mx.array.
+        ``_run_specprefill_for_request`` must unwrap before returning
+        so the caller can subscript ``logits[:, -1, :]`` for first
+        token sampling."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+        import vllm_mlx.mllm_batch_generator as mbg
+
+        inner_logits = mx.zeros((1, 1, 16), dtype=mx.float32)
+
+        class _LanguageModelOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        wrapped_logits = _LanguageModelOutput(inner_logits)
+        fake_cache = [object()]
+
+        class _FakeSession:
+            def __init__(self, **kwargs):
+                self._done = False
+
+            @property
+            def is_done(self):
+                return self._done
+
+            def step(self):
+                self._done = True
+                return True
+
+            def finalize(self):
+                from vllm_mlx.cooperative_specprefill import (
+                    CooperativeSpecPrefillResult,
+                )
+
+                return CooperativeSpecPrefillResult(
+                    logits=wrapped_logits,
+                    cache=fake_cache,
+                    cache_token_count=512,
+                    selected_token_count=512,
+                )
+
+            def cleanup(self):
+                pass
+
+        monkeypatch.setattr(mbg, "CooperativeSpecPrefillSession", _FakeSession)
+
+        gen = self._build_generator(
+            draft_model=MagicMock(name="draft"),
+            threshold=512,
+            keep_pct=0.3,
+        )
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="r-wrapped",
+            prompt="needle",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+
+        logits, cache = gen._run_specprefill_for_request(req)
+
+        # The wrapper must be unwrapped: ``logits`` is the inner
+        # mx.array, not the LanguageModelOutput. This is the bit that
+        # must hold so the caller can do ``logits[:, -1, :]``.
+        assert isinstance(logits, mx.array)
+        assert logits is inner_logits
+        assert cache is fake_cache
+        # Sanity: the unwrapped logits actually subscript.
+        last_token_slice = logits[:, -1, :]
+        assert last_token_slice.shape == (1, 16)
+
+        gen.close()
+
+    def test_process_prompts_routes_eligible_request_through_specprefill(
+        self, monkeypatch
+    ):
+        """``_process_prompts`` with one SpecPrefill-eligible request must
+        produce a single-row MLLMBatch whose cache comes from the session,
+        bypassing the regular vision encoding + merge path."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        gen = self._build_generator(
+            draft_model=MagicMock(name="draft"),
+            threshold=512,
+            keep_pct=0.3,
+        )
+
+        # Skip preprocessing — just install the input_ids directly so the
+        # request looks pre-tokenized to the eligibility check.
+        gen._preprocess_request = lambda req: None  # type: ignore[method-assign]
+
+        fake_logits = mx.zeros((1, 1, 8), dtype=mx.float32)
+        fake_wrapped_cache = [object(), object()]
+
+        run_calls = []
+
+        def fake_run_specprefill(req):
+            run_calls.append(req)
+            return fake_logits, fake_wrapped_cache
+
+        gen._run_specprefill_for_request = fake_run_specprefill  # type: ignore[method-assign]
+
+        # Spy: dense path must NOT be entered.
+        gen._run_vision_encoding = MagicMock(
+            side_effect=AssertionError("dense path should not run"),
+        )
+
+        # Sample helper produces a deterministic first token.
+        def fake_sample(req, logits):
+            return mx.array([99]), mx.array([[0.0] * 8])
+
+        gen._sample_request = fake_sample  # type: ignore[method-assign]
+
+        req = MLLMBatchRequest(
+            uid=42,
+            request_id="r-eligible",
+            prompt="needle",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+
+        batch, failed = gen._process_prompts([req])
+
+        assert failed == []
+        assert isinstance(batch, MLLMBatch)
+        assert len(batch) == 1
+        assert batch.uids == [42]
+        assert batch.cache is fake_wrapped_cache
+        assert batch.y.tolist() == [99]
+        assert len(run_calls) == 1
+        assert run_calls[0] is req
+
+        gen.close()
+
+    def test_process_prompts_isolates_eligible_and_defers_other_requests(
+        self, monkeypatch
+    ):
+        """When a slice of requests includes a SpecPrefill-eligible one
+        alongside short ones, the eligible request is processed solo
+        and the other requests are pushed BACK to the unprocessed queue
+        head so a future ``_next`` call can batch them normally."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        gen = self._build_generator(
+            draft_model=MagicMock(name="draft"),
+            threshold=512,
+            keep_pct=0.3,
+        )
+        gen._preprocess_request = lambda req: None  # type: ignore[method-assign]
+
+        fake_logits = mx.zeros((1, 1, 8), dtype=mx.float32)
+        fake_wrapped_cache = [object()]
+        gen._run_specprefill_for_request = (  # type: ignore[method-assign]
+            lambda req: (fake_logits, fake_wrapped_cache)
+        )
+        gen._run_vision_encoding = MagicMock(
+            side_effect=AssertionError("dense path should not run"),
+        )
+        gen._sample_request = lambda req, logits: (  # type: ignore[method-assign]
+            mx.array([7]),
+            mx.array([[0.0] * 8]),
+        )
+
+        short_a = MLLMBatchRequest(
+            uid=1,
+            request_id="r-short-a",
+            prompt="hi",
+            input_ids=mx.zeros(64, dtype=mx.int32),
+        )
+        long_b = MLLMBatchRequest(
+            uid=2,
+            request_id="r-long-b",
+            prompt="needle",
+            input_ids=mx.zeros(2048, dtype=mx.int32),
+        )
+        short_c = MLLMBatchRequest(
+            uid=3,
+            request_id="r-short-c",
+            prompt="hello",
+            input_ids=mx.zeros(64, dtype=mx.int32),
+        )
+
+        batch, failed = gen._process_prompts([short_a, long_b, short_c])
+
+        # Solo batch: only the eligible request makes it through.
+        assert failed == []
+        assert batch is not None
+        assert batch.uids == [2]
+        # Short requests must be back on the queue (head order preserved
+        # so they batch together on the next _next call).
+        assert [r.request_id for r in gen.unprocessed_requests] == [
+            "r-short-a",
+            "r-short-c",
+        ]
+
+        gen.close()
+
+
+class TestMLLMSchedulerSpecPrefillConfig:
+    """Tests for the SpecPrefill plumbing across MLLMScheduler ->
+    MLLMBatchGenerator. Verifies the config flows from constructor
+    args through to the batch generator that actually decides
+    eligibility."""
+
+    def test_scheduler_forwards_specprefill_config_to_generator(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        draft_mock = MagicMock(name="draft")
+        scheduler = MLLMScheduler(
+            MagicMock(),
+            MagicMock(),
+            config=MLLMSchedulerConfig(),
+            draft_model=draft_mock,
+            specprefill_threshold=8192,
+            specprefill_keep_pct=0.3,
+        )
+        scheduler._ensure_batch_generator()
+
+        gen = scheduler.batch_generator
+        assert gen is not None
+        assert gen._draft_model is draft_mock
+        assert gen._specprefill_threshold == 8192
+        assert gen._specprefill_keep_pct == 0.3
+
+    def test_scheduler_defaults_specprefill_to_disabled(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        scheduler = MLLMScheduler(MagicMock(), MagicMock())
+        scheduler._ensure_batch_generator()
+
+        gen = scheduler.batch_generator
+        assert gen is not None
+        assert gen._draft_model is None
+        assert gen._specprefill_threshold is None
+        assert gen._specprefill_keep_pct is None
+
+
 class TestMLLMSchedulerConfig:
     """Tests for MLLMSchedulerConfig."""
 

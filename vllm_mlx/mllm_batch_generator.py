@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .cooperative_specprefill import CooperativeSpecPrefillSession
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -387,6 +388,10 @@ class MLLMBatchGenerator:
         prefill_step_size: int = 1024,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
+        draft_model: Optional[nn.Module] = None,
+        specprefill_threshold: Optional[int] = None,
+        specprefill_keep_pct: Optional[float] = None,
+        specprefill_max_input: Optional[int] = 131072,
     ):
         """
         Initialize MLLM batch generator.
@@ -429,6 +434,20 @@ class MLLMBatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prefill_step_size = prefill_step_size
+
+        # SpecPrefill configuration. Session 84 Fix 2: text-only long
+        # prompts on the MLLM scheduler path can route through
+        # cooperative SpecPrefill (draft scoring + sparse prefill) to
+        # cut prefill work, matching the text scheduler path. Disabled
+        # by leaving draft_model None or threshold/keep_pct None.
+        # ``specprefill_max_input`` caps eligibility above which the
+        # request falls through to the dense chunked path; this is
+        # the macOS GPU watchdog workaround for the manual_rope path
+        # at very long prompts.
+        self._draft_model = draft_model
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_max_input = specprefill_max_input
 
         # Request management
         self.unprocessed_requests: List[MLLMBatchRequest] = []
@@ -674,6 +693,132 @@ class MLLMBatchGenerator:
             f"({processing_time:.2f}s)"
         )
 
+    def _qualifies_for_specprefill(self, request: MLLMBatchRequest) -> bool:
+        """Decide whether a preprocessed request can route through
+        cooperative SpecPrefill on the MLLM path.
+
+        SpecPrefill drops "unimportant" prompt tokens before the dense
+        forward, so it must NOT run for requests carrying images: image
+        token placeholders need to stay aligned with their pixel
+        features inside ``masked_scatter`` in the VLM's
+        ``get_input_embeddings``. Above-threshold text-only requests
+        are eligible when the runtime supplies a draft model and the
+        threshold/keep configuration.
+
+        Inputs above ``self._specprefill_max_input`` (when set) are
+        ineligible: the sparse-prefill path on the target VLM goes
+        through ``manual_rope_proportional`` (a sequence of ~20 mlx
+        ops per attention layer) instead of the fused
+        ``mx.fast.rope`` kernel that the dense path uses, and at
+        very long prompts the cumulative GPU dispatch pressure from
+        500+ chunks crosses the macOS GPU watchdog threshold and
+        fires ``kIOGPUCommandBufferCallbackErrorImpactingInteractivity``.
+        Capping eligibility lets such requests fall through to the
+        dense chunked path, which is slower but reliable at 256K.
+        """
+        if self._draft_model is None:
+            return False
+        if (
+            self._specprefill_threshold is None
+            or self._specprefill_keep_pct is None
+        ):
+            return False
+        if request.pixel_values is not None or request.image_grid_thw is not None:
+            return False
+        if request.input_ids is None:
+            return False
+        iids = request.input_ids
+        if iids.ndim == 1:
+            seq_len = int(iids.size)
+        else:
+            seq_len = int(iids.shape[-1])
+        if seq_len <= int(self._specprefill_threshold):
+            return False
+        if (
+            self._specprefill_max_input is not None
+            and seq_len > int(self._specprefill_max_input)
+        ):
+            return False
+        return True
+
+    def _run_specprefill_for_request(
+        self, request: MLLMBatchRequest
+    ) -> Tuple[mx.array, List[Any]]:
+        """Run cooperative SpecPrefill end-to-end on a single text-only
+        request.
+
+        Pre-allocates the base cache from ``self.language_model`` so
+        the cache shape matches what the VLM's underlying language
+        model expects (e.g. Gemma 4's hybrid sliding-window + global
+        layout). Drives the session synchronously since the MLLM
+        scheduler does not currently expose cooperative step
+        boundaries; the dense path inside ``_process_prompts`` is
+        already serialized at the request boundary today.
+
+        Returns ``(logits, wrapped_cache)`` where ``wrapped_cache`` is
+        a list of ``RopeAdjustedCache`` layers ready for decode. The
+        adjustment carried by each wrapper compensates for the gap
+        between the (smaller) sparse-prefilled cache size and the
+        original prompt length so RoPE positions during decode line up
+        with the original token positions.
+        """
+        from mlx_lm.models.cache import make_prompt_cache
+
+        iids = request.input_ids
+        if iids.ndim == 2:
+            iids = iids[0]
+        tokens = iids.tolist()
+
+        base_cache = make_prompt_cache(self.language_model)
+
+        # SpecPrefill chunk sizes are split between two phases:
+        #
+        # - ``chunk_size=2048`` for the draft scoring phase. The draft
+        #   model is small (~1.6B) and handles large forward chunks
+        #   easily; smaller chunks just add per-chunk loop overhead.
+        # - ``target_chunk_size=256`` for the sparse prefill phase on
+        #   the target model. Matches the dense-path
+        #   ``prefill_step_size=256`` lower bound. The sparse path
+        #   goes through ``manual_rope_proportional`` (a sequence of
+        #   pure mlx ops, ~20 per attention layer) instead of the
+        #   fused ``mx.fast.rope`` kernel that the dense path uses,
+        #   so per-chunk cumulative GPU time is higher than the raw
+        #   attention pair count would suggest. 512 was empirically
+        #   too large for 256K input + keep_pct=0.5: the watchdog
+        #   ``kIOGPUCommandBufferCallbackErrorImpactingInteractivity``
+        #   fires on the late chunks. 256 stays under the limit at
+        #   256K + keep_pct=0.5, matching the dense lower bound.
+        session = CooperativeSpecPrefillSession(
+            model=self.model,
+            draft_model=self._draft_model,
+            tokens=tokens,
+            base_cache=base_cache,
+            position_offset=0,
+            keep_pct=float(self._specprefill_keep_pct),
+            chunk_size=2048,
+            target_chunk_size=256,
+        )
+
+        try:
+            while not session.is_done:
+                session.step()
+            result = session.finalize()
+        finally:
+            session.cleanup()
+
+        request.vision_encoded = True
+
+        # Unwrap LanguageModelOutput (Gemma 4 / Qwen 3.5 VLM language
+        # models return a wrapper object whose ``logits`` attribute is
+        # the actual mx.array). The cooperative session passes the raw
+        # call result through without unwrapping, so we have to do it
+        # here before _process_prompts subscripts ``logits[:, -1, :]``
+        # for first-token sampling.
+        logits = result.logits
+        if hasattr(logits, "logits"):
+            logits = logits.logits
+        return logits, result.cache
+
     def _run_vision_encoding(
         self, request: MLLMBatchRequest, cache: Optional[List[Any]] = None
     ) -> mx.array:
@@ -683,6 +828,16 @@ class MLLMBatchGenerator:
         This runs the full VLM model (vision + language) on the prompt,
         which encodes the images and fills the provided KV cache.
 
+        Long text-only prompts are split into ``prefill_step_size``-sized
+        chunks so the activation memory needed for any single forward pass
+        stays bounded. Cache state is materialized between chunks via
+        ``mx.eval`` so the lazy graph cannot grow unbounded across the
+        chunk loop. Vision (``pixel_values is not None``) requests stay
+        on the single-shot path because image-token placeholders need to
+        share the same forward pass as their pixel features for
+        ``masked_scatter`` inside the VLM's ``get_input_embeddings`` to
+        align them correctly.
+
         Args:
             request: Preprocessed request with input_ids and pixel_values
             cache: KV cache list for the language model. If provided, the
@@ -690,7 +845,7 @@ class MLLMBatchGenerator:
                    during the forward pass.
 
         Returns:
-            Logits from the forward pass
+            Logits from the (last) forward pass
         """
         # Build model call kwargs
         kwargs = dict(request.extra_kwargs)
@@ -709,7 +864,40 @@ class MLLMBatchGenerator:
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
-        output = self.model(input_ids, cache=cache, **kwargs)
+        seq_len = input_ids.shape[1]
+        chunk_size = max(1, int(self.prefill_step_size or seq_len))
+        has_vision = request.pixel_values is not None
+
+        if has_vision or seq_len <= chunk_size:
+            # Single-shot path: short input, or vision-bearing input where
+            # image-token placeholders must stay aligned with their pixels
+            # inside one forward.
+            output = self.model(input_ids, cache=cache, **kwargs)
+        else:
+            # Chunked text-only path. Subsequent chunks pass only input_ids
+            # and cache; the VLM's get_input_embeddings sees pixel_values=None
+            # and skips the vision tower entirely. Cache state is forced
+            # between chunks so the lazy MLX graph cannot grow unbounded.
+            output = None
+            for start in range(0, seq_len, chunk_size):
+                end = min(start + chunk_size, seq_len)
+                chunk = input_ids[:, start:end]
+                if start == 0:
+                    output = self.model(chunk, cache=cache, **kwargs)
+                else:
+                    output = self.model(chunk, cache=cache)
+                if cache is not None and end < seq_len:
+                    # Materialize cache writes so activation graph stays bounded.
+                    try:
+                        mx.eval([c.state for c in cache])
+                    except Exception:
+                        # Defensive: if a cache layer doesn't expose .state
+                        # we still want chunked prefill to keep working;
+                        # MLX will lazily evaluate on the next chunk's read.
+                        pass
+                    if hasattr(mx, "clear_cache"):
+                        mx.clear_cache()
+
         request.vision_encoded = True
 
         # Handle LanguageModelOutput or plain tensor
@@ -770,6 +958,27 @@ class MLLMBatchGenerator:
             self._stats.prompt_time += time.perf_counter() - tic
             return None, failed_requests
 
+        # Session 84 Fix 2: detect the first SpecPrefill-eligible
+        # request in the slice. If found, isolate it as a SOLO batch
+        # because the wrapped cache produced by sparse prefill carries
+        # a per-request RoPE adjustment that does not safely co-merge
+        # with dense-path caches in the existing
+        # _normalize_cache_for_merge + .merge() path. Other valid
+        # requests in this slice are pushed BACK to the head of
+        # ``unprocessed_requests`` so the next ``_next`` call can batch
+        # them normally on the dense path.
+        specprefill_req: Optional[MLLMBatchRequest] = None
+        for i, candidate in enumerate(valid_requests):
+            if self._qualifies_for_specprefill(candidate):
+                specprefill_req = candidate
+                deferred = valid_requests[:i] + valid_requests[i + 1 :]
+                if deferred:
+                    self.unprocessed_requests = (
+                        list(deferred) + list(self.unprocessed_requests)
+                    )
+                valid_requests = [candidate]
+                break
+
         total_prompt_tokens = sum(
             req.input_ids.size if req.input_ids is not None else 1
             for req in valid_requests
@@ -792,6 +1001,39 @@ class MLLMBatchGenerator:
         first_tokens = []
         all_logprobs = []
         per_request_caches = []
+
+        if specprefill_req is not None:
+            # Solo SpecPrefill path: bypass the dense vision encoding
+            # loop and the per-layer cache merge entirely. The session
+            # produces a fully-populated, RoPE-adjusted wrapped cache
+            # that decode can read directly without going through
+            # MLLMBatch's merge step.
+            with mx.stream(MLLMBatchGenerator._stream):
+                logits, wrapped_cache = self._run_specprefill_for_request(
+                    specprefill_req
+                )
+                last_logits = logits[:, -1, :]
+                sampled, logprobs = self._sample_request(
+                    specprefill_req, last_logits
+                )
+                mx.eval(sampled, logprobs)
+                first_tokens.append(sampled.item())
+                all_logprobs.append(logprobs.squeeze(0))
+
+            self._stats.prompt_time += time.perf_counter() - tic
+            return (
+                MLLMBatch(
+                    uids=[specprefill_req.uid],
+                    request_ids=[specprefill_req.request_id],
+                    y=mx.array(first_tokens),
+                    logprobs=all_logprobs,
+                    max_tokens=[specprefill_req.max_tokens],
+                    num_tokens=[0],
+                    cache=wrapped_cache,
+                    requests=[specprefill_req],
+                ),
+                failed_requests,
+            )
 
         for req in valid_requests:
             # Create a fresh KVCache for this request's language model prefill

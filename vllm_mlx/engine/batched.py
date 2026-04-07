@@ -236,6 +236,13 @@ class BatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        # Track whether prefill_step_size was explicitly set by the
+        # caller (mode.json -> start-vllm-mlx -> CLI flag) vs left to
+        # the engine default. This matters for the MLLM scheduler path:
+        # historically MLLMSchedulerConfig defaulted to 1024 while the
+        # LLM/text path defaulted to 2048, and we want to preserve the
+        # 1024 MLLM default unless the user explicitly overrides it.
+        self._prefill_step_size_arg = prefill_step_size
         self._prefill_step_size = prefill_step_size or 2048
 
         # SpecPrefill configuration
@@ -345,19 +352,76 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config, "completion_batch_size", 16
         )
 
-        mllm_config = MLLMSchedulerConfig(
+        mllm_config_kwargs = dict(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
             enable_vision_cache=True,
             vision_cache_size=100,
         )
+        # Only forward prefill_step_size when the caller explicitly set
+        # it; otherwise let MLLMSchedulerConfig use its own (1024)
+        # default so MLLM behavior does not silently inherit the LLM
+        # path's 2048 default. The chunked-prefill path inside
+        # MLLMBatchGenerator (Session 84 Gemma 4 long-context fix)
+        # respects this value, so dropping it to e.g. 256 is the
+        # operator knob for working around the Metal command-buffer
+        # watchdog on very long prompts.
+        if self._prefill_step_size_arg is not None:
+            mllm_config_kwargs["prefill_step_size"] = self._prefill_step_size_arg
+        mllm_config = MLLMSchedulerConfig(**mllm_config_kwargs)
 
-        # Create and start MLLM scheduler
+        # Load SpecPrefill draft model BEFORE the MLLM scheduler so we
+        # can wire it into MLLMBatchGenerator for the cooperative
+        # SpecPrefill text-only path (Session 84 Fix 2). Failure here
+        # disables SpecPrefill on both the MLLM scheduler path and the
+        # later TextBatchScheduler path.
+        if (
+            self._specprefill_enabled
+            and self._specprefill_draft_model_path
+            and self._draft_model is None
+        ):
+            try:
+                from pathlib import Path
+
+                from mlx_lm import load as mlx_lm_load
+
+                draft_path = str(
+                    Path.home()
+                    / "ai-models"
+                    / "mlx_models"
+                    / self._specprefill_draft_model_path
+                )
+                self._draft_model, _ = mlx_lm_load(draft_path)
+                logger.info(
+                    "SpecPrefill draft model loaded (MLLM path): %s "
+                    "(threshold=%d, keep=%.0f%%)",
+                    self._specprefill_draft_model_path,
+                    self._specprefill_threshold,
+                    self._specprefill_keep_pct * 100,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load SpecPrefill draft model for MLLM path: %s",
+                    e,
+                )
+                self._specprefill_enabled = False
+                self._draft_model = None
+
+        # Create and start MLLM scheduler with SpecPrefill plumbing
+        # (Session 84 Fix 2). MLLMBatchGenerator decides per-request
+        # eligibility on the text-only long-context path.
         self._mllm_scheduler = MLLMScheduler(
             model=self._model,
             processor=self._processor,
             config=mllm_config,
+            draft_model=self._draft_model,
+            specprefill_threshold=(
+                self._specprefill_threshold if self._draft_model is not None else None
+            ),
+            specprefill_keep_pct=(
+                self._specprefill_keep_pct if self._draft_model is not None else None
+            ),
         )
         self._mllm_scheduler.set_gpu_lock(self._gpu_lock)
         await self._mllm_scheduler.start()
@@ -427,9 +491,15 @@ class BatchedEngine(BaseEngine):
                 self._text_model = None
                 self._text_tokenizer = None
 
-        # Load SpecPrefill draft model (for TextModel path — after sparse
-        # prefill, decode uses stream_generate with MTP for full throughput)
-        if self._specprefill_enabled and self._specprefill_draft_model_path:
+        # Load SpecPrefill draft model for the TextModel/TextBatchScheduler
+        # path. Idempotent: the cooperative SpecPrefill block earlier in
+        # ``_start_mllm`` may have already loaded the draft for the MLLM
+        # path, in which case we reuse the same instance.
+        if (
+            self._specprefill_enabled
+            and self._specprefill_draft_model_path
+            and self._draft_model is None
+        ):
             try:
                 from pathlib import Path
 

@@ -189,6 +189,10 @@ class MLLMScheduler:
         model: Any,
         processor: Any,
         config: Optional[MLLMSchedulerConfig] = None,
+        draft_model: Optional[Any] = None,
+        specprefill_threshold: Optional[int] = None,
+        specprefill_keep_pct: Optional[float] = None,
+        specprefill_max_input: Optional[int] = 131072,
     ):
         """
         Initialize MLLM scheduler.
@@ -197,10 +201,25 @@ class MLLMScheduler:
             model: The VLM model
             processor: The VLM processor
             config: Scheduler configuration
+            draft_model: Optional draft model for cooperative SpecPrefill
+                on text-only long-context requests (Session 84 Fix 2).
+                When None, SpecPrefill is disabled on the MLLM path.
+            specprefill_threshold: Minimum input token count required to
+                trigger SpecPrefill scoring + sparse prefill.
+            specprefill_keep_pct: Fraction of tokens to keep after
+                SpecPrefill scoring (lower = more aggressive reduction).
         """
         self.model = model
         self.processor = processor
         self.config = config or MLLMSchedulerConfig()
+
+        # Optional cooperative SpecPrefill plumbing for text-only
+        # long-context requests on the MLLM path (Session 84 Fix 2).
+        # The batch generator decides per-request eligibility.
+        self._draft_model = draft_model
+        self._specprefill_threshold = specprefill_threshold
+        self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_max_input = specprefill_max_input
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -288,6 +307,10 @@ class MLLMScheduler:
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
+                draft_model=self._draft_model,
+                specprefill_threshold=self._specprefill_threshold,
+                specprefill_keep_pct=self._specprefill_keep_pct,
+                specprefill_max_input=self._specprefill_max_input,
             )
 
     # ========== Sync API (step-based) ==========

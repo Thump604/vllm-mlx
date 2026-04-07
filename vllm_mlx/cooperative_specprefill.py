@@ -583,7 +583,19 @@ class ChunkedSparsePrefiller:
 
 
 class CooperativeSpecPrefillSession:
-    """End-to-end cooperative SpecPrefill session for one request."""
+    """End-to-end cooperative SpecPrefill session for one request.
+
+    The two phases (draft scoring + sparse prefill on the target model)
+    can run with different chunk sizes. The draft model is small and
+    handles large forward chunks easily, so a bigger ``chunk_size`` is
+    usually correct. The target sparse-prefill chunk needs to stay
+    small enough that individual Metal command buffers do not exceed
+    the macOS GPU watchdog at large cumulative cache sizes; this is
+    the same scaling concern that forces the dense MLLM prefill path
+    to use a small ``prefill_step_size``. ``target_chunk_size``
+    defaults to ``chunk_size`` for backwards compatibility with
+    existing call sites that have not been updated.
+    """
 
     def __init__(
         self,
@@ -595,6 +607,7 @@ class CooperativeSpecPrefillSession:
         position_offset: int,
         keep_pct: float,
         chunk_size: int = 2048,
+        target_chunk_size: Optional[int] = None,
     ):
         self._model = model
         self._draft_model = draft_model
@@ -603,6 +616,9 @@ class CooperativeSpecPrefillSession:
         self._position_offset = int(position_offset)
         self._keep_pct = keep_pct
         self._chunk_size = chunk_size
+        self._target_chunk_size = (
+            int(target_chunk_size) if target_chunk_size is not None else int(chunk_size)
+        )
 
         self._scorer = ChunkedDraftScorer(
             draft_model=self._draft_model,
@@ -635,7 +651,7 @@ class CooperativeSpecPrefillSession:
                     self._tokens,
                     selected,
                     self._base_cache,
-                    step_size=self._chunk_size,
+                    step_size=self._target_chunk_size,
                     position_offset=self._position_offset,
                 )
                 self._phase = "prefill"

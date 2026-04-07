@@ -485,6 +485,94 @@ def manual_rope_with_freqs(x, positions, dims, freqs, pre_scale=1.0):
     return mx.concatenate([rotated, x_pass], axis=-1)
 
 
+def manual_rope_proportional(x, positions, full_dims, rotated_dims, freqs):
+    """Apply ProportionalRoPE-style rotation at arbitrary positions.
+
+    Mirrors ``mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE.__call__``
+    but rotates by per-token positions instead of a single starting offset.
+
+    ProportionalRoPE only rotates ``rotated_dims`` of the ``full_dims``
+    head dimension, using a SPLIT pattern: take the first
+    ``rotated_dims // 2`` elements from each half of the head, rotate
+    them as a single ``rotated_dims``-wide tensor, then stitch the
+    rotated values back into their original positions while leaving
+    the unrotated channels untouched.
+
+    Pinned by ``tests/test_specprefill_position_mapped_rope.py``
+    against the canonical ``ProportionalRoPE`` for both contiguous
+    and sparse position arrays.
+
+    Args:
+        x: input tensor with last dim >= ``full_dims``. Shape
+            ``(..., L, head_dim)``.
+        positions: ``(L,)`` per-token position indices.
+        full_dims: total head dimension that ProportionalRoPE
+            considers ``self.dims``.
+        rotated_dims: number of dimensions actually rotated; must be
+            even and <= full_dims.
+        freqs: ``(rotated_dims // 2,)`` frequency tensor stored on the
+            ProportionalRoPE module as ``self._freqs``.
+
+    Returns:
+        Tensor with the same shape as ``x``, with ProportionalRoPE-
+        style rotation applied at the supplied positions.
+    """
+    if rotated_dims <= 0 or freqs is None:
+        return x
+
+    head = x[..., :full_dims]
+    tail = x[..., full_dims:]
+    half = full_dims // 2
+    rot_half = rotated_dims // 2
+
+    left = head[..., :half]
+    right = head[..., half:]
+
+    # Build the rotated_in tensor exactly the way ProportionalRoPE
+    # does: first rot_half columns of left, then first rot_half
+    # columns of right, concatenated along the last axis. Shape
+    # becomes (..., rotated_dims).
+    rotated_in = mx.concatenate(
+        [left[..., :rot_half], right[..., :rot_half]],
+        axis=-1,
+    )
+
+    # Apply manual position-mapped rope to the entire rotated_in
+    # tensor (dims == rotated_dims). manual_rope_with_freqs expects
+    # ``half = dims // 2`` cosine columns, which equals
+    # ``rotated_dims // 2 == rot_half == len(freqs)``.
+    rotated_out = manual_rope_with_freqs(
+        rotated_in,
+        positions,
+        rotated_dims,
+        freqs,
+        pre_scale=1.0,
+    )
+
+    # Stitch the rotated channels back into their original column
+    # positions inside left/right halves. Channels beyond rot_half
+    # in left/right pass through unchanged.
+    left_out = mx.concatenate(
+        [
+            rotated_out[..., :rot_half],
+            left[..., rot_half:],
+        ],
+        axis=-1,
+    )
+    right_out = mx.concatenate(
+        [
+            rotated_out[..., rot_half:],
+            right[..., rot_half:],
+        ],
+        axis=-1,
+    )
+    head_out = mx.concatenate([left_out, right_out], axis=-1)
+
+    if tail.shape[-1] == 0:
+        return head_out
+    return mx.concatenate([head_out, tail], axis=-1)
+
+
 # ---------------------------------------------------------------------------
 # RoPE wrappers
 # ---------------------------------------------------------------------------
@@ -507,7 +595,26 @@ class _PositionMappedRoPE:
         self._cache_start = cache_start
         self._has_custom_freqs = hasattr(original_rope, "_freqs")
 
-        if self._has_custom_freqs:
+        # ProportionalRoPE detection. Gemma 4's full-attention layers
+        # use mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE which
+        # exposes ``self.dims = full_head_dim`` while only rotating
+        # ``self.rotated_dims`` of those dims through a split-and-stitch
+        # pattern (left/right halves, first rot_half of each rotated).
+        # Plain manual_rope_with_freqs cannot reproduce this, so we
+        # capture both dims and dispatch to manual_rope_proportional.
+        # The presence of ``rotated_dims`` is a unique-enough signal
+        # without importing the rope class directly.
+        self._proportional_mode = (
+            hasattr(original_rope, "rotated_dims")
+            and getattr(original_rope, "rotated_dims", 0) > 0
+            and getattr(original_rope, "_freqs", None) is not None
+        )
+
+        if self._proportional_mode:
+            self._full_dims = int(original_rope.dims)
+            self._rotated_dims = int(original_rope.rotated_dims)
+            self._freqs = original_rope._freqs
+        elif self._has_custom_freqs:
             self._freqs = original_rope._freqs
             self._dims = _get_dims(original_rope)
             self._pre_scale = _get_pre_scale(original_rope)
@@ -521,6 +628,14 @@ class _PositionMappedRoPE:
         L = x.shape[2]
         idx = offset - self._cache_start
         positions = self._all_positions[idx : idx + L]
+        if self._proportional_mode:
+            return manual_rope_proportional(
+                x,
+                positions=positions,
+                full_dims=self._full_dims,
+                rotated_dims=self._rotated_dims,
+                freqs=self._freqs,
+            )
         if self._has_custom_freqs:
             return manual_rope_with_freqs(
                 x, positions, self._dims, self._freqs, pre_scale=self._pre_scale

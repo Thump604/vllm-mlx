@@ -96,3 +96,113 @@ def test_rope_adjusted_cache_reports_adjusted_offset():
     cache = RopeAdjustedCache(base, adjustment=5)
 
     assert cache.offset == 12
+
+
+def test_session_routes_target_chunk_size_to_sparse_prefiller():
+    """``CooperativeSpecPrefillSession`` must support a separate
+    ``target_chunk_size`` so callers can keep the draft scoring at a
+    large chunk (the small draft model handles big forwards easily)
+    while constraining the sparse-prefill chunk on the target model
+    to keep individual Metal command buffers under the macOS GPU
+    watchdog at large cumulative cache sizes (Session 84 Fix 2)."""
+    from vllm_mlx.cooperative_specprefill import CooperativeSpecPrefillSession
+    import vllm_mlx.cooperative_specprefill as csp
+
+    # Stub the underlying primitives so we can read what step_size
+    # the prefiller was constructed with without running real models.
+    captured = {}
+
+    class _FakeScorer:
+        def __init__(self, **kwargs):
+            captured["scorer_kwargs"] = kwargs
+            self._steps = 0
+
+        @property
+        def is_done(self):
+            return self._steps >= 1
+
+        def step(self):
+            self._steps += 1
+            return self._steps >= 1
+
+        def finalize(self):
+            import mlx.core as mx
+
+            return mx.zeros((4,), dtype=mx.float32)
+
+        def cleanup(self):
+            pass
+
+    class _FakePrefiller:
+        def __init__(self, model, tokens, selected_indices, cache, *, step_size, position_offset):
+            captured["prefiller_step_size"] = step_size
+            captured["prefiller_position_offset"] = position_offset
+            self._done = False
+
+        @property
+        def is_done(self):
+            return self._done
+
+        @property
+        def selected_token_count(self):
+            return 0
+
+        @property
+        def cache_token_count(self):
+            return 0
+
+        def step(self):
+            self._done = True
+            return True
+
+        def finalize(self):
+            return None, []
+
+        def cleanup(self):
+            pass
+
+    import unittest.mock
+
+    with (
+        unittest.mock.patch.object(csp, "ChunkedDraftScorer", _FakeScorer),
+        unittest.mock.patch.object(csp, "ChunkedSparsePrefiller", _FakePrefiller),
+        unittest.mock.patch.object(
+            csp, "select_chunks", lambda importance, keep_pct: [0, 1, 2, 3]
+        ),
+    ):
+        session = CooperativeSpecPrefillSession(
+            model=MagicMock(),
+            draft_model=MagicMock(),
+            tokens=list(range(16)),
+            base_cache=None,
+            position_offset=0,
+            keep_pct=0.5,
+            chunk_size=2048,
+            target_chunk_size=512,
+        )
+        # Drive to completion so the prefiller is constructed.
+        for _ in range(8):
+            if session.step():
+                break
+
+    assert captured["scorer_kwargs"]["chunk_size"] == 2048
+    assert captured["prefiller_step_size"] == 512
+
+
+def test_session_target_chunk_size_defaults_to_chunk_size():
+    """If ``target_chunk_size`` is not supplied, the existing
+    ``chunk_size`` value must be used for both phases. This pins the
+    backwards-compatible default for the existing call sites
+    (TextBatchScheduler) that have not been updated."""
+    from vllm_mlx.cooperative_specprefill import CooperativeSpecPrefillSession
+
+    session = CooperativeSpecPrefillSession(
+        model=MagicMock(),
+        draft_model=MagicMock(),
+        tokens=list(range(16)),
+        base_cache=None,
+        position_offset=0,
+        keep_pct=0.5,
+        chunk_size=1024,
+    )
+    assert session._target_chunk_size == 1024
