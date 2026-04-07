@@ -993,16 +993,44 @@ class BatchedEngine(BaseEngine):
             )
             # MLLMMultimodalLM.chat is synchronous and CPU/GPU-bound; run in
             # a worker thread under the GPU lock so the event loop stays responsive.
+            #
+            # Cancellation safety: if this task is cancelled mid-generation
+            # (e.g. client disconnect via `_disconnect_guard_nonstream`), a
+            # bare ``await asyncio.to_thread(...)`` would raise CancelledError
+            # out of the await, exit the ``async with self._gpu_lock:`` block,
+            # and release the lock while the MLX worker thread is still
+            # running. A subsequent request would then acquire the lock and
+            # start a second MLX worker thread in parallel, racing on Metal
+            # command buffers and tripping the assertion:
+            #
+            #   -[_MTLCommandBuffer addCompletedHandler:]:1011:
+            #     failed assertion 'Completed handler provided after commit call'
+            #
+            # which SIGABRTs the server process. To keep the lock held until
+            # the worker thread actually finishes, wrap the to_thread call in
+            # a shielded task and wait for it to complete inside the except
+            # handler before re-raising. This mirrors the pattern already used
+            # by MLLMScheduler._process_loop and TextBatchScheduler._step_engine.
             async with self._gpu_lock:
-                mllm_output = await asyncio.to_thread(
-                    self._mllm_instance.chat,
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    tools=tools,
-                    **kwargs,
+                worker = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        self._mllm_instance.chat,
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        tools=tools,
+                        **kwargs,
+                    )
                 )
+                try:
+                    mllm_output = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    try:
+                        await worker
+                    except Exception:
+                        pass
+                    raise
             return GenerationOutput(
                 text=mllm_output.text,
                 prompt_tokens=mllm_output.prompt_tokens,
@@ -1198,7 +1226,18 @@ class BatchedEngine(BaseEngine):
                     finally:
                         loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
-                producer_fut = loop.run_in_executor(None, _producer)
+                # Schedule the producer via ``asyncio.ensure_future`` so the
+                # surrounding exception handling can cleanly await its
+                # completion on cancellation. See the matching cancellation-
+                # safety note in ``chat()``: a bare ``loop.run_in_executor``
+                # here combined with outer task cancellation would let the
+                # ``async with self._gpu_lock:`` block exit while the MLX
+                # worker thread is still mid-step, allowing a second request
+                # to start a concurrent worker and trip the Metal command
+                # buffer assertion.
+                producer_task = asyncio.ensure_future(
+                    asyncio.to_thread(_producer)
+                )
                 last_text = ""
                 try:
                     while True:
@@ -1217,8 +1256,36 @@ class BatchedEngine(BaseEngine):
                             finished=chunk.finish_reason is not None,
                             finish_reason=chunk.finish_reason,
                         )
+                except asyncio.CancelledError:
+                    # Outer task cancelled (client disconnect, request
+                    # timeout, async generator close). Drain the queue
+                    # until the producer's sentinel so the background
+                    # thread can exit without blocking, then await the
+                    # task to guarantee the MLX worker has fully released
+                    # the Metal context before the lock drops.
+                    try:
+                        while True:
+                            chunk = await queue.get()
+                            if chunk is _SENTINEL:
+                                break
+                    except Exception:
+                        pass
+                    try:
+                        await producer_task
+                    except Exception:
+                        pass
+                    raise
                 finally:
-                    await producer_fut
+                    # Normal-exit and exception paths: producer_task is
+                    # usually already done here because the consumer loop
+                    # only exits once the sentinel arrives. Await it
+                    # defensively so the lock release is always ordered
+                    # after the worker thread's final MLX call.
+                    if not producer_task.done():
+                        try:
+                            await producer_task
+                        except Exception:
+                            pass
             return
 
         # Per-request MTP routing: text-only → TextModel, media → MLLM
