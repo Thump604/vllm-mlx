@@ -245,11 +245,22 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
+    stream_options: StreamOptions | None = None
     stop: list[str] | None = None
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
+    # OpenAI client compatibility: server-specific extensions
+    extra_body: dict[str, Any] | None = None
 
 
 class CompletionChoice(BaseModel):

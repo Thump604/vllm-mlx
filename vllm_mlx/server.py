@@ -141,12 +141,16 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
-def _resolve_request_field(request: ChatCompletionRequest, field_name: str, default):
+def _resolve_request_field(
+    request: "ChatCompletionRequest | CompletionRequest",
+    field_name: str,
+    default,
+):
     """Resolve request fields with OpenAI-compatible extra_body fallback."""
     value = getattr(request, field_name, None)
     if value is not None:
         return value
-    extra_body = request.extra_body or {}
+    extra_body = getattr(request, "extra_body", None) or {}
     extra_value = extra_body.get(field_name)
     if extra_value is not None:
         return extra_value
@@ -1325,6 +1329,17 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     total_completion_tokens = 0
     total_prompt_tokens = 0
 
+    # Per-request SpecPrefill overrides via top-level fields or extra_body
+    gen_kwargs: dict = {}
+    specprefill = _resolve_request_field(request, "specprefill", None)
+    if specprefill is not None:
+        gen_kwargs["specprefill"] = specprefill
+    specprefill_keep_pct = _resolve_request_field(
+        request, "specprefill_keep_pct", None
+    )
+    if specprefill_keep_pct is not None:
+        gen_kwargs["specprefill_keep_pct"] = specprefill_keep_pct
+
     for i, prompt in enumerate(prompts):
         output = await _wait_with_disconnect(
             engine.generate(
@@ -1337,6 +1352,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 presence_penalty=request.presence_penalty or 0.0,
                 repetition_penalty=request.repetition_penalty or 1.0,
                 stop=request.stop,
+                **gen_kwargs,
             ),
             raw_request,
             timeout=timeout,
