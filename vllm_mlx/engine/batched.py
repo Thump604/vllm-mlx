@@ -685,9 +685,18 @@ class BatchedEngine(BaseEngine):
                 f"target vocab_size ({t_vocab}). Cannot use this draft."
             )
 
+        # Special-token checks are informational only. SpecPrefill feeds
+        # prompts encoded by the TARGET tokenizer into the draft's forward
+        # pass; it never uses the draft's tokenizer for identity. If either
+        # side lacks a special token (draft packages without their own
+        # tokenizer.json return None), skip the mismatch check rather than
+        # reject. vocab_size remains strict because a vocab mismatch means
+        # target token IDs are out-of-range for the draft embedding table.
         for attr in ("eos_token_id", "bos_token_id", "pad_token_id"):
             t_id = _attr(target_tokenizer, attr)
             d_id = _attr(draft_tokenizer, attr)
+            if t_id is None or d_id is None:
+                continue
             if t_id != d_id:
                 raise ValueError(
                     f"SpecPrefill draft {attr} ({d_id}) does not match "
