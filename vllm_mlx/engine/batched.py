@@ -976,6 +976,336 @@ class BatchedEngine(BaseEngine):
             finish_reason=output.finish_reason,
         )
 
+    def _specprefill_eligible_text(
+        self,
+        prompt: str,
+        specprefill_override: bool | None,
+        stop: list[str] | None,
+    ) -> tuple[bool, list[int], int]:
+        """Single decision point for whether a text request is SpecPrefill-eligible
+        on the new non-MLLM BatchedEngine path.
+
+        Returns (eligible, sp_tokens, sp_n_total). When eligible is True,
+        sp_tokens and sp_n_total are the pre-tokenized prompt and its length
+        so the caller can hand them to _stream_generate_text_specprefill
+        without re-tokenizing. When eligible is False, sp_tokens=[] and
+        sp_n_total=0 — the ineligible path is the scheduler, which does its
+        own tokenization inside Request.
+
+        Cheap gates first (no tokenization), then tokenize only when we're
+        about to accept. Duplicate tokenize cost between generate() and
+        stream_generate() on the eligible non-streaming path is intentional
+        and documented in the spec.
+        """
+        # Hard disable: per-request specprefill=false always wins, regardless
+        # of engine default.
+        if specprefill_override is False:
+            return (False, [], 0)
+
+        # Cheap gates
+        if self._is_mllm:
+            return (False, [], 0)
+        if self._has_hybrid_cache:
+            return (False, [], 0)
+        if self._draft_model is None:
+            return (False, [], 0)
+        if self._model is None:
+            return (False, [], 0)
+
+        # stop sequences are an explicit ineligibility condition.
+        # mlx_lm.stream_generate has no stop-sequence API; the scheduler path
+        # does, so send stop-containing requests there instead.
+        if stop:
+            if specprefill_override is True:
+                logger.warning(
+                    "SpecPrefill force-enabled but request has stop sequences; "
+                    "falling back to scheduler path (stop sequences unsupported "
+                    "on the SpecPrefill hand-off)"
+                )
+            return (False, [], 0)
+
+        enabled = (
+            specprefill_override is True
+            or (specprefill_override is None and self._specprefill_enabled)
+        )
+        if not enabled:
+            return (False, [], 0)
+
+        sp_tokens = self._tokenizer.encode(prompt)
+        sp_n_total = len(sp_tokens)
+
+        # Threshold check (force-enable bypasses threshold, matching the
+        # existing _stream_chat_text_model semantics).
+        if (
+            specprefill_override is not True
+            and sp_n_total <= self._specprefill_threshold
+        ):
+            return (False, [], 0)
+
+        # Upper cap (same 196608 as _stream_chat_text_model).
+        _SPECPREFILL_MAX_TOKENS = 196608
+        if sp_n_total > _SPECPREFILL_MAX_TOKENS:
+            logger.warning(
+                "SpecPrefill: prompt %d tokens exceeds cap %d, "
+                "falling back to scheduler path",
+                sp_n_total,
+                _SPECPREFILL_MAX_TOKENS,
+            )
+            return (False, [], 0)
+
+        return (True, sp_tokens, sp_n_total)
+
+    async def _stream_generate_text_specprefill(
+        self,
+        prompt: str,
+        sp_tokens: list[int],
+        sp_n_total: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        specprefill_keep_pct_override: float | None,
+        raw_output: bool,
+    ):
+        """SpecPrefill-accelerated text generation for non-MLLM BatchedEngine models.
+
+        NOTE TO READERS: This path intentionally bypasses the
+        continuous-batching scheduler (self._engine). Eligible requests are
+        serialized under self._text_generation_lock because the Phase 4
+        hand-off via mlx_lm.stream_generate with a pre-filled prompt_cache
+        cannot compose with the scheduler's cache lifecycle without teaching
+        the scheduler a new cache-ownership protocol — a deliberate v1 scope
+        cut. Eligible requests therefore bypass scheduler prefix-cache reuse
+        by design. See
+        docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
+        ("Known regression: prefix cache bypass") for the tradeoff rationale
+        and the planned system-KV-snapshot follow-up.
+
+        Cancellation safety follows CLAUDE.md Golden Rule 4: the worker
+        thread runs inside asyncio.to_thread; the outer task wraps it in
+        asyncio.shield and awaits it on CancelledError so the lock stays
+        held until the worker has actually exited. Violating this pattern
+        recreates the Metal command buffer SIGABRT race (Session 83).
+        """
+        import asyncio
+        import os
+        import time
+        import uuid
+
+        import mlx.core as mx
+        from mlx_lm import stream_generate as mlx_stream_generate
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_sampler
+
+        from ..specprefill import (
+            cleanup_rope,
+            score_tokens,
+            select_chunks,
+            sparse_prefill,
+        )
+
+        req_id = uuid.uuid4().hex[:8]
+
+        # Normalize max_tokens up-front; do not push this policy into the worker.
+        if max_tokens == 0 or max_tokens is None:
+            max_tokens = 4096
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+        prefill_step_size = self._prefill_step_size
+
+        async with self._text_generation_lock:
+            # The begin log MUST be inside the lock scope. Logging it before
+            # the `async with` would let two concurrent requests log "begin"
+            # before either acquired the lock, defeating the concurrency test
+            # that proves serialization by asserting begin(B) timestamp comes
+            # AFTER end(A) timestamp on the captured log records.
+            logger.info(
+                "SpecPrefill text begin req=%s prompt_tokens=%d keep_pct=%.2f",
+                req_id,
+                sp_n_total,
+                (
+                    specprefill_keep_pct_override
+                    if specprefill_keep_pct_override is not None
+                    else self._specprefill_keep_pct
+                ),
+            )
+
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            _SENTINEL = object()
+
+            def _worker() -> None:
+                target_cache = make_prompt_cache(self._model)
+                try:
+                    # Phase 1: score with draft
+                    t0 = time.monotonic()
+                    importance = score_tokens(
+                        self._draft_model,
+                        sp_tokens,
+                        prefill_step_size=prefill_step_size,
+                    )
+                    t_score = time.monotonic() - t0
+
+                    # Phase 2: select chunks
+                    effective_keep = (
+                        specprefill_keep_pct_override
+                        if specprefill_keep_pct_override is not None
+                        else self._specprefill_keep_pct
+                    )
+                    selected = select_chunks(importance, keep_pct=effective_keep)
+                    n_selected = selected.shape[0]
+                    n_scored = len(sp_tokens)
+
+                    # Phase 3: sparse prefill on target
+                    t0 = time.monotonic()
+                    logits = sparse_prefill(
+                        self._model,
+                        sp_tokens,
+                        selected,
+                        target_cache,
+                        step_size=prefill_step_size,
+                        position_offset=0,
+                    )
+                    t_prefill = time.monotonic() - t0
+
+                    logger.info(
+                        "SpecPrefill text phases req=%s scored=%d in %.1fs "
+                        "sparse=%d/%d (keep=%.0f%%) in %.1fs",
+                        req_id,
+                        n_scored,
+                        t_score,
+                        n_selected,
+                        n_scored,
+                        n_selected / n_scored * 100,
+                        t_prefill,
+                    )
+
+                    # Test-only fail injection (pre-emission phase).
+                    # See CLAUDE.md Golden Rule 5 for the policy on env-gated
+                    # exception conditions.
+                    _test_fail = os.environ.get("VLLM_MLX_TEST_FORCE_SPECPREFILL_FAIL")
+                    if _test_fail == "pre_emit":
+                        raise RuntimeError(
+                            "VLLM_MLX_TEST_FORCE_SPECPREFILL_FAIL=pre_emit"
+                        )
+
+                    # Phase 4: sample first token from sparse prefill logits
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
+
+                    y0_text = self._tokenizer.decode([y0.item()])
+                    eos_id = self._tokenizer.eos_token_id
+
+                    # Emit first chunk
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        (
+                            "chunk",
+                            y0_text,
+                            y0_text,
+                            "stop" if y0.item() == eos_id else None,
+                        ),
+                    )
+
+                    # Test-only fail injection (post-emission phase).
+                    if _test_fail == "post_emit":
+                        raise RuntimeError(
+                            "VLLM_MLX_TEST_FORCE_SPECPREFILL_FAIL=post_emit"
+                        )
+
+                    # max_tokens <= 1: skip Phase 4 hand-off entirely so we
+                    # never call mlx_lm.stream_generate(..., max_tokens=0).
+                    if y0.item() != eos_id and max_tokens > 1:
+                        accumulated = y0_text
+                        for resp in mlx_stream_generate(
+                            self._model,
+                            self._tokenizer,
+                            prompt=y0.reshape(-1),
+                            max_tokens=max_tokens - 1,
+                            sampler=sampler,
+                            prompt_cache=target_cache,
+                            prefill_step_size=prefill_step_size,
+                        ):
+                            if resp.text.startswith(accumulated):
+                                new_text = resp.text[len(accumulated):]
+                            else:
+                                new_text = resp.text
+                            accumulated = resp.text
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                (
+                                    "chunk",
+                                    resp.text,
+                                    new_text,
+                                    resp.finish_reason,
+                                ),
+                            )
+                            if resp.finish_reason is not None:
+                                break
+                except Exception as e:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
+                finally:
+                    try:
+                        cleanup_rope(self._model)
+                    except Exception as cleanup_err:
+                        logger.error(
+                            "SpecPrefill text cleanup_rope failed req=%s "
+                            "(masked by original error if any): %s",
+                            req_id,
+                            cleanup_err,
+                            exc_info=True,
+                        )
+                    loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
+
+            worker = asyncio.ensure_future(asyncio.to_thread(_worker))
+            completion_count = 0
+            try:
+                while True:
+                    msg = await queue.get()
+                    if msg is _SENTINEL:
+                        break
+                    if isinstance(msg, tuple) and msg[0] == "error":
+                        raise msg[1]
+                    _, text, new_text, finish_reason = msg
+                    completion_count += 1
+                    yield GenerationOutput(
+                        text=text if raw_output else clean_output_text(text),
+                        new_text=(
+                            new_text
+                            if raw_output
+                            else clean_output_text(new_text)
+                        ),
+                        prompt_tokens=sp_n_total,
+                        completion_tokens=completion_count,
+                        finished=finish_reason is not None,
+                        finish_reason=finish_reason,
+                    )
+            except asyncio.CancelledError:
+                # Drain queue to sentinel, then await worker so lock release
+                # is ordered after the Metal context actually releases.
+                try:
+                    while True:
+                        msg = await queue.get()
+                        if msg is _SENTINEL:
+                            break
+                except Exception:
+                    pass
+                try:
+                    await worker
+                except Exception:
+                    pass
+                raise
+            finally:
+                if not worker.done():
+                    try:
+                        await worker
+                    except Exception:
+                        pass
+                logger.info(
+                    "SpecPrefill text end req=%s completion_tokens=%d",
+                    req_id,
+                    completion_count,
+                )
+
     async def stream_generate(
         self,
         prompt: str,
@@ -1033,6 +1363,56 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                 )
             return
+
+        # NEW: Non-MLLM text SpecPrefill dispatch.
+        # Eligible requests bypass the continuous-batching scheduler and run
+        # serially under self._text_generation_lock via
+        # _stream_generate_text_specprefill. Ineligible requests fall through
+        # to the existing self._engine.add_request scheduler path below.
+        # See spec docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
+        if not self._is_mllm:
+            specprefill_override = kwargs.pop("specprefill", None)
+            specprefill_keep_pct_override = kwargs.pop(
+                "specprefill_keep_pct", None
+            )
+
+            eligible, sp_tokens, sp_n_total = self._specprefill_eligible_text(
+                prompt, specprefill_override, stop,
+            )
+
+            if eligible:
+                first_chunk_emitted = False
+                try:
+                    async for chunk in self._stream_generate_text_specprefill(
+                        prompt=prompt,
+                        sp_tokens=sp_tokens,
+                        sp_n_total=sp_n_total,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        specprefill_keep_pct_override=specprefill_keep_pct_override,
+                        raw_output=raw_output,
+                    ):
+                        first_chunk_emitted = True
+                        yield chunk
+                    return
+                except Exception as e:
+                    if first_chunk_emitted:
+                        logger.error(
+                            "SpecPrefill (non-MLLM text) failed after first "
+                            "chunk emission; propagating error (cannot safely "
+                            "fall back mid-stream): %s",
+                            e,
+                            exc_info=True,
+                        )
+                        raise
+                    logger.error(
+                        "SpecPrefill (non-MLLM text) failed before first "
+                        "chunk; falling back to scheduler path: %s",
+                        e,
+                        exc_info=True,
+                    )
+                    # Fall through to scheduler path below
 
         # Use LLM engine for text-only
         from ..request import SamplingParams
