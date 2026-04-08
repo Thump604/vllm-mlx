@@ -638,7 +638,16 @@ class BatchedEngine(BaseEngine):
                     / "mlx_models"
                     / self._specprefill_draft_model_path
                 )
-                self._draft_model, _ = mlx_lm_load(draft_path)
+                self._draft_model, draft_tokenizer = mlx_lm_load(draft_path)
+                # Compatibility check: vocab + special tokens must match the
+                # target. SpecPrefill encodes with self._tokenizer and passes
+                # the resulting token IDs directly into the draft's forward
+                # pass; mismatch produces meaningless scores or a crash.
+                self._check_specprefill_draft_compatibility(
+                    target_tokenizer=self._tokenizer,
+                    draft_tokenizer=draft_tokenizer,
+                )
+                del draft_tokenizer  # only needed for the compat check
                 logger.info(
                     "SpecPrefill draft model loaded: %s (threshold=%d, keep=%.0f%%)",
                     self._specprefill_draft_model_path,
@@ -649,6 +658,49 @@ class BatchedEngine(BaseEngine):
                 logger.warning("Failed to load SpecPrefill draft model: %s", e)
                 self._specprefill_enabled = False
                 self._draft_model = None
+
+    def _check_specprefill_draft_compatibility(
+        self, target_tokenizer, draft_tokenizer
+    ) -> None:
+        """Fail fast if the SpecPrefill draft tokenizer is incompatible with target.
+
+        SpecPrefill encodes prompts with the target tokenizer and passes those
+        token IDs directly into the draft model's forward pass. If vocab or
+        special tokens differ, the draft will either crash or produce
+        meaningless importance scores. The check runs once at engine start
+        immediately after the draft load.
+
+        Raises:
+            ValueError: if vocab_size, eos_token_id, bos_token_id, or
+                pad_token_id differ between target and draft tokenizers.
+        """
+        def _attr(t, name):
+            return getattr(t, name, None) if t is not None else None
+
+        t_vocab = _attr(target_tokenizer, "vocab_size")
+        d_vocab = _attr(draft_tokenizer, "vocab_size")
+        if t_vocab != d_vocab:
+            raise ValueError(
+                f"SpecPrefill draft vocab_size ({d_vocab}) does not match "
+                f"target vocab_size ({t_vocab}). Cannot use this draft."
+            )
+
+        for attr in ("eos_token_id", "bos_token_id", "pad_token_id"):
+            t_id = _attr(target_tokenizer, attr)
+            d_id = _attr(draft_tokenizer, attr)
+            if t_id != d_id:
+                raise ValueError(
+                    f"SpecPrefill draft {attr} ({d_id}) does not match "
+                    f"target {attr} ({t_id}). Cannot use this draft."
+                )
+
+        logger.info(
+            "SpecPrefill draft compatibility OK: vocab=%d, eos=%s, bos=%s, pad=%s",
+            t_vocab,
+            _attr(target_tokenizer, "eos_token_id"),
+            _attr(target_tokenizer, "bos_token_id"),
+            _attr(target_tokenizer, "pad_token_id"),
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -1792,7 +1844,15 @@ class BatchedEngine(BaseEngine):
                     return results, sp_n_total
 
                 finally:
-                    cleanup_rope(self._text_model)
+                    try:
+                        cleanup_rope(self._text_model)
+                    except Exception as cleanup_err:
+                        logger.error(
+                            "_stream_chat_text_model cleanup_rope failed "
+                            "(masked by original error if any): %s",
+                            cleanup_err,
+                            exc_info=True,
+                        )
 
             def _run_cache_hit():
                 """Restore system KV snapshot, prefill only suffix, generate."""
