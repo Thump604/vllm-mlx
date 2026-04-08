@@ -238,13 +238,23 @@ class SimpleEngine(BaseEngine):
         """
         Generate a complete response (non-streaming).
 
+        Thin accumulator over stream_generate(). SpecPrefill engagement and
+        per-request specprefill / specprefill_keep_pct overrides live in
+        stream_generate — this method iterates the streaming variant and
+        returns the last GenerationOutput. Without this accumulator,
+        non-streaming /v1/completions clients that pass
+        extra_body.specprefill=true had their overrides silently dropped
+        because the old direct self._model.generate() path does not consume
+        the specprefill kwargs.
+
         Args:
             prompt: Input text
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
-            **kwargs: Additional model-specific parameters
+            **kwargs: Additional parameters forwarded to stream_generate,
+                including per-request specprefill / specprefill_keep_pct
 
         Returns:
             GenerationOutput with complete text
@@ -252,30 +262,29 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        async with self._generation_lock:
-            # Run in thread pool to allow asyncio timeout to work
-            output = await asyncio.to_thread(
-                self._model.generate,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
-            )
+        last_output: GenerationOutput | None = None
+        async for output in self.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            **kwargs,
+        ):
+            last_output = output
 
-            # Clean output text
-            text = clean_output_text(output.text)
+        if last_output is None:
+            return GenerationOutput(text="", finish_reason="stop")
 
-            return GenerationOutput(
-                text=text,
-                tokens=getattr(output, "tokens", []),
-                prompt_tokens=getattr(output, "prompt_tokens", 0),
-                completion_tokens=getattr(
-                    output, "completion_tokens", len(getattr(output, "tokens", []))
-                ),
-                finish_reason=output.finish_reason,
-            )
+        text = clean_output_text(last_output.text)
+        return GenerationOutput(
+            text=text,
+            tokens=list(last_output.tokens),
+            prompt_tokens=last_output.prompt_tokens,
+            completion_tokens=last_output.completion_tokens,
+            finish_reason=last_output.finish_reason,
+            finished=True,
+        )
 
     async def stream_generate(
         self,
