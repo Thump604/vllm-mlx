@@ -2265,9 +2265,14 @@ class BatchedEngine(BaseEngine):
                         effective_keep,
                     )
 
-                    # Phase 4: Generate with MTP via stream_generate
-                    y0 = sampler(logits[:, -1, :])
-                    mx.eval(y0)
+                    # Phase 4: Generate with MTP via stream_generate.
+                    # Match the working SimpleEngine hand-off shape from
+                    # PR #248: convert the first sampled token to a plain
+                    # Python id, then re-enter pipelined decode with a
+                    # 1-token prompt array and the sparse-prefilled cache.
+                    eos_id = self._text_tokenizer.eos_token_id
+                    first_token_id = sampler(logits[:, -1, :]).item()
+                    first_text = self._text_tokenizer.decode([first_token_id])
 
                     # Build cache with MTP entries
                     if hasattr(self._text_model, "make_mtp_cache"):
@@ -2277,34 +2282,26 @@ class BatchedEngine(BaseEngine):
                     else:
                         gen_cache = list(target_cache)
 
-                    # y0 was sampled from Phase 3 logits but stream_generate
-                    # consumes it as "prompt", so prepend its text
-                    y0_text = self._text_tokenizer.decode([y0.item()])
-                    eos_id = self._text_tokenizer.eos_token_id
                     results = [
                         SimpleNamespace(
-                            text=y0_text,
-                            finish_reason=("stop" if y0.item() == eos_id else None),
+                            text=first_text,
+                            finish_reason=(
+                                "stop" if first_token_id == eos_id else None
+                            ),
                         )
                     ]
 
-                    if y0.item() != eos_id:
+                    if first_token_id != eos_id:
                         for resp in mlx_stream_generate(
                             self._text_model,
                             self._text_tokenizer,
-                            prompt=y0.reshape(-1),
+                            prompt=mx.array([first_token_id]),
                             max_tokens=max_tokens - 1,
                             sampler=sampler,
                             mtp=_has_mtp,
                             prompt_cache=gen_cache,
-                            prefill_step_size=prefill_step_size,
                         ):
-                            results.append(
-                                SimpleNamespace(
-                                    text=resp.text,
-                                    finish_reason=resp.finish_reason,
-                                )
-                            )
+                            results.append(resp)
 
                     return results, sp_n_total
 

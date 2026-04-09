@@ -3,6 +3,7 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 
@@ -161,3 +162,91 @@ class TestBatchedEngineGenerate:
         )
 
         assert accumulated == "NX-4271-NEMO"
+
+    @pytest.mark.anyio
+    async def test_stream_chat_text_model_specprefill_phase4_uses_pipelined_handoff(
+        self,
+    ):
+        """SpecPrefill MTP decode must re-enter mlx_lm.stream_generate cleanly."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        class DummyTextModel:
+            def __init__(self):
+                self.mtp_forward = object()
+
+            def make_mtp_cache(self):
+                return ["mtp-cache"]
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine(
+                "test-model",
+                force_mllm=True,
+                mtp=True,
+                specprefill_enabled=True,
+                specprefill_threshold=1,
+                specprefill_keep_pct=0.5,
+            )
+
+        engine._loaded = True
+        engine._text_model = DummyTextModel()
+        engine._draft_model = MagicMock()
+        engine._text_tokenizer = MagicMock()
+        engine._text_tokenizer.apply_chat_template.return_value = "hello"
+        engine._text_tokenizer.encode.return_value = [11, 12, 13, 14]
+        engine._text_tokenizer.decode.side_effect = lambda toks: "".join(
+            chr(64 + tok) for tok in toks
+        )
+        engine._text_tokenizer.eos_token_id = 0
+
+        def fake_sampler(_logits):
+            return mx.array([1], dtype=mx.int32)
+
+        def fake_stream_generate(
+            _model,
+            _tokenizer,
+            *,
+            prompt,
+            max_tokens,
+            sampler,
+            mtp,
+            prompt_cache,
+        ):
+            assert _model is engine._text_model
+            assert _tokenizer is engine._text_tokenizer
+            assert prompt.tolist() == [1]
+            assert max_tokens == 2
+            assert sampler is fake_sampler
+            assert mtp is True
+            assert prompt_cache == ["cache", "mtp-cache"]
+            yield SimpleNamespace(text="B", finish_reason="stop")
+
+        with (
+            patch("mlx_lm.sample_utils.make_sampler", return_value=fake_sampler),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=["cache"]),
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "vllm_mlx.specprefill.score_tokens",
+                return_value=mx.array([0.5]),
+            ),
+            patch(
+                "vllm_mlx.specprefill.select_chunks",
+                return_value=mx.array([0], dtype=mx.int32),
+            ),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 8)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            chunks = []
+            async for chunk in engine._stream_chat_text_model(
+                [{"role": "user", "content": "hello"}],
+                max_tokens=3,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                chunks.append(chunk.new_text)
+
+        assert chunks == ["A", "B"]
