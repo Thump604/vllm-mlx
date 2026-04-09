@@ -960,6 +960,40 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
 
+        # NEW: Non-MLLM text conditional accumulator for SpecPrefill eligibility.
+        # When SpecPrefill is eligible for this request, accumulate over the
+        # streaming path (which dispatches into _stream_generate_text_specprefill).
+        # Otherwise fall through to the existing self._engine.generate() scheduler
+        # path below, which is unchanged.
+        # See spec: docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
+        if not self._is_mllm:
+            specprefill_override = kwargs.get("specprefill")
+            eligible, _, _ = self._specprefill_eligible_text(
+                prompt, specprefill_override, stop or [],
+            )
+            if eligible:
+                accumulated_text = ""
+                last_chunk = None
+                async for chunk in self.stream_generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                    **kwargs,
+                ):
+                    accumulated_text = chunk.text
+                    last_chunk = chunk
+                if last_chunk is not None:
+                    return GenerationOutput(
+                        text=accumulated_text,
+                        prompt_tokens=last_chunk.prompt_tokens,
+                        completion_tokens=last_chunk.completion_tokens,
+                        finish_reason=last_chunk.finish_reason,
+                    )
+                return GenerationOutput(text="", finish_reason="stop")
+            # Non-eligible: fall through to existing scheduler path below
+
         # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
