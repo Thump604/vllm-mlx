@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible Responses API."""
 
+import json
 import platform
 import sys
-from types import SimpleNamespace
 from collections import OrderedDict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -30,11 +31,13 @@ def server_state():
     original_engine = srv._engine
     original_model_name = srv._model_name
     original_store = srv._responses_store
+    original_store_max_size = srv._RESPONSES_STORE_MAX_SIZE
     original_api_key = srv._api_key
 
     srv._engine = None
     srv._model_name = "test-model"
     srv._responses_store = OrderedDict()
+    srv._RESPONSES_STORE_MAX_SIZE = 1000
     srv._api_key = None
 
     try:
@@ -43,6 +46,7 @@ def server_state():
         srv._engine = original_engine
         srv._model_name = original_model_name
         srv._responses_store = original_store
+        srv._RESPONSES_STORE_MAX_SIZE = original_store_max_size
         srv._api_key = original_api_key
 
 
@@ -87,6 +91,23 @@ def _stream_output(
         finish_reason=finish_reason,
         finished=finish_reason is not None,
     )
+
+
+def _parse_sse_events(body: str) -> list[tuple[str, dict]]:
+    events = []
+    for chunk in body.strip().split("\n\n"):
+        if not chunk.strip():
+            continue
+        event_type = None
+        payload = None
+        for line in chunk.splitlines():
+            if line.startswith("event: "):
+                event_type = line.removeprefix("event: ").strip()
+            elif line.startswith("data: "):
+                payload = json.loads(line.removeprefix("data: ").strip())
+        if event_type is not None and payload is not None:
+            events.append((event_type, payload))
+    return events
 
 
 class TestResponsesEndpoint:
@@ -259,6 +280,23 @@ class TestResponsesEndpoint:
         assert second_messages[2]["role"] == "assistant"
         assert second_messages[3]["role"] == "user"
 
+    def test_previous_response_id_missing_returns_404(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("unused"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": "resp_missing",
+                "input": "Follow-up prompt",
+            },
+        )
+
+        assert resp.status_code == 404
+        assert "resp_missing" in resp.json()["detail"]
+
     def test_developer_role_is_normalized_to_system(self, client):
         import vllm_mlx.server as srv
 
@@ -409,6 +447,64 @@ class TestResponsesEndpoint:
         assert body["output"][0]["name"] == "shell"
         assert body["output_text"] == ""
 
+    def test_store_false_skips_persistence(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Ephemeral answer"))
+
+        first = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Do not store this",
+                "store": False,
+            },
+        )
+
+        assert first.status_code == 200
+        assert first.json()["store"] is False
+        assert first.json()["id"] not in srv._responses_store
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": first.json()["id"],
+                "input": "Follow-up prompt",
+            },
+        )
+
+        assert second.status_code == 404
+
+    def test_responses_store_is_lru_bounded(self, client):
+        import vllm_mlx.server as srv
+
+        srv._RESPONSES_STORE_MAX_SIZE = 2
+        srv._engine = _mock_engine(
+            _output("First answer"),
+            _output("Second answer"),
+            _output("Third answer"),
+        )
+
+        first = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "First prompt"},
+        )
+        second = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Second prompt"},
+        )
+        third = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Third prompt"},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert third.status_code == 200
+        assert list(srv._responses_store) == [second.json()["id"], third.json()["id"]]
+        assert first.json()["id"] not in srv._responses_store
+
     def test_streaming_response_returns_sse_events(self, client):
         import vllm_mlx.server as srv
 
@@ -435,6 +531,39 @@ class TestResponsesEndpoint:
         assert len(engine._stream_calls) == 1
         engine.chat.assert_not_awaited()
 
+    def test_streaming_response_sequence_metadata_is_monotonic(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(side_effect=AssertionError("stream path should not call chat"))
+        engine._stream_outputs = [
+            _stream_output("Hello ", completion_tokens=1),
+            _stream_output("stream", completion_tokens=2, finish_reason="stop"),
+        ]
+        srv._engine = engine
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(body)
+        assert [event_type for event_type, _ in events[:2]] == [
+            "response.created",
+            "response.in_progress",
+        ]
+        sequence_numbers = [payload["sequence_number"] for _, payload in events]
+        assert sequence_numbers == sorted(sequence_numbers)
+        created_payload = events[0][1]
+        completed_payload = next(
+            payload for event_type, payload in events if event_type == "response.completed"
+        )
+        assert created_payload["response"]["id"] == completed_payload["response"]["id"]
+        assert completed_payload["response"]["output_text"] == "Hello stream"
+
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv
 
@@ -452,10 +581,11 @@ class TestResponsesEndpoint:
         assert resp.status_code == 400
         assert "json_object" in resp.json()["detail"]
 
-    def test_reasoning_configuration_is_rejected(self, client):
+    def test_reasoning_configuration_is_ignored(self, client):
         import vllm_mlx.server as srv
 
-        srv._engine = _mock_engine(_output("Hello"))
+        engine = _mock_engine(_output("Hello"))
+        srv._engine = engine
 
         resp = client.post(
             "/v1/responses",
@@ -466,13 +596,14 @@ class TestResponsesEndpoint:
             },
         )
 
-        assert resp.status_code == 400
-        assert "reasoning configuration" in resp.json()["detail"]
+        assert resp.status_code == 200
+        assert engine.chat.await_count == 1
 
-    def test_reasoning_input_item_is_rejected(self, client):
+    def test_reasoning_input_item_is_accepted(self, client):
         import vllm_mlx.server as srv
 
-        srv._engine = _mock_engine(_output("Hello"))
+        engine = _mock_engine(_output("Hello"))
+        srv._engine = engine
 
         resp = client.post(
             "/v1/responses",
@@ -485,8 +616,12 @@ class TestResponsesEndpoint:
             },
         )
 
-        assert resp.status_code == 400
-        assert "reasoning input items are not supported" in resp.json()["detail"]
+        assert resp.status_code == 200
+        messages = engine.chat.call_args.kwargs["messages"]
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "Hello"
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "x"
 
     def test_length_finish_reason_marks_response_incomplete(self, client):
         import vllm_mlx.server as srv
