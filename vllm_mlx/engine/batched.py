@@ -1048,8 +1048,14 @@ class BatchedEngine(BaseEngine):
         # Cheap gates
         if self._is_mllm:
             return (False, [], 0)
-        if self._has_hybrid_cache:
-            return (False, [], 0)
+        # NOTE: `self._has_hybrid_cache` is NOT an eligibility gate. Nemotron-H
+        # (Mamba-2+Attn hybrid) is the paper's target model, so hybrid caches
+        # MUST be allowed through. The existing `_stream_chat_text_model`
+        # guard at `batched.py:1532` / `:1756` only fires when
+        # `_has_hybrid_cache AND _mllm_instance is not None` — i.e., for
+        # MLLM-with-hybrid-cache models that need to route through the serial
+        # mlx_vlm path. For non-MLLM hybrid models (Nemotron-H), SpecPrefill
+        # engages on the BatchedEngine path directly.
         if self._draft_model is None:
             return (False, [], 0)
         if self._model is None:
