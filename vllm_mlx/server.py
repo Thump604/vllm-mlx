@@ -876,7 +876,9 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                         "content": "",
                         "tool_calls": [
                             {
-                                "id": item.get("call_id", _new_response_item_id("call")),
+                                "id": item.get(
+                                    "call_id", _new_response_item_id("call")
+                                ),
                                 "type": "function",
                                 "function": {
                                     "name": item.get("name", ""),
@@ -955,7 +957,9 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
     return messages
 
 
-def _responses_request_to_new_persisted_messages(request: ResponsesRequest) -> list[dict]:
+def _responses_request_to_new_persisted_messages(
+    request: ResponsesRequest,
+) -> list[dict]:
     """Persist only the current request's replayable input items."""
     request_without_history = request.model_copy(
         update={"previous_response_id": None, "instructions": None},
@@ -983,7 +987,9 @@ def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[
     return messages
 
 
-def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatCompletionRequest:
+def _responses_request_to_chat_request(
+    request: ResponsesRequest,
+) -> ChatCompletionRequest:
     """Build a ChatCompletionRequest from a ResponsesRequest."""
     if request.text.format.type == "json_object":
         raise HTTPException(
@@ -1107,7 +1113,9 @@ def _response_output_items_to_chat_messages(output_items: list) -> list[dict]:
 
 def _build_response_object(
     request: ResponsesRequest,
-    output_items: list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem],
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ],
     prompt_tokens: int,
     completion_tokens: int,
     finish_reason: str | None,
@@ -1437,7 +1445,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                 if not tool_markup_possible:
                     tool_markup_possible = True
                 tool_result = tool_parser.extract_tool_calls_streaming(
-                    tool_accumulated_text, tool_accumulated_text + delta_text, delta_text
+                    tool_accumulated_text,
+                    tool_accumulated_text + delta_text,
+                    delta_text,
                 )
                 tool_accumulated_text += delta_text
                 if tool_result is None:
@@ -1629,7 +1639,11 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
 def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
     """Encode a Responses API SSE event."""
-    data = payload.model_dump_json() if isinstance(payload, BaseModel) else json.dumps(payload)
+    data = (
+        payload.model_dump_json()
+        if isinstance(payload, BaseModel)
+        else json.dumps(payload)
+    )
     return f"event: {event_type}\ndata: {data}\n\n"
 
 

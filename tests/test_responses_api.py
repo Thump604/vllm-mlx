@@ -333,7 +333,11 @@ class TestResponsesEndpoint:
                 "model": "test-model",
                 "instructions": "System instructions",
                 "input": [
-                    {"type": "message", "role": "developer", "content": "Developer note"},
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": "Developer note",
+                    },
                     {"type": "message", "role": "user", "content": "Hi"},
                 ],
             },
@@ -363,7 +367,7 @@ class TestResponsesEndpoint:
                         "type": "function_call",
                         "call_id": "call_1",
                         "name": "shell",
-                        "arguments": "{\"cmd\":\"pwd\"}",
+                        "arguments": '{"cmd":"pwd"}',
                     },
                     {
                         "type": "function_call_output",
@@ -509,7 +513,9 @@ class TestResponsesEndpoint:
         import vllm_mlx.server as srv
 
         engine = _mock_engine(_output("unused"))
-        engine.chat = AsyncMock(side_effect=AssertionError("stream path should not call chat"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
         engine._stream_outputs = [
             _stream_output("Hello ", completion_tokens=1),
             _stream_output("stream", completion_tokens=2, finish_reason="stop"),
@@ -535,7 +541,9 @@ class TestResponsesEndpoint:
         import vllm_mlx.server as srv
 
         engine = _mock_engine(_output("unused"))
-        engine.chat = AsyncMock(side_effect=AssertionError("stream path should not call chat"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
         engine._stream_outputs = [
             _stream_output("Hello ", completion_tokens=1),
             _stream_output("stream", completion_tokens=2, finish_reason="stop"),
@@ -559,7 +567,9 @@ class TestResponsesEndpoint:
         assert sequence_numbers == sorted(sequence_numbers)
         created_payload = events[0][1]
         completed_payload = next(
-            payload for event_type, payload in events if event_type == "response.completed"
+            payload
+            for event_type, payload in events
+            if event_type == "response.completed"
         )
         assert created_payload["response"]["id"] == completed_payload["response"]["id"]
         assert completed_payload["response"]["output_text"] == "Hello stream"
@@ -611,7 +621,10 @@ class TestResponsesEndpoint:
                 "model": "test-model",
                 "input": [
                     {"type": "message", "role": "user", "content": "Hello"},
-                    {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "x"}]},
+                    {
+                        "type": "reasoning",
+                        "content": [{"type": "reasoning_text", "text": "x"}],
+                    },
                 ],
             },
         )
