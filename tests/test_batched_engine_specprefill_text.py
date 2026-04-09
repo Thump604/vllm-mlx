@@ -438,3 +438,65 @@ async def test_post_emission_failure_propagates(nano4b_engine, caplog, monkeypat
         "after first chunk emission; propagating error" in rec.getMessage()
         for rec in caplog.records if rec.levelname == "ERROR"
     ), "Expected ERROR log for post-emission propagation"
+
+
+def _build_needle_haystack(target_tokens: int, needle: str) -> str:
+    """Build a haystack of approximately `target_tokens` tokens with the
+    needle inserted near the middle."""
+    para = (
+        "The lunar module sits on the plain. The regolith is fine and grey. "
+        "Ancient craters mark the horizon. Radiation counters tick steadily. "
+        "Nothing lives here except the instruments. "
+    )
+    est_per_para = 35
+    n_paras = max(1, target_tokens // est_per_para - 2)
+    insert_at = n_paras // 2
+    parts = []
+    for i in range(n_paras):
+        parts.append(para)
+        if i == insert_at:
+            parts.append(f"\n\n{needle}\n\n")
+    return "".join(parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("VLLM_MLX_TEST_NEMOTRON_SPECPREFILL_INTEGRATION"),
+    reason="Set VLLM_MLX_TEST_NEMOTRON_SPECPREFILL_INTEGRATION=1 to run",
+)
+async def test_nemotron_specprefill_end_to_end_with_needle(nano4b_engine, caplog):
+    """Real long-prompt end-to-end SpecPrefill on Nemotron-H Nano 4B.
+
+    Uses a realistic threshold (8192) and a 16K needle-in-haystack prompt
+    that actually exercises Phase 1 scoring on meaningful token counts.
+    Verifies the needle is retrieved and SpecPrefill engaged.
+    """
+    caplog.set_level("INFO")
+    # Override the fixture's tiny threshold for this realistic test
+    nano4b_engine._specprefill_threshold = 8192
+    nano4b_engine._specprefill_keep_pct = 0.2
+
+    needle = "The hidden activation code is NX-4271-NANO. Remember it."
+    haystack = _build_needle_haystack(target_tokens=16384, needle=needle)
+    question = (
+        "What is the hidden activation code? Answer with just the code, "
+        "nothing else."
+    )
+    prompt = f"{haystack}\n\n{question}"
+
+    last = None
+    async for chunk in nano4b_engine.stream_generate(
+        prompt=prompt,
+        max_tokens=32,
+        temperature=1.0,
+        top_p=0.95,
+    ):
+        last = chunk
+
+    assert last is not None
+    assert "NX-4271-NANO" in last.text, (
+        f"Needle not retrieved: {last.text!r}"
+    )
+    assert _has_log(caplog, "sparse="), (
+        "SpecPrefill phase log did not include sparse= field"
+    )
