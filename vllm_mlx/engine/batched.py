@@ -314,6 +314,22 @@ class BatchedEngine(BaseEngine):
         self._loaded = True
         logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
 
+    @staticmethod
+    def _accumulate_streamed_text(
+        accumulated_text: str,
+        chunk: GenerationOutput,
+    ) -> str:
+        """Accumulate either cumulative-text or delta-text chunk shapes safely."""
+        if chunk.text:
+            if chunk.text.startswith(accumulated_text):
+                return chunk.text
+            if chunk.new_text:
+                return accumulated_text + chunk.new_text
+            return accumulated_text + chunk.text
+        if chunk.new_text:
+            return accumulated_text + chunk.new_text
+        return accumulated_text
+
     async def _start_mllm(self) -> None:
         """Start the MLLM engine with MLLMScheduler (continuous batching)."""
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
@@ -437,11 +453,7 @@ class BatchedEngine(BaseEngine):
         # - MTP is enabled (text-only gets MTP speedup)
         # - SpecPrefill is enabled (text-only gets sparse prefill)
         # - TextBatchScheduler canary routing is enabled (text-only foundation path)
-        if (
-            self._mtp
-            or self._specprefill_enabled
-            or self._text_scheduler_route_enabled
-        ):
+        if self._mtp or self._specprefill_enabled or self._text_scheduler_route_enabled:
             try:
                 from ..text_model_from_vlm import build_text_model
 
@@ -533,8 +545,7 @@ class BatchedEngine(BaseEngine):
                     gpu_lock=self._gpu_lock,
                     stop_tokens=_collect_stop_tokens(self._text_tokenizer),
                     draft_model=self._draft_model,
-                    enable_mtp=self._mtp
-                    and hasattr(self._text_model, "mtp_forward"),
+                    enable_mtp=self._mtp and hasattr(self._text_model, "mtp_forward"),
                     prefill_step_size=self._prefill_step_size,
                     specprefill_threshold=self._specprefill_threshold,
                     specprefill_keep_pct=self._specprefill_keep_pct,
@@ -674,6 +685,7 @@ class BatchedEngine(BaseEngine):
             ValueError: if vocab_size, eos_token_id, bos_token_id, or
                 pad_token_id differ between target and draft tokenizers.
         """
+
         def _attr(t, name):
             return getattr(t, name, None) if t is not None else None
 
@@ -849,8 +861,12 @@ class BatchedEngine(BaseEngine):
                 template_kwargs["tools"] = tools
             # Pass enable_thinking from env (set by runtime_patches from mode.json)
             import os
+
             if "enable_thinking" not in template_kwargs:
-                if os.environ.get("VLLM_MLX_ENABLE_THINKING", "").lower() in ("1", "true"):
+                if os.environ.get("VLLM_MLX_ENABLE_THINKING", "").lower() in (
+                    "1",
+                    "true",
+                ):
                     template_kwargs["enable_thinking"] = True
 
             try:
@@ -952,7 +968,11 @@ class BatchedEngine(BaseEngine):
                 **kwargs,
             )
 
-            text = output.output_text if raw_output else clean_output_text(output.output_text)
+            text = (
+                output.output_text
+                if raw_output
+                else clean_output_text(output.output_text)
+            )
             return GenerationOutput(
                 text=text,
                 prompt_tokens=output.prompt_tokens,
@@ -969,7 +989,9 @@ class BatchedEngine(BaseEngine):
         if not self._is_mllm:
             specprefill_override = kwargs.get("specprefill")
             eligible, _, _ = self._specprefill_eligible_text(
-                prompt, specprefill_override, stop or [],
+                prompt,
+                specprefill_override,
+                stop or [],
             )
             if eligible:
                 accumulated_text = ""
@@ -982,7 +1004,10 @@ class BatchedEngine(BaseEngine):
                     stop=stop,
                     **kwargs,
                 ):
-                    accumulated_text = chunk.text
+                    accumulated_text = self._accumulate_streamed_text(
+                        accumulated_text,
+                        chunk,
+                    )
                     last_chunk = chunk
                 if last_chunk is not None:
                     return GenerationOutput(
@@ -1009,7 +1034,9 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = output.output_text if raw_output else clean_output_text(output.output_text)
+        text = (
+            output.output_text if raw_output else clean_output_text(output.output_text)
+        )
 
         return GenerationOutput(
             text=text,
@@ -1073,9 +1100,8 @@ class BatchedEngine(BaseEngine):
                 )
             return (False, [], 0)
 
-        enabled = (
-            specprefill_override is True
-            or (specprefill_override is None and self._specprefill_enabled)
+        enabled = specprefill_override is True or (
+            specprefill_override is None and self._specprefill_enabled
         )
         if not enabled:
             return (False, [], 0)
@@ -1275,15 +1301,16 @@ class BatchedEngine(BaseEngine):
                             prefill_step_size=prefill_step_size,
                         ):
                             if resp.text.startswith(accumulated):
-                                new_text = resp.text[len(accumulated):]
+                                new_text = resp.text[len(accumulated) :]
+                                accumulated = resp.text
                             else:
                                 new_text = resp.text
-                            accumulated = resp.text
+                                accumulated += resp.text
                             loop.call_soon_threadsafe(
                                 queue.put_nowait,
                                 (
                                     "chunk",
-                                    resp.text,
+                                    accumulated,
                                     new_text,
                                     resp.finish_reason,
                                 ),
@@ -1319,9 +1346,7 @@ class BatchedEngine(BaseEngine):
                     yield GenerationOutput(
                         text=text if raw_output else clean_output_text(text),
                         new_text=(
-                            new_text
-                            if raw_output
-                            else clean_output_text(new_text)
+                            new_text if raw_output else clean_output_text(new_text)
                         ),
                         prompt_tokens=sp_n_total,
                         completion_tokens=completion_count,
@@ -1401,8 +1426,16 @@ class BatchedEngine(BaseEngine):
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
-                text = output.output_text if raw_output else clean_output_text(output.output_text)
-                new_text = output.new_text if raw_output else clean_output_text(output.new_text)
+                text = (
+                    output.output_text
+                    if raw_output
+                    else clean_output_text(output.output_text)
+                )
+                new_text = (
+                    output.new_text
+                    if raw_output
+                    else clean_output_text(output.new_text)
+                )
                 yield GenerationOutput(
                     text=text,
                     new_text=new_text,
@@ -1421,12 +1454,12 @@ class BatchedEngine(BaseEngine):
         # See spec docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
         if not self._is_mllm:
             specprefill_override = kwargs.pop("specprefill", None)
-            specprefill_keep_pct_override = kwargs.pop(
-                "specprefill_keep_pct", None
-            )
+            specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
 
             eligible, sp_tokens, sp_n_total = self._specprefill_eligible_text(
-                prompt, specprefill_override, stop,
+                prompt,
+                specprefill_override,
+                stop,
             )
 
             if eligible:
@@ -1481,8 +1514,14 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = output.output_text if raw_output else clean_output_text(output.output_text)
-            new_text = output.new_text if raw_output else clean_output_text(output.new_text)
+            text = (
+                output.output_text
+                if raw_output
+                else clean_output_text(output.output_text)
+            )
+            new_text = (
+                output.new_text if raw_output else clean_output_text(output.new_text)
+            )
 
             yield GenerationOutput(
                 text=text,
@@ -1612,9 +1651,8 @@ class BatchedEngine(BaseEngine):
                 return last_output
             return GenerationOutput(text="", finish_reason="stop")
 
-        if (
-            self._text_model is not None
-            and not _has_any_media(messages, images, videos)
+        if self._text_model is not None and not _has_any_media(
+            messages, images, videos
         ):
             return await self._chat_text_model(
                 messages,
@@ -1798,9 +1836,7 @@ class BatchedEngine(BaseEngine):
                 # worker thread is still mid-step, allowing a second request
                 # to start a concurrent worker and trip the Metal command
                 # buffer assertion.
-                producer_task = asyncio.ensure_future(
-                    asyncio.to_thread(_producer)
-                )
+                producer_task = asyncio.ensure_future(asyncio.to_thread(_producer))
                 last_text = ""
                 try:
                     while True:
@@ -1809,7 +1845,7 @@ class BatchedEngine(BaseEngine):
                             break
                         if isinstance(chunk, Exception):
                             raise chunk
-                        new_text = (chunk.text or "")[len(last_text):]
+                        new_text = (chunk.text or "")[len(last_text) :]
                         last_text = chunk.text or last_text
                         yield GenerationOutput(
                             text=chunk.text or "",
@@ -1870,9 +1906,8 @@ class BatchedEngine(BaseEngine):
                 yield output
             return
 
-        if (
-            self._text_model is not None
-            and not _has_any_media(messages, images, videos)
+        if self._text_model is not None and not _has_any_media(
+            messages, images, videos
         ):
             async for output in self._stream_chat_text_model(
                 messages,
@@ -1948,7 +1983,10 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             **kwargs,
         ):
-            accumulated_text = chunk.text
+            accumulated_text = self._accumulate_streamed_text(
+                accumulated_text,
+                chunk,
+            )
             last_chunk = chunk
         if last_chunk is not None:
             return GenerationOutput(
@@ -2246,9 +2284,7 @@ class BatchedEngine(BaseEngine):
                     results = [
                         SimpleNamespace(
                             text=y0_text,
-                            finish_reason=(
-                                "stop" if y0.item() == eos_id else None
-                            ),
+                            finish_reason=("stop" if y0.item() == eos_id else None),
                         )
                     ]
 
@@ -2369,10 +2405,12 @@ class BatchedEngine(BaseEngine):
                         # QuantizedSDPACache: state is nested tuples
                         # ((packed, scales, biases), (packed, scales, biases))
                         k_tuple, v_tuple = state
-                        self._system_kv_snapshot.append((
-                            tuple(mx.array(t) for t in k_tuple),
-                            tuple(mx.array(t) for t in v_tuple),
-                        ))
+                        self._system_kv_snapshot.append(
+                            (
+                                tuple(mx.array(t) for t in k_tuple),
+                                tuple(mx.array(t) for t in v_tuple),
+                            )
+                        )
                     elif isinstance(state, tuple) and len(state) == 2:
                         # KVCache: (keys, values) — copy to detach from cache
                         keys, values = state
@@ -2535,6 +2573,7 @@ class BatchedEngine(BaseEngine):
         # biases))). Walk recursively so every backing array is counted
         # regardless of cache shape.
         if self._system_kv_snapshot is not None:
+
             def _entry_bytes(x):
                 if hasattr(x, "nbytes"):
                     return x.nbytes
@@ -2542,9 +2581,7 @@ class BatchedEngine(BaseEngine):
                     return sum(_entry_bytes(i) for i in x if i is not None)
                 return 0
 
-            cache_bytes = sum(
-                _entry_bytes(e) for e in self._system_kv_snapshot
-            )
+            cache_bytes = sum(_entry_bytes(e) for e in self._system_kv_snapshot)
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,

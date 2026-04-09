@@ -8,6 +8,7 @@ CLAUDE.md Golden Rule 5.
 
 Spec: docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
 """
+
 import asyncio
 import os
 from pathlib import Path
@@ -19,10 +20,12 @@ import pytest_asyncio
 # fix is in place. The fixture below loads the model via mlx_lm; without this
 # patch, the load fails with KeyError('-').
 import sys
+
 _RUNTIME_LIB = "/opt/ai-runtime/lib"
 if _RUNTIME_LIB not in sys.path:
     sys.path.insert(0, _RUNTIME_LIB)
 import runtime_patches
+
 runtime_patches._patch_nemotron_h_mlp_pattern()
 
 from vllm_mlx.engine.batched import BatchedEngine
@@ -74,6 +77,20 @@ def _count_log(caplog, substring: str) -> int:
     return sum(1 for rec in caplog.records if substring in rec.getMessage())
 
 
+def _render_chat_prompt(engine, system_text: str, user_text: str) -> str:
+    prompt = engine.tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert isinstance(prompt, str)
+    assert "<|im_start|>user" in prompt
+    return prompt
+
+
 @pytest.mark.asyncio
 async def test_below_threshold_takes_scheduler_path(nano4b_engine, caplog):
     """A 5-token prompt is below the threshold (16) and should take the
@@ -93,9 +110,9 @@ async def test_below_threshold_takes_scheduler_path(nano4b_engine, caplog):
         last = chunk
 
     assert last is not None and last.text, "scheduler path produced no output"
-    assert not _has_log(caplog, "SpecPrefill text begin"), (
-        "Below-threshold prompt unexpectedly engaged SpecPrefill"
-    )
+    assert not _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "Below-threshold prompt unexpectedly engaged SpecPrefill"
 
 
 @pytest.mark.asyncio
@@ -118,15 +135,53 @@ async def test_above_threshold_takes_specprefill_path(nano4b_engine, caplog):
         last = chunk
 
     assert last is not None and last.text, "SpecPrefill path produced no output"
-    assert _has_log(caplog, "SpecPrefill text begin"), (
-        "Above-threshold prompt did not engage SpecPrefill"
-    )
-    assert _has_log(caplog, "SpecPrefill text phases"), (
-        "SpecPrefill phase timing log missing"
-    )
-    assert _has_log(caplog, "SpecPrefill text end"), (
-        "SpecPrefill end log missing"
-    )
+    assert _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "Above-threshold prompt did not engage SpecPrefill"
+    assert _has_log(
+        caplog, "SpecPrefill text phases"
+    ), "SpecPrefill phase timing log missing"
+    assert _has_log(caplog, "SpecPrefill text end"), "SpecPrefill end log missing"
+
+
+@pytest.mark.asyncio
+async def test_specprefill_stream_outputs_remain_cumulative(nano4b_engine, caplog):
+    """Real SpecPrefill stream outputs should remain cumulative end-to-end.
+
+    This drives the actual _stream_generate_text_specprefill worker queue on a
+    real model and proves that concatenating chunk.new_text reproduces the last
+    chunk.text. If the worker ever enqueues deltas as the cumulative text field,
+    this assertion fails immediately.
+    """
+    caplog.set_level("INFO")
+
+    prompt = "The quick brown fox jumps over the lazy dog. " * 12
+
+    chunks = []
+    async for chunk in nano4b_engine.stream_generate(
+        prompt=prompt,
+        max_tokens=8,
+        temperature=1.0,
+        top_p=0.95,
+        raw_output=True,
+    ):
+        chunks.append(chunk)
+
+    assert chunks and chunks[-1].text, "SpecPrefill path produced no output"
+    assert _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "Expected SpecPrefill engagement for cumulative-stream regression test"
+
+    reconstructed = "".join(chunk.new_text or "" for chunk in chunks)
+    cumulative = [chunk.text for chunk in chunks if chunk.text]
+
+    assert cumulative, "Expected at least one non-empty cumulative text chunk"
+    assert (
+        reconstructed == cumulative[-1]
+    ), "Concatenated deltas did not match final cumulative text"
+    assert all(
+        cumulative[i].startswith(cumulative[i - 1]) for i in range(1, len(cumulative))
+    ), "Observed non-cumulative text regression in SpecPrefill stream outputs"
 
 
 @pytest.mark.asyncio
@@ -147,9 +202,9 @@ async def test_force_enable_bypasses_threshold(nano4b_engine, caplog):
         last = chunk
 
     assert last is not None and last.text
-    assert _has_log(caplog, "SpecPrefill text begin"), (
-        "specprefill=True did not bypass threshold for short prompt"
-    )
+    assert _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "specprefill=True did not bypass threshold for short prompt"
 
 
 @pytest.mark.asyncio
@@ -173,9 +228,9 @@ async def test_force_disable_hard_disables(nano4b_engine, caplog):
         last = chunk
 
     assert last is not None and last.text
-    assert not _has_log(caplog, "SpecPrefill text begin"), (
-        "specprefill=False did not hard-disable for above-threshold prompt"
-    )
+    assert not _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "specprefill=False did not hard-disable for above-threshold prompt"
 
 
 @pytest.mark.asyncio
@@ -199,12 +254,12 @@ async def test_stop_sequences_force_scheduler_path(nano4b_engine, caplog):
         last = chunk
 
     assert last is not None
-    assert not _has_log(caplog, "SpecPrefill text begin"), (
-        "stop sequences did not exclude request from SpecPrefill"
-    )
-    assert not _has_log(caplog, "stop sequences unsupported"), (
-        "Unexpected WARNING for non-force-enabled stop request"
-    )
+    assert not _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "stop sequences did not exclude request from SpecPrefill"
+    assert not _has_log(
+        caplog, "stop sequences unsupported"
+    ), "Unexpected WARNING for non-force-enabled stop request"
 
 
 @pytest.mark.asyncio
@@ -229,13 +284,13 @@ async def test_force_enable_with_stop_warns_and_falls_back(nano4b_engine, caplog
         last = chunk
 
     assert last is not None
-    assert not _has_log(caplog, "SpecPrefill text begin"), (
-        "Force-enable with stop should not engage SpecPrefill"
-    )
+    assert not _has_log(
+        caplog, "SpecPrefill text begin"
+    ), "Force-enable with stop should not engage SpecPrefill"
     warnings = _count_log(caplog, "stop sequences unsupported")
-    assert warnings == 1, (
-        f"Expected exactly 1 'stop sequences unsupported' WARNING, got {warnings}"
-    )
+    assert (
+        warnings == 1
+    ), f"Expected exactly 1 'stop sequences unsupported' WARNING, got {warnings}"
 
 
 @pytest.mark.asyncio
@@ -246,6 +301,7 @@ async def test_concurrent_eligible_requests_serialize(nano4b_engine, caplog):
     then end(A) must also be logged before begin(B).
     """
     import re
+
     caplog.set_level("INFO")
 
     prompt = "The quick brown fox jumps over the lazy dog. " * 12
@@ -266,9 +322,9 @@ async def test_concurrent_eligible_requests_serialize(nano4b_engine, caplog):
         _one_request(),
         _one_request(),
     )
-    assert all(r is not None and r.text for r in results), (
-        "Concurrent SpecPrefill requests did not all complete"
-    )
+    assert all(
+        r is not None and r.text for r in results
+    ), "Concurrent SpecPrefill requests did not all complete"
 
     begin_re = re.compile(r"SpecPrefill text begin req=(\w+)")
     end_re = re.compile(r"SpecPrefill text end req=(\w+)")
@@ -335,14 +391,15 @@ async def test_cancellation_under_lock_releases_cleanly(nano4b_engine, caplog):
 
     # Second request — should complete cleanly with no Metal errors
     result2 = await _gen()
-    assert result2 is not None and result2.text, (
-        "Second request after cancellation did not complete"
-    )
+    assert (
+        result2 is not None and result2.text
+    ), "Second request after cancellation did not complete"
 
     # Verify the second request's begin log appears AFTER the first
     # request's end log (proving the lock was actually held until task1's
     # worker fully released).
     import re
+
     begin_re = re.compile(r"SpecPrefill text begin req=(\w+)")
     end_re = re.compile(r"SpecPrefill text end req=(\w+)")
     events = []  # list of (ts, kind, req_id)
@@ -363,9 +420,9 @@ async def test_cancellation_under_lock_releases_cleanly(nano4b_engine, caplog):
     assert len(events) >= 4, f"expected at least 4 begin/end events, got {events}"
     seq = [(kind, req_id) for _, kind, req_id in events]
     # First two events should be begin/end of the same req_id
-    assert seq[0][0] == "begin" and seq[1][0] == "end" and seq[0][1] == seq[1][1], (
-        f"Lock-release ordering violated: events were {seq}"
-    )
+    assert (
+        seq[0][0] == "begin" and seq[1][0] == "end" and seq[0][1] == seq[1][1]
+    ), f"Lock-release ordering violated: events were {seq}"
 
 
 @pytest.mark.asyncio
@@ -389,13 +446,14 @@ async def test_fallback_on_pre_emission_failure(nano4b_engine, caplog, monkeypat
     ):
         last = chunk
 
-    assert last is not None and last.text, (
-        "Pre-emission fallback did not produce a response"
-    )
+    assert (
+        last is not None and last.text
+    ), "Pre-emission fallback did not produce a response"
     # ERROR log with traceback should be present
     assert any(
         "SpecPrefill (non-MLLM text) failed before first chunk" in rec.getMessage()
-        for rec in caplog.records if rec.levelname == "ERROR"
+        for rec in caplog.records
+        if rec.levelname == "ERROR"
     ), "Expected ERROR log for pre-emission fallback"
 
 
@@ -436,7 +494,8 @@ async def test_post_emission_failure_propagates(nano4b_engine, caplog, monkeypat
     # ERROR log with the propagation message should be present
     assert any(
         "after first chunk emission; propagating error" in rec.getMessage()
-        for rec in caplog.records if rec.levelname == "ERROR"
+        for rec in caplog.records
+        if rec.levelname == "ERROR"
     ), "Expected ERROR log for post-emission propagation"
 
 
@@ -494,9 +553,7 @@ async def test_nemotron_specprefill_end_to_end_with_needle(nano4b_engine, caplog
         last = chunk
 
     assert last is not None
-    assert "NX-4271-NANO" in last.text, (
-        f"Needle not retrieved: {last.text!r}"
-    )
-    assert _has_log(caplog, "sparse="), (
-        "SpecPrefill phase log did not include sparse= field"
-    )
+    assert "NX-4271-NANO" in last.text, f"Needle not retrieved: {last.text!r}"
+    assert _has_log(
+        caplog, "sparse="
+    ), "SpecPrefill phase log did not include sparse= field"

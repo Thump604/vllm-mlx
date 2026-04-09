@@ -3,6 +3,7 @@
 
 import platform
 import sys
+import json
 
 import pytest
 
@@ -189,6 +190,126 @@ class TestChatCompletionRequest:
             "enable_thinking": True,
             "force_nonempty_content": True,
         }
+
+
+class TestReasoningResponseGuards:
+    """Regression coverage for reasoning-parser response assembly."""
+
+    def test_chat_completion_recovers_raw_output_when_parser_returns_empty(
+        self, monkeypatch
+    ):
+        from fastapi.testclient import TestClient
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+
+        class FakeEngine:
+            model_name = "test-model"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def chat(self, messages, **kwargs):
+                return GenerationOutput(
+                    text="NX-4271-NEMO",
+                    prompt_tokens=10,
+                    completion_tokens=11,
+                    finish_reason="stop",
+                )
+
+        class EmptyReasoningParser:
+            def extract_reasoning(self, model_output, request=None):
+                return None, None
+
+        monkeypatch.setattr(srv, "_engine", FakeEngine())
+        monkeypatch.setattr(srv, "_model_name", "test-model")
+        monkeypatch.setattr(srv, "_reasoning_parser", EmptyReasoningParser())
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(srv, "_tool_call_parser", None)
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+
+        client = TestClient(srv.app)
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Reply with NX-4271-NEMO"}],
+                "max_tokens": 16,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["choices"][0]["message"]["content"] == "NX-4271-NEMO"
+        assert payload["choices"][0]["message"]["reasoning"] is None
+
+    def test_streaming_chat_completion_emits_content_for_nemotron_when_thinking_disabled(
+        self, monkeypatch
+    ):
+        from fastapi.testclient import TestClient
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import get_parser
+
+        class FakeEngine:
+            model_name = "nemotron-3-super"
+            is_mllm = False
+            preserve_native_tool_format = False
+
+            async def stream_chat(self, messages, **kwargs):
+                pieces = ["N", "X", "-", "4", "2", "7", "1", "-N", "EM", "O"]
+                text = ""
+                for index, piece in enumerate(pieces, start=1):
+                    text += piece
+                    yield GenerationOutput(
+                        text=text,
+                        prompt_tokens=10,
+                        completion_tokens=index,
+                        new_text=piece,
+                        finished=index == len(pieces),
+                        finish_reason="stop" if index == len(pieces) else None,
+                    )
+
+        monkeypatch.setattr(srv, "_engine", FakeEngine())
+        monkeypatch.setattr(srv, "_model_name", "nemotron-3-super")
+        monkeypatch.setattr(srv, "_reasoning_parser", get_parser("super_v3")())
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(srv, "_tool_call_parser", None)
+        monkeypatch.setattr(srv, "_tool_parser_instance", None)
+
+        client = TestClient(srv.app)
+        content_parts = []
+        reasoning_parts = []
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "nemotron-3-super",
+                "messages": [{"role": "user", "content": "Reply with NX-4271-NEMO"}],
+                "max_tokens": 16,
+                "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        ) as response:
+            assert response.status_code == 200
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    continue
+                chunk = json.loads(payload)
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                    if delta.get("reasoning"):
+                        reasoning_parts.append(delta["reasoning"])
+
+        assert "".join(content_parts) == "NX-4271-NEMO"
+        assert reasoning_parts == []
 
 
 class TestCompletionRequest:

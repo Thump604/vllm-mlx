@@ -169,6 +169,15 @@ def _resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, o
     return merged
 
 
+def _should_force_content_response(request: ChatCompletionRequest) -> bool:
+    """Whether parser output should be coerced back into assistant content."""
+    kwargs = _resolve_chat_template_kwargs(request)
+    return (
+        kwargs.get("enable_thinking") is False
+        or kwargs.get("force_nonempty_content") is True
+    )
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -627,10 +636,7 @@ def _json_safe(value, depth: int = 0):
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item, depth + 1)
-            for key, item in value.items()
-        }
+        return {str(key): _json_safe(item, depth + 1) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item, depth + 1) for item in value]
     if hasattr(value, "to_dict"):
@@ -1334,9 +1340,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     specprefill = _resolve_request_field(request, "specprefill", None)
     if specprefill is not None:
         gen_kwargs["specprefill"] = specprefill
-    specprefill_keep_pct = _resolve_request_field(
-        request, "specprefill_keep_pct", None
-    )
+    specprefill_keep_pct = _resolve_request_field(request, "specprefill_keep_pct", None)
     if specprefill_keep_pct is not None:
         gen_kwargs["specprefill_keep_pct"] = specprefill_keep_pct
 
@@ -1515,13 +1519,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Prepare kwargs
     chat_kwargs = {
-        "max_tokens": _resolve_request_field(request, "max_tokens", _default_max_tokens),
-        "temperature": _resolve_temperature(_resolve_request_field(request, "temperature", None)),
+        "max_tokens": _resolve_request_field(
+            request, "max_tokens", _default_max_tokens
+        ),
+        "temperature": _resolve_temperature(
+            _resolve_request_field(request, "temperature", None)
+        ),
         "top_p": _resolve_top_p(_resolve_request_field(request, "top_p", None)),
         "top_k": _resolve_request_field(request, "top_k", 0) or 0,
         "min_p": _resolve_request_field(request, "min_p", 0.0) or 0.0,
-        "presence_penalty": _resolve_request_field(request, "presence_penalty", 0.0) or 0.0,
-        "repetition_penalty": _resolve_request_field(request, "repetition_penalty", 1.0) or 1.0,
+        "presence_penalty": _resolve_request_field(request, "presence_penalty", 0.0)
+        or 0.0,
+        "repetition_penalty": _resolve_request_field(request, "repetition_penalty", 1.0)
+        or 1.0,
         "stop": request.stop,
     }
 
@@ -1586,8 +1596,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
+    text_to_parse = cleaned_text or output.text
     if _reasoning_parser and not tool_calls:
-        text_to_parse = cleaned_text or output.text
         try:
             reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
                 text_to_parse,
@@ -1597,6 +1607,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
                 text_to_parse
             )
+
+        if _should_force_content_response(request) and not cleaned_text:
+            if reasoning_text:
+                cleaned_text, reasoning_text = reasoning_text, None
+            elif text_to_parse and text_to_parse.strip():
+                cleaned_text = text_to_parse
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
@@ -1649,7 +1665,9 @@ def _responses_input_to_messages(request):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
         for item in inp:
-            item_dict = item if isinstance(item, dict) else item.model_dump(exclude_none=True)
+            item_dict = (
+                item if isinstance(item, dict) else item.model_dump(exclude_none=True)
+            )
             item_type = item_dict.get("type", "message")
 
             if item_type == "message":
@@ -1660,17 +1678,28 @@ def _responses_input_to_messages(request):
                     # Translate input_text → text content parts
                     parts = []
                     for part in content:
-                        p = part if isinstance(part, dict) else (
-                            part.model_dump(exclude_none=True) if hasattr(part, "model_dump") else {"type": "text", "text": str(part)}
+                        p = (
+                            part
+                            if isinstance(part, dict)
+                            else (
+                                part.model_dump(exclude_none=True)
+                                if hasattr(part, "model_dump")
+                                else {"type": "text", "text": str(part)}
+                            )
                         )
                         ptype = p.get("type", "")
                         if ptype == "input_text":
                             parts.append({"type": "text", "text": p.get("text", "")})
                         elif ptype == "input_image":
-                            parts.append({
-                                "type": "image_url",
-                                "image_url": {"url": p.get("image_url", ""), "detail": p.get("detail", "auto")},
-                            })
+                            parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": p.get("image_url", ""),
+                                        "detail": p.get("detail", "auto"),
+                                    },
+                                }
+                            )
                         else:
                             parts.append(p)
                     messages.append({"role": role, "content": parts})
@@ -1679,26 +1708,32 @@ def _responses_input_to_messages(request):
 
             elif item_type == "function_call_output":
                 # Tool result
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": item_dict.get("call_id", ""),
-                    "content": item_dict.get("output", ""),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item_dict.get("call_id", ""),
+                        "content": item_dict.get("output", ""),
+                    }
+                )
 
             elif item_type == "function_call":
                 # Previous assistant tool call (for context)
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": item_dict.get("call_id", ""),
-                        "type": "function",
-                        "function": {
-                            "name": item_dict.get("name", ""),
-                            "arguments": item_dict.get("arguments", "{}"),
-                        },
-                    }],
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": item_dict.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item_dict.get("name", ""),
+                                    "arguments": item_dict.get("arguments", "{}"),
+                                },
+                            }
+                        ],
+                    }
+                )
     return messages
 
 
@@ -1709,14 +1744,16 @@ def _responses_tools_to_chat(tools):
     result = []
     for tool in tools:
         if tool.get("type") == "function":
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": tool.get("name", ""),
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {}),
-                },
-            })
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    },
+                }
+            )
         # Skip non-function tools (web_search, etc.) — not supported
     return result or None
 
@@ -1762,7 +1799,9 @@ async def create_response(raw_request: Request):
     chat_messages = []
     for m in messages:
         if isinstance(m, dict):
-            chat_messages.append(Message(**{k: v for k, v in m.items() if k in Message.model_fields}))
+            chat_messages.append(
+                Message(**{k: v for k, v in m.items() if k in Message.model_fields})
+            )
         else:
             chat_messages.append(m)
 
@@ -1788,8 +1827,11 @@ async def create_response(raw_request: Request):
 
             # response.created
             created_resp = ResponseObject(
-                id=resp_id, model=_model_name, status="in_progress",
-                temperature=request.temperature, top_p=request.top_p,
+                id=resp_id,
+                model=_model_name,
+                status="in_progress",
+                temperature=request.temperature,
+                top_p=request.top_p,
                 max_output_tokens=request.max_output_tokens,
                 instructions=request.instructions,
             )
@@ -1797,9 +1839,13 @@ async def create_response(raw_request: Request):
             seq += 1
 
             # output_item.added (message)
-            msg_item = ResponseOutputMessage(id=msg_id, status="in_progress", content=[
-                ResponseOutputText(text=""),
-            ])
+            msg_item = ResponseOutputMessage(
+                id=msg_id,
+                status="in_progress",
+                content=[
+                    ResponseOutputText(text=""),
+                ],
+            )
             yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'item': msg_item.model_dump(), 'output_index': 0, 'sequence_number': seq})}\n\n"
             seq += 1
 
@@ -1832,9 +1878,7 @@ async def create_response(raw_request: Request):
                 else:
                     msg_dicts.append(dict(m))
 
-            async for chunk in engine.stream_chat(
-                messages=msg_dicts, **chat_kwargs
-            ):
+            async for chunk in engine.stream_chat(messages=msg_dicts, **chat_kwargs):
                 new_text = chunk.new_text if hasattr(chunk, "new_text") else ""
                 if new_text:
                     full_text += new_text
@@ -1862,10 +1906,13 @@ async def create_response(raw_request: Request):
             # response.completed
             total_tokens = prompt_tokens + completion_tokens
             completed_resp = ResponseObject(
-                id=resp_id, model=_model_name, status="completed",
+                id=resp_id,
+                model=_model_name,
+                status="completed",
                 output=[msg_item.model_dump()],
                 output_text=full_text,
-                temperature=request.temperature, top_p=request.top_p,
+                temperature=request.temperature,
+                top_p=request.top_p,
                 max_output_tokens=request.max_output_tokens,
                 instructions=request.instructions,
                 usage=ResponseUsage(
@@ -1914,7 +1961,9 @@ async def create_response(raw_request: Request):
     # Parse tool calls and reasoning
     # Skip tool parsing when no tools requested (avoids NoneType warnings)
     if tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, chat_request
+        )
     else:
         cleaned_text, tool_calls = output.text, None
     reasoning_text = None
@@ -1926,31 +1975,41 @@ async def create_response(raw_request: Request):
                 request=chat_request,
             )
         except TypeError:
-            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(text_to_parse)
+            reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+                text_to_parse
+            )
 
     # Build output items
     output_items = []
 
     # Reasoning item (if present)
     if reasoning_text:
-        output_items.append(ResponseReasoningItem(
-            summary=[{"type": "summary_text", "text": reasoning_text}],
-        ).model_dump())
+        output_items.append(
+            ResponseReasoningItem(
+                summary=[{"type": "summary_text", "text": reasoning_text}],
+            ).model_dump()
+        )
 
     # Tool calls
     if tool_calls:
         for tc in tool_calls:
-            output_items.append(ResponseFunctionCall(
-                call_id=tc.id,
-                name=tc.function.name,
-                arguments=tc.function.arguments,
-            ).model_dump())
+            output_items.append(
+                ResponseFunctionCall(
+                    call_id=tc.id,
+                    name=tc.function.name,
+                    arguments=tc.function.arguments,
+                ).model_dump()
+            )
     else:
         # Text message
-        final_text = clean_output_text(cleaned_text) if cleaned_text else (output.text or "")
-        output_items.append(ResponseOutputMessage(
-            content=[ResponseOutputText(text=final_text)],
-        ).model_dump())
+        final_text = (
+            clean_output_text(cleaned_text) if cleaned_text else (output.text or "")
+        )
+        output_items.append(
+            ResponseOutputMessage(
+                content=[ResponseOutputText(text=final_text)],
+            ).model_dump()
+        )
 
     output_text = ""
     for item in output_items:
@@ -2499,9 +2558,17 @@ async def stream_chat_completion(
         if _reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
-                previous_text, accumulated_text, delta_text
-            )
+            try:
+                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                    previous_text,
+                    accumulated_text,
+                    delta_text,
+                    request=request,
+                )
+            except TypeError:
+                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                    previous_text, accumulated_text, delta_text
+                )
 
             if delta_msg is None:
                 # Skip this chunk (e.g., <think> token itself)
@@ -2522,7 +2589,9 @@ async def stream_chat_completion(
                     tool_accumulated_text += content_delta
                     request_dict = request.model_dump() if request else None
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content_delta,
+                        tool_previous,
+                        tool_accumulated_text,
+                        content_delta,
                         request=request_dict,
                     )
 
@@ -2537,7 +2606,11 @@ async def stream_chat_completion(
                                         delta=ChatCompletionChunkDelta(
                                             reasoning=reasoning,
                                         ),
-                                        finish_reason=output.finish_reason if output.finished else None,
+                                        finish_reason=(
+                                            output.finish_reason
+                                            if output.finished
+                                            else None
+                                        ),
                                     )
                                 ],
                                 usage=get_usage(output) if output.finished else None,
@@ -2616,7 +2689,9 @@ async def stream_chat_completion(
                     tool_accumulated_text += delta_text
                     request_dict = request.model_dump() if request else None
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text,
+                        tool_previous,
+                        tool_accumulated_text,
+                        delta_text,
                         request=request_dict,
                     )
 

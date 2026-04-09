@@ -6,8 +6,11 @@ Tests cover:
 - Parser registry (registration, lookup, listing)
 - Qwen3 parser (non-streaming and streaming)
 - DeepSeek-R1 parser (non-streaming and streaming)
+- SuperV3 / Nemotron parser behavior
 - Edge cases (no tags, partial tags, etc.)
 """
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -264,6 +267,75 @@ class TestDeepSeekR1Parser:
 
         assert "".join(reasoning_parts) == "thinking"
         assert "".join(content_parts) == "answer"
+
+
+class TestSuperV3Parser:
+    """Tests for the Nemotron SuperV3 reasoning parser."""
+
+    @pytest.fixture
+    def parser(self):
+        """Create a fresh SuperV3 parser for each test."""
+        return get_parser("super_v3")()
+
+    def test_extract_plain_output_as_content_when_thinking_disabled(self, parser):
+        """Plain Nemotron output should stay in content when thinking is off."""
+        request = SimpleNamespace(chat_template_kwargs={"enable_thinking": False})
+        reasoning, content = parser.extract_reasoning("NX-4271-NEMO", request=request)
+
+        assert reasoning is None
+        assert content == "NX-4271-NEMO"
+
+    def test_streaming_routes_plain_output_to_content_when_thinking_disabled(
+        self, parser
+    ):
+        """Streaming plain-text output should not be emitted as reasoning."""
+        request = SimpleNamespace(chat_template_kwargs={"enable_thinking": False})
+        accumulated = ""
+        content_parts = []
+        reasoning_parts = []
+
+        for delta in ["N", "X", "-", "4", "2", "7", "1"]:
+            previous = accumulated
+            accumulated += delta
+            result = parser.extract_reasoning_streaming(
+                previous,
+                accumulated,
+                delta,
+                request=request,
+            )
+            if result:
+                if result.content:
+                    content_parts.append(result.content)
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+
+        assert "".join(content_parts) == "NX-4271"
+        assert reasoning_parts == []
+
+    def test_streaming_keeps_reasoning_hidden_when_thinking_enabled(self, parser):
+        """Implicit-thinking Nemotron deltas must stay in reasoning until </think>."""
+        request = SimpleNamespace(chat_template_kwargs={"enable_thinking": True})
+        accumulated = ""
+        content_parts = []
+        reasoning_parts = []
+
+        for delta in ["reasoning ", "body", "</think>", "final", " answer"]:
+            previous = accumulated
+            accumulated += delta
+            result = parser.extract_reasoning_streaming(
+                previous,
+                accumulated,
+                delta,
+                request=request,
+            )
+            if result:
+                if result.content:
+                    content_parts.append(result.content)
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+
+        assert "".join(reasoning_parts) == "reasoning body"
+        assert "".join(content_parts) == "final answer"
 
 
 class TestDeltaMessage:
