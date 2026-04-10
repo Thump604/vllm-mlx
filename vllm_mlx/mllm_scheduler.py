@@ -28,7 +28,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
-
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .mllm_batch_generator import (
@@ -36,9 +35,9 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mllm_cache import MLLMCacheManager
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .mllm_cache import MLLMCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +415,9 @@ class MLLMScheduler:
         self.finished_req_ids.add(request_id)
         self.requests.pop(request_id, None)
 
+        # Clean up streaming detokenizer
+        self._detokenizer_pool.pop(request_id, None)
+
         # Signal output queue
         if request_id in self.output_queues:
             try:
@@ -579,7 +581,7 @@ class MLLMScheduler:
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
-                detok = self._detokenizer_pool.pop(request_id, None)
+                detok = self._detokenizer_pool.get(request_id)
                 if detok is not None:
                     detok.finalize()
                     output.output_text = detok.text
@@ -587,6 +589,7 @@ class MLLMScheduler:
                     output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
+                self._detokenizer_pool.pop(request_id, None)
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -933,6 +936,8 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             self.batch_generator.close()
             self.batch_generator = None
+
+        self._detokenizer_pool.clear()
 
         if self.vision_cache:
             self.vision_cache.clear()
