@@ -330,6 +330,93 @@ class BatchedEngine(BaseEngine):
             return accumulated_text + chunk.new_text
         return accumulated_text
 
+    @staticmethod
+    def _extract_system_kv_prefix(prompt: str) -> tuple[str | None, str, str | None]:
+        """Split a rendered chat prompt into reusable system prefix + suffix.
+
+        Returns `(system_prefix, suffix, prefix_hash)`. When no supported
+        user-turn marker is present, `system_prefix` / `prefix_hash` are None
+        and `suffix` is the full prompt.
+        """
+        import hashlib
+
+        user_markers = ("<|im_start|>user", "<|turn>user")
+        marker_pos = -1
+        for marker in user_markers:
+            marker_pos = prompt.find(marker)
+            if marker_pos > 0:
+                break
+
+        if marker_pos > 0:
+            system_prefix = prompt[:marker_pos]
+            suffix = prompt[marker_pos:]
+            prefix_hash = hashlib.sha256(system_prefix.encode()).hexdigest()[:16]
+            return system_prefix, suffix, prefix_hash
+
+        return None, prompt, None
+
+    @staticmethod
+    def _clone_cache_snapshot_value(value: Any) -> Any:
+        """Detach cache snapshot payloads from live cache objects."""
+        if isinstance(value, dict):
+            return {
+                key: BatchedEngine._clone_cache_snapshot_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(
+                BatchedEngine._clone_cache_snapshot_value(item) for item in value
+            )
+        if isinstance(value, list):
+            return [BatchedEngine._clone_cache_snapshot_value(item) for item in value]
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            import mlx.core as mx
+
+            return mx.array(value)
+        return value
+
+    @classmethod
+    def _snapshot_cache_entry(cls, cache_entry: Any) -> Any:
+        """Capture a cache entry including meta_state when available."""
+        snapshot = {
+            "state": cls._clone_cache_snapshot_value(cache_entry.state),
+        }
+        meta_state = getattr(cache_entry, "meta_state", None)
+        if meta_state is not None:
+            snapshot["meta_state"] = cls._clone_cache_snapshot_value(meta_state)
+        return snapshot
+
+    @classmethod
+    def _restore_cache_snapshot_entry(
+        cls, cache_entry: Any, snapshot_entry: Any
+    ) -> None:
+        """Restore either legacy raw snapshot shapes or dict snapshots."""
+        if isinstance(snapshot_entry, dict):
+            cache_entry.state = cls._clone_cache_snapshot_value(snapshot_entry["state"])
+            meta_state = snapshot_entry.get("meta_state")
+            if meta_state is not None and hasattr(cache_entry, "meta_state"):
+                cache_entry.meta_state = cls._clone_cache_snapshot_value(meta_state)
+            return
+
+        cache_entry.state = cls._clone_cache_snapshot_value(snapshot_entry)
+
+    @classmethod
+    def _snapshot_entry_bytes(cls, value: Any) -> int:
+        """Count backing bytes for legacy and dict-based snapshot entries."""
+        if hasattr(value, "nbytes"):
+            return value.nbytes
+        if isinstance(value, dict):
+            return sum(
+                cls._snapshot_entry_bytes(item)
+                for item in value.values()
+                if item is not None
+            )
+        if isinstance(value, (tuple, list)):
+            return sum(
+                cls._snapshot_entry_bytes(item) for item in value if item is not None
+            )
+        return 0
+
     async def _start_mllm(self) -> None:
         """Start the MLLM engine with MLLMScheduler (continuous batching)."""
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
@@ -1149,11 +1236,10 @@ class BatchedEngine(BaseEngine):
         hand-off via mlx_lm.stream_generate with a pre-filled prompt_cache
         cannot compose with the scheduler's cache lifecycle without teaching
         the scheduler a new cache-ownership protocol — a deliberate v1 scope
-        cut. Eligible requests therefore bypass scheduler prefix-cache reuse
-        by design. See
-        docs/superpowers/specs/2026-04-08-batched-engine-text-specprefill-design.md
-        ("Known regression: prefix cache bypass") for the tradeoff rationale
-        and the planned system-KV-snapshot follow-up.
+        cut. The path still bypasses the scheduler's native prefix cache, but
+        now mirrors `_stream_chat_text_model`'s private system-KV snapshot for
+        shared chat prefixes so repeated requests do not re-prefill the full
+        system prompt on every SpecPrefill-eligible turn.
 
         Cancellation safety follows CLAUDE.md Golden Rule 4: the worker
         thread runs inside asyncio.to_thread; the outer task wraps it in
@@ -1186,6 +1272,50 @@ class BatchedEngine(BaseEngine):
 
         sampler = make_sampler(temp=temperature, top_p=top_p)
         prefill_step_size = self._prefill_step_size
+        system_prefix, suffix, prefix_hash = self._extract_system_kv_prefix(prompt)
+        cache_hit = (
+            prefix_hash is not None
+            and prefix_hash == self._system_kv_hash
+            and self._system_kv_snapshot is not None
+        )
+        sp_offset = self._system_kv_token_count if cache_hit else 0
+        if cache_hit:
+            sp_tokens = self._tokenizer.encode(suffix)
+
+        def _restore_system_kv_snapshot(target_cache) -> None:
+            for layer_idx, snapshot_state in enumerate(self._system_kv_snapshot or []):
+                if layer_idx < len(target_cache):
+                    self._restore_cache_snapshot_entry(
+                        target_cache[layer_idx], snapshot_state
+                    )
+            mx.eval([c.state for c in target_cache if hasattr(c, "state")])
+
+        def _snapshot_system_kv_prefix() -> None:
+            snapshot_cache = make_prompt_cache(self._model)
+            prefix_tokens = self._tokenizer.encode(system_prefix)
+            prefix_ids = mx.array(prefix_tokens)
+
+            for i in range(0, prefix_ids.size, prefill_step_size):
+                chunk = prefix_ids[i : i + prefill_step_size]
+                self._model(chunk[None], cache=snapshot_cache)
+                mx.eval([c.state for c in snapshot_cache if hasattr(c, "state")])
+
+            self._system_kv_snapshot = []
+            for c in snapshot_cache:
+                self._system_kv_snapshot.append(self._snapshot_cache_entry(c))
+
+            self._system_kv_token_count = len(prefix_tokens)
+            self._system_kv_hash = prefix_hash
+
+            cache_bytes = sum(
+                self._snapshot_entry_bytes(entry) for entry in self._system_kv_snapshot
+            )
+            logger.info(
+                "System KV cache: stored %d-token snapshot (%.1f MB), hash=%s",
+                len(prefix_tokens),
+                cache_bytes / 1e6,
+                prefix_hash,
+            )
 
         async with self._text_generation_lock:
             # The begin log MUST be inside the lock scope. Logging it before
@@ -1210,7 +1340,18 @@ class BatchedEngine(BaseEngine):
 
             def _worker() -> None:
                 target_cache = make_prompt_cache(self._model)
+                should_snapshot_prefix = False
                 try:
+                    if cache_hit:
+                        _restore_system_kv_snapshot(target_cache)
+                        logger.info(
+                            "System KV cache HIT: sparse-prefilling %d suffix tokens "
+                            "(skipped %d cached tokens), hash=%s",
+                            len(sp_tokens),
+                            sp_offset,
+                            prefix_hash,
+                        )
+
                     # Phase 1: score with draft
                     t0 = time.monotonic()
                     importance = score_tokens(
@@ -1238,13 +1379,13 @@ class BatchedEngine(BaseEngine):
                         selected,
                         target_cache,
                         step_size=prefill_step_size,
-                        position_offset=0,
+                        position_offset=sp_offset,
                     )
                     t_prefill = time.monotonic() - t0
 
                     logger.info(
                         "SpecPrefill text phases req=%s scored=%d in %.1fs "
-                        "sparse=%d/%d (keep=%.0f%%) in %.1fs",
+                        "sparse=%d/%d (keep=%.0f%%) in %.1fs (offset=%d)",
                         req_id,
                         n_scored,
                         t_score,
@@ -1252,6 +1393,7 @@ class BatchedEngine(BaseEngine):
                         n_scored,
                         n_selected / n_scored * 100,
                         t_prefill,
+                        sp_offset,
                     )
 
                     # Test-only fail injection (pre-emission phase).
@@ -1317,11 +1459,18 @@ class BatchedEngine(BaseEngine):
                             )
                             if resp.finish_reason is not None:
                                 break
+                    should_snapshot_prefix = (
+                        prefix_hash is not None
+                        and system_prefix is not None
+                        and not cache_hit
+                    )
                 except Exception as e:
                     loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
                 finally:
+                    cleaned = False
                     try:
                         cleanup_rope(self._model)
+                        cleaned = True
                     except Exception as cleanup_err:
                         logger.error(
                             "SpecPrefill text cleanup_rope failed req=%s "
@@ -1330,6 +1479,15 @@ class BatchedEngine(BaseEngine):
                             cleanup_err,
                             exc_info=True,
                         )
+                    if should_snapshot_prefix and cleaned:
+                        try:
+                            _snapshot_system_kv_prefix()
+                        except Exception as snapshot_err:
+                            logger.warning(
+                                "Failed to snapshot system KV cache for req=%s: %s",
+                                req_id,
+                                snapshot_err,
+                            )
                     loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
 
             worker = asyncio.ensure_future(asyncio.to_thread(_worker))
@@ -2218,7 +2376,9 @@ class BatchedEngine(BaseEngine):
                         self._system_kv_snapshot
                     ):
                         if layer_idx < len(target_cache):
-                            target_cache[layer_idx].state = snapshot_state
+                            self._restore_cache_snapshot_entry(
+                                target_cache[layer_idx], snapshot_state
+                            )
                     mx.eval([c.state for c in target_cache if hasattr(c, "state")])
 
                 try:
@@ -2265,14 +2425,9 @@ class BatchedEngine(BaseEngine):
                         effective_keep,
                     )
 
-                    # Phase 4: Generate with MTP via stream_generate.
-                    # Match the working SimpleEngine hand-off shape from
-                    # PR #248: convert the first sampled token to a plain
-                    # Python id, then re-enter pipelined decode with a
-                    # 1-token prompt array and the sparse-prefilled cache.
-                    eos_id = self._text_tokenizer.eos_token_id
-                    first_token_id = sampler(logits[:, -1, :]).item()
-                    first_text = self._text_tokenizer.decode([first_token_id])
+                    # Phase 4: Generate with MTP via stream_generate
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
 
                     # Build cache with MTP entries
                     if hasattr(self._text_model, "make_mtp_cache"):
@@ -2282,26 +2437,34 @@ class BatchedEngine(BaseEngine):
                     else:
                         gen_cache = list(target_cache)
 
+                    # y0 was sampled from Phase 3 logits but stream_generate
+                    # consumes it as "prompt", so prepend its text
+                    y0_text = self._text_tokenizer.decode([y0.item()])
+                    eos_id = self._text_tokenizer.eos_token_id
                     results = [
                         SimpleNamespace(
-                            text=first_text,
-                            finish_reason=(
-                                "stop" if first_token_id == eos_id else None
-                            ),
+                            text=y0_text,
+                            finish_reason=("stop" if y0.item() == eos_id else None),
                         )
                     ]
 
-                    if first_token_id != eos_id:
+                    if y0.item() != eos_id:
                         for resp in mlx_stream_generate(
                             self._text_model,
                             self._text_tokenizer,
-                            prompt=mx.array([first_token_id]),
+                            prompt=y0.reshape(-1),
                             max_tokens=max_tokens - 1,
                             sampler=sampler,
                             mtp=_has_mtp,
                             prompt_cache=gen_cache,
+                            prefill_step_size=prefill_step_size,
                         ):
-                            results.append(resp)
+                            results.append(
+                                SimpleNamespace(
+                                    text=resp.text,
+                                    finish_reason=resp.finish_reason,
+                                )
+                            )
 
                     return results, sp_n_total
 
@@ -2322,7 +2485,9 @@ class BatchedEngine(BaseEngine):
                 restored_cache = make_prompt_cache(self._text_model)
                 for layer_idx, snapshot_state in enumerate(self._system_kv_snapshot):
                     if layer_idx < len(restored_cache):
-                        restored_cache[layer_idx].state = snapshot_state
+                        self._restore_cache_snapshot_entry(
+                            restored_cache[layer_idx], snapshot_state
+                        )
                 mx.eval([c.state for c in restored_cache if hasattr(c, "state")])
 
                 # Tokenize just the suffix and generate with the primed cache.
@@ -2397,43 +2562,15 @@ class BatchedEngine(BaseEngine):
                 # Save snapshot: deep copy of each cache layer's state
                 self._system_kv_snapshot = []
                 for c in snapshot_cache:
-                    state = c.state
-                    if getattr(c, "_use_fused_sdpa", False):
-                        # QuantizedSDPACache: state is nested tuples
-                        # ((packed, scales, biases), (packed, scales, biases))
-                        k_tuple, v_tuple = state
-                        self._system_kv_snapshot.append(
-                            (
-                                tuple(mx.array(t) for t in k_tuple),
-                                tuple(mx.array(t) for t in v_tuple),
-                            )
-                        )
-                    elif isinstance(state, tuple) and len(state) == 2:
-                        # KVCache: (keys, values) — copy to detach from cache
-                        keys, values = state
-                        self._system_kv_snapshot.append(
-                            (mx.array(keys), mx.array(values))
-                        )
-                    elif isinstance(state, list):
-                        # ArraysCache: list of arrays (Mamba/hybrid)
-                        self._system_kv_snapshot.append(
-                            [mx.array(a) if a is not None else None for a in state]
-                        )
-                    else:
-                        # Unknown cache type — store as-is
-                        self._system_kv_snapshot.append(state)
+                    self._system_kv_snapshot.append(self._snapshot_cache_entry(c))
 
                 self._system_kv_token_count = len(prefix_tokens)
                 self._system_kv_hash = prefix_hash
 
-                def _entry_bytes(x):
-                    if hasattr(x, "nbytes"):
-                        return x.nbytes
-                    elif isinstance(x, (tuple, list)):
-                        return sum(_entry_bytes(i) for i in x if i is not None)
-                    return 0
-
-                cache_bytes = sum(_entry_bytes(e) for e in self._system_kv_snapshot)
+                cache_bytes = sum(
+                    self._snapshot_entry_bytes(entry)
+                    for entry in self._system_kv_snapshot
+                )
                 logger.info(
                     "System KV cache: stored %d-token snapshot " "(%.1f MB), hash=%s",
                     len(prefix_tokens),
@@ -2570,15 +2707,9 @@ class BatchedEngine(BaseEngine):
         # biases))). Walk recursively so every backing array is counted
         # regardless of cache shape.
         if self._system_kv_snapshot is not None:
-
-            def _entry_bytes(x):
-                if hasattr(x, "nbytes"):
-                    return x.nbytes
-                if isinstance(x, (tuple, list)):
-                    return sum(_entry_bytes(i) for i in x if i is not None)
-                return 0
-
-            cache_bytes = sum(_entry_bytes(e) for e in self._system_kv_snapshot)
+            cache_bytes = sum(
+                self._snapshot_entry_bytes(entry) for entry in self._system_kv_snapshot
+            )
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,

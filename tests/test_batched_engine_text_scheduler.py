@@ -174,6 +174,7 @@ def test_hybrid_cache_text_chat_routes_through_serial_mllm_instance():
     """Hybrid-cache models (e.g. Gemma 4 RotatingKVCache) bypass MLLM
     continuous batching due to vllm-mlx #159 and route text-only chat
     through the serial _mllm_instance.chat path."""
+
     async def _run():
         engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
@@ -211,6 +212,7 @@ def test_hybrid_cache_text_chat_routes_through_serial_mllm_instance():
 
 def test_hybrid_cache_text_chat_forwards_kwargs_to_mllm_instance():
     """Hybrid-cache route must forward sampling and template kwargs."""
+
     async def _run():
         engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
@@ -249,6 +251,7 @@ def test_hybrid_cache_text_stream_chat_routes_through_serial_mllm_instance():
     """Hybrid-cache stream_chat path pumps the synchronous mlx_vlm
     stream_chat generator through an asyncio queue and yields
     GenerationOutput chunks back to the caller."""
+
     async def _run():
         engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
@@ -295,6 +298,7 @@ def test_hybrid_cache_text_stream_chat_routes_through_serial_mllm_instance():
 
 def test_hybrid_cache_routes_only_text_only_requests():
     """Image requests on hybrid-cache models still go through MLLMScheduler."""
+
     async def _run():
         engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
         engine._loaded = True
@@ -446,8 +450,7 @@ def test_get_stats_survives_text_scheduler_failure():
 
 
 def test_get_stats_handles_quantized_kv_snapshot():
-    """Regression: get_stats() must walk nested-tuple QuantizedSDPACache
-    snapshots without crashing on entry[0].nbytes.
+    """Regression: get_stats() must walk legacy and dict-wrapped snapshots.
 
     A QuantizedSDPACache snapshot entry is shaped
     ((packed, scales, biases), (packed, scales, biases)) — i.e. entry[0] is
@@ -457,6 +460,10 @@ def test_get_stats_handles_quantized_kv_snapshot():
     on the very first request once a system prefix had been snapshotted on
     a model with --kv-quantize, which left /v1/status reporting
     'status: degraded' on Qwen 3.5 122B.
+
+    Session 93's rotating-cache snapshot fix wraps new snapshot entries in
+    {"state": ..., "meta_state": ...}; stats must still count only backing
+    array bytes and ignore string/int metadata.
     """
     engine = _make_engine()
     engine._mllm_scheduler = None
@@ -483,10 +490,10 @@ def test_get_stats_handles_quantized_kv_snapshot():
     list_layer = [_Arr(8192), None, _Arr(8192)]
 
     engine._system_kv_snapshot = [
-        quant_layer_a,
-        quant_layer_b,
-        plain_layer,
-        list_layer,
+        {"state": quant_layer_a, "meta_state": ("0", "4", "2", "2")},
+        {"state": quant_layer_b, "meta_state": ("0", "4", "4", "4")},
+        {"state": plain_layer},
+        {"state": list_layer, "meta_state": None},
     ]
     engine._system_kv_token_count = 128
     engine._system_kv_hash = "deadbeef"

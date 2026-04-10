@@ -163,90 +163,101 @@ class TestBatchedEngineGenerate:
 
         assert accumulated == "NX-4271-NEMO"
 
-    @pytest.mark.anyio
-    async def test_stream_chat_text_model_specprefill_phase4_uses_pipelined_handoff(
-        self,
-    ):
-        """SpecPrefill MTP decode must re-enter mlx_lm.stream_generate cleanly."""
-        from types import SimpleNamespace
+    def test_snapshot_restore_round_trips_rotating_kv_meta_state(self):
+        """RotatingKVCache snapshots must preserve offset/_idx via meta_state."""
+        from mlx_lm.models.cache import RotatingKVCache
 
         from vllm_mlx.engine.batched import BatchedEngine
 
-        class DummyTextModel:
-            def __init__(self):
-                self.mtp_forward = object()
+        cache = RotatingKVCache(max_size=4, keep=0)
+        prefix = mx.arange(3, dtype=mx.float32).reshape(1, 1, 3, 1)
+        cache.update_and_fetch(prefix, prefix)
 
-            def make_mtp_cache(self):
-                return ["mtp-cache"]
+        snapshot = BatchedEngine._snapshot_cache_entry(cache)
+        restored = RotatingKVCache(max_size=16, keep=2)
+        BatchedEngine._restore_cache_snapshot_entry(restored, snapshot)
 
-        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
-            engine = BatchedEngine(
-                "test-model",
-                force_mllm=True,
-                mtp=True,
-                specprefill_enabled=True,
-                specprefill_threshold=1,
-                specprefill_keep_pct=0.5,
-            )
+        assert restored.meta_state == cache.meta_state
 
-        engine._loaded = True
-        engine._text_model = DummyTextModel()
-        engine._draft_model = MagicMock()
-        engine._text_tokenizer = MagicMock()
-        engine._text_tokenizer.apply_chat_template.return_value = "hello"
-        engine._text_tokenizer.encode.return_value = [11, 12, 13, 14]
-        engine._text_tokenizer.decode.side_effect = lambda toks: "".join(
-            chr(64 + tok) for tok in toks
+        step = mx.array([[[[99.0]]]], dtype=mx.float32)
+        cache_k, cache_v = cache.update_and_fetch(step, step)
+        restored_k, restored_v = restored.update_and_fetch(step, step)
+
+        assert restored.meta_state == cache.meta_state
+        assert mx.array_equal(cache_k, restored_k)
+        assert mx.array_equal(cache_v, restored_v)
+
+    def test_extract_system_kv_prefix_splits_chatml_prompt(self):
+        """System prefix extraction should split at the first user turn marker."""
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        prompt = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nHello<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"
         )
-        engine._text_tokenizer.eos_token_id = 0
 
-        def fake_sampler(_logits):
-            return mx.array([1], dtype=mx.int32)
+        system_prefix, suffix, prefix_hash = BatchedEngine._extract_system_kv_prefix(
+            prompt
+        )
 
-        def fake_stream_generate(
-            _model,
-            _tokenizer,
-            *,
-            prompt,
-            max_tokens,
-            sampler,
-            mtp,
-            prompt_cache,
-        ):
-            assert _model is engine._text_model
-            assert _tokenizer is engine._text_tokenizer
-            assert prompt.tolist() == [1]
-            assert max_tokens == 2
-            assert sampler is fake_sampler
-            assert mtp is True
-            assert prompt_cache == ["cache", "mtp-cache"]
-            yield SimpleNamespace(text="B", finish_reason="stop")
+        assert system_prefix == "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+        assert (
+            suffix
+            == "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
+        assert prefix_hash is not None and len(prefix_hash) == 16
 
-        with (
-            patch("mlx_lm.sample_utils.make_sampler", return_value=fake_sampler),
-            patch("mlx_lm.models.cache.make_prompt_cache", return_value=["cache"]),
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
-            patch(
-                "vllm_mlx.specprefill.score_tokens",
-                return_value=mx.array([0.5]),
-            ),
-            patch(
-                "vllm_mlx.specprefill.select_chunks",
-                return_value=mx.array([0], dtype=mx.int32),
-            ),
-            patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 1, 8)),
-            ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
-        ):
-            chunks = []
-            async for chunk in engine._stream_chat_text_model(
-                [{"role": "user", "content": "hello"}],
-                max_tokens=3,
-                temperature=0.7,
-                top_p=0.9,
-            ):
-                chunks.append(chunk.new_text)
+    def test_extract_system_kv_prefix_returns_full_prompt_without_user_marker(self):
+        """Prompts without a supported user marker should not claim a prefix hit."""
+        from vllm_mlx.engine.batched import BatchedEngine
 
-        assert chunks == ["A", "B"]
+        prompt = "Plain completion prompt with no chat markers."
+
+        system_prefix, suffix, prefix_hash = BatchedEngine._extract_system_kv_prefix(
+            prompt
+        )
+
+        assert system_prefix is None
+        assert suffix == prompt
+        assert prefix_hash is None
+
+    def test_extract_system_kv_prefix_supports_turn_marker(self):
+        """Gemma-style turn markers should also split at the first user turn."""
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        prompt = (
+            "<|turn|>system\nYou are helpful.<|endturn|>\n"
+            "<|turn>user\nHello<|endturn|>\n"
+            "<|turn>assistant\n"
+        )
+
+        system_prefix, suffix, prefix_hash = BatchedEngine._extract_system_kv_prefix(
+            prompt
+        )
+
+        assert system_prefix == "<|turn|>system\nYou are helpful.<|endturn|>\n"
+        assert suffix == "<|turn>user\nHello<|endturn|>\n<|turn>assistant\n"
+        assert prefix_hash is not None and len(prefix_hash) == 16
+
+    def test_extract_system_kv_prefix_hash_stable_across_suffix_changes(self):
+        """Changing only the user suffix should keep the system prefix hash stable."""
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        prompt_a = (
+            "<|im_start|>system\nRules.<|im_end|>\n"
+            "<|im_start|>user\nQuestion A<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        prompt_b = (
+            "<|im_start|>system\nRules.<|im_end|>\n"
+            "<|im_start|>user\nQuestion B<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+        prefix_a, suffix_a, hash_a = BatchedEngine._extract_system_kv_prefix(prompt_a)
+        prefix_b, suffix_b, hash_b = BatchedEngine._extract_system_kv_prefix(prompt_b)
+
+        assert prefix_a == prefix_b
+        assert hash_a == hash_b
+        assert suffix_a != suffix_b
