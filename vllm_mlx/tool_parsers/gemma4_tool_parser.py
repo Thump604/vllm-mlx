@@ -49,40 +49,40 @@ def _parse_gemma4_params(param_str: str) -> dict:
     current = []
     pairs = []
     for ch in s:
-        if ch == PLACEHOLDER[0] and s[len(current):].startswith(PLACEHOLDER):
+        if ch == PLACEHOLDER[0] and s[len(current) :].startswith(PLACEHOLDER):
             in_string = not in_string
             current.append(ch)
-        elif ch == '{' and not in_string:
+        elif ch == "{" and not in_string:
             depth += 1
             current.append(ch)
-        elif ch == '}' and not in_string:
+        elif ch == "}" and not in_string:
             depth -= 1
             current.append(ch)
-        elif ch == ',' and depth == 0 and not in_string:
-            pairs.append(''.join(current).strip())
+        elif ch == "," and depth == 0 and not in_string:
+            pairs.append("".join(current).strip())
             current = []
         else:
             current.append(ch)
     if current:
-        pairs.append(''.join(current).strip())
+        pairs.append("".join(current).strip())
 
     for pair in pairs:
-        if ':' not in pair:
+        if ":" not in pair:
             continue
-        key, _, val = pair.partition(':')
+        key, _, val = pair.partition(":")
         key = key.strip()
         val = val.strip()
 
         # Restore escaped quotes and extract string value
-        val = val.replace(PLACEHOLDER, '')
+        val = val.replace(PLACEHOLDER, "")
         if not val:
             val = val  # empty string
         # Try numeric/bool conversion
-        elif val.lower() == 'true':
+        elif val.lower() == "true":
             val = True
-        elif val.lower() == 'false':
+        elif val.lower() == "false":
             val = False
-        elif val.lower() == 'null':
+        elif val.lower() == "null":
             val = None
         else:
             try:
@@ -99,7 +99,7 @@ def _parse_gemma4_params(param_str: str) -> dict:
 
 # Pattern: <|tool_call>call:function_name{params}<tool_call|>
 GEMMA4_TOOL_PATTERN = re.compile(
-    r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+    r"<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>",
     re.DOTALL,
 )
 
@@ -129,11 +129,13 @@ class Gemma4ToolParser(ToolParser):
             param_str = match.group(2)
             arguments = _parse_gemma4_params(param_str)
 
-            tool_calls.append({
-                "id": _generate_tool_id(),
-                "name": func_name,
-                "arguments": json.dumps(arguments),
-            })
+            tool_calls.append(
+                {
+                    "id": _generate_tool_id(),
+                    "name": func_name,
+                    "arguments": json.dumps(arguments),
+                }
+            )
             cleaned_text = cleaned_text.replace(match.group(0), "").strip()
 
         return ExtractedToolCallInformation(
@@ -162,7 +164,10 @@ class Gemma4ToolParser(ToolParser):
                             "index": i,
                             "id": tc["id"],
                             "type": "function",
-                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments"],
+                            },
                         }
                         for i, tc in enumerate(result.tool_calls)
                     ]

@@ -45,7 +45,9 @@ _CONTROL_TOKENS = (
     "<tool_response|>",
 )
 _CONTROL_TOKEN_RE = re.compile(
-    "|".join(re.escape(token) for token in sorted(_CONTROL_TOKENS, key=len, reverse=True))
+    "|".join(
+        re.escape(token) for token in sorted(_CONTROL_TOKENS, key=len, reverse=True)
+    )
 )
 _CONTROL_LINE_RE = re.compile(r"(?m)^[ \t]*(?://)?thought[ \t]*$")
 _INLINE_THOUGHT_SUFFIX_RE = re.compile(r"(?m)//thought[ \t]*$")
@@ -148,7 +150,9 @@ class Gemma4ReasoningParser(ReasoningParser):
 
     @staticmethod
     def _truncate_at_first_marker(text: str, markers: tuple[str, ...]) -> str:
-        cut_positions = [idx for idx in (text.find(marker) for marker in markers) if idx >= 0]
+        cut_positions = [
+            idx for idx in (text.find(marker) for marker in markers) if idx >= 0
+        ]
         if not cut_positions:
             return text
         return text[: min(cut_positions)]
@@ -206,6 +210,6 @@ class Gemma4ReasoningParser(ReasoningParser):
         if current == previous:
             return None
         if current.startswith(previous):
-            delta = current[len(previous):]
+            delta = current[len(previous) :]
             return delta or None
         return None

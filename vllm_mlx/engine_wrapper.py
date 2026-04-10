@@ -5,6 +5,7 @@ Decouples the TextBatchScheduler from BatchGenerator internals so that
 upstream API changes (e.g. class renames, signature changes) only affect
 this wrapper, not the scheduler logic.
 """
+
 from typing import Any, Callable, List, Optional
 
 

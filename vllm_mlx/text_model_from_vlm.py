@@ -125,7 +125,9 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             def _class_predicate(path, module):
                 if not hasattr(module, "to_quantized"):
                     return False
-                return _resolve_quantization_recipe(path, quantization, all_weight_names)
+                return _resolve_quantization_recipe(
+                    path, quantization, all_weight_names
+                )
 
             nn.quantize(
                 text_model,

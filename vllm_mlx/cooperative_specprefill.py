@@ -91,7 +91,9 @@ class RopeAdjustedCache:
         if hasattr(self._cache, "size"):
             return self._cache.size()
         actual_offset = getattr(self._cache, "offset", 0)
-        return int(actual_offset.item() if hasattr(actual_offset, "item") else actual_offset)
+        return int(
+            actual_offset.item() if hasattr(actual_offset, "item") else actual_offset
+        )
 
     def empty(self):
         if hasattr(self._cache, "empty"):
@@ -127,7 +129,9 @@ class RopeAdjustedCache:
         other_adjustment = (
             other._adjustment if isinstance(other, RopeAdjustedCache) else 0
         )
-        if isinstance(self._adjustment, mx.array) or isinstance(other_adjustment, mx.array):
+        if isinstance(self._adjustment, mx.array) or isinstance(
+            other_adjustment, mx.array
+        ):
             left = (
                 self._adjustment
                 if isinstance(self._adjustment, mx.array)
@@ -321,7 +325,9 @@ class ChunkedDraftScorer:
         if self._done:
             return 0
         prefill_remaining = max(len(self._tokens) - self._prefill_processed, 0)
-        prefill_chunks = math.ceil(prefill_remaining / self._chunk_size) if prefill_remaining else 0
+        prefill_chunks = (
+            math.ceil(prefill_remaining / self._chunk_size) if prefill_remaining else 0
+        )
         lookahead_remaining = max(self._n_lookahead - self._lookahead_steps, 0)
         return prefill_chunks + lookahead_remaining
 
@@ -358,7 +364,7 @@ class ChunkedDraftScorer:
             if remaining > self._chunk_size + 1:
                 end = self._prefill_processed + self._chunk_size
                 self._draft_model(
-                    prompt[self._prefill_processed:end][None],
+                    prompt[self._prefill_processed : end][None],
                     cache=self._cache,
                 )
                 mx.eval([c.state for c in self._cache])
@@ -367,7 +373,7 @@ class ChunkedDraftScorer:
                 return False
 
             self._logits = self._draft_model(
-                prompt[self._prefill_processed:][None],
+                prompt[self._prefill_processed :][None],
                 cache=self._cache,
             )
             self._prefill_processed = len(self._tokens)
@@ -398,10 +404,13 @@ class ChunkedDraftScorer:
 
     def finalize(self):
         if not self._done:
-            raise RuntimeError("Cannot finalize ChunkedDraftScorer before scoring completes")
+            raise RuntimeError(
+                "Cannot finalize ChunkedDraftScorer before scoring completes"
+            )
 
         attn_caches = [
-            self._cache[self._layer_to_cache[layer_idx]] for layer_idx in self._attn_indices
+            self._cache[self._layer_to_cache[layer_idx]]
+            for layer_idx in self._attn_indices
         ]
         importance = _compute_importance(
             self._query_buffer,
@@ -467,7 +476,11 @@ class ChunkedSparsePrefiller:
 
     @property
     def selected_token_count(self) -> int:
-        return 0 if self._selected_positions is None else int(self._selected_positions.shape[0])
+        return (
+            0
+            if self._selected_positions is None
+            else int(self._selected_positions.shape[0])
+        )
 
     @property
     def cache_token_count(self) -> int:
@@ -477,7 +490,9 @@ class ChunkedSparsePrefiller:
         if hasattr(first, "size"):
             return int(first.size())
         actual_offset = getattr(first, "_cache", first).offset
-        return int(actual_offset.item() if hasattr(actual_offset, "item") else actual_offset)
+        return int(
+            actual_offset.item() if hasattr(actual_offset, "item") else actual_offset
+        )
 
     def _ensure_initialized(self) -> None:
         if self._selected_tokens is not None:
@@ -498,9 +513,13 @@ class ChunkedSparsePrefiller:
         if max_rotating_size > 0:
             tail_start = max(0, total_prompt_tokens - max_rotating_size)
             tail_indices = set(range(tail_start, total_prompt_tokens))
-            selected_indices = mx.array(sorted(set(selected_indices.tolist()) | tail_indices))
+            selected_indices = mx.array(
+                sorted(set(selected_indices.tolist()) | tail_indices)
+            )
 
-        self._selected_positions = selected_indices.astype(mx.int32) + self._position_offset
+        self._selected_positions = (
+            selected_indices.astype(mx.int32) + self._position_offset
+        )
         self._selected_tokens = tokens[selected_indices]
 
         layer_to_cache = _build_layer_to_cache_map(self._model)
@@ -511,9 +530,7 @@ class ChunkedSparsePrefiller:
             if isinstance(self._cache[first_attn_cache_idx], RopeAdjustedCache)
             else self._cache[first_attn_cache_idx]
         )
-        self._cache_start = (
-            base_cache.offset if hasattr(base_cache, "offset") else 0
-        )
+        self._cache_start = base_cache.offset if hasattr(base_cache, "offset") else 0
 
         if self._has_rope:
             for layer_idx, layer in self._attn_layers:
@@ -547,19 +564,25 @@ class ChunkedSparsePrefiller:
 
         if remaining > self._step_size + 1:
             end = self._processed + self._step_size
-            self._model(self._selected_tokens[self._processed:end][None], cache=self._cache)
+            self._model(
+                self._selected_tokens[self._processed : end][None], cache=self._cache
+            )
             mx.eval([c.state for c in self._cache])
             mx.clear_cache()
             self._processed = end
             return False
 
-        self._logits = self._model(self._selected_tokens[self._processed:][None], cache=self._cache)
+        self._logits = self._model(
+            self._selected_tokens[self._processed :][None], cache=self._cache
+        )
         mx.eval(self._logits)
         self._processed = int(self._selected_tokens.shape[0])
 
         total_prompt_len = self._position_offset + len(self._tokens)
         final_cache_offset = int(
-            self._cache_start.item() if hasattr(self._cache_start, "item") else self._cache_start
+            self._cache_start.item()
+            if hasattr(self._cache_start, "item")
+            else self._cache_start
         ) + int(self._selected_tokens.shape[0])
         self._adjustment = int(total_prompt_len) - int(final_cache_offset)
 
@@ -572,7 +595,9 @@ class ChunkedSparsePrefiller:
 
     def finalize(self) -> tuple[Any, list[Any]]:
         if not self._done:
-            raise RuntimeError("Cannot finalize ChunkedSparsePrefiller before prefill completes")
+            raise RuntimeError(
+                "Cannot finalize ChunkedSparsePrefiller before prefill completes"
+            )
         return self._logits, self._wrapped_cache
 
     def cleanup(self) -> None:
@@ -674,7 +699,9 @@ class CooperativeSpecPrefillSession:
 
     def finalize(self) -> CooperativeSpecPrefillResult:
         if self._result is None:
-            raise RuntimeError("Cannot finalize cooperative SpecPrefill before completion")
+            raise RuntimeError(
+                "Cannot finalize cooperative SpecPrefill before completion"
+            )
         return self._result
 
     def cleanup(self) -> None:
