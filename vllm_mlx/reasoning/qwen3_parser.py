@@ -23,6 +23,14 @@ _DRAFT_MARKER_RE = re.compile(
 _DRAFT_SECTION_RE = re.compile(
     r"(?ims)^\*Draft(?:\s+\d+)?:\*\s*(.+?)(?=^\*(?:Word Count Check|Constraints Check):\*|^\d+\.\s+\*\*|^\*\*[^*]+:\*\*|\Z)"
 )
+_ANSWER_MARKER_RE = re.compile(
+    r"(?ims)(?:^|\n)\s*(?:final answer|answer|response)\s*:\s*([^\n]+)"
+)
+_ANSWER_SENTENCE_RE = re.compile(
+    r"(?ims)\b(?:the|therefore,\s*the|so,\s*the)?\s*"
+    r"(?:final\s+)?(?:answer|phrase|secret(?:[_ ]?phrase)?|code)\s+is\s+"
+    r"(`[^`]+`|\"[^\"]+\"|'[^']+'|[^\n]+?)(?=(?:\.\s*$|[.!?]\s|\n|$))"
+)
 _LISTY_PARAGRAPH_RE = re.compile(r"^\s*(?:\d+\.\s|[-*]\s|\*\*[^*]+:\*\*)")
 _RECOVERY_HINTS = (
     "the user wants me to",
@@ -84,12 +92,14 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         """
         # If no end token at all, treat as pure content
         if self.end_token not in model_output:
-            reasoning, content = self._extract_plaintext_reasoning(model_output, request=request)
-            return self._recover_final_content(reasoning, content)
+            reasoning, content = self._extract_plaintext_reasoning(
+                model_output, request=request
+            )
+            return self._recover_final_content(reasoning, content, request=request)
 
         # Use base class implementation (handles both explicit and implicit)
         reasoning, content = super().extract_reasoning(model_output)
-        return self._recover_final_content(reasoning, content)
+        return self._recover_final_content(reasoning, content, request=request)
 
     def _extract_plaintext_reasoning(
         self,
@@ -126,6 +136,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if content is None:
             kwargs = getattr(request, "chat_template_kwargs", None) or {}
             if kwargs.get("force_nonempty_content") is True:
+                recovered = self._extract_reasoning_answer(body)
+                if recovered:
+                    return body, recovered
                 return None, body
             return body, None
 
@@ -135,6 +148,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         self,
         reasoning: str | None,
         content: str | None,
+        request=None,
     ) -> tuple[str | None, str | None]:
         """Promote the final draft from reasoning when visible content is junk.
 
@@ -142,13 +156,23 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         emitted reasoning with no visible answer (e.g. ``<think>X</think>``).
         Respect that and do not promote reasoning to content.
         """
+        kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if not content:
+            if kwargs.get("force_nonempty_content") is True:
+                recovered = self._extract_reasoning_answer(reasoning)
+                if recovered:
+                    return reasoning, recovered
+                if reasoning:
+                    return None, reasoning
             return reasoning, content
         if not self._content_needs_recovery(content):
             return reasoning, content
 
         for text in (reasoning, content):
             recovered = self._extract_draft_content(text)
+            if recovered:
+                return reasoning, recovered
+            recovered = self._extract_reasoning_answer(text)
             if recovered:
                 return reasoning, recovered
 
@@ -179,6 +203,18 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 return candidate
         return None
 
+    def _extract_reasoning_answer(self, text: str | None) -> str | None:
+        if not text:
+            return None
+
+        for pattern in (_ANSWER_MARKER_RE, _ANSWER_SENTENCE_RE):
+            matches = list(pattern.finditer(text))
+            for match in reversed(matches):
+                candidate = self._normalize_answer_candidate(match.group(1))
+                if candidate:
+                    return candidate
+        return None
+
     def _normalize_candidate(self, text: str | None) -> str | None:
         if not text:
             return None
@@ -190,7 +226,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             lower = stripped.lower()
             if _LISTY_PARAGRAPH_RE.match(stripped):
                 continue
-            if lower.startswith("*word count check:*") or lower.startswith("*constraints check:*"):
+            if lower.startswith("*word count check:*") or lower.startswith(
+                "*constraints check:*"
+            ):
                 continue
             lines.append(stripped)
 
@@ -201,3 +239,19 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         if self._content_needs_recovery(candidate):
             return None
         return candidate
+
+    def _normalize_answer_candidate(self, text: str | None) -> str | None:
+        candidate = self._normalize_candidate(text)
+        if not candidate:
+            return None
+
+        candidate = candidate.strip().strip("`")
+        if (
+            len(candidate) >= 2
+            and candidate[0] == candidate[-1]
+            and candidate[0] in "\"'"
+        ):
+            candidate = candidate[1:-1].strip()
+        if candidate.endswith((".", "!", "?")) and candidate.count(" ") <= 6:
+            candidate = candidate[:-1].rstrip()
+        return candidate or None

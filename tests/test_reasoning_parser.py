@@ -135,6 +135,35 @@ class TestQwen3Parser:
         assert "Gather evidence" in reasoning
         assert content == "The production priority is deterministic state management."
 
+    def test_force_nonempty_recovers_answer_from_reasoning_only_output(self, parser):
+        """force_nonempty_content should recover an answer-only payload first."""
+        output = (
+            "<think>"
+            "1. Scan the passage carefully.\n\n"
+            "2. Verify the marker.\n\n"
+            "The phrase is `MARMALOID_XYZ_42`."
+            "</think>"
+        )
+        request = SimpleNamespace(chat_template_kwargs={"force_nonempty_content": True})
+
+        reasoning, content = parser.extract_reasoning(output, request=request)
+
+        assert reasoning is not None
+        assert "Scan the passage" in reasoning
+        assert content == "MARMALOID_XYZ_42"
+
+    def test_force_nonempty_falls_back_to_full_reasoning_when_no_answer_marker(
+        self, parser
+    ):
+        """force_nonempty_content should keep the old non-empty fallback contract."""
+        output = "<think>Still thinking through the possibilities.</think>"
+        request = SimpleNamespace(chat_template_kwargs={"force_nonempty_content": True})
+
+        reasoning, content = parser.extract_reasoning(output, request=request)
+
+        assert reasoning is None
+        assert content == "Still thinking through the possibilities."
+
     def test_only_start_tag_no_reasoning(self, parser):
         """Qwen3 requires both tags - missing end tag means no reasoning."""
         output = "<think>Started thinking but never finished"
