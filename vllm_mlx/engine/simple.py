@@ -226,6 +226,23 @@ class SimpleEngine(BaseEngine):
         self._system_kv_token_count = 0
         logger.info("SimpleEngine stopped")
 
+    async def _run_blocking_serialized(self, func, /, *args, **kwargs):
+        """Run a blocking MLX operation under the generation lock.
+
+        Cancellation must not release the async lock before the worker thread
+        finishes, or a follow-up request can overlap MLX/Metal work.
+        """
+        async with self._generation_lock:
+            task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                try:
+                    await task
+                except BaseException:
+                    pass
+                raise
+
     async def generate(
         self,
         prompt: str,
@@ -488,47 +505,30 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        async with self._generation_lock:
-            if self._is_mllm:
-                # For MLLM, use the chat method which handles images/videos
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    tools=template_tools,
-                    chat_template_kwargs=chat_template_kwargs,
-                    **kwargs,
-                )
-                text = output.text if raw_output else clean_output_text(output.text)
-                return GenerationOutput(
-                    text=text,
-                    prompt_tokens=output.prompt_tokens,
-                    completion_tokens=output.completion_tokens,
-                    finish_reason=output.finish_reason,
-                )
-            else:
-                # For LLM, use the chat method
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    tools=template_tools,
-                    chat_template_kwargs=chat_template_kwargs,
-                    **kwargs,
-                )
-                text = output.text if raw_output else clean_output_text(output.text)
-                return GenerationOutput(
-                    text=text,
-                    tokens=output.tokens,
-                    completion_tokens=len(output.tokens),
-                    finish_reason=output.finish_reason,
-                )
+        output = await self._run_blocking_serialized(
+            self._model.chat,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            tools=template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            **kwargs,
+        )
+        text = output.text if raw_output else clean_output_text(output.text)
+        if self._is_mllm:
+            return GenerationOutput(
+                text=text,
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                finish_reason=output.finish_reason,
+            )
+        return GenerationOutput(
+            text=text,
+            tokens=output.tokens,
+            completion_tokens=len(output.tokens),
+            finish_reason=output.finish_reason,
+        )
 
     async def stream_chat(
         self,
@@ -589,49 +589,46 @@ class SimpleEngine(BaseEngine):
         if self._is_mllm:
             if self._text_model is not None:
                 logger.info("Media request → MLLM path")
+
             # For MLLM, use stream_chat which yields tokens incrementally.
-            # Must hold _generation_lock to prevent concurrent Metal access
-            # (e.g. OpenCode sends title + main request simultaneously).
-            async with self._generation_lock:
-                accumulated_text = ""
-                token_count = 0
-
-                # Run stream_chat in thread pool since it's synchronous
-                def run_stream():
-                    local_kwargs = dict(kwargs)
-                    if chat_template_kwargs:
-                        local_kwargs["chat_template_kwargs"] = chat_template_kwargs
-                    return list(
-                        self._model.stream_chat(
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            tools=template_tools,
-                            **local_kwargs,
-                        )
+            # Keep the full blocking run serialized under one helper.
+            def run_stream():
+                local_kwargs = dict(kwargs)
+                if chat_template_kwargs:
+                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
+                return list(
+                    self._model.stream_chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        tools=template_tools,
+                        **local_kwargs,
                     )
+                )
 
-                chunks = await asyncio.to_thread(run_stream)
+            chunks = await self._run_blocking_serialized(run_stream)
+            accumulated_text = ""
+            token_count = 0
 
-                for chunk in chunks:
-                    token_count += 1
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    accumulated_text += new_text
+            for chunk in chunks:
+                token_count += 1
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                accumulated_text += new_text
 
-                    finished = chunk.finish_reason is not None
+                finished = chunk.finish_reason is not None
 
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                        completion_tokens=token_count,
-                        finished=finished,
-                        finish_reason=chunk.finish_reason if finished else None,
-                    )
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=chunk.finish_reason if finished else None,
+                )
 
-                    if finished:
-                        break
+                if finished:
+                    break
             return
 
         # For LLM, apply chat template and stream
@@ -701,128 +698,124 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
 
-        async with self._generation_lock:
+        def _run_all():
+            try:
+                return _run_specprefill()
+            except Exception as e:
+                logger.error("SpecPrefill failed, falling back to normal path: %s", e)
+                return _run_normal()
 
-            def _run_all():
-                try:
-                    return _run_specprefill()
-                except Exception as e:
-                    logger.error(
-                        "SpecPrefill failed, falling back to normal path: %s", e
-                    )
-                    return _run_normal()
+        def _run_specprefill():
+            """Score tokens, sparse prefill, generate autoregressively."""
+            import time
+            from types import SimpleNamespace
 
-            def _run_specprefill():
-                """Score tokens, sparse prefill, generate autoregressively."""
-                import time
-                from types import SimpleNamespace
+            from ..specprefill import (
+                cleanup_rope,
+                score_tokens,
+                select_chunks,
+                sparse_prefill,
+            )
 
-                from ..specprefill import (
-                    cleanup_rope,
-                    score_tokens,
-                    select_chunks,
-                    sparse_prefill,
+            cache = make_prompt_cache(model)
+
+            try:
+                # Phase 1: Score with draft model
+                t0 = time.monotonic()
+                importance = score_tokens(
+                    self._draft_model,
+                    tokens,
+                    prefill_step_size=self._prefill_step_size,
+                )
+                t_score = time.monotonic() - t0
+
+                # Phase 2: Select important chunks
+                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                selected = select_chunks(importance, keep_pct=effective_keep)
+                n_selected = selected.shape[0]
+
+                # Phase 3: Sparse prefill on target model
+                t0 = time.monotonic()
+                logits = sparse_prefill(
+                    model,
+                    tokens,
+                    selected,
+                    cache,
+                    step_size=self._prefill_step_size,
+                )
+                t_prefill = time.monotonic() - t0
+
+                logger.info(
+                    "SpecPrefill: scored %d tokens in %.1fs, "
+                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
+                    n_tokens,
+                    t_score,
+                    n_selected,
+                    n_tokens,
+                    n_selected / n_tokens * 100,
+                    t_prefill,
                 )
 
-                cache = make_prompt_cache(model)
+                # Phase 4: Generate via engine's standard pipelined path
+                # (PR #248 fix — replaces manual model() + mx.eval loop
+                # which produced ~0.3 tok/s due to missing kernel pipelining)
+                sampler = make_sampler(temp=temperature, top_p=top_p)
+                first_token_id = sampler(logits[:, -1, :]).item()
+                first_text = tokenizer.decode([first_token_id])
+                eos_id = tokenizer.eos_token_id
 
-                try:
-                    # Phase 1: Score with draft model
-                    t0 = time.monotonic()
-                    importance = score_tokens(
-                        self._draft_model,
-                        tokens,
-                        prefill_step_size=self._prefill_step_size,
+                results = [
+                    SimpleNamespace(
+                        text=first_text,
+                        finish_reason="stop" if first_token_id == eos_id else None,
                     )
-                    t_score = time.monotonic() - t0
+                ]
 
-                    # Phase 2: Select important chunks
-                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                    selected = select_chunks(importance, keep_pct=effective_keep)
-                    n_selected = selected.shape[0]
-
-                    # Phase 3: Sparse prefill on target model
-                    t0 = time.monotonic()
-                    logits = sparse_prefill(
-                        model,
-                        tokens,
-                        selected,
-                        cache,
-                        step_size=self._prefill_step_size,
-                    )
-                    t_prefill = time.monotonic() - t0
-
-                    logger.info(
-                        "SpecPrefill: scored %d tokens in %.1fs, "
-                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
-                        n_tokens,
-                        t_score,
-                        n_selected,
-                        n_tokens,
-                        n_selected / n_tokens * 100,
-                        t_prefill,
-                    )
-
-                    # Phase 4: Generate via engine's standard pipelined path
-                    # (PR #248 fix — replaces manual model() + mx.eval loop
-                    # which produced ~0.3 tok/s due to missing kernel pipelining)
-                    sampler = make_sampler(temp=temperature, top_p=top_p)
-                    first_token_id = sampler(logits[:, -1, :]).item()
-                    first_text = tokenizer.decode([first_token_id])
-                    eos_id = tokenizer.eos_token_id
-
-                    results = [
-                        SimpleNamespace(
-                            text=first_text,
-                            finish_reason="stop" if first_token_id == eos_id else None,
-                        )
-                    ]
-
-                    if first_token_id != eos_id:
-                        for chunk in self._model.stream_generate(
-                            prompt=mx.array([first_token_id]),
-                            max_tokens=max_tokens - 1,
-                            temperature=temperature,
-                            top_p=top_p,
-                            stop=stop,
-                            prompt_cache=cache,
-                        ):
-                            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                            results.append(
-                                SimpleNamespace(
-                                    text=new_text,
-                                    finish_reason=getattr(chunk, "finish_reason", None),
-                                )
+                if first_token_id != eos_id:
+                    for chunk in self._model.stream_generate(
+                        prompt=mx.array([first_token_id]),
+                        max_tokens=max_tokens - 1,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop,
+                        prompt_cache=cache,
+                    ):
+                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        results.append(
+                            SimpleNamespace(
+                                text=new_text,
+                                finish_reason=getattr(chunk, "finish_reason", None),
                             )
-
-                    return results
-
-                finally:
-                    cleanup_rope(model)
-
-            def _run_normal():
-                """Fallback: normal generation without specprefill."""
-                from types import SimpleNamespace
-
-                results = []
-                for chunk in self._model.stream_generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    **kwargs,
-                ):
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    results.append(
-                        SimpleNamespace(
-                            text=new_text,
-                            finish_reason=getattr(chunk, "finish_reason", None),
                         )
-                    )
+
                 return results
 
-            all_resps = await asyncio.to_thread(_run_all)
+            finally:
+                cleanup_rope(model)
+
+        def _run_normal():
+            """Fallback: normal generation without specprefill."""
+            from types import SimpleNamespace
+
+            results = []
+            for chunk in self._model.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                results.append(
+                    SimpleNamespace(
+                        text=new_text,
+                        finish_reason=getattr(chunk, "finish_reason", None),
+                    )
+                )
+            return results
+
+        all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
@@ -1083,95 +1076,93 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
-        # Run under generation lock, all Metal ops in single thread
-        async with self._generation_lock:
+        # Run all Metal ops in a single serialized thread.
+        def _run_all():
+            nonlocal backbone_cache, prompt_to_send
 
-            def _run_all():
-                nonlocal backbone_cache, prompt_to_send
+            model = self._text_model
 
-                model = self._text_model
+            # Cache MISS with valid prefix: prefill system tokens and snapshot
+            if (
+                not cache_hit
+                and system_token_count > 0
+                and system_tokens is not None
+                and suffix_tokens is not None
+            ):
+                mc = make_prompt_cache(model)
+                sys_arr = mx.array(system_tokens)
 
-                # Cache MISS with valid prefix: prefill system tokens and snapshot
-                if (
-                    not cache_hit
-                    and system_token_count > 0
-                    and system_tokens is not None
-                    and suffix_tokens is not None
-                ):
-                    mc = make_prompt_cache(model)
-                    sys_arr = mx.array(system_tokens)
+                # Prefill system tokens in chunks (matching generate_step)
+                step = self._prefill_step_size
+                while sys_arr.size > step:
+                    model(sys_arr[:step][None], cache=mc)
+                    mx.eval([c.state for c in mc])
+                    sys_arr = sys_arr[step:]
+                    mx.clear_cache()
+                if sys_arr.size > 0:
+                    model(sys_arr[None], cache=mc)
+                    mx.eval([c.state for c in mc])
 
-                    # Prefill system tokens in chunks (matching generate_step)
-                    step = self._prefill_step_size
-                    while sys_arr.size > step:
-                        model(sys_arr[:step][None], cache=mc)
-                        mx.eval([c.state for c in mc])
-                        sys_arr = sys_arr[step:]
-                        mx.clear_cache()
-                    if sys_arr.size > 0:
-                        model(sys_arr[None], cache=mc)
-                        mx.eval([c.state for c in mc])
+                # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
+                snapshot = [c.state for c in mc]
+                mx.eval([s for pair in snapshot for s in pair])
 
-                    # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
-                    snapshot = [c.state for c in mc]
-                    mx.eval([s for pair in snapshot for s in pair])
+                self._system_kv_snapshot = snapshot
+                self._system_kv_hash = system_hash
+                self._system_kv_token_count = system_token_count
 
-                    self._system_kv_snapshot = snapshot
-                    self._system_kv_hash = system_hash
-                    self._system_kv_token_count = system_token_count
-
-                    backbone_cache = mc
-                    prompt_to_send = mx.array(suffix_tokens)
-                    logger.info(
-                        "System KV cache: stored %d-token snapshot (%.1f MB), "
-                        "prefilling %d remaining",
-                        system_token_count,
-                        sum(c.nbytes for c in mc) / 1e6,
-                        len(suffix_tokens),
-                    )
-
-                # --- SpecPrefill path (with fallback to normal on failure) ---
-                if use_specprefill:
-                    try:
-                        return _run_specprefill(model, backbone_cache)
-                    except Exception as e:
-                        logger.error(
-                            "SpecPrefill failed, falling back to normal MTP path: %s",
-                            e,
-                        )
-                        # Discard potentially corrupted cache
-                        backbone_cache = None
-                        prompt_to_send = full_prompt
-
-                # --- Normal path (MTP via mlx_lm stream_generate) ---
-                prompt_cache = None
-                if backbone_cache is not None:
-                    # Add MTP cache on top of backbone
-                    if hasattr(model, "make_mtp_cache"):
-                        mtp_cache = model.make_mtp_cache()
-                        prompt_cache = backbone_cache + mtp_cache
-                    else:
-                        prompt_cache = backbone_cache
-
-                results = []
-                gen_kwargs = dict(
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    logits_processors=logits_processors,
-                    mtp=True,
-                    prefill_step_size=self._prefill_step_size,
+                backbone_cache = mc
+                prompt_to_send = mx.array(suffix_tokens)
+                logger.info(
+                    "System KV cache: stored %d-token snapshot (%.1f MB), "
+                    "prefilling %d remaining",
+                    system_token_count,
+                    sum(c.nbytes for c in mc) / 1e6,
+                    len(suffix_tokens),
                 )
-                if prompt_cache is not None:
-                    gen_kwargs["prompt_cache"] = prompt_cache
 
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=prompt_to_send,
-                    **gen_kwargs,
-                ):
-                    results.append(resp)
-                return results
+            # --- SpecPrefill path (with fallback to normal on failure) ---
+            if use_specprefill:
+                try:
+                    return _run_specprefill(model, backbone_cache)
+                except Exception as e:
+                    logger.error(
+                        "SpecPrefill failed, falling back to normal MTP path: %s",
+                        e,
+                    )
+                    # Discard potentially corrupted cache
+                    backbone_cache = None
+                    prompt_to_send = full_prompt
+
+            # --- Normal path (MTP via mlx_lm stream_generate) ---
+            prompt_cache = None
+            if backbone_cache is not None:
+                # Add MTP cache on top of backbone
+                if hasattr(model, "make_mtp_cache"):
+                    mtp_cache = model.make_mtp_cache()
+                    prompt_cache = backbone_cache + mtp_cache
+                else:
+                    prompt_cache = backbone_cache
+
+            results = []
+            gen_kwargs = dict(
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                mtp=True,
+                prefill_step_size=self._prefill_step_size,
+            )
+            if prompt_cache is not None:
+                gen_kwargs["prompt_cache"] = prompt_cache
+
+            for resp in mlx_stream_generate(
+                model,
+                self._text_tokenizer,
+                prompt=prompt_to_send,
+                **gen_kwargs,
+            ):
+                results.append(resp)
+            return results
 
             def _run_specprefill(model, bc):
                 """Score tokens, sparse prefill, generate with MTP."""
@@ -1273,7 +1264,7 @@ class SimpleEngine(BaseEngine):
                 finally:
                     cleanup_rope(model)
 
-            all_resps = await asyncio.to_thread(_run_all)
+        all_resps = await self._run_blocking_serialized(_run_all)
 
         # Yield results as GenerationOutput
         accumulated_text = ""
@@ -1334,6 +1325,7 @@ class SimpleEngine(BaseEngine):
         # biases))). Walk recursively so every backing array is counted
         # regardless of cache shape.
         if self._system_kv_snapshot is not None:
+
             def _entry_bytes(x):
                 if hasattr(x, "nbytes"):
                     return x.nbytes
@@ -1341,9 +1333,7 @@ class SimpleEngine(BaseEngine):
                     return sum(_entry_bytes(i) for i in x if i is not None)
                 return 0
 
-            cache_bytes = sum(
-                _entry_bytes(e) for e in self._system_kv_snapshot
-            )
+            cache_bytes = sum(_entry_bytes(e) for e in self._system_kv_snapshot)
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,
