@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 from mlx_lm.generate import generate_step
 
 from vllm_mlx.thump.replay import (
@@ -33,6 +34,32 @@ def _next_token(runner: ReplayRunner, cache: list[object], token_id: int) -> int
     )
     token, _ = next(generator)
     return int(token)
+
+
+def _diff_summary(
+    *,
+    layer_idx: int,
+    layer_type: str,
+    left_k,
+    left_v,
+    right_k,
+    right_v,
+) -> dict[str, object]:
+    k_diff = mx.abs(
+        mx.array(left_k.astype("float32")) - mx.array(right_k.astype("float32"))
+    )
+    v_diff = mx.abs(
+        mx.array(left_v.astype("float32")) - mx.array(right_v.astype("float32"))
+    )
+    mx.eval(k_diff, v_diff)
+    return {
+        "layer_index": layer_idx,
+        "layer_type": layer_type,
+        "k_max_abs_diff": float(mx.max(k_diff).item()),
+        "k_mean_abs_diff": float(mx.mean(k_diff).item()),
+        "v_max_abs_diff": float(mx.max(v_diff).item()),
+        "v_mean_abs_diff": float(mx.mean(v_diff).item()),
+    }
 
 
 def probe_splice_limit(
@@ -144,39 +171,81 @@ def probe_splice_limit(
         tokens.last_prompt_token,
     )
 
-    sampled_layers = [0, 5, 29]
-    layer_diffs: list[dict[str, object]] = []
+    sampled_layers = [0, 1, 2, 5, 29]
+    updated_suffix_start = len(tokens.prefix) + len(tokens.insert)
+    direct_suffix_capture_diffs: list[dict[str, object]] = []
+    full_capture = full_collector.joined()
+    suffix_capture = suffix_collector.joined()
+    for layer_idx in sampled_layers:
+        direct_suffix_k = full_capture[layer_idx].keys[updated_suffix_start:]
+        direct_suffix_v = full_capture[layer_idx].values[updated_suffix_start:]
+        reused_suffix_k = suffix_capture[layer_idx].keys[: direct_suffix_k.shape[0]]
+        reused_suffix_v = suffix_capture[layer_idx].values[: direct_suffix_v.shape[0]]
+        direct_suffix_capture_diffs.append(
+            _diff_summary(
+                layer_idx=layer_idx,
+                layer_type=runner.model.layers[layer_idx].layer_type,
+                left_k=direct_suffix_k,
+                left_v=direct_suffix_v,
+                right_k=reused_suffix_k,
+                right_v=reused_suffix_v,
+            )
+        )
+
+    roundtrip_layer_diffs: list[dict[str, object]] = []
     for layer_idx in sampled_layers:
         full_k, full_v = full_roundtrip_cache[layer_idx].state
         splice_k, splice_v = splice_roundtrip_cache[layer_idx].state
-        k_diff = mx.abs(full_k.astype(mx.float32) - splice_k.astype(mx.float32))
-        v_diff = mx.abs(full_v.astype(mx.float32) - splice_v.astype(mx.float32))
-        mx.eval(k_diff, v_diff)
-        layer_diffs.append(
-            {
-                "layer_index": layer_idx,
-                "layer_type": runner.model.layers[layer_idx].layer_type,
-                "k_max_abs_diff": float(mx.max(k_diff).item()),
-                "k_mean_abs_diff": float(mx.mean(k_diff).item()),
-                "v_max_abs_diff": float(mx.max(v_diff).item()),
-                "v_mean_abs_diff": float(mx.mean(v_diff).item()),
-            }
+        roundtrip_layer_diffs.append(
+            _diff_summary(
+                layer_idx=layer_idx,
+                layer_type=runner.model.layers[layer_idx].layer_type,
+                left_k=np.asarray(full_k),
+                left_v=np.asarray(full_v),
+                right_k=np.asarray(splice_k),
+                right_v=np.asarray(splice_v),
+            )
         )
 
+    first_diverging_layer = next(
+        (
+            item["layer_index"]
+            for item in direct_suffix_capture_diffs
+            if item["k_max_abs_diff"] > 0.0 or item["v_max_abs_diff"] > 0.0
+        ),
+        None,
+    )
+    layer0_direct = direct_suffix_capture_diffs[0]
     result = {
         "model_path": str(model_path),
         "trace_name": trace.name,
         "block_size_tokens": 1,
+        "prompt_lengths": {
+            "prefix_tokens": len(tokens.prefix),
+            "insert_tokens": len(tokens.insert),
+            "suffix_tokens": len(tokens.suffix),
+            "updated_prompt_tokens": len(tokens.updated_prompt),
+        },
         "baseline_next_token": baseline_next,
         "full_roundtrip_next_token": full_roundtrip_next,
         "splice_roundtrip_next_token": splice_roundtrip_next,
         "full_roundtrip_exact": baseline_next == full_roundtrip_next,
         "splice_roundtrip_exact": baseline_next == splice_roundtrip_next,
-        "interpretation": (
-            "Direct updated-prompt round-trip is exact, but prefix+suffix seed "
-            "plus insert splice is still not parity-safe."
+        "layer0_suffix_exact_before_thump": (
+            layer0_direct["k_max_abs_diff"] == 0.0
+            and layer0_direct["v_max_abs_diff"] == 0.0
         ),
-        "sampled_layer_diffs": layer_diffs,
+        "first_diverging_suffix_layer_before_thump": first_diverging_layer,
+        "direct_suffix_capture_diffs": direct_suffix_capture_diffs,
+        "roundtrip_layer_diffs": roundtrip_layer_diffs,
+        "sampled_layer_diffs": roundtrip_layer_diffs,
+        "interpretation": (
+            "Direct updated-prompt round-trip is exact. Direct suffix captures "
+            "are also exact at layer 0 and start diverging at layer 1 before "
+            "Thump materialization. The splice-vs-full round-trip still shows "
+            "small layer-0 drift, but the replay-invalidating boundary starts "
+            "at layer 1, so the adapter path is not the primary blocker."
+        ),
     }
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
