@@ -151,6 +151,52 @@ def test_session_substrate_insert_then_replace_round_trip(tmp_path):
     assert np.allclose(tokens_first[32:48], 10.0, atol=0.1)
 
 
+def test_session_substrate_checkpoint_and_attach_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(layer_index=0, layer_type="full_attention", geometry=geometry)
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=8,
+        root_dir=tmp_path / "live",
+    )
+
+    initial = LayerCapture(
+        keys=np.full((32, 2, 8), 1.0, dtype=np.float16),
+        values=np.full((32, 2, 8), 10.0, dtype=np.float16),
+    )
+    session.initialize_from_capture({0: initial}, total_tokens=32)
+    checkpoint = session.checkpoint(
+        tmp_path / "live" / "session.tsmf",
+        model_id_hash=0x1234,
+        session_id=0x5678,
+        sequence_id=0x9ABC,
+        prompt_tokens=24,
+        generated_tokens=9,
+    )
+    session.close()
+
+    restored, restored_checkpoint = SessionSubstrate.attach_from_manifest(
+        [spec],
+        checkpoint.manifest_path,
+        expected_model_id_hash=0x1234,
+    )
+    assert restored_checkpoint.sequence_id == 0x9ABC
+    assert restored.total_tokens == 32
+
+    caches = restored.materialize_prompt_cache(_DummyModel(), upto_tokens=32)
+    _keys, values = caches[0].state
+    values_np = np.asarray(values)
+    tokens_first = np.transpose(values_np[0], (1, 0, 2))
+    assert np.allclose(tokens_first[:32], 10.0, atol=0.1)
+    restored.close()
+
+
 def test_nontraditional_rope_layout_helpers_round_trip():
     keys = np.arange(16, dtype=np.float16).reshape(2, 1, 8)
     interleaved = _interleave_split_rotary_pairs(keys, 4)

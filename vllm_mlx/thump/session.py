@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import tempfile
 from dataclasses import dataclass
@@ -13,7 +14,16 @@ import numpy as np
 
 from mlx_lm.models.cache import RotatingKVCache
 
-from .adapter import BlockGeometry, RopeConfig, RuntimeHandle
+from .adapter import (
+    BlockGeometry,
+    RopeConfig,
+    RuntimeHandle,
+    SessionBankEntry,
+    SessionManifest,
+    SessionMetadata,
+    validate_session_manifest,
+    write_session_manifest,
+)
 from .capture import LayerCapture
 
 
@@ -33,9 +43,7 @@ def _interleave_split_rotary_pairs(keys: np.ndarray, rotated_dims: int) -> np.nd
     return out
 
 
-def _deinterleave_split_rotary_pairs(
-    keys: np.ndarray, rotated_dims: int
-) -> np.ndarray:
+def _deinterleave_split_rotary_pairs(keys: np.ndarray, rotated_dims: int) -> np.ndarray:
     """Restore MLX split-pair rotary layout from adjacent-pair layout."""
     if rotated_dims <= 0 or rotated_dims > keys.shape[-1]:
         return keys
@@ -68,6 +76,28 @@ class _LayerBank:
     handle: RuntimeHandle
 
 
+@dataclass(frozen=True)
+class SessionCheckpoint:
+    manifest_path: Path
+    root_dir: Path
+    model_id_hash: int
+    session_id: int
+    sequence_id: int
+    prompt_tokens: int
+    generated_tokens: int
+    artifact_bytes: int
+
+    @property
+    def context_tokens(self) -> int:
+        return self.prompt_tokens + max(0, self.generated_tokens - 1)
+
+
+def _stable_u64(value: str) -> int:
+    return int.from_bytes(
+        hashlib.blake2b(value.encode(), digest_size=8).digest(), "little"
+    )
+
+
 class SessionSubstrate:
     """One logical editable session mirrored across per-layer Thump banks."""
 
@@ -98,17 +128,14 @@ class SessionSubstrate:
                 spec=spec, path=path, handle=handle
             )
         self.total_tokens = 0
+        self.last_checkpoint: SessionCheckpoint | None = None
 
-    @classmethod
-    def from_gemma4_model(
-        cls,
+    @staticmethod
+    def gemma4_layer_specs(
         model: Any,
         *,
         block_size_tokens: int = 16,
-        block_capacity: int,
-        root_dir: str | Path | None = None,
-        lib_path: str | Path | None = None,
-    ) -> "SessionSubstrate":
+    ) -> list[LayerSpec]:
         args = model.args
         layer_specs: list[LayerSpec] = []
         for layer_idx, layer in enumerate(model.layers):
@@ -136,7 +163,9 @@ class SessionSubstrate:
                 group_size=attn.n_heads // attn.n_kv_heads,
                 rope=RopeConfig(
                     variant=variant,
-                    theta=float(getattr(rope, "base", rope_params.get("rope_theta", 10000.0))),
+                    theta=float(
+                        getattr(rope, "base", rope_params.get("rope_theta", 10000.0))
+                    ),
                     partial_rotary_factor=partial,
                 ),
             )
@@ -153,11 +182,95 @@ class SessionSubstrate:
                     rope_traditional=bool(getattr(rope, "traditional", True)),
                 )
             )
+        return layer_specs
+
+    @classmethod
+    def from_gemma4_model(
+        cls,
+        model: Any,
+        *,
+        block_size_tokens: int = 16,
+        block_capacity: int,
+        root_dir: str | Path | None = None,
+        lib_path: str | Path | None = None,
+    ) -> "SessionSubstrate":
         return cls(
-            layer_specs,
+            cls.gemma4_layer_specs(model, block_size_tokens=block_size_tokens),
             block_capacity=block_capacity,
             root_dir=root_dir,
             lib_path=lib_path,
+        )
+
+    @classmethod
+    def attach_from_manifest(
+        cls,
+        layer_specs: list[LayerSpec],
+        manifest_path: str | Path,
+        *,
+        lib_path: str | Path | None = None,
+        expected_model_id_hash: int | None = None,
+    ) -> tuple["SessionSubstrate", SessionCheckpoint]:
+        if not layer_specs:
+            raise ValueError("layer_specs must not be empty")
+        manifest, bank_entries = validate_session_manifest(
+            manifest_path, lib_path=lib_path
+        )
+        if expected_model_id_hash is not None and (
+            manifest.model_id_hash != expected_model_id_hash
+        ):
+            raise ValueError("checkpoint model_id_hash does not match current model")
+        spec_by_layer = {spec.layer_index: spec for spec in layer_specs}
+        root_dir = Path(manifest_path).parent
+        self = cls.__new__(cls)
+        self.layer_specs = list(layer_specs)
+        self.block_size_tokens = layer_specs[0].geometry.block_size_tokens
+        self.root_dir = root_dir
+        self._banks = {}
+        for bank_entry in bank_entries:
+            if bank_entry.layer_index not in spec_by_layer:
+                raise ValueError(
+                    f"checkpoint layer {bank_entry.layer_index} is not supported by the runtime"
+                )
+            spec = spec_by_layer[bank_entry.layer_index]
+            path = root_dir / bank_entry.bank_relpath
+            handle = RuntimeHandle.attach(path, lib_path=lib_path)
+            handle.validate_session_snapshot()
+            self._banks[spec.layer_index] = _LayerBank(
+                spec=spec, path=path, handle=handle
+            )
+        self.total_tokens = int(manifest.prompt_tokens) + max(
+            0, int(manifest.generated_tokens) - 1
+        )
+        self.last_checkpoint = SessionCheckpoint(
+            manifest_path=Path(manifest_path),
+            root_dir=root_dir,
+            model_id_hash=manifest.model_id_hash,
+            session_id=manifest.session_id,
+            sequence_id=manifest.sequence_id,
+            prompt_tokens=manifest.prompt_tokens,
+            generated_tokens=manifest.generated_tokens,
+            artifact_bytes=(
+                Path(manifest_path).stat().st_size
+                + sum(bank.path.stat().st_size for bank in self._banks.values())
+            ),
+        )
+        return self, self.last_checkpoint
+
+    @classmethod
+    def attach_gemma4_checkpoint(
+        cls,
+        model: Any,
+        manifest_path: str | Path,
+        *,
+        block_size_tokens: int = 16,
+        lib_path: str | Path | None = None,
+        expected_model_id_hash: int | None = None,
+    ) -> tuple["SessionSubstrate", SessionCheckpoint]:
+        return cls.attach_from_manifest(
+            cls.gemma4_layer_specs(model, block_size_tokens=block_size_tokens),
+            manifest_path,
+            lib_path=lib_path,
+            expected_model_id_hash=expected_model_id_hash,
         )
 
     def close(self) -> None:
@@ -234,8 +347,72 @@ class SessionSubstrate:
         replace_at = replace_token_index // self.block_size_tokens
         for layer_idx, bank in self._banks.items():
             packed_k, packed_v = self._pack_capture(captures[layer_idx], bank.spec)
-            new_ids = bank.handle.splice_replace_equal_length(replace_at, replace_blocks)
+            new_ids = bank.handle.splice_replace_equal_length(
+                replace_at, replace_blocks
+            )
             bank.handle.write_blocks(new_ids, packed_k, packed_v)
+
+    def checkpoint(
+        self,
+        manifest_path: str | Path,
+        *,
+        model_id_hash: int,
+        session_id: int,
+        sequence_id: int,
+        prompt_tokens: int,
+        generated_tokens: int,
+        flags: int = 1,
+    ) -> SessionCheckpoint:
+        manifest_path = Path(manifest_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        bank_entries: list[SessionBankEntry] = []
+        for layer_idx in sorted(self._banks):
+            bank = self._banks[layer_idx]
+            bank.handle.sequence_id = sequence_id
+            bank.handle.set_session_metadata(
+                SessionMetadata(
+                    flags=flags,
+                    model_id_hash=model_id_hash,
+                    session_id=session_id,
+                    layer_index=layer_idx,
+                    prompt_tokens=prompt_tokens,
+                    generated_tokens=generated_tokens,
+                )
+            )
+            bank.handle.validate_session_snapshot()
+            bank_entries.append(
+                SessionBankEntry(
+                    layer_index=layer_idx,
+                    bank_relpath=bank.path.relative_to(self.root_dir).as_posix(),
+                )
+            )
+
+        write_session_manifest(
+            manifest_path,
+            SessionManifest(
+                flags=flags,
+                model_id_hash=model_id_hash,
+                session_id=session_id,
+                sequence_id=sequence_id,
+                prompt_tokens=prompt_tokens,
+                generated_tokens=generated_tokens,
+                bank_count=len(bank_entries),
+            ),
+            bank_entries,
+        )
+        checkpoint = SessionCheckpoint(
+            manifest_path=manifest_path,
+            root_dir=self.root_dir,
+            model_id_hash=model_id_hash,
+            session_id=session_id,
+            sequence_id=sequence_id,
+            prompt_tokens=prompt_tokens,
+            generated_tokens=generated_tokens,
+            artifact_bytes=manifest_path.stat().st_size
+            + sum(bank.path.stat().st_size for bank in self._banks.values()),
+        )
+        self.last_checkpoint = checkpoint
+        return checkpoint
 
     def materialize_prompt_cache(self, model: Any, upto_tokens: int) -> list[Any]:
         caches = model.make_cache()
@@ -317,3 +494,7 @@ class SessionSubstrate:
                     str(min(upto_tokens, alloc_tokens)),
                 )
         return caches
+
+
+def model_id_hash_for_path(model_path: str | Path) -> int:
+    return _stable_u64(str(Path(model_path)))
