@@ -499,3 +499,183 @@ class TestSimpleEngineConcurrency:
             assert len(outputs) == 1
             assert outputs[0].finished
             assert outputs[0].completion_tokens == 0
+
+    @pytest.mark.anyio
+    async def test_specprefill_threads_same_cancel_check_to_helpers(self):
+        """SpecPrefill worker should pass one cooperative cancel hook through both phases."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        def fake_score_tokens(*args, cancel_check=None, **kwargs):
+            captured["score"] = cancel_check
+            return mx.array([0.5], dtype=mx.float32)
+
+        def fake_sparse_prefill(*args, cancel_check=None, **kwargs):
+            captured["prefill"] = cancel_check
+            return mx.zeros((1, 1, 8), dtype=mx.float32)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+            engine._model.tokenizer.decode = MagicMock(return_value="A")
+            engine._model.tokenizer.eos_token_id = 0
+
+            outputs = []
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "mlx_lm.sample_utils.make_sampler",
+                    return_value=lambda logits: mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens", side_effect=fake_score_tokens
+                ),
+                patch(
+                    "vllm_mlx.specprefill.select_chunks",
+                    return_value=mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.sparse_prefill",
+                    side_effect=fake_sparse_prefill,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                async for chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    outputs.append(chunk.new_text)
+
+        assert outputs == ["A"]
+        assert callable(captured["score"])
+        assert captured["score"] is captured["prefill"]
+
+    @pytest.mark.anyio
+    async def test_cancelling_specprefill_request_stops_during_scoring(self):
+        """Cancelling SpecPrefill should signal the blocking scorer and exit without output."""
+        import time
+        from threading import Event
+
+        from vllm_mlx.engine.simple import SimpleEngine, _SpecPrefillCancelled
+
+        score_started = Event()
+        score_cancelled = Event()
+
+        def fake_score_tokens(*args, cancel_check=None, **kwargs):
+            assert callable(cancel_check)
+            score_started.set()
+            while True:
+                try:
+                    cancel_check()
+                except _SpecPrefillCancelled:
+                    score_cancelled.set()
+                    raise
+                time.sleep(0.01)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+
+            async def consume():
+                async for _chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    pytest.fail("Cancelled SpecPrefill request should not emit output")
+
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens",
+                    side_effect=fake_score_tokens,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                task = asyncio.create_task(consume())
+                assert await asyncio.to_thread(score_started.wait, 1.0)
+                task.cancel()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        assert await asyncio.to_thread(score_cancelled.wait, 1.0)
+
+    @pytest.mark.anyio
+    async def test_cancelling_specprefill_request_stops_during_sparse_prefill(self):
+        """Cancelling SpecPrefill should signal the sparse-prefill loop and exit without output."""
+        import time
+        from threading import Event
+
+        from vllm_mlx.engine.simple import SimpleEngine, _SpecPrefillCancelled
+
+        prefill_started = Event()
+        prefill_cancelled = Event()
+
+        def fake_sparse_prefill(*args, cancel_check=None, **kwargs):
+            assert callable(cancel_check)
+            prefill_started.set()
+            while True:
+                try:
+                    cancel_check()
+                except _SpecPrefillCancelled:
+                    prefill_cancelled.set()
+                    raise
+                time.sleep(0.01)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._draft_model = MagicMock()
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+
+            async def consume():
+                async for _chunk in engine._stream_generate_specprefill(
+                    prompt="hello",
+                    tokens=[1, 2, 3, 4],
+                    max_tokens=4,
+                    temperature=0.7,
+                    top_p=0.9,
+                ):
+                    pytest.fail("Cancelled SpecPrefill request should not emit output")
+
+            with (
+                patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+                patch(
+                    "vllm_mlx.specprefill.score_tokens",
+                    return_value=mx.array([0.5], dtype=mx.float32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.select_chunks",
+                    return_value=mx.array([0], dtype=mx.int32),
+                ),
+                patch(
+                    "vllm_mlx.specprefill.sparse_prefill",
+                    side_effect=fake_sparse_prefill,
+                ),
+                patch("vllm_mlx.specprefill.cleanup_rope"),
+            ):
+                task = asyncio.create_task(consume())
+                assert await asyncio.to_thread(prefill_started.wait, 1.0)
+                task.cancel()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)
