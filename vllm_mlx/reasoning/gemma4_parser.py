@@ -33,6 +33,8 @@ _CONTROL_TOKENS = (
     "<|channel>thought",
     "<|channel>-thought\n",
     "<|channel>-thought",
+    "//thought\n",
+    "//thought",
     END_TOKEN,
     TURN_START_TOKEN,
     TURN_END_TOKEN,
@@ -65,6 +67,7 @@ class Gemma4ReasoningParser(ReasoningParser):
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
         self._in_reasoning = False
+        self._stream_plain_pending = ""
 
     def extract_reasoning(
         self,
@@ -90,8 +93,10 @@ class Gemma4ReasoningParser(ReasoningParser):
         previous_text: str,
         current_text: str,
         delta_text: str,
+        request=None,
     ) -> DeltaMessage | None:
-        del delta_text
+        if self._thinking_disabled(request):
+            return self._extract_plain_content_delta(delta_text)
 
         prev_reasoning, prev_content = self.extract_reasoning(previous_text)
         curr_reasoning, curr_content = self.extract_reasoning(current_text)
@@ -109,6 +114,7 @@ class Gemma4ReasoningParser(ReasoningParser):
 
     def reset_state(self):
         self._in_reasoning = False
+        self._stream_plain_pending = ""
 
     def _extract_reasoning_prefixed(
         self,
@@ -200,6 +206,54 @@ class Gemma4ReasoningParser(ReasoningParser):
         if not text or not text.startswith("<"):
             return False
         return any(token.startswith(text) for token in _START_TOKEN_VARIANTS)
+
+    @staticmethod
+    def _request_template_kwargs(request) -> dict:
+        if request is None:
+            return {}
+        kwargs = getattr(request, "chat_template_kwargs", None)
+        return kwargs or {}
+
+    @classmethod
+    def _thinking_disabled(cls, request) -> bool:
+        return cls._request_template_kwargs(request).get("enable_thinking") is False
+
+    def _extract_plain_content_delta(self, delta_text: str) -> DeltaMessage | None:
+        if not delta_text:
+            return None
+
+        stable_text, pending_suffix = self._split_partial_control_suffix(
+            self._stream_plain_pending + delta_text
+        )
+        self._stream_plain_pending = pending_suffix
+        if not stable_text:
+            return None
+
+        content = _CONTROL_TOKEN_RE.sub("", stable_text)
+        content = _CONTROL_LINE_RE.sub("", content)
+        content = _INLINE_THOUGHT_SUFFIX_RE.sub("", content)
+        if not content:
+            return None
+        return DeltaMessage(content=content)
+
+    @staticmethod
+    def _split_partial_control_suffix(text: str) -> tuple[str, str]:
+        if not text:
+            return "", ""
+
+        pending = ""
+        for token in _CONTROL_TOKENS:
+            max_suffix = min(len(token) - 1, len(text))
+            for suffix_len in range(max_suffix, 0, -1):
+                suffix = text[-suffix_len:]
+                if token.startswith(suffix) and suffix != token:
+                    if len(suffix) > len(pending):
+                        pending = suffix
+                    break
+
+        if not pending:
+            return text, ""
+        return text[: -len(pending)], pending
 
     @staticmethod
     def _suffix_delta(previous: str | None, current: str | None) -> str | None:
