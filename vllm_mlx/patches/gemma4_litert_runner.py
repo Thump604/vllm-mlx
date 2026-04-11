@@ -63,7 +63,7 @@ class Gemma4LiteRTMTPRunner:
         self.contract = contract
         self.input_details = input_details
         self.activations_formula = str(contract["activations_formula"])
-        self.hidden_size = int(contract["model_hidden_size"])
+        self.token_embedding_size = int(contract["model_hidden_size"])
         self.projected_size = int(contract["projected_activations_size"])
         self.param_shape = tuple(int(dim) for dim in contract["param_tensor_shape"])
 
@@ -122,32 +122,36 @@ class Gemma4LiteRTMTPRunner:
 
     def build_activations(
         self,
-        hidden_states: np.ndarray,
+        token_embeddings: np.ndarray,
         state: Gemma4LiteRTMTPState,
     ) -> np.ndarray:
-        hidden = _to_numpy(hidden_states, dtype=np.float32)
-        if hidden.shape[-1] != self.hidden_size:
+        embeddings = _to_numpy(token_embeddings, dtype=np.float32)
+        if embeddings.shape[-1] != self.token_embedding_size:
             raise ValueError(
-                f"Expected hidden size {self.hidden_size}, got {hidden.shape[-1]}"
+                "Expected token embedding size "
+                f"{self.token_embedding_size}, got {embeddings.shape[-1]}"
             )
-        if self.activations_formula == "concat(hidden_states, projected_activations)":
-            return np.concatenate([hidden, state.projected_activations], axis=-1)
-        if self.activations_formula == "hidden_states":
-            return hidden
+        if (
+            self.activations_formula
+            == "concat(next_token_embedding, projected_activations)"
+        ):
+            return np.concatenate([embeddings, state.projected_activations], axis=-1)
+        if self.activations_formula == "projected_activations":
+            return state.projected_activations
         raise ValueError(
             f"Unsupported activations formula {self.activations_formula!r}"
         )
 
     def run_step(
         self,
-        hidden_states: np.ndarray,
+        token_embeddings: np.ndarray,
         *,
         input_pos: int,
         state: Gemma4LiteRTMTPState,
         mask: np.ndarray | None = None,
         param_tensor: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        activations = self.build_activations(hidden_states, state)
+        activations = self.build_activations(token_embeddings, state)
         if mask is None:
             mask = np.zeros(tuple(self.input_details["mask"]["shape"]), dtype=np.bool_)
         if param_tensor is None:

@@ -66,7 +66,7 @@ def _make_mask(shape: tuple[int, ...], tokens: int) -> np.ndarray:
 
 def _run(
     runner: Gemma4LiteRTMTPRunner,
-    hidden_states: np.ndarray,
+    token_embeddings: np.ndarray,
     state: Gemma4LiteRTMTPState,
     *,
     input_pos: int,
@@ -74,7 +74,7 @@ def _run(
     param_tensor: np.ndarray | None = None,
 ) -> dict[str, np.ndarray | float]:
     return runner.run_step(
-        hidden_states,
+        token_embeddings,
         input_pos=input_pos,
         state=state.copy(),
         mask=mask,
@@ -91,7 +91,9 @@ def main() -> None:
         contract_path=args.contract_json,
     )
     base_state = _make_dense_state(runner, rng)
-    hidden_states = rng.standard_normal((1, 1, runner.hidden_size), dtype=np.float32)
+    token_embeddings = rng.standard_normal(
+        (1, 1, runner.token_embedding_size), dtype=np.float32
+    )
     base_mask = _make_mask(
         tuple(runner.input_details["mask"]["shape"]), args.mask_tokens
     )
@@ -104,7 +106,7 @@ def main() -> None:
 
     baseline = _run(
         runner,
-        hidden_states,
+        token_embeddings,
         base_state,
         input_pos=args.input_pos,
         mask=base_mask,
@@ -136,7 +138,7 @@ def main() -> None:
 
     input_pos_alt = _run(
         runner,
-        hidden_states,
+        token_embeddings,
         base_state,
         input_pos=args.input_pos + 1,
         mask=base_mask,
@@ -155,7 +157,7 @@ def main() -> None:
 
     mask_alt = _run(
         runner,
-        hidden_states,
+        token_embeddings,
         base_state,
         input_pos=args.input_pos,
         mask=alt_mask,
@@ -176,7 +178,7 @@ def main() -> None:
         )
         probe = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             base_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -199,7 +201,7 @@ def main() -> None:
         param_tensor.reshape(-1)[slot] = args.param_value
         probe = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             base_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -226,7 +228,7 @@ def main() -> None:
         param_tensor.reshape(-1)[slot] = time_capacity
         probe = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             base_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -272,7 +274,7 @@ def main() -> None:
         param_tensor.reshape(-1)[0] = value
         probe = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             base_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -293,7 +295,7 @@ def main() -> None:
     slot0_capacity.reshape(-1)[0] = time_capacity
     mask_with_slot0_capacity = _run(
         runner,
-        hidden_states,
+        token_embeddings,
         base_state,
         input_pos=args.input_pos,
         mask=alt_mask,
@@ -301,7 +303,7 @@ def main() -> None:
     )
     slot0_capacity_base = _run(
         runner,
-        hidden_states,
+        token_embeddings,
         base_state,
         input_pos=args.input_pos,
         mask=base_mask,
@@ -324,7 +326,7 @@ def main() -> None:
         getattr(cache_state, name)[...] = 0
         probe = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             cache_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -346,7 +348,7 @@ def main() -> None:
         slot0_param.reshape(-1)[0] = slot0_value
         slot0_base = _run(
             runner,
-            hidden_states,
+            token_embeddings,
             base_state,
             input_pos=args.input_pos,
             mask=base_mask,
@@ -366,7 +368,7 @@ def main() -> None:
             getattr(cache_state, name)[...] = 0
             probe = _run(
                 runner,
-                hidden_states,
+                token_embeddings,
                 cache_state,
                 input_pos=args.input_pos,
                 mask=base_mask,

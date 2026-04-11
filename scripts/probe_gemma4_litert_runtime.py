@@ -40,12 +40,18 @@ def main() -> None:
     )
 
     zero_state = runner.make_cache()
-    zero_hidden = np.zeros((1, 1, runner.hidden_size), dtype=np.float32)
-    zero_result = runner.run_step(zero_hidden, input_pos=0, state=zero_state)
+    zero_token_embeddings = np.zeros(
+        (1, 1, runner.token_embedding_size), dtype=np.float32
+    )
+    zero_result = runner.run_step(zero_token_embeddings, input_pos=0, state=zero_state)
 
     random_state = runner.make_cache()
-    random_hidden = rng.standard_normal((1, 1, runner.hidden_size), dtype=np.float32)
-    random_result = runner.run_step(random_hidden, input_pos=17, state=random_state)
+    random_token_embeddings = rng.standard_normal(
+        (1, 1, runner.token_embedding_size), dtype=np.float32
+    )
+    random_result = runner.run_step(
+        random_token_embeddings, input_pos=17, state=random_state
+    )
 
     payload = {
         "model": str(args.model),

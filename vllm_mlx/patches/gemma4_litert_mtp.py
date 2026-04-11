@@ -6,11 +6,13 @@ runtime-facing adapter contract that matches the existing MLX MTP entrypoint:
 
     mtp_forward(hidden_states, next_token_ids, mtp_cache) -> logits
 
-The Gemma LiteRT drafter does not expose that exact signature. It takes an
-explicit activations tensor, explicit KV cache tensors, a mask, and a small
-param tensor, and it returns both logits and projected activations. The
-functions here formalize how to adapt that signature without widening the
-runtime's scheduler contract prematurely.
+The Gemma LiteRT drafter does not expose that exact signature. Public
+LiteRT-LM source shows the real runtime loop concatenating the next-token
+embedding with carried projected activations outside the graph, feeding
+explicit KV cache tensors plus a small param tensor into the graph, and
+running a separate draft+verify choreography around it. The functions here
+formalize that adapter contract without pretending the graph is a drop-in
+native MLX MTP head.
 """
 
 from __future__ import annotations
@@ -62,6 +64,10 @@ class Gemma4LiteRTMTPContract:
     mask_shape: tuple[int, ...]
     param_tensor_shape: tuple[int, ...]
     next_token_ids_required: bool
+    requires_draft_token_embedding_lookup: bool
+    requires_projected_activations_feedback: bool
+    requires_explicit_kv_cache_adapter: bool
+    requires_external_verifier_loop: bool
     activations_formula: str
     runtime_adapter_strategy: str
     projected_state_cache_field: str
@@ -248,17 +254,18 @@ def build_gemma4_litert_mtp_contract(
             f"{projected.width} does not match model hidden size {model_hidden_size}"
         )
 
-    if activations.width == model_hidden_size:
-        activations_formula = "hidden_states"
-        projected_state_cache_field = "projected_activations"
+    if activations.width == projected.width:
+        activations_formula = "projected_activations"
+        next_token_ids_required = False
     elif activations.width == model_hidden_size + projected.width:
-        activations_formula = "concat(hidden_states, projected_activations)"
-        projected_state_cache_field = "projected_activations"
+        activations_formula = "concat(next_token_embedding, projected_activations)"
+        next_token_ids_required = True
     else:
         raise ValueError(
             "LiteRT activations width does not line up with Gemma hidden sizes: "
             f"{activations.width} vs hidden={model_hidden_size}, projected={projected.width}"
         )
+    projected_state_cache_field = "projected_activations"
 
     return Gemma4LiteRTMTPContract(
         signature_key=str(signature["key"]),
@@ -274,12 +281,18 @@ def build_gemma4_litert_mtp_contract(
         input_pos_dtype=input_pos.dtype,
         mask_shape=mask.shape,
         param_tensor_shape=param_tensor.shape,
-        next_token_ids_required=False,
+        next_token_ids_required=next_token_ids_required,
+        requires_draft_token_embedding_lookup=next_token_ids_required,
+        requires_projected_activations_feedback=True,
+        requires_explicit_kv_cache_adapter=True,
+        requires_external_verifier_loop=True,
         activations_formula=activations_formula,
         runtime_adapter_strategy=(
-            "keep mtp_forward(hidden_states, next_token_ids, mtp_cache); "
-            "ignore next_token_ids, store projected_activations in mtp_cache, "
-            "and map explicit LiteRT cache tensors through mtp_cache slots"
+            "do not treat the LiteRT graph as a drop-in native MLX MTP head; "
+            "look up the next-token embedding outside the graph, persist "
+            "projected_activations between draft steps, maintain dedicated "
+            "single-buffer INT8 LiteRT KV caches, and run the external "
+            "draft+verify choreography around the signature"
         ),
         projected_state_cache_field=projected_state_cache_field,
         kv_cache_specs=_cache_specs(inputs_by_name, text_config=text_config),

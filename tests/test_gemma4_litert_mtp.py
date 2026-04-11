@@ -82,9 +82,14 @@ def test_build_gemma4_litert_mtp_contract():
     assert contract.activations_input_size == 3072
     assert contract.projected_activations_size == 1536
     assert contract.logits_vocab_size == 262144
-    assert contract.next_token_ids_required is False
+    assert contract.next_token_ids_required is True
+    assert contract.requires_draft_token_embedding_lookup is True
+    assert contract.requires_projected_activations_feedback is True
+    assert contract.requires_explicit_kv_cache_adapter is True
+    assert contract.requires_external_verifier_loop is True
     assert (
-        contract.activations_formula == "concat(hidden_states, projected_activations)"
+        contract.activations_formula
+        == "concat(next_token_embedding, projected_activations)"
     )
     assert contract.projected_state_cache_field == "projected_activations"
     assert len(contract.kv_cache_specs) == 2

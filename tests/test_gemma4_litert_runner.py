@@ -31,7 +31,7 @@ def test_build_activations_and_run_step():
     runner = Gemma4LiteRTMTPRunner(
         signature_runner=fake,
         contract={
-            "activations_formula": "concat(hidden_states, projected_activations)",
+            "activations_formula": "concat(next_token_embedding, projected_activations)",
             "model_hidden_size": 1536,
             "projected_activations_size": 1536,
             "param_tensor_shape": [1, 1, 1, 7],
@@ -46,8 +46,8 @@ def test_build_activations_and_run_step():
     )
 
     state = runner.make_cache()
-    hidden = np.ones((1, 1, 1536), dtype=np.float32)
-    result = runner.run_step(hidden, input_pos=3, state=state)
+    token_embeddings = np.ones((1, 1, 1536), dtype=np.float32)
+    result = runner.run_step(token_embeddings, input_pos=3, state=state)
 
     assert fake.calls, "runner must invoke the signature runner"
     activations = fake.calls[0]["activations"]
@@ -67,7 +67,7 @@ def test_build_activations_rejects_bad_hidden_width():
     runner = Gemma4LiteRTMTPRunner(
         signature_runner=_FakeSignatureRunner(),
         contract={
-            "activations_formula": "concat(hidden_states, projected_activations)",
+            "activations_formula": "concat(next_token_embedding, projected_activations)",
             "model_hidden_size": 1536,
             "projected_activations_size": 1536,
             "param_tensor_shape": [1, 1, 1, 7],
@@ -88,11 +88,11 @@ def test_build_activations_rejects_bad_hidden_width():
         kv_cache_v_14=np.zeros((1, 1, 512, 8), dtype=np.int8),
     )
 
-    hidden = np.zeros((1, 1, 256), dtype=np.float32)
+    token_embeddings = np.zeros((1, 1, 256), dtype=np.float32)
     try:
-        runner.build_activations(hidden, state)
+        runner.build_activations(token_embeddings, state)
     except ValueError as exc:
-        assert "Expected hidden size 1536" in str(exc)
+        assert "Expected token embedding size 1536" in str(exc)
     else:
         raise AssertionError("build_activations must reject the wrong hidden size")
 
@@ -118,7 +118,7 @@ def test_build_cache_param_tensor_matches_official_helper():
     runner = Gemma4LiteRTMTPRunner(
         signature_runner=_FakeSignatureRunner(),
         contract={
-            "activations_formula": "concat(hidden_states, projected_activations)",
+            "activations_formula": "concat(next_token_embedding, projected_activations)",
             "model_hidden_size": 1536,
             "projected_activations_size": 1536,
             "param_tensor_shape": [1, 1, 1, 7],
