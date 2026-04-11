@@ -57,6 +57,10 @@ def test_build_activations_and_run_step():
     assert result["logits"].shape == (1, 1, 32)
     assert state.projected_activations.shape == (1, 1, 1536)
     assert np.allclose(state.projected_activations, 0.5)
+    np.testing.assert_array_equal(
+        fake.calls[0]["param_tensor"].reshape(-1)[:3],
+        np.array([3, 4, 4], dtype=np.int32),
+    )
 
 
 def test_build_activations_rejects_bad_hidden_width():
@@ -108,3 +112,28 @@ def test_state_copy_is_deep():
 
     assert state.projected_activations[0, 0, 0] == 1.0
     assert state.kv_cache_k_13[0, 0, 0, 0] == 1
+
+
+def test_build_cache_param_tensor_matches_official_helper():
+    runner = Gemma4LiteRTMTPRunner(
+        signature_runner=_FakeSignatureRunner(),
+        contract={
+            "activations_formula": "concat(hidden_states, projected_activations)",
+            "model_hidden_size": 1536,
+            "projected_activations_size": 1536,
+            "param_tensor_shape": [1, 1, 1, 7],
+        },
+        input_details={
+            "kv_cache_k_13": {"shape": [1, 1, 8, 256]},
+            "kv_cache_k_14": {"shape": [1, 1, 8, 512]},
+            "kv_cache_v_13": {"shape": [1, 1, 256, 8]},
+            "kv_cache_v_14": {"shape": [1, 1, 512, 8]},
+            "mask": {"shape": [1, 1, 1, 8]},
+        },
+    )
+
+    param_tensor = runner.build_cache_param_tensor(start_index=5, update_length=10)
+    flat = param_tensor.reshape(-1)
+
+    np.testing.assert_array_equal(flat[:3], np.array([5, 15, 15], dtype=np.int32))
+    np.testing.assert_array_equal(flat[3:], np.zeros(flat.shape[0] - 3, dtype=np.int32))

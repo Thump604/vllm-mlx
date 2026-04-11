@@ -107,6 +107,19 @@ class Gemma4LiteRTMTPRunner:
             ),
         )
 
+    def build_cache_param_tensor(
+        self, *, start_index: int, update_length: int
+    ) -> np.ndarray:
+        """Mirror LiteRT-LM FillSingleBufferCacheParamTensor semantics."""
+        param_tensor = np.zeros(self.param_shape, dtype=np.int32)
+        flat = param_tensor.reshape(-1)
+        if flat.size >= 3:
+            end_index = start_index + update_length
+            flat[0] = start_index
+            flat[1] = end_index
+            flat[2] = end_index
+        return param_tensor
+
     def build_activations(
         self,
         hidden_states: np.ndarray,
@@ -138,7 +151,9 @@ class Gemma4LiteRTMTPRunner:
         if mask is None:
             mask = np.zeros(tuple(self.input_details["mask"]["shape"]), dtype=np.bool_)
         if param_tensor is None:
-            param_tensor = np.zeros(self.param_shape, dtype=np.int32)
+            param_tensor = self.build_cache_param_tensor(
+                start_index=input_pos, update_length=1
+            )
 
         start = time.perf_counter()
         outputs = self._runner(

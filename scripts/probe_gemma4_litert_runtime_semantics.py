@@ -98,6 +98,9 @@ def main() -> None:
     alt_mask = _make_mask(
         tuple(runner.input_details["mask"]["shape"]), args.mask_tokens_alt
     )
+    canonical_param = runner.build_cache_param_tensor(
+        start_index=args.input_pos, update_length=1
+    )
 
     baseline = _run(
         runner,
@@ -105,6 +108,7 @@ def main() -> None:
         base_state,
         input_pos=args.input_pos,
         mask=base_mask,
+        param_tensor=canonical_param,
     )
 
     payload: dict[str, object] = {
@@ -114,18 +118,20 @@ def main() -> None:
         "baseline": {
             "input_pos": args.input_pos,
             "mask_tokens": args.mask_tokens,
+            "param_tensor_first3": canonical_param.reshape(-1)[:3].tolist(),
             "logits": _stats(baseline["logits"]),
             "projected_activations": _stats(baseline["projected_activations"]),
             "elapsed_ms": round(float(baseline["elapsed_ms"]), 3),
         },
         "input_pos_probe": {},
         "mask_probe": {},
-        "param_slot_probes": [],
-        "param_slot_capacity_probes": [],
-        "slot0_threshold_probe": [],
-        "mask_probe_with_slot0_capacity": {},
+        "canonical_update_length_probes": [],
+        "noncanonical_param_slot_probes": [],
+        "noncanonical_param_slot_capacity_probes": [],
+        "noncanonical_slot0_threshold_probe": [],
+        "mask_probe_with_noncanonical_slot0_capacity": {},
         "cache_zero_probes": [],
-        "cache_zero_probes_by_slot0": [],
+        "cache_zero_probes_by_noncanonical_slot0": [],
     }
 
     input_pos_alt = _run(
@@ -134,6 +140,9 @@ def main() -> None:
         base_state,
         input_pos=args.input_pos + 1,
         mask=base_mask,
+        param_tensor=runner.build_cache_param_tensor(
+            start_index=args.input_pos + 1, update_length=1
+        ),
     )
     payload["input_pos_probe"] = {
         "alt_input_pos": args.input_pos + 1,
@@ -150,6 +159,7 @@ def main() -> None:
         base_state,
         input_pos=args.input_pos,
         mask=alt_mask,
+        param_tensor=canonical_param,
     )
     payload["mask_probe"] = {
         "alt_mask_tokens": args.mask_tokens_alt,
@@ -159,6 +169,30 @@ def main() -> None:
             mask_alt["projected_activations"],
         ),
     }
+
+    for update_length in (1, 2, 4):
+        param_tensor = runner.build_cache_param_tensor(
+            start_index=args.input_pos, update_length=update_length
+        )
+        probe = _run(
+            runner,
+            hidden_states,
+            base_state,
+            input_pos=args.input_pos,
+            mask=base_mask,
+            param_tensor=param_tensor,
+        )
+        payload["canonical_update_length_probes"].append(
+            {
+                "update_length": update_length,
+                "param_tensor_first3": param_tensor.reshape(-1)[:3].tolist(),
+                "logits_diff": _diff_stats(baseline["logits"], probe["logits"]),
+                "projected_diff": _diff_stats(
+                    baseline["projected_activations"],
+                    probe["projected_activations"],
+                ),
+            }
+        )
 
     for slot in range(int(np.prod(runner.param_shape))):
         param_tensor = np.zeros(runner.param_shape, dtype=np.int32)
@@ -171,7 +205,7 @@ def main() -> None:
             mask=base_mask,
             param_tensor=param_tensor,
         )
-        payload["param_slot_probes"].append(
+        payload["noncanonical_param_slot_probes"].append(
             {
                 "slot": slot,
                 "value": args.param_value,
@@ -198,7 +232,7 @@ def main() -> None:
             mask=base_mask,
             param_tensor=param_tensor,
         )
-        payload["param_slot_capacity_probes"].append(
+        payload["noncanonical_param_slot_capacity_probes"].append(
             {
                 "slot": slot,
                 "value": time_capacity,
@@ -244,7 +278,7 @@ def main() -> None:
             mask=base_mask,
             param_tensor=param_tensor,
         )
-        payload["slot0_threshold_probe"].append(
+        payload["noncanonical_slot0_threshold_probe"].append(
             {
                 "value": value,
                 "logits_diff": _diff_stats(baseline["logits"], probe["logits"]),
@@ -273,7 +307,7 @@ def main() -> None:
         mask=base_mask,
         param_tensor=slot0_capacity,
     )
-    payload["mask_probe_with_slot0_capacity"] = {
+    payload["mask_probe_with_noncanonical_slot0_capacity"] = {
         "slot0_value": time_capacity,
         "alt_mask_tokens": args.mask_tokens_alt,
         "logits_diff": _diff_stats(
@@ -294,6 +328,7 @@ def main() -> None:
             cache_state,
             input_pos=args.input_pos,
             mask=base_mask,
+            param_tensor=canonical_param,
         )
         payload["cache_zero_probes"].append(
             {
@@ -347,7 +382,7 @@ def main() -> None:
                     ),
                 }
             )
-        payload["cache_zero_probes_by_slot0"].append(slot_payload)
+        payload["cache_zero_probes_by_noncanonical_slot0"].append(slot_payload)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
