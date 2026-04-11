@@ -38,6 +38,8 @@ class LiteRTTensorSpec:
 @dataclass(frozen=True)
 class Gemma4LiteRTKVCacheSpec:
     layer_index: int
+    runtime_source_layer_index: int
+    source_layer_type: str
     key: LiteRTTensorSpec
     value: LiteRTTensorSpec
     time_capacity: int
@@ -87,6 +89,20 @@ def _resolve_text_config(model_config: dict[str, Any]) -> dict[str, Any]:
     return model_config.get("text_config", model_config)
 
 
+def _resolve_layer_types(text_config: dict[str, Any]) -> list[str]:
+    layer_types = text_config.get("layer_types")
+    if isinstance(layer_types, list) and layer_types:
+        return [str(item) for item in layer_types]
+
+    num_hidden_layers = int(text_config.get("num_hidden_layers", 0))
+    sliding_window_pattern = int(text_config.get("sliding_window_pattern", 5))
+    if num_hidden_layers <= 0:
+        raise ValueError("Gemma text config missing num_hidden_layers")
+    pattern = ["sliding_attention"] * (sliding_window_pattern - 1) + ["full_attention"]
+    repeated = pattern * (num_hidden_layers // len(pattern) + 1)
+    return repeated[:num_hidden_layers]
+
+
 def _tensor_spec(entry: dict[str, Any], short_name: str) -> LiteRTTensorSpec:
     return LiteRTTensorSpec(
         short_name=short_name,
@@ -127,7 +143,10 @@ def _tensor_map(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def _cache_specs(
     inputs_by_name: dict[str, dict[str, Any]],
+    *,
+    text_config: dict[str, Any],
 ) -> tuple[Gemma4LiteRTKVCacheSpec, ...]:
+    layer_types = _resolve_layer_types(text_config)
     cache_layers = sorted(
         {
             int(name.split("_")[-1])
@@ -158,6 +177,8 @@ def _cache_specs(
         specs.append(
             Gemma4LiteRTKVCacheSpec(
                 layer_index=layer_index,
+                runtime_source_layer_index=layer_index,
+                source_layer_type=str(layer_types[layer_index]),
                 key=key,
                 value=value,
                 time_capacity=int(key.shape[2]),
@@ -261,7 +282,7 @@ def build_gemma4_litert_mtp_contract(
             "and map explicit LiteRT cache tensors through mtp_cache slots"
         ),
         projected_state_cache_field=projected_state_cache_field,
-        kv_cache_specs=_cache_specs(inputs_by_name),
+        kv_cache_specs=_cache_specs(inputs_by_name, text_config=text_config),
     )
 
 

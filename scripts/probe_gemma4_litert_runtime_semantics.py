@@ -125,6 +125,7 @@ def main() -> None:
         "slot0_threshold_probe": [],
         "mask_probe_with_slot0_capacity": {},
         "cache_zero_probes": [],
+        "cache_zero_probes_by_slot0": [],
     }
 
     input_pos_alt = _run(
@@ -304,6 +305,49 @@ def main() -> None:
                 ),
             }
         )
+
+    for slot0_value in (512, 1024, time_capacity - 1, time_capacity):
+        slot0_param = np.zeros(runner.param_shape, dtype=np.int32)
+        slot0_param.reshape(-1)[0] = slot0_value
+        slot0_base = _run(
+            runner,
+            hidden_states,
+            base_state,
+            input_pos=args.input_pos,
+            mask=base_mask,
+            param_tensor=slot0_param,
+        )
+        slot_payload = {
+            "slot0_value": slot0_value,
+            "cache_probes": [],
+        }
+        for name in (
+            "kv_cache_k_13",
+            "kv_cache_k_14",
+            "kv_cache_v_13",
+            "kv_cache_v_14",
+        ):
+            cache_state = base_state.copy()
+            getattr(cache_state, name)[...] = 0
+            probe = _run(
+                runner,
+                hidden_states,
+                cache_state,
+                input_pos=args.input_pos,
+                mask=base_mask,
+                param_tensor=slot0_param,
+            )
+            slot_payload["cache_probes"].append(
+                {
+                    "cache_name": name,
+                    "logits_diff": _diff_stats(slot0_base["logits"], probe["logits"]),
+                    "projected_diff": _diff_stats(
+                        slot0_base["projected_activations"],
+                        probe["projected_activations"],
+                    ),
+                }
+            )
+        payload["cache_zero_probes_by_slot0"].append(slot_payload)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

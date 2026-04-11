@@ -70,6 +70,7 @@ def test_build_gemma4_litert_mtp_contract():
             "model_type": "gemma4_text",
             "hidden_size": 1536,
             "vocab_size": 262144,
+            "num_hidden_layers": 35,
             "hidden_size_per_layer_input": 256,
         }
     }
@@ -88,6 +89,14 @@ def test_build_gemma4_litert_mtp_contract():
     assert contract.projected_state_cache_field == "projected_activations"
     assert len(contract.kv_cache_specs) == 2
     assert [spec.layer_index for spec in contract.kv_cache_specs] == [13, 14]
+    assert [spec.runtime_source_layer_index for spec in contract.kv_cache_specs] == [
+        13,
+        14,
+    ]
+    assert [spec.source_layer_type for spec in contract.kv_cache_specs] == [
+        "sliding_attention",
+        "full_attention",
+    ]
     assert contract.kv_cache_specs[0].head_dim == 256
     assert contract.kv_cache_specs[1].head_dim == 512
     assert contract.kv_cache_specs[0].time_capacity == 32003
