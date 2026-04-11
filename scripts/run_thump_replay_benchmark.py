@@ -19,9 +19,15 @@ def main() -> None:
     )
     parser.add_argument("--draft-model-path")
     parser.add_argument("--thump-lib")
+    parser.add_argument("--composition-threshold", type=int)
+    parser.add_argument("--keep-pct", type=float)
     args = parser.parse_args()
 
     trace = ReplayTrace.from_path(args.trace)
+    if args.composition_threshold is not None:
+        trace.composition_threshold = args.composition_threshold
+    if args.keep_pct is not None:
+        trace.keep_pct = args.keep_pct
     runner = ReplayRunner(
         args.model_path,
         thump_lib_path=args.thump_lib,

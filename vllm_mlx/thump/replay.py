@@ -227,6 +227,8 @@ class ReplayRunResult:
 class ReplayComparison:
     model_path: str
     trace_name: str
+    keep_pct: float
+    composition_threshold: int
     prefill_step_size: int
     capture_step_size: int
     tail_without_last_tokens: int
@@ -617,6 +619,8 @@ class ReplayRunner:
         return ReplayComparison(
             model_path=self.model_path,
             trace_name=trace.name,
+            keep_pct=trace.keep_pct,
+            composition_threshold=trace.composition_threshold,
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=trace.capture_step_size or trace.prefill_step_size,
             tail_without_last_tokens=len(tokens.tail_without_last),
