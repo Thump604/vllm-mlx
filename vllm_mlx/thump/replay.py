@@ -526,6 +526,79 @@ class ReplayRunner:
             timings_ms=timings_ms,
         )
 
+    def run_direct_full_prompt(
+        self,
+        trace: ReplayTrace,
+        tokens: TraceTokens,
+    ) -> ReplayRunResult:
+        session_start = time.perf_counter()
+        timings_ms: dict[str, float] = {}
+        edit_continuations_ms: list[float] = []
+        edit_post_edit_totals_ms: list[float] = []
+        edit_cumulative_session_totals_ms: list[float] = []
+        edit_output_texts: list[str] = []
+        edit_output_tokens: list[list[int]] = []
+        for edit_index in range(tokens.edit_count):
+            cache = self.model.make_cache()
+            prompt = tokens.updated_prompt_for_edit(edit_index)
+            edit_start = time.perf_counter()
+            start = time.perf_counter()
+            _prefill_tokens(
+                self.model,
+                prompt[:-1],
+                cache,
+                prefill_step_size=trace.prefill_step_size,
+            )
+            prefill_ms = (time.perf_counter() - start) * 1000.0
+            timings_ms["direct_full_prefill_ms"] = (
+                timings_ms.get("direct_full_prefill_ms", 0.0) + prefill_ms
+            )
+            decode_start = time.perf_counter()
+            continuation_ms, output_text, output_tokens = self._decode_from_cache(
+                cache,
+                prompt[-1],
+                max_new_tokens=trace.max_new_tokens,
+                start_time=edit_start,
+            )
+            decode_ms = (time.perf_counter() - decode_start) * 1000.0
+            timings_ms["resumed_decode_ms"] = (
+                timings_ms.get("resumed_decode_ms", 0.0) + decode_ms
+            )
+            post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
+            timings_ms["post_edit_overhead_ms"] = timings_ms.get(
+                "post_edit_overhead_ms", 0.0
+            ) + max(0.0, post_edit_ms - (prefill_ms + decode_ms))
+            edit_continuations_ms.append(continuation_ms)
+            edit_post_edit_totals_ms.append(post_edit_ms)
+            edit_cumulative_session_totals_ms.append(
+                (time.perf_counter() - session_start) * 1000.0
+            )
+            edit_output_texts.append(output_text)
+            edit_output_tokens.append(output_tokens)
+        session_total_ms = (time.perf_counter() - session_start) * 1000.0
+        measured_session_ms = sum(timings_ms.values())
+        timings_ms["session_overhead_ms"] = max(
+            0.0, session_total_ms - measured_session_ms
+        )
+        return ReplayRunResult(
+            variant="direct_full_prompt",
+            continuation_latency_ms=edit_continuations_ms[0],
+            post_edit_total_ms=sum(edit_post_edit_totals_ms),
+            session_total_ms=session_total_ms,
+            output_text=edit_output_texts[-1],
+            output_tokens=edit_output_tokens[-1],
+            re_prefill_avoided_tokens=0,
+            fallback_count=0,
+            fallback_reason=None,
+            edit_count=tokens.edit_count,
+            edit_continuation_latencies_ms=edit_continuations_ms,
+            edit_post_edit_totals_ms=edit_post_edit_totals_ms,
+            edit_cumulative_session_totals_ms=edit_cumulative_session_totals_ms,
+            edit_output_texts=edit_output_texts,
+            edit_output_tokens=edit_output_tokens,
+            timings_ms=timings_ms,
+        )
+
     def run_thump(self, trace: ReplayTrace, tokens: TraceTokens) -> ReplayRunResult:
         session_start = time.perf_counter()
         try:
@@ -729,6 +802,7 @@ class ReplayRunner:
 
     def run_comparison(self, trace: ReplayTrace) -> ReplayComparison:
         tokens = self.build_trace_tokens(trace)
+        isolation_direct = self.run_direct_full_prompt(trace, tokens)
         isolation_baseline = self.run_baseline(trace, tokens, use_specprefill=False)
         isolation_thump = self.run_thump(trace, tokens)
 
@@ -757,6 +831,7 @@ class ReplayRunner:
             ) == _run_output_sequences(isolation_baseline)
 
         isolation = {
+            "direct_full_prompt": asdict(isolation_direct),
             "baseline": asdict(isolation_baseline),
             "thump": asdict(isolation_thump),
             "output_exact_match": _run_output_sequences(isolation_baseline)
@@ -764,6 +839,22 @@ class ReplayRunner:
             "edit_output_exact_matches": _output_exact_matches(
                 isolation_baseline,
                 isolation_thump,
+            ),
+            "baseline_vs_direct_full_prompt_exact_match": _run_output_sequences(
+                isolation_baseline
+            )
+            == _run_output_sequences(isolation_direct),
+            "thump_vs_direct_full_prompt_exact_match": _run_output_sequences(
+                isolation_thump
+            )
+            == _run_output_sequences(isolation_direct),
+            "baseline_vs_direct_full_prompt_edit_exact_matches": _output_exact_matches(
+                isolation_baseline,
+                isolation_direct,
+            ),
+            "thump_vs_direct_full_prompt_edit_exact_matches": _output_exact_matches(
+                isolation_thump,
+                isolation_direct,
             ),
             "prefix_pad_tokens": tokens.prefix_pad_tokens,
             "insert_pad_tokens": tokens.insert_pad_tokens,
