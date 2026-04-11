@@ -319,6 +319,19 @@ class RuntimeHandle:
         )
         return ids
 
+    def splice_replace_equal_length(self, replace_at: int, count: int) -> np.ndarray:
+        ids = np.zeros(count, dtype=np.uint32)
+        _check(
+            self._lib.thump_rt_splice_replace_equal_length(
+                self._handle,
+                replace_at,
+                count,
+                ids.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            ),
+            "thump_rt_splice_replace_equal_length",
+        )
+        return ids
+
     def write_blocks(
         self, block_ids: np.ndarray, k_fp16: np.ndarray, v_fp16: np.ndarray
     ) -> None:

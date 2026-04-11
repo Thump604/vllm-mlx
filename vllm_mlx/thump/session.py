@@ -17,12 +17,48 @@ from .adapter import BlockGeometry, RopeConfig, RuntimeHandle
 from .capture import LayerCapture
 
 
+def _interleave_split_rotary_pairs(keys: np.ndarray, rotated_dims: int) -> np.ndarray:
+    """Map MLX split-pair rotary layout to adjacent-pair layout."""
+    if rotated_dims <= 0 or rotated_dims > keys.shape[-1]:
+        return keys
+    half = rotated_dims // 2
+    if half == 0:
+        return keys
+    out = np.array(keys, copy=True)
+    rotated = out[..., :rotated_dims]
+    interleaved = np.empty_like(rotated)
+    interleaved[..., 0::2] = rotated[..., :half]
+    interleaved[..., 1::2] = rotated[..., half:rotated_dims]
+    out[..., :rotated_dims] = interleaved
+    return out
+
+
+def _deinterleave_split_rotary_pairs(
+    keys: np.ndarray, rotated_dims: int
+) -> np.ndarray:
+    """Restore MLX split-pair rotary layout from adjacent-pair layout."""
+    if rotated_dims <= 0 or rotated_dims > keys.shape[-1]:
+        return keys
+    half = rotated_dims // 2
+    if half == 0:
+        return keys
+    out = np.array(keys, copy=True)
+    rotated = out[..., :rotated_dims]
+    split = np.empty_like(rotated)
+    split[..., :half] = rotated[..., 0::2]
+    split[..., half:rotated_dims] = rotated[..., 1::2]
+    out[..., :rotated_dims] = split
+    return out
+
+
 @dataclass(frozen=True)
 class LayerSpec:
     layer_index: int
     layer_type: str
     geometry: BlockGeometry
     window_size: int | None = None
+    rotary_dims: int = 0
+    rope_traditional: bool = True
 
 
 @dataclass
@@ -83,7 +119,9 @@ class SessionSubstrate:
                 else "full_attention"
             )
             rope_params = dict(args.rope_parameters.get(layer_key, {}))
-            partial = float(rope_params.get("partial_rotary_factor", 1.0))
+            rope = attn.rope
+            rope_dims = int(getattr(rope, "dims", attn.head_dim))
+            partial = float(rope_dims) / float(attn.head_dim)
             rope_type = rope_params.get("rope_type", "default")
             if rope_type == "proportional":
                 variant = 3
@@ -98,7 +136,7 @@ class SessionSubstrate:
                 group_size=attn.n_heads // attn.n_kv_heads,
                 rope=RopeConfig(
                     variant=variant,
-                    theta=float(rope_params.get("rope_theta", 10000.0)),
+                    theta=float(getattr(rope, "base", rope_params.get("rope_theta", 10000.0))),
                     partial_rotary_factor=partial,
                 ),
             )
@@ -111,6 +149,8 @@ class SessionSubstrate:
                     layer_type=layer.layer_type,
                     geometry=geometry,
                     window_size=window_size,
+                    rotary_dims=rope_dims,
+                    rope_traditional=bool(getattr(rope, "traditional", True)),
                 )
             )
         return cls(
@@ -128,6 +168,9 @@ class SessionSubstrate:
         self, capture: LayerCapture, spec: LayerSpec
     ) -> tuple[np.ndarray, np.ndarray]:
         tokens = capture.keys.shape[0]
+        keys = capture.keys
+        if not spec.rope_traditional and spec.rotary_dims > 0:
+            keys = _interleave_split_rotary_pairs(keys, spec.rotary_dims)
         padded_tokens = (
             math.ceil(tokens / spec.geometry.block_size_tokens)
             * spec.geometry.block_size_tokens
@@ -137,7 +180,7 @@ class SessionSubstrate:
             dtype=np.float16,
         )
         v = np.zeros_like(k)
-        k[:tokens] = capture.keys.astype(np.float16, copy=False)
+        k[:tokens] = keys.astype(np.float16, copy=False)
         v[:tokens] = capture.values.astype(np.float16, copy=False)
         block_count = padded_tokens // spec.geometry.block_size_tokens
         return (
@@ -176,6 +219,24 @@ class SessionSubstrate:
             bank.handle.write_blocks(new_ids, packed_k, packed_v)
         self.total_tokens += insert_token_count
 
+    def replace_equal_length_from_capture(
+        self,
+        replace_token_index: int,
+        captures: dict[int, LayerCapture],
+        *,
+        replace_token_count: int,
+    ) -> None:
+        if replace_token_index % self.block_size_tokens != 0:
+            raise ValueError("replace_token_index must be block aligned")
+        if replace_token_count % self.block_size_tokens != 0:
+            raise ValueError("replace_token_count must be block aligned")
+        replace_blocks = replace_token_count // self.block_size_tokens
+        replace_at = replace_token_index // self.block_size_tokens
+        for layer_idx, bank in self._banks.items():
+            packed_k, packed_v = self._pack_capture(captures[layer_idx], bank.spec)
+            new_ids = bank.handle.splice_replace_equal_length(replace_at, replace_blocks)
+            bank.handle.write_blocks(new_ids, packed_k, packed_v)
+
     def materialize_prompt_cache(self, model: Any, upto_tokens: int) -> list[Any]:
         caches = model.make_cache()
         for bank in self._banks.values():
@@ -207,6 +268,8 @@ class SessionSubstrate:
             )
             token_k = full_k[token_offset : token_offset + materialize_tokens]
             token_v = full_v[token_offset : token_offset + materialize_tokens]
+            if not spec.rope_traditional and spec.rotary_dims > 0:
+                token_k = _deinterleave_split_rotary_pairs(token_k, spec.rotary_dims)
             keys = mx.array(
                 np.transpose(token_k[None, ...], (0, 2, 1, 3)),
                 dtype=mx.float16,
@@ -216,12 +279,41 @@ class SessionSubstrate:
                 dtype=mx.float16,
             )
             cache = caches[bank.spec.layer_index]
-            cache.state = (keys, values)
+            alloc_tokens = materialize_tokens
+            cache_step = getattr(cache, "step", None)
+            cache_max = getattr(cache, "max_size", None)
+            if cache_step:
+                alloc_tokens = max(
+                    cache_step,
+                    math.ceil(upto_tokens / cache_step) * cache_step,
+                )
+            if cache_max is not None:
+                alloc_tokens = min(alloc_tokens, cache_max)
+
+            if hasattr(cache, "keys") and hasattr(cache, "values"):
+                padded_k = mx.zeros(
+                    (keys.shape[0], keys.shape[1], alloc_tokens, keys.shape[3]),
+                    dtype=keys.dtype,
+                )
+                padded_v = mx.zeros(
+                    (values.shape[0], values.shape[1], alloc_tokens, values.shape[3]),
+                    dtype=values.dtype,
+                )
+                padded_k[..., :materialize_tokens, :] = keys
+                padded_v[..., :materialize_tokens, :] = values
+                cache.keys = padded_k
+                cache.values = padded_v
+                if hasattr(cache, "offset"):
+                    cache.offset = upto_tokens
+                if hasattr(cache, "_idx"):
+                    cache._idx = min(upto_tokens, alloc_tokens)
+            else:
+                cache.state = (keys, values)
             if isinstance(cache, RotatingKVCache):
                 cache.meta_state = (
                     str(cache.keep),
                     str(cache.max_size),
                     str(upto_tokens),
-                    str(materialize_tokens),
+                    str(min(upto_tokens, alloc_tokens)),
                 )
         return caches

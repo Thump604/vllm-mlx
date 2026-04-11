@@ -153,6 +153,7 @@ class ReplayTrace:
     keep_pct: float = 0.5
     composition_threshold: int = 256
     prefill_step_size: int = 256
+    capture_step_size: int | None = None
     expected_substrings: list[str] | None = None
 
     @classmethod
@@ -186,6 +187,10 @@ class TraceTokens:
     def last_prompt_token(self) -> int:
         return self.updated_prompt[-1]
 
+    @property
+    def suffix_without_last(self) -> list[int]:
+        return self.suffix[:-1]
+
 
 @dataclass
 class ReplayRunResult:
@@ -205,6 +210,8 @@ class ReplayRunResult:
 class ReplayComparison:
     model_path: str
     trace_name: str
+    prefill_step_size: int
+    capture_step_size: int
     isolation: dict[str, Any]
     composition: dict[str, Any] | None
 
@@ -372,13 +379,14 @@ class ReplayRunner:
     def run_thump(self, trace: ReplayTrace, tokens: TraceTokens) -> ReplayRunResult:
         session_start = time.perf_counter()
         try:
+            capture_step_size = trace.capture_step_size or trace.prefill_step_size
             prefix_cache = self.model.make_cache()
             prefix_collector = CaptureCollector()
             _prefill_tokens(
                 self.model,
                 tokens.prefix,
                 prefix_cache,
-                prefill_step_size=trace.prefill_step_size,
+                prefill_step_size=capture_step_size,
                 collector=prefix_collector,
             )
             prefix_snapshot = clone_prompt_cache(prefix_cache)
@@ -387,7 +395,7 @@ class ReplayRunner:
                 self.model,
                 tokens.suffix,
                 prefix_cache,
-                prefill_step_size=trace.prefill_step_size,
+                prefill_step_size=capture_step_size,
                 collector=suffix_collector,
             )
             full_capture = _merge_captures(
@@ -415,7 +423,7 @@ class ReplayRunner:
                 self.model,
                 tokens.insert,
                 delta_cache,
-                prefill_step_size=trace.prefill_step_size,
+                prefill_step_size=capture_step_size,
                 collector=insert_collector,
             )
             session.splice_insert_from_capture(
@@ -484,6 +492,8 @@ class ReplayRunner:
         return ReplayComparison(
             model_path=self.model_path,
             trace_name=trace.name,
+            prefill_step_size=trace.prefill_step_size,
+            capture_step_size=trace.capture_step_size or trace.prefill_step_size,
             isolation=isolation,
             composition=composition,
         )
