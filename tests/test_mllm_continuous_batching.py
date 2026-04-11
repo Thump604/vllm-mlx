@@ -192,6 +192,37 @@ class TestMLLMBatch:
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
 
+    def test_extract_cache_clamps_negative_left_padding_for_rotating_cache(self):
+        """BatchRotatingKVCache extraction must not slice from the tail."""
+        from mlx_lm.generate import BatchRotatingKVCache
+        from mlx_lm.models.cache import RotatingKVCache
+        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        batch_cache = BatchRotatingKVCache(4, [0])
+        batch_cache.keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+        batch_cache.values = (mx.arange(4, dtype=mx.float32) + 1).reshape(1, 1, 4, 1)
+        batch_cache.left_padding = mx.array([-2], dtype=mx.int32)
+        batch_cache.offset = mx.array([6], dtype=mx.int32)
+        batch_cache._idx = 4
+        batch_cache.rotated = False
+
+        batch = MLLMBatch(
+            uids=[0],
+            request_ids=["req-1"],
+            y=mx.array([1], dtype=mx.int32),
+            logprobs=[mx.array([0.0], dtype=mx.float32)],
+            max_tokens=[8],
+            num_tokens=[0],
+            cache=[batch_cache],
+            requests=[MLLMBatchRequest(uid=0, request_id="req-1", prompt="hi")],
+        )
+
+        extracted = batch.extract_cache(0)
+
+        assert isinstance(extracted[0], RotatingKVCache)
+        assert extracted[0].offset == 6
+        assert extracted[0].keys.shape == (1, 1, 4, 1)
+
 
 class TestMLLMBatchStats:
     """Tests for MLLMBatchStats."""
@@ -276,7 +307,9 @@ class TestMLLMBatchGeneratorSampling:
         """
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
 
-        generator = MLLMBatchGenerator(MagicMock(), MagicMock(), enable_vision_cache=False)
+        generator = MLLMBatchGenerator(
+            MagicMock(), MagicMock(), enable_vision_cache=False
+        )
 
         # Force preprocessing to fail with the same error shape PIL raises
         # on malformed 1x1 greyscale PNGs.
@@ -321,7 +354,9 @@ class TestMLLMBatchGeneratorSampling:
         """Each active request should apply its own processors and sampler."""
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
 
-        generator = MLLMBatchGenerator(MagicMock(), MagicMock(), enable_vision_cache=False)
+        generator = MLLMBatchGenerator(
+            MagicMock(), MagicMock(), enable_vision_cache=False
+        )
         generator.language_model = MagicMock(
             return_value=mx.array(
                 [
@@ -543,9 +578,7 @@ class TestMLLMBatchGeneratorChunkedPrefill:
         from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
 
         gen = self._build_generator(prefill_step_size=1024)
-        model_mock = MagicMock(
-            return_value=mx.zeros((1, 1500, 8), dtype=mx.float32)
-        )
+        model_mock = MagicMock(return_value=mx.zeros((1, 1500, 8), dtype=mx.float32))
         gen.model = model_mock
 
         req = MLLMBatchRequest(
@@ -570,9 +603,7 @@ class TestMLLMBatchGeneratorChunkedPrefill:
         from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
 
         gen = self._build_generator(prefill_step_size=1024)
-        model_mock = MagicMock(
-            return_value=mx.zeros((1, 1024, 4), dtype=mx.float32)
-        )
+        model_mock = MagicMock(return_value=mx.zeros((1, 1024, 4), dtype=mx.float32))
         gen.model = model_mock
 
         req = MLLMBatchRequest(
@@ -804,9 +835,7 @@ class TestMLLMBatchGeneratorSpecPrefill:
         monkeypatch.setattr(mbg, "CooperativeSpecPrefillSession", _FakeSession)
 
         draft_mock = MagicMock(name="draft_model")
-        gen = self._build_generator(
-            draft_model=draft_mock, threshold=512, keep_pct=0.3
-        )
+        gen = self._build_generator(draft_model=draft_mock, threshold=512, keep_pct=0.3)
 
         req = MLLMBatchRequest(
             uid=0,

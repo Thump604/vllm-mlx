@@ -255,44 +255,106 @@ class _CacheEntry:
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
-    """Create shallow copies of KVCache/QuantizedKVCache layers with offset reduced.
+    """Create copies of cache layers with the last ``trim_by`` positions removed.
 
     This is used when returning a cached KV state to the scheduler so that
     the last N positions are "freed" and the model will recompute them on the
     next forward pass (preventing duplicate KV entries).
 
-    Supports both KVCache (keys/values are arrays) and QuantizedKVCache
-    (keys/values are 3-tuples of arrays).
-    """
-    from mlx_lm.models.cache import KVCache
+    For plain KVCache: reduces offset (surplus data beyond offset is harmless
+    since merge slices to ``keys[:, :, :offset, :]``).
 
-    try:
-        from mlx_lm.models.cache import QuantizedKVCache
-    except ImportError:
-        QuantizedKVCache = None  # noqa: N806
+    For RotatingKVCache: actually trims the circular buffer. Reducing offset
+    alone breaks ``size()`` / ``_temporal_order`` invariants.
+
+    Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
+    """
+    import mlx.core as mx
+    from mlx_lm.models.cache import RotatingKVCache
 
     trimmed: list[Any] = []
+    eval_targets: list[Any] = []
     for layer_cache in cache:
-        if QuantizedKVCache is not None and isinstance(layer_cache, QuantizedKVCache):
-            tc = QuantizedKVCache.__new__(QuantizedKVCache)
+        if isinstance(layer_cache, _QuantizedCacheWrapper):
+            tc = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
-            tc.group_size = layer_cache.group_size
             tc.bits = layer_cache.bits
+            tc.group_size = layer_cache.group_size
+            tc.orig_type = layer_cache.orig_type
+            tc.orig_attrs = layer_cache.orig_attrs
+            trimmed.append(tc)
+        elif isinstance(layer_cache, RotatingKVCache):
+            if layer_cache.keys is None or trim_by <= 0:
+                trimmed.append(layer_cache)
+                continue
+
+            old_offset = layer_cache.offset
+            new_offset = max(old_offset - trim_by, 0)
+            old_size = min(old_offset, layer_cache.max_size)
+            entries_to_keep = max(0, old_size - trim_by)
+
+            orig_cls = type(layer_cache)
+            tc = orig_cls.__new__(orig_cls)
+            tc.offset = new_offset
+            tc.max_size = layer_cache.max_size
+            tc.keep = getattr(layer_cache, "keep", 0)
+            tc.step = getattr(layer_cache, "step", layer_cache.max_size)
+
+            if entries_to_keep <= 0:
+                tc.keys = None
+                tc.values = None
+                tc._idx = 0
+            elif entries_to_keep < old_size:
+                ordered_k = layer_cache._temporal_order(layer_cache.keys)
+                ordered_v = layer_cache._temporal_order(layer_cache.values)
+                kept_k = ordered_k[:, :, :entries_to_keep, :]
+                kept_v = ordered_v[:, :, :entries_to_keep, :]
+
+                if new_offset >= tc.max_size:
+                    pad_n = tc.max_size - entries_to_keep
+                    pad_k = mx.zeros(
+                        (kept_k.shape[0], kept_k.shape[1], pad_n, kept_k.shape[3]),
+                        dtype=kept_k.dtype,
+                    )
+                    pad_v = mx.zeros(
+                        (kept_v.shape[0], kept_v.shape[1], pad_n, kept_v.shape[3]),
+                        dtype=kept_v.dtype,
+                    )
+                    tc.keys = mx.concatenate([pad_k, kept_k], axis=2)
+                    tc.values = mx.concatenate([pad_v, kept_v], axis=2)
+                    tc._idx = tc.max_size
+                else:
+                    tc.keys = kept_k
+                    tc.values = kept_v
+                    tc._idx = entries_to_keep
+                eval_targets.extend([tc.keys, tc.values])
+            else:
+                tc.keys = layer_cache.keys
+                tc.values = layer_cache.values
+                tc._idx = layer_cache._idx
             trimmed.append(tc)
         elif (
             hasattr(layer_cache, "offset")
             and hasattr(layer_cache, "keys")
             and not isinstance(layer_cache.keys, (list, tuple))
         ):
-            tc = KVCache.__new__(KVCache)
+            orig_cls = type(layer_cache)
+            tc = orig_cls.__new__(orig_cls)
             tc.keys = layer_cache.keys
             tc.values = layer_cache.values
             tc.offset = max(layer_cache.offset - trim_by, 0)
+            for attr in ("max_size", "keep", "step", "_idx"):
+                if hasattr(layer_cache, attr):
+                    setattr(tc, attr, getattr(layer_cache, attr))
             trimmed.append(tc)
         else:
             trimmed.append(layer_cache)
+
+    if eval_targets:
+        mx.eval(*eval_targets)
+
     return trimmed
 
 
@@ -353,28 +415,56 @@ def _trim_to_offset(cache: list[Any]) -> list[Any]:
     return trimmed
 
 
+class _QuantizedCacheWrapper:
+    """Quantized KV storage that preserves the original cache type metadata."""
+
+    __slots__ = (
+        "keys",
+        "values",
+        "offset",
+        "bits",
+        "group_size",
+        "orig_type",
+        "orig_attrs",
+    )
+
+    def __init__(self, layer: Any, bits: int, group_size: int):
+        import mlx.core as mx
+
+        self.keys = mx.quantize(layer.keys, group_size=group_size, bits=bits)
+        self.values = mx.quantize(layer.values, group_size=group_size, bits=bits)
+        self.offset = layer.offset
+        self.bits = bits
+        self.group_size = group_size
+        self.orig_type = type(layer)
+        self.orig_attrs = {}
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if hasattr(layer, attr):
+                self.orig_attrs[attr] = getattr(layer, attr)
+
+
 def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
-    """Quantize KVCache layers to reduce memory. Non-KVCache layers are kept as-is."""
+    """Quantize plain KVCache layers and preserve hybrid-cache types as-is."""
     from mlx_lm.models.cache import KVCache
 
     quantized = []
     for layer in cache:
-        if isinstance(layer, KVCache) and layer.keys is not None:
-            quantized.append(layer.to_quantized(group_size=group_size, bits=bits))
+        if type(layer) is KVCache and layer.keys is not None:
+            quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
         else:
             quantized.append(layer)
     return quantized
 
 
 def _dequantize_cache(cache: list[Any]) -> list[Any]:
-    """Dequantize QuantizedKVCache layers back to regular KVCache."""
+    """Dequantize wrappers and deep-copy non-quantized cache layers."""
     import mlx.core as mx
-    from mlx_lm.models.cache import KVCache, QuantizedKVCache
 
     result = []
     for layer in cache:
-        if isinstance(layer, QuantizedKVCache) and layer.keys is not None:
-            kv = KVCache()
+        if isinstance(layer, _QuantizedCacheWrapper):
+            orig_cls = layer.orig_type
+            kv = orig_cls.__new__(orig_cls)
             kv.keys = mx.dequantize(
                 *layer.keys, group_size=layer.group_size, bits=layer.bits
             )
@@ -382,6 +472,18 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 *layer.values, group_size=layer.group_size, bits=layer.bits
             )
             kv.offset = layer.offset
+            for attr, val in layer.orig_attrs.items():
+                setattr(kv, attr, val)
+            result.append(kv)
+        elif hasattr(layer, "keys") and hasattr(layer, "offset"):
+            orig_cls = type(layer)
+            kv = orig_cls.__new__(orig_cls)
+            kv.keys = mx.array(layer.keys) if layer.keys is not None else None
+            kv.values = mx.array(layer.values) if layer.values is not None else None
+            kv.offset = layer.offset
+            for attr in ("max_size", "keep", "step", "_idx"):
+                if hasattr(layer, attr):
+                    setattr(kv, attr, getattr(layer, attr))
             result.append(kv)
         else:
             result.append(layer)

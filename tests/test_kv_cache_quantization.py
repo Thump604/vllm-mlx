@@ -2,13 +2,15 @@
 """Tests for KV cache quantization in prefix cache."""
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from vllm_mlx.memory_cache import (
     MemoryAwarePrefixCache,
     MemoryCacheConfig,
+    _QuantizedCacheWrapper,
     _dequantize_cache,
     _quantize_cache,
+    _trim_cache_offset,
     _trim_to_offset,
     estimate_kv_cache_memory,
 )
@@ -37,7 +39,7 @@ class TestQuantizeDequantize:
         quantized = _quantize_cache(cache, bits=8, group_size=64)
         assert len(quantized) == len(cache)
         for layer in quantized:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
     def test_dequantize_produces_kv_cache(self):
         cache = _make_kv_cache()
@@ -89,6 +91,47 @@ class TestQuantizeDequantize:
         assert isinstance(result[0], KVCache)
         assert result[0].keys is None
 
+    def test_rotating_cache_is_not_quantized(self):
+        """RotatingKVCache keeps its native type and window metadata."""
+        cache = RotatingKVCache(max_size=8, keep=0)
+        cache.keys = mx.random.normal((1, 4, 4, 8))
+        cache.values = mx.random.normal((1, 4, 4, 8))
+        cache.offset = 4
+        cache._idx = 4
+        mx.eval(cache.keys, cache.values)
+
+        result = _quantize_cache([cache], bits=8, group_size=64)
+        assert isinstance(result[0], RotatingKVCache)
+        assert result[0] is cache
+
+    def test_dequantize_copies_rotating_cache(self):
+        """Non-quantized rotating caches must be copied on fetch."""
+        cache = RotatingKVCache(max_size=8, keep=0)
+        cache.keys = mx.arange(16, dtype=mx.float32).reshape(1, 1, 4, 4)
+        cache.values = (mx.arange(16, dtype=mx.float32) + 1).reshape(1, 1, 4, 4)
+        cache.offset = 4
+        cache._idx = 4
+
+        restored = _dequantize_cache([cache])
+        assert isinstance(restored[0], RotatingKVCache)
+        assert restored[0] is not cache
+        assert restored[0].offset == cache.offset
+        assert restored[0].max_size == cache.max_size
+        assert restored[0].keys.shape == cache.keys.shape
+
+    def test_trim_cache_offset_preserves_rotating_cache_type(self):
+        """Trimming a rotating cache must keep rotating-cache semantics."""
+        cache = RotatingKVCache(max_size=8, keep=0)
+        cache.keys = mx.arange(16, dtype=mx.float32).reshape(1, 1, 4, 4)
+        cache.values = (mx.arange(16, dtype=mx.float32) + 1).reshape(1, 1, 4, 4)
+        cache.offset = 4
+        cache._idx = 4
+
+        trimmed = _trim_cache_offset([cache], trim_by=1)
+        assert isinstance(trimmed[0], RotatingKVCache)
+        assert trimmed[0].offset == 3
+        assert trimmed[0].max_size == 8
+
 
 class TestMixedCacheLayers:
     """Test that non-KVCache layers are preserved."""
@@ -107,7 +150,7 @@ class TestMixedCacheLayers:
         cache = [kv, fake_mamba]
         quantized = _quantize_cache(cache, bits=8, group_size=64)
 
-        assert isinstance(quantized[0], QuantizedKVCache)
+        assert isinstance(quantized[0], _QuantizedCacheWrapper)
         assert isinstance(quantized[1], dict)  # Preserved as-is
 
         restored = _dequantize_cache(quantized)
@@ -196,7 +239,7 @@ class TestPrefixCacheIntegration:
         # Internally stored as quantized
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
-            assert isinstance(layer, QuantizedKVCache)
+            assert isinstance(layer, _QuantizedCacheWrapper)
 
         # Fetched as dequantized KVCache
         fetched, remaining = pc.fetch(tokens)
@@ -312,7 +355,7 @@ class TestMinQuantizeTokensThreshold:
         stored_entry = list(pc._entries.values())[0]
         for layer in stored_entry.cache:
             assert isinstance(
-                layer, QuantizedKVCache
+                layer, _QuantizedCacheWrapper
             ), "Long sequences should be quantized"
 
     def test_trim_applied_without_quantization(self):

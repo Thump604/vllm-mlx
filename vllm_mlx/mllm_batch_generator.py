@@ -233,15 +233,40 @@ class MLLMBatch:
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
-        Extract cache for a single request (for caching).
+        Extract cache for a single request (for prefix caching).
 
-        Args:
-            idx: Index of request in batch
-
-        Returns:
-            Cache state for that request
+        Handles BatchRotatingKVCache negative left_padding bug: during
+        generation with rotation, left_padding can become negative, which
+        would make the default extract() path slice from the tail.
         """
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        from mlx_lm.generate import BatchRotatingKVCache
+        from mlx_lm.models.cache import RotatingKVCache
+
+        result = []
+        for c in self.cache:
+            if not hasattr(c, "extract"):
+                result.append(None)
+            elif isinstance(c, BatchRotatingKVCache):
+                cache = RotatingKVCache(c.max_size)
+                padding = max(0, c.left_padding[idx].item())
+                offset = c.offset[idx].item()
+                cache.keys = c.keys[idx : idx + 1]
+                cache.values = c.values[idx : idx + 1]
+                cache._idx = c._idx
+                if c.rotated:
+                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
+                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache._idx = c.max_size
+                cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+                cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+                cache.offset = offset
+                cache._idx = cache.keys.shape[2]
+                cache.step = getattr(c, "step", c.max_size)
+                cache.keep = getattr(c, "keep", 0)
+                result.append(cache)
+            else:
+                result.append(c.extract(idx))
+        return result
 
 
 class MLLMBatchStats:
@@ -718,10 +743,7 @@ class MLLMBatchGenerator:
         """
         if self._draft_model is None:
             return False
-        if (
-            self._specprefill_threshold is None
-            or self._specprefill_keep_pct is None
-        ):
+        if self._specprefill_threshold is None or self._specprefill_keep_pct is None:
             return False
         if request.pixel_values is not None or request.image_grid_thw is not None:
             return False
@@ -734,9 +756,8 @@ class MLLMBatchGenerator:
             seq_len = int(iids.shape[-1])
         if seq_len <= int(self._specprefill_threshold):
             return False
-        if (
-            self._specprefill_max_input is not None
-            and seq_len > int(self._specprefill_max_input)
+        if self._specprefill_max_input is not None and seq_len > int(
+            self._specprefill_max_input
         ):
             return False
         return True
@@ -973,8 +994,8 @@ class MLLMBatchGenerator:
                 specprefill_req = candidate
                 deferred = valid_requests[:i] + valid_requests[i + 1 :]
                 if deferred:
-                    self.unprocessed_requests = (
-                        list(deferred) + list(self.unprocessed_requests)
+                    self.unprocessed_requests = list(deferred) + list(
+                        self.unprocessed_requests
                     )
                 valid_requests = [candidate]
                 break
@@ -1013,9 +1034,7 @@ class MLLMBatchGenerator:
                     specprefill_req
                 )
                 last_logits = logits[:, -1, :]
-                sampled, logprobs = self._sample_request(
-                    specprefill_req, last_logits
-                )
+                sampled, logprobs = self._sample_request(specprefill_req, last_logits)
                 mx.eval(sampled, logprobs)
                 first_tokens.append(sampled.item())
                 all_logprobs.append(logprobs.squeeze(0))
