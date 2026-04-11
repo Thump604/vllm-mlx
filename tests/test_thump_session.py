@@ -101,6 +101,56 @@ def test_session_substrate_replace_equal_length_round_trip(tmp_path):
     assert np.allclose(tokens_first[32:48], 10.0, atol=0.1)
 
 
+def test_session_substrate_insert_then_replace_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(layer_index=0, layer_type="full_attention", geometry=geometry)
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=12,
+        root_dir=tmp_path,
+    )
+
+    initial = LayerCapture(
+        keys=np.full((32, 2, 8), 1.0, dtype=np.float16),
+        values=np.full((32, 2, 8), 10.0, dtype=np.float16),
+    )
+    session.initialize_from_capture({0: initial}, total_tokens=32)
+
+    inserted = LayerCapture(
+        keys=np.full((16, 2, 8), 2.0, dtype=np.float16),
+        values=np.full((16, 2, 8), 20.0, dtype=np.float16),
+    )
+    session.splice_insert_from_capture(
+        16,
+        {0: inserted},
+        insert_token_count=16,
+    )
+
+    replacement = LayerCapture(
+        keys=np.full((16, 2, 8), 3.0, dtype=np.float16),
+        values=np.full((16, 2, 8), 30.0, dtype=np.float16),
+    )
+    session.replace_equal_length_from_capture(
+        16,
+        {0: replacement},
+        replace_token_count=16,
+    )
+
+    caches = session.materialize_prompt_cache(_DummyModel(), upto_tokens=48)
+    _keys, values = caches[0].state
+    values_np = np.asarray(values)
+    tokens_first = np.transpose(values_np[0], (1, 0, 2))
+    assert np.allclose(tokens_first[:16], 10.0, atol=0.1)
+    assert np.allclose(tokens_first[16:32], 30.0, atol=0.1)
+    assert np.allclose(tokens_first[32:48], 10.0, atol=0.1)
+
+
 def test_nontraditional_rope_layout_helpers_round_trip():
     keys = np.arange(16, dtype=np.float16).reshape(2, 1, 8)
     interleaved = _interleave_split_rotary_pairs(keys, 4)

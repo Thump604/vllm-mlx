@@ -157,12 +157,29 @@ def _effective_selected_indices(
     return mx.array(merged, dtype=selected_indices.dtype)
 
 
+def _run_output_sequences(run: ReplayRunResult) -> list[list[int]]:
+    if run.edit_output_tokens:
+        return run.edit_output_tokens
+    return [run.output_tokens]
+
+
+def _output_exact_matches(
+    lhs: ReplayRunResult,
+    rhs: ReplayRunResult,
+) -> list[bool]:
+    left = _run_output_sequences(lhs)
+    right = _run_output_sequences(rhs)
+    count = min(len(left), len(right))
+    return [left[index] == right[index] for index in range(count)]
+
+
 @dataclass
 class ReplayTrace:
     name: str
     prefix_text: str
     insert_text: str
     suffix_text: str
+    insert_texts: list[str] | None = None
     max_new_tokens: int = 48
     description: str = ""
     keep_pct: float = 0.5
@@ -179,11 +196,19 @@ class ReplayTrace:
 @dataclass
 class TraceTokens:
     prefix: list[int]
-    insert: list[int]
+    insert_variants: list[list[int]]
     suffix: list[int]
     pad_token_id: int
     prefix_pad_tokens: int
     insert_pad_tokens: int
+
+    @property
+    def insert(self) -> list[int]:
+        return self.insert_variants[0]
+
+    @property
+    def edit_count(self) -> int:
+        return len(self.insert_variants)
 
     @property
     def original_prompt(self) -> list[int]:
@@ -193,9 +218,16 @@ class TraceTokens:
     def updated_prompt(self) -> list[int]:
         return self.prefix + self.insert + self.suffix
 
+    def updated_prompt_for_edit(self, edit_index: int) -> list[int]:
+        return self.prefix + self.insert_variants[edit_index] + self.suffix
+
     @property
     def tail_without_last(self) -> list[int]:
         prompt = self.updated_prompt
+        return prompt[len(self.prefix) : -1]
+
+    def tail_without_last_for_edit(self, edit_index: int) -> list[int]:
+        prompt = self.updated_prompt_for_edit(edit_index)
         return prompt[len(self.prefix) : -1]
 
     @property
@@ -218,6 +250,12 @@ class ReplayRunResult:
     re_prefill_avoided_tokens: int
     fallback_count: int
     fallback_reason: str | None
+    edit_count: int = 1
+    edit_continuation_latencies_ms: list[float] | None = None
+    edit_post_edit_totals_ms: list[float] | None = None
+    edit_cumulative_session_totals_ms: list[float] | None = None
+    edit_output_texts: list[str] | None = None
+    edit_output_tokens: list[list[int]] | None = None
     specprefill_selected_tokens: int = 0
     specprefill_effective_selected_tokens: int = 0
     timings_ms: dict[str, float] | None = None
@@ -227,6 +265,7 @@ class ReplayRunResult:
 class ReplayComparison:
     model_path: str
     trace_name: str
+    edit_count: int
     keep_pct: float
     composition_threshold: int
     prefill_step_size: int
@@ -288,17 +327,23 @@ class ReplayRunner:
         block_size = block_size or self.block_size_tokens
         pad_token_id = _choose_pad_token(self.tokenizer)
         prefix = list(self.tokenizer.encode(trace.prefix_text))
-        insert = list(self.tokenizer.encode(trace.insert_text))
+        raw_inserts = trace.insert_texts or [trace.insert_text]
+        insert_variants = [list(self.tokenizer.encode(text)) for text in raw_inserts]
         suffix = list(self.tokenizer.encode(trace.suffix_text))
         prefix_pad = (-len(prefix)) % block_size
-        insert_pad = (-len(insert)) % block_size
+        max_insert_len = max(len(tokens) for tokens in insert_variants)
+        target_insert_len = math.ceil(max_insert_len / block_size) * block_size
+        insert_pad = target_insert_len - len(insert_variants[0])
         prefix.extend([pad_token_id] * prefix_pad)
-        insert.extend([pad_token_id] * insert_pad)
+        padded_insert_variants: list[list[int]] = []
+        for variant_tokens in insert_variants:
+            pad = target_insert_len - len(variant_tokens)
+            padded_insert_variants.append(variant_tokens + [pad_token_id] * pad)
         if not suffix:
             raise ValueError("suffix_text must produce at least one token")
         return TraceTokens(
             prefix=prefix,
-            insert=insert,
+            insert_variants=padded_insert_variants,
             suffix=suffix,
             pad_token_id=pad_token_id,
             prefix_pad_tokens=prefix_pad,
@@ -355,9 +400,7 @@ class ReplayRunner:
         timings_ms["prefix_prefill_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
         prefix_snapshot = clone_prompt_cache(prefix_cache)
-        timings_ms["prefix_snapshot_clone_ms"] = (
-            time.perf_counter() - start
-        ) * 1000.0
+        timings_ms["prefix_snapshot_clone_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
         _prefill_tokens(
             self.model,
@@ -367,70 +410,94 @@ class ReplayRunner:
         )
         timings_ms["suffix_prefill_ms"] = (time.perf_counter() - start) * 1000.0
 
-        start = time.perf_counter()
-        edit_cache = clone_prompt_cache(prefix_snapshot)
-        timings_ms["edit_cache_clone_ms"] = (time.perf_counter() - start) * 1000.0
-        edit_start = time.perf_counter()
         selected_count = 0
         effective_selected_count = 0
-        if use_specprefill and self.draft_model is not None:
+        edit_continuations_ms: list[float] = []
+        edit_post_edit_totals_ms: list[float] = []
+        edit_cumulative_session_totals_ms: list[float] = []
+        edit_output_texts: list[str] = []
+        edit_output_tokens: list[list[int]] = []
+        for edit_index, insert_tokens in enumerate(tokens.insert_variants):
             start = time.perf_counter()
-            importance = score_tokens(
-                self.draft_model,
-                tokens.tail_without_last,
-                prefill_step_size=trace.prefill_step_size,
+            edit_cache = clone_prompt_cache(prefix_snapshot)
+            timings_ms["edit_cache_clone_ms"] = (
+                timings_ms.get("edit_cache_clone_ms", 0.0)
+                + (time.perf_counter() - start) * 1000.0
             )
-            timings_ms["specprefill_score_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
-            selected = select_chunks(importance, keep_pct=trace.keep_pct)
-            selected_count = int(selected.shape[0])
-            effective_selected = _effective_selected_indices(
-                selected,
-                token_count=len(tokens.tail_without_last),
-                max_rotating_size=self.max_rotating_size,
-            )
-            effective_selected_count = int(effective_selected.shape[0])
-            start = time.perf_counter()
-            sparse_prefill(
-                self.model,
-                tokens.tail_without_last,
-                effective_selected,
+            edit_start = time.perf_counter()
+            tail_without_last = tokens.tail_without_last_for_edit(edit_index)
+            edit_measured_ms = 0.0
+            if use_specprefill and self.draft_model is not None:
+                start = time.perf_counter()
+                importance = score_tokens(
+                    self.draft_model,
+                    tail_without_last,
+                    prefill_step_size=trace.prefill_step_size,
+                )
+                score_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["specprefill_score_ms"] = (
+                    timings_ms.get("specprefill_score_ms", 0.0) + score_ms
+                )
+                edit_measured_ms += score_ms
+                selected = select_chunks(importance, keep_pct=trace.keep_pct)
+                selected_count += int(selected.shape[0])
+                effective_selected = _effective_selected_indices(
+                    selected,
+                    token_count=len(tail_without_last),
+                    max_rotating_size=self.max_rotating_size,
+                )
+                effective_selected_count += int(effective_selected.shape[0])
+                start = time.perf_counter()
+                sparse_prefill(
+                    self.model,
+                    tail_without_last,
+                    effective_selected,
+                    edit_cache,
+                    step_size=trace.prefill_step_size,
+                    position_offset=len(tokens.prefix),
+                )
+                prefill_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["specprefill_prefill_ms"] = (
+                    timings_ms.get("specprefill_prefill_ms", 0.0) + prefill_ms
+                )
+                edit_measured_ms += prefill_ms
+            else:
+                start = time.perf_counter()
+                _prefill_tokens(
+                    self.model,
+                    tail_without_last,
+                    edit_cache,
+                    prefill_step_size=trace.prefill_step_size,
+                )
+                prefill_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["delta_prefill_ms"] = (
+                    timings_ms.get("delta_prefill_ms", 0.0) + prefill_ms
+                )
+                edit_measured_ms += prefill_ms
+            decode_start = time.perf_counter()
+            continuation_ms, output_text, output_tokens = self._decode_from_cache(
                 edit_cache,
-                step_size=trace.prefill_step_size,
-                position_offset=len(tokens.prefix),
+                tokens.last_prompt_token,
+                max_new_tokens=trace.max_new_tokens,
+                start_time=edit_start,
             )
-            timings_ms["specprefill_prefill_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
-        else:
-            start = time.perf_counter()
-            _prefill_tokens(
-                self.model,
-                tokens.tail_without_last,
-                edit_cache,
-                prefill_step_size=trace.prefill_step_size,
+            decode_ms = (time.perf_counter() - decode_start) * 1000.0
+            timings_ms["resumed_decode_ms"] = (
+                timings_ms.get("resumed_decode_ms", 0.0) + decode_ms
             )
-            timings_ms["delta_prefill_ms"] = (time.perf_counter() - start) * 1000.0
-        decode_start = time.perf_counter()
-        continuation_ms, output_text, output_tokens = self._decode_from_cache(
-            edit_cache,
-            tokens.last_prompt_token,
-            max_new_tokens=trace.max_new_tokens,
-            start_time=edit_start,
-        )
-        timings_ms["resumed_decode_ms"] = (time.perf_counter() - decode_start) * 1000.0
-        post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
+            edit_measured_ms += decode_ms
+            post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
+            timings_ms["post_edit_overhead_ms"] = timings_ms.get(
+                "post_edit_overhead_ms", 0.0
+            ) + max(0.0, post_edit_ms - edit_measured_ms)
+            edit_continuations_ms.append(continuation_ms)
+            edit_post_edit_totals_ms.append(post_edit_ms)
+            edit_cumulative_session_totals_ms.append(
+                (time.perf_counter() - session_start) * 1000.0
+            )
+            edit_output_texts.append(output_text)
+            edit_output_tokens.append(output_tokens)
         session_total_ms = (time.perf_counter() - session_start) * 1000.0
-        post_edit_measured_ms = (
-            timings_ms.get("delta_prefill_ms", 0.0)
-            + timings_ms.get("specprefill_score_ms", 0.0)
-            + timings_ms.get("specprefill_prefill_ms", 0.0)
-            + timings_ms["resumed_decode_ms"]
-        )
-        timings_ms["post_edit_overhead_ms"] = max(
-            0.0, post_edit_ms - post_edit_measured_ms
-        )
         measured_session_ms = sum(timings_ms.values())
         timings_ms["session_overhead_ms"] = max(
             0.0, session_total_ms - measured_session_ms
@@ -438,14 +505,20 @@ class ReplayRunner:
         cleanup_rope(self.model)
         return ReplayRunResult(
             variant="baseline",
-            continuation_latency_ms=continuation_ms,
-            post_edit_total_ms=post_edit_ms,
+            continuation_latency_ms=edit_continuations_ms[0],
+            post_edit_total_ms=sum(edit_post_edit_totals_ms),
             session_total_ms=session_total_ms,
-            output_text=output_text,
-            output_tokens=output_tokens,
+            output_text=edit_output_texts[-1],
+            output_tokens=edit_output_tokens[-1],
             re_prefill_avoided_tokens=0,
             fallback_count=0,
             fallback_reason=None,
+            edit_count=tokens.edit_count,
+            edit_continuation_latencies_ms=edit_continuations_ms,
+            edit_post_edit_totals_ms=edit_post_edit_totals_ms,
+            edit_cumulative_session_totals_ms=edit_cumulative_session_totals_ms,
+            edit_output_texts=edit_output_texts,
+            edit_output_tokens=edit_output_tokens,
             specprefill_selected_tokens=selected_count,
             specprefill_effective_selected_tokens=effective_selected_count,
             timings_ms=timings_ms,
@@ -492,8 +565,15 @@ class ReplayRunner:
                 suffix_collector.joined(),
             )
             timings_ms["capture_merge_ms"] = (time.perf_counter() - start) * 1000.0
+            replace_headroom_blocks = (
+                math.ceil(len(tokens.insert) / self.block_size_tokens)
+                if tokens.edit_count > 1
+                else 0
+            )
             total_blocks = (
-                math.ceil(len(tokens.updated_prompt) / self.block_size_tokens) + 8
+                math.ceil(len(tokens.updated_prompt) / self.block_size_tokens)
+                + replace_headroom_blocks
+                + 8
             )
             start = time.perf_counter()
             session = SessionSubstrate.from_gemma4_model(
@@ -502,64 +582,91 @@ class ReplayRunner:
                 block_capacity=total_blocks,
                 lib_path=self.thump_lib_path,
             )
-            timings_ms["session_construct_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
+            timings_ms["session_construct_ms"] = (time.perf_counter() - start) * 1000.0
             start = time.perf_counter()
             session.initialize_from_capture(
                 full_capture,
                 total_tokens=len(tokens.original_prompt),
             )
             timings_ms["capture_write_ms"] = (time.perf_counter() - start) * 1000.0
-
-            start = time.perf_counter()
-            delta_cache = clone_prompt_cache(prefix_snapshot)
-            timings_ms["delta_cache_clone_ms"] = (
-                time.perf_counter() - start
-            ) * 1000.0
-            edit_start = time.perf_counter()
-            insert_collector = CaptureCollector()
-            start = time.perf_counter()
-            _prefill_tokens(
-                self.model,
-                tokens.insert,
-                delta_cache,
-                prefill_step_size=capture_step_size,
-                collector=insert_collector,
-            )
-            timings_ms["delta_prefill_ms"] = (time.perf_counter() - start) * 1000.0
-            start = time.perf_counter()
-            session.splice_insert_from_capture(
-                len(tokens.prefix),
-                insert_collector.joined(),
-                insert_token_count=len(tokens.insert),
-            )
-            timings_ms["splice_ms"] = (time.perf_counter() - start) * 1000.0
-            start = time.perf_counter()
-            materialized_cache = session.materialize_prompt_cache(
-                self.model,
-                upto_tokens=len(tokens.updated_prompt) - 1,
-            )
-            timings_ms["materialize_ms"] = (time.perf_counter() - start) * 1000.0
-            decode_start = time.perf_counter()
-            continuation_ms, output_text, output_tokens = self._decode_from_cache(
-                materialized_cache,
-                tokens.last_prompt_token,
-                max_new_tokens=trace.max_new_tokens,
-                start_time=edit_start,
-            )
-            timings_ms["resumed_decode_ms"] = (time.perf_counter() - decode_start) * 1000.0
-            post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
+            edit_continuations_ms: list[float] = []
+            edit_post_edit_totals_ms: list[float] = []
+            edit_cumulative_session_totals_ms: list[float] = []
+            edit_output_texts: list[str] = []
+            edit_output_tokens: list[list[int]] = []
+            insert_token_count = len(tokens.insert)
+            for edit_index, insert_tokens in enumerate(tokens.insert_variants):
+                start = time.perf_counter()
+                delta_cache = clone_prompt_cache(prefix_snapshot)
+                timings_ms["delta_cache_clone_ms"] = (
+                    timings_ms.get("delta_cache_clone_ms", 0.0)
+                    + (time.perf_counter() - start) * 1000.0
+                )
+                edit_start = time.perf_counter()
+                insert_collector = CaptureCollector()
+                start = time.perf_counter()
+                _prefill_tokens(
+                    self.model,
+                    insert_tokens,
+                    delta_cache,
+                    prefill_step_size=capture_step_size,
+                    collector=insert_collector,
+                )
+                delta_prefill_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["delta_prefill_ms"] = (
+                    timings_ms.get("delta_prefill_ms", 0.0) + delta_prefill_ms
+                )
+                start = time.perf_counter()
+                if edit_index == 0:
+                    session.splice_insert_from_capture(
+                        len(tokens.prefix),
+                        insert_collector.joined(),
+                        insert_token_count=insert_token_count,
+                    )
+                else:
+                    session.replace_equal_length_from_capture(
+                        len(tokens.prefix),
+                        insert_collector.joined(),
+                        replace_token_count=insert_token_count,
+                    )
+                splice_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["splice_ms"] = timings_ms.get("splice_ms", 0.0) + splice_ms
+                start = time.perf_counter()
+                materialized_cache = session.materialize_prompt_cache(
+                    self.model,
+                    upto_tokens=len(tokens.updated_prompt_for_edit(edit_index)) - 1,
+                )
+                materialize_ms = (time.perf_counter() - start) * 1000.0
+                timings_ms["materialize_ms"] = (
+                    timings_ms.get("materialize_ms", 0.0) + materialize_ms
+                )
+                decode_start = time.perf_counter()
+                continuation_ms, output_text, output_tokens = self._decode_from_cache(
+                    materialized_cache,
+                    tokens.last_prompt_token,
+                    max_new_tokens=trace.max_new_tokens,
+                    start_time=edit_start,
+                )
+                decode_ms = (time.perf_counter() - decode_start) * 1000.0
+                timings_ms["resumed_decode_ms"] = (
+                    timings_ms.get("resumed_decode_ms", 0.0) + decode_ms
+                )
+                post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
+                timings_ms["post_edit_overhead_ms"] = timings_ms.get(
+                    "post_edit_overhead_ms", 0.0
+                ) + max(
+                    0.0,
+                    post_edit_ms
+                    - (delta_prefill_ms + splice_ms + materialize_ms + decode_ms),
+                )
+                edit_continuations_ms.append(continuation_ms)
+                edit_post_edit_totals_ms.append(post_edit_ms)
+                edit_cumulative_session_totals_ms.append(
+                    (time.perf_counter() - session_start) * 1000.0
+                )
+                edit_output_texts.append(output_text)
+                edit_output_tokens.append(output_tokens)
             session_total_ms = (time.perf_counter() - session_start) * 1000.0
-            post_edit_measured_ms = (
-                timings_ms["delta_prefill_ms"]
-                + timings_ms["splice_ms"]
-                + timings_ms["materialize_ms"]
-                + timings_ms["resumed_decode_ms"]
-            )
-            timings_ms["post_edit_overhead_ms"] = max(
-                0.0, post_edit_ms - post_edit_measured_ms
-            )
             measured_session_ms = sum(timings_ms.values())
             timings_ms["session_overhead_ms"] = max(
                 0.0, session_total_ms - measured_session_ms
@@ -567,14 +674,21 @@ class ReplayRunner:
             session.close()
             return ReplayRunResult(
                 variant="thump",
-                continuation_latency_ms=continuation_ms,
-                post_edit_total_ms=post_edit_ms,
+                continuation_latency_ms=edit_continuations_ms[0],
+                post_edit_total_ms=sum(edit_post_edit_totals_ms),
                 session_total_ms=session_total_ms,
-                output_text=output_text,
-                output_tokens=output_tokens,
-                re_prefill_avoided_tokens=max(0, len(tokens.suffix) - 1),
+                output_text=edit_output_texts[-1],
+                output_tokens=edit_output_tokens[-1],
+                re_prefill_avoided_tokens=max(0, len(tokens.suffix) - 1)
+                * tokens.edit_count,
                 fallback_count=0,
                 fallback_reason=None,
+                edit_count=tokens.edit_count,
+                edit_continuation_latencies_ms=edit_continuations_ms,
+                edit_post_edit_totals_ms=edit_post_edit_totals_ms,
+                edit_cumulative_session_totals_ms=edit_cumulative_session_totals_ms,
+                edit_output_texts=edit_output_texts,
+                edit_output_tokens=edit_output_tokens,
                 specprefill_effective_selected_tokens=0,
                 timings_ms=timings_ms,
             )
@@ -595,30 +709,41 @@ class ReplayRunner:
             self.draft_model is not None
             and len(tokens.tail_without_last) >= trace.composition_threshold
         ):
+            composition_baseline = self.run_baseline(
+                trace, tokens, use_specprefill=True
+            )
+            composition_thump = self.run_thump(trace, tokens)
             composition = {
-                "baseline": asdict(
-                    self.run_baseline(trace, tokens, use_specprefill=True)
-                ),
-                "thump": asdict(self.run_thump(trace, tokens)),
+                "baseline": asdict(composition_baseline),
+                "thump": asdict(composition_thump),
                 "specprefill_threshold": trace.composition_threshold,
                 "keep_pct": trace.keep_pct,
+                "edit_output_exact_matches": _output_exact_matches(
+                    composition_baseline,
+                    composition_thump,
+                ),
             }
             composition["baseline_vs_isolation_baseline_exact_match"] = (
-                composition["baseline"]["output_tokens"]
-                == isolation_baseline.output_tokens
-            )
+                composition["baseline"].get("edit_output_tokens")
+                or [composition["baseline"]["output_tokens"]]
+            ) == _run_output_sequences(isolation_baseline)
 
         isolation = {
             "baseline": asdict(isolation_baseline),
             "thump": asdict(isolation_thump),
-            "output_exact_match": isolation_baseline.output_tokens
-            == isolation_thump.output_tokens,
+            "output_exact_match": _run_output_sequences(isolation_baseline)
+            == _run_output_sequences(isolation_thump),
+            "edit_output_exact_matches": _output_exact_matches(
+                isolation_baseline,
+                isolation_thump,
+            ),
             "prefix_pad_tokens": tokens.prefix_pad_tokens,
             "insert_pad_tokens": tokens.insert_pad_tokens,
         }
         return ReplayComparison(
             model_path=self.model_path,
             trace_name=trace.name,
+            edit_count=tokens.edit_count,
             keep_pct=trace.keep_pct,
             composition_threshold=trace.composition_threshold,
             prefill_step_size=trace.prefill_step_size,
