@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -1995,7 +1996,7 @@ class BatchedEngine(BaseEngine):
                 # to start a concurrent worker and trip the Metal command
                 # buffer assertion.
                 producer_task = asyncio.ensure_future(asyncio.to_thread(_producer))
-                last_text = ""
+                accumulated_text = ""
                 try:
                     while True:
                         chunk = await queue.get()
@@ -2003,10 +2004,29 @@ class BatchedEngine(BaseEngine):
                             break
                         if isinstance(chunk, Exception):
                             raise chunk
-                        new_text = (chunk.text or "")[len(last_text) :]
-                        last_text = chunk.text or last_text
+                        chunk_text = getattr(chunk, "text", "")
+                        if not isinstance(chunk_text, str):
+                            chunk_text = ""
+                        chunk_new_text = getattr(chunk, "new_text", "")
+                        if not isinstance(chunk_new_text, str):
+                            chunk_new_text = ""
+                        previous_text = accumulated_text
+                        accumulated_text = self._accumulate_streamed_text(
+                            accumulated_text,
+                            SimpleNamespace(
+                                text=chunk_text,
+                                new_text=chunk_new_text,
+                                finished=bool(getattr(chunk, "finish_reason", None)),
+                            ),
+                        )
+                        if chunk_new_text:
+                            new_text = chunk_new_text
+                        elif accumulated_text.startswith(previous_text):
+                            new_text = accumulated_text[len(previous_text) :]
+                        else:
+                            new_text = chunk_text
                         yield GenerationOutput(
-                            text=chunk.text or "",
+                            text=accumulated_text,
                             new_text=new_text,
                             prompt_tokens=chunk.prompt_tokens,
                             completion_tokens=chunk.completion_tokens,

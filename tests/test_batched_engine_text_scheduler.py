@@ -296,6 +296,58 @@ def test_hybrid_cache_text_stream_chat_routes_through_serial_mllm_instance():
     asyncio.run(_run())
 
 
+def test_hybrid_cache_text_stream_chat_accumulates_delta_only_chunks():
+    """Hybrid-cache stream_chat must tolerate delta-only chunk.text values."""
+
+    async def _run():
+        engine = BatchedEngine("gemma-4-26b-a4b-it-5bit", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._has_hybrid_cache = True
+        engine._mllm_instance = MagicMock()
+
+        def _stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="The ",
+                prompt_tokens=15,
+                completion_tokens=1,
+                finish_reason=None,
+            )
+            yield MagicMock(
+                text="answer",
+                prompt_tokens=15,
+                completion_tokens=2,
+                finish_reason=None,
+            )
+            yield MagicMock(
+                text=" is OK",
+                prompt_tokens=15,
+                completion_tokens=3,
+                finish_reason="stop",
+            )
+
+        engine._mllm_instance.stream_chat = MagicMock(side_effect=_stream_chat)
+        engine._text_scheduler = FakeTextScheduler()
+        engine._text_scheduler_route_enabled = True
+        engine._text_model = MagicMock()
+
+        outputs = []
+        async for output in engine.stream_chat(
+            [{"role": "user", "content": "Say OK"}],
+            max_tokens=64,
+            temperature=1.0,
+            top_p=0.95,
+        ):
+            outputs.append((output.text, output.new_text, output.finished))
+
+        assert outputs == [
+            ("The ", "The ", False),
+            ("The answer", "answer", False),
+            ("The answer is OK", " is OK", True),
+        ]
+
+    asyncio.run(_run())
+
+
 def test_hybrid_cache_routes_only_text_only_requests():
     """Image requests on hybrid-cache models still go through MLLMScheduler."""
 
