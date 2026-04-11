@@ -204,6 +204,7 @@ class ReplayRunResult:
     fallback_count: int
     fallback_reason: str | None
     specprefill_selected_tokens: int = 0
+    timings_ms: dict[str, float] | None = None
 
 
 @dataclass
@@ -313,32 +314,48 @@ class ReplayRunner:
         use_specprefill: bool,
     ) -> ReplayRunResult:
         session_start = time.perf_counter()
+        timings_ms: dict[str, float] = {}
         prefix_cache = self.model.make_cache()
+        start = time.perf_counter()
         _prefill_tokens(
             self.model,
             tokens.prefix,
             prefix_cache,
             prefill_step_size=trace.prefill_step_size,
         )
+        timings_ms["prefix_prefill_ms"] = (time.perf_counter() - start) * 1000.0
+        start = time.perf_counter()
         prefix_snapshot = clone_prompt_cache(prefix_cache)
+        timings_ms["prefix_snapshot_clone_ms"] = (
+            time.perf_counter() - start
+        ) * 1000.0
+        start = time.perf_counter()
         _prefill_tokens(
             self.model,
             tokens.suffix,
             prefix_cache,
             prefill_step_size=trace.prefill_step_size,
         )
+        timings_ms["suffix_prefill_ms"] = (time.perf_counter() - start) * 1000.0
 
+        start = time.perf_counter()
         edit_cache = clone_prompt_cache(prefix_snapshot)
+        timings_ms["edit_cache_clone_ms"] = (time.perf_counter() - start) * 1000.0
         edit_start = time.perf_counter()
         selected_count = 0
         if use_specprefill and self.draft_model is not None:
+            start = time.perf_counter()
             importance = score_tokens(
                 self.draft_model,
                 tokens.tail_without_last,
                 prefill_step_size=trace.prefill_step_size,
             )
+            timings_ms["specprefill_score_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
             selected = select_chunks(importance, keep_pct=trace.keep_pct)
             selected_count = int(selected.shape[0])
+            start = time.perf_counter()
             sparse_prefill(
                 self.model,
                 tokens.tail_without_last,
@@ -347,21 +364,41 @@ class ReplayRunner:
                 step_size=trace.prefill_step_size,
                 position_offset=len(tokens.prefix),
             )
+            timings_ms["specprefill_prefill_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
         else:
+            start = time.perf_counter()
             _prefill_tokens(
                 self.model,
                 tokens.tail_without_last,
                 edit_cache,
                 prefill_step_size=trace.prefill_step_size,
             )
+            timings_ms["delta_prefill_ms"] = (time.perf_counter() - start) * 1000.0
+        decode_start = time.perf_counter()
         continuation_ms, output_text, output_tokens = self._decode_from_cache(
             edit_cache,
             tokens.last_prompt_token,
             max_new_tokens=trace.max_new_tokens,
             start_time=edit_start,
         )
+        timings_ms["resumed_decode_ms"] = (time.perf_counter() - decode_start) * 1000.0
         post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
         session_total_ms = (time.perf_counter() - session_start) * 1000.0
+        post_edit_measured_ms = (
+            timings_ms.get("delta_prefill_ms", 0.0)
+            + timings_ms.get("specprefill_score_ms", 0.0)
+            + timings_ms.get("specprefill_prefill_ms", 0.0)
+            + timings_ms["resumed_decode_ms"]
+        )
+        timings_ms["post_edit_overhead_ms"] = max(
+            0.0, post_edit_ms - post_edit_measured_ms
+        )
+        measured_session_ms = sum(timings_ms.values())
+        timings_ms["session_overhead_ms"] = max(
+            0.0, session_total_ms - measured_session_ms
+        )
         cleanup_rope(self.model)
         return ReplayRunResult(
             variant="baseline",
@@ -374,14 +411,17 @@ class ReplayRunner:
             fallback_count=0,
             fallback_reason=None,
             specprefill_selected_tokens=selected_count,
+            timings_ms=timings_ms,
         )
 
     def run_thump(self, trace: ReplayTrace, tokens: TraceTokens) -> ReplayRunResult:
         session_start = time.perf_counter()
         try:
             capture_step_size = trace.capture_step_size or trace.prefill_step_size
+            timings_ms: dict[str, float] = {}
             prefix_cache = self.model.make_cache()
             prefix_collector = CaptureCollector()
+            start = time.perf_counter()
             _prefill_tokens(
                 self.model,
                 tokens.prefix,
@@ -389,8 +429,16 @@ class ReplayRunner:
                 prefill_step_size=capture_step_size,
                 collector=prefix_collector,
             )
+            timings_ms["prefix_capture_prefill_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+            start = time.perf_counter()
             prefix_snapshot = clone_prompt_cache(prefix_cache)
+            timings_ms["prefix_snapshot_clone_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
             suffix_collector = CaptureCollector()
+            start = time.perf_counter()
             _prefill_tokens(
                 self.model,
                 tokens.suffix,
@@ -398,27 +446,43 @@ class ReplayRunner:
                 prefill_step_size=capture_step_size,
                 collector=suffix_collector,
             )
+            timings_ms["suffix_capture_prefill_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+            start = time.perf_counter()
             full_capture = _merge_captures(
                 prefix_collector.joined(),
                 suffix_collector.joined(),
             )
+            timings_ms["capture_merge_ms"] = (time.perf_counter() - start) * 1000.0
             total_blocks = (
                 math.ceil(len(tokens.updated_prompt) / self.block_size_tokens) + 8
             )
+            start = time.perf_counter()
             session = SessionSubstrate.from_gemma4_model(
                 self.model,
                 block_size_tokens=self.block_size_tokens,
                 block_capacity=total_blocks,
                 lib_path=self.thump_lib_path,
             )
+            timings_ms["session_construct_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
+            start = time.perf_counter()
             session.initialize_from_capture(
                 full_capture,
                 total_tokens=len(tokens.original_prompt),
             )
+            timings_ms["capture_write_ms"] = (time.perf_counter() - start) * 1000.0
 
+            start = time.perf_counter()
             delta_cache = clone_prompt_cache(prefix_snapshot)
+            timings_ms["delta_cache_clone_ms"] = (
+                time.perf_counter() - start
+            ) * 1000.0
             edit_start = time.perf_counter()
             insert_collector = CaptureCollector()
+            start = time.perf_counter()
             _prefill_tokens(
                 self.model,
                 tokens.insert,
@@ -426,23 +490,43 @@ class ReplayRunner:
                 prefill_step_size=capture_step_size,
                 collector=insert_collector,
             )
+            timings_ms["delta_prefill_ms"] = (time.perf_counter() - start) * 1000.0
+            start = time.perf_counter()
             session.splice_insert_from_capture(
                 len(tokens.prefix),
                 insert_collector.joined(),
                 insert_token_count=len(tokens.insert),
             )
+            timings_ms["splice_ms"] = (time.perf_counter() - start) * 1000.0
+            start = time.perf_counter()
             materialized_cache = session.materialize_prompt_cache(
                 self.model,
                 upto_tokens=len(tokens.updated_prompt) - 1,
             )
+            timings_ms["materialize_ms"] = (time.perf_counter() - start) * 1000.0
+            decode_start = time.perf_counter()
             continuation_ms, output_text, output_tokens = self._decode_from_cache(
                 materialized_cache,
                 tokens.last_prompt_token,
                 max_new_tokens=trace.max_new_tokens,
                 start_time=edit_start,
             )
+            timings_ms["resumed_decode_ms"] = (time.perf_counter() - decode_start) * 1000.0
             post_edit_ms = (time.perf_counter() - edit_start) * 1000.0
             session_total_ms = (time.perf_counter() - session_start) * 1000.0
+            post_edit_measured_ms = (
+                timings_ms["delta_prefill_ms"]
+                + timings_ms["splice_ms"]
+                + timings_ms["materialize_ms"]
+                + timings_ms["resumed_decode_ms"]
+            )
+            timings_ms["post_edit_overhead_ms"] = max(
+                0.0, post_edit_ms - post_edit_measured_ms
+            )
+            measured_session_ms = sum(timings_ms.values())
+            timings_ms["session_overhead_ms"] = max(
+                0.0, session_total_ms - measured_session_ms
+            )
             session.close()
             return ReplayRunResult(
                 variant="thump",
@@ -454,6 +538,7 @@ class ReplayRunner:
                 re_prefill_avoided_tokens=max(0, len(tokens.suffix) - 1),
                 fallback_count=0,
                 fallback_reason=None,
+                timings_ms=timings_ms,
             )
         except Exception as exc:
             fallback = self.run_baseline(trace, tokens, use_specprefill=False)
