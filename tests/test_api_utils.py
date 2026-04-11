@@ -149,6 +149,10 @@ class TestIsMllmModel:
         assert is_mllm_model("mlx-community/gemma-3-12b-it-4bit") is True
         assert is_mllm_model("mlx-community/gemma3-4b-it-4bit") is True
 
+    def test_gemma4_models(self):
+        assert is_mllm_model("mlx-community/gemma-4-27b-it-4bit") is True
+        assert is_mllm_model("mlx-community/gemma4-4b-it-4bit") is True
+
     def test_medgemma_models(self):
         assert is_mllm_model("mlx-community/MedGemma-4b-it-4bit") is True
         assert is_mllm_model("mlx-community/medgemma-4b") is True

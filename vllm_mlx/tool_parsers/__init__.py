@@ -80,4 +80,5 @@ __all__ = [
     "FunctionaryToolParser",
     "Glm47ToolParser",
     "HarmonyToolParser",
+    "Gemma4ToolParser",
 ]

@@ -138,8 +138,12 @@ class TestMLLMThinkingPropagation:
         model._loaded = True
         model._video_native = False
         model._cache_manager = None
-        model.processor = SimpleNamespace(tokenizer=SimpleNamespace(encode=lambda text: [1, 2, 3]))
-        model.model = SimpleNamespace(config={"model_type": "gemma4"}, language_model=None)
+        model.processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(encode=lambda text: [1, 2, 3])
+        )
+        model.model = SimpleNamespace(
+            config={"model_type": "gemma4"}, language_model=None
+        )
         model.model_name = "test-model"
         return model
 
@@ -152,7 +156,9 @@ class TestMLLMThinkingPropagation:
             calls["generate"] = kwargs
             return SimpleNamespace(text="ok", prompt_tokens=12, generation_tokens=3)
 
-        def fake_apply_chat_template(processor, config, prompt, add_generation_prompt=True, **kwargs):
+        def fake_apply_chat_template(
+            processor, config, prompt, add_generation_prompt=True, **kwargs
+        ):
             calls["template"] = {
                 "processor": processor,
                 "config": config,
@@ -201,7 +207,9 @@ class TestMLLMThinkingPropagation:
             calls["stream_generate"] = kwargs
             yield types.SimpleNamespace(text="chunk", prompt_tokens=9)
 
-        def fake_apply_chat_template(processor, config, prompt, add_generation_prompt=True, **kwargs):
+        def fake_apply_chat_template(
+            processor, config, prompt, add_generation_prompt=True, **kwargs
+        ):
             calls["template"] = kwargs
             return "FORMATTED"
 
@@ -233,6 +241,23 @@ class TestMLLMThinkingPropagation:
         assert chunks[0].text == "chunk"
         assert calls["template"]["enable_thinking"] is False
         assert calls["stream_generate"]["enable_thinking"] is False
+
+
+class TestMLXMultimodalLMDetection:
+    """Unit tests for supported-family helpers."""
+
+    def test_is_mllm_model_detects_gemma4(self):
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        assert MLXMultimodalLM.is_mllm_model("mlx-community/gemma-4-27b-it-4bit")
+        assert MLXMultimodalLM.is_mllm_model("mlx-community/gemma4-4b-it-4bit")
+
+    def test_supported_families_lists_gemma4(self):
+        from vllm_mlx.models.mllm import MLXMultimodalLM
+
+        supported = MLXMultimodalLM.list_supported_model_families()
+
+        assert supported["Gemma 4"] == "Gemma 4 multimodal models"
 
 
 class TestVideoFrameExtraction:

@@ -342,6 +342,7 @@ class TestHelperFunctions:
         assert is_mllm_model("mlx-community/Qwen3-VL-4B-Instruct-3bit")
         assert is_mllm_model("mlx-community/llava-1.5-7b-4bit")
         assert is_mllm_model("mlx-community/paligemma-3b-mix-224-4bit")
+        assert is_mllm_model("mlx-community/gemma-4-27b-it-4bit")
         assert is_mllm_model("mlx-community/pixtral-12b-4bit")
         assert is_mllm_model("mlx-community/Idefics3-8B-Llama3-4bit")
         assert is_mllm_model("mlx-community/deepseek-vl-7b-chat-4bit")

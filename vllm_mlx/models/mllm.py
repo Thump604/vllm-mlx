@@ -1592,9 +1592,20 @@ class MLXMultimodalLM:
 
         # Only pass kwargs that mlx_vlm.generate_step actually accepts
         _vlm_kwargs = {}
-        for k in ("top_k", "min_p", "top_p", "repetition_penalty", "repetition_context_size",
-                   "logit_bias", "max_kv_size", "kv_bits", "kv_group_size",
-                   "sampler", "logits_processors", "prefill_step_size"):
+        for k in (
+            "top_k",
+            "min_p",
+            "top_p",
+            "repetition_penalty",
+            "repetition_context_size",
+            "logit_bias",
+            "max_kv_size",
+            "kv_bits",
+            "kv_group_size",
+            "sampler",
+            "logits_processors",
+            "prefill_step_size",
+        ):
             if k in kwargs:
                 _vlm_kwargs[k] = kwargs[k]
         result = generate(
@@ -2084,6 +2095,7 @@ class MLXMultimodalLM:
             "LLaVA": "LLaVA vision-language models",
             "Idefics": "Idefics vision-language models",
             "PaliGemma": "PaliGemma multimodal models",
+            "Gemma 4": "Gemma 4 multimodal models",
             "Pixtral": "Mistral's Pixtral vision models",
             "Molmo": "Allen AI's Molmo models",
             "Phi-3-Vision": "Microsoft's Phi-3 Vision models",
@@ -2109,6 +2121,8 @@ class MLXMultimodalLM:
             "PaliGemma",
             "gemma-3",
             "gemma3",  # Gemma 3 (multimodal)
+            "gemma-4",
+            "gemma4",  # Gemma 4 (multimodal: vision + audio)
             "medgemma",
             "MedGemma",  # MedGemma (medical multimodal)
             "pixtral",

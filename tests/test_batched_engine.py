@@ -99,6 +99,45 @@ class TestBatchedEngineGenerate:
         assert result.completion_tokens == 1
         assert result.finish_reason == "stop"
 
+
+class TestMLLMModelWrapper:
+    """Test MLLM model wrapper behavior for multimodal families."""
+
+    def test_injects_pixel_values_for_gemma4_text_only_calls(self):
+        from vllm_mlx.engine.batched import MLLMModelWrapper
+
+        recorded = {}
+
+        class DummyModel:
+            model_type = "gemma4"
+
+            def __call__(self, *args, **kwargs):
+                recorded["kwargs"] = kwargs
+                return mx.zeros((1, 1, 10))
+
+        wrapper = MLLMModelWrapper(DummyModel())
+        wrapper(mx.zeros((1, 1, 4)))
+
+        assert recorded["kwargs"]["pixel_values"] is None
+
+    def test_does_not_override_explicit_pixel_values(self):
+        from vllm_mlx.engine.batched import MLLMModelWrapper
+
+        recorded = {}
+        pixel_values = mx.ones((1, 3, 4, 4))
+
+        class DummyModel:
+            model_type = "gemma4"
+
+            def __call__(self, *args, **kwargs):
+                recorded["kwargs"] = kwargs
+                return mx.zeros((1, 1, 10))
+
+        wrapper = MLLMModelWrapper(DummyModel())
+        wrapper(mx.zeros((1, 1, 4)), pixel_values=pixel_values)
+
+        assert recorded["kwargs"]["pixel_values"] is pixel_values
+
     def test_accumulate_streamed_text_keeps_last_nonempty_text_on_terminal_stop_chunk(
         self,
     ):
