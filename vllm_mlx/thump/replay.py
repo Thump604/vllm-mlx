@@ -229,6 +229,9 @@ class ReplayComparison:
     trace_name: str
     prefill_step_size: int
     capture_step_size: int
+    tail_without_last_tokens: int
+    max_rotating_size: int
+    composition_control_viable: bool
     isolation: dict[str, Any]
     composition: dict[str, Any] | None
 
@@ -616,6 +619,10 @@ class ReplayRunner:
             trace_name=trace.name,
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=trace.capture_step_size or trace.prefill_step_size,
+            tail_without_last_tokens=len(tokens.tail_without_last),
+            max_rotating_size=self.max_rotating_size,
+            composition_control_viable=len(tokens.tail_without_last)
+            > self.max_rotating_size,
             isolation=isolation,
             composition=composition,
         )
