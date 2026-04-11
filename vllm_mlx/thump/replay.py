@@ -142,6 +142,21 @@ def _merge_captures(
     return out
 
 
+def _effective_selected_indices(
+    selected_indices: mx.array,
+    *,
+    token_count: int,
+    max_rotating_size: int,
+) -> mx.array:
+    """Mirror sparse_prefill's RotatingKVCache tail expansion for telemetry."""
+    if max_rotating_size <= 0:
+        return selected_indices
+    tail_start = max(0, token_count - max_rotating_size)
+    tail_indices = set(range(tail_start, token_count))
+    merged = sorted(set(selected_indices.tolist()) | tail_indices)
+    return mx.array(merged, dtype=selected_indices.dtype)
+
+
 @dataclass
 class ReplayTrace:
     name: str
@@ -204,6 +219,7 @@ class ReplayRunResult:
     fallback_count: int
     fallback_reason: str | None
     specprefill_selected_tokens: int = 0
+    specprefill_effective_selected_tokens: int = 0
     timings_ms: dict[str, float] | None = None
 
 
@@ -245,6 +261,14 @@ class ReplayRunner:
         # remaining parity gap is in suffix reuse after splice, not in
         # coarse block-level key quantization.
         self.block_size_tokens = block_size_tokens
+        self.max_rotating_size = max(
+            (
+                int(getattr(c, "max_size", 0))
+                for c in self.model.make_cache()
+                if type(c).__name__ == "RotatingKVCache"
+            ),
+            default=0,
+        )
         self.draft_model = None
         if draft_model_path is not None:
             draft_outer, _ = _load_strict_false(
@@ -343,6 +367,7 @@ class ReplayRunner:
         timings_ms["edit_cache_clone_ms"] = (time.perf_counter() - start) * 1000.0
         edit_start = time.perf_counter()
         selected_count = 0
+        effective_selected_count = 0
         if use_specprefill and self.draft_model is not None:
             start = time.perf_counter()
             importance = score_tokens(
@@ -355,11 +380,17 @@ class ReplayRunner:
             ) * 1000.0
             selected = select_chunks(importance, keep_pct=trace.keep_pct)
             selected_count = int(selected.shape[0])
+            effective_selected = _effective_selected_indices(
+                selected,
+                token_count=len(tokens.tail_without_last),
+                max_rotating_size=self.max_rotating_size,
+            )
+            effective_selected_count = int(effective_selected.shape[0])
             start = time.perf_counter()
             sparse_prefill(
                 self.model,
                 tokens.tail_without_last,
-                selected,
+                effective_selected,
                 edit_cache,
                 step_size=trace.prefill_step_size,
                 position_offset=len(tokens.prefix),
@@ -411,6 +442,7 @@ class ReplayRunner:
             fallback_count=0,
             fallback_reason=None,
             specprefill_selected_tokens=selected_count,
+            specprefill_effective_selected_tokens=effective_selected_count,
             timings_ms=timings_ms,
         )
 
@@ -538,6 +570,7 @@ class ReplayRunner:
                 re_prefill_avoided_tokens=max(0, len(tokens.suffix) - 1),
                 fallback_count=0,
                 fallback_reason=None,
+                specprefill_effective_selected_tokens=0,
                 timings_ms=timings_ms,
             )
         except Exception as exc:
@@ -565,6 +598,10 @@ class ReplayRunner:
                 "specprefill_threshold": trace.composition_threshold,
                 "keep_pct": trace.keep_pct,
             }
+            composition["baseline_vs_isolation_baseline_exact_match"] = (
+                composition["baseline"]["output_tokens"]
+                == isolation_baseline.output_tokens
+            )
 
         isolation = {
             "baseline": asdict(isolation_baseline),
