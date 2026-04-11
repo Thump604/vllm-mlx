@@ -82,7 +82,9 @@ class SchedulerConfig:
     use_paged_cache: bool = (
         False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
     )
-    paged_cache_block_size: int = 128  # Tokens per block (128 reduces dispatch overhead at 1M ctx)
+    paged_cache_block_size: int = (
+        128  # Tokens per block (128 reduces dispatch overhead at 1M ctx)
+    )
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
@@ -91,9 +93,11 @@ class SchedulerConfig:
     chunked_prefill_tokens: int = 0
 
     # Mid-prefill cache saving: save intermediate KV cache every N tokens
-    # during chunked prefill. If the client disconnects mid-prefill, the
+    # during prompt processing. If the client disconnects mid-prefill, the
     # saved cache is reused for the next request with the same prefix.
-    # 0 = disabled. Only effective when chunked_prefill_tokens > 0.
+    # 0 = disabled. Effective whenever prompt processing spans multiple
+    # BatchGenerator._next() calls (native prefill_step_size chunking or an
+    # explicit chunked_prefill_tokens override).
     mid_prefill_save_interval: int = 8192
 
     # MTP (Multi-Token Prediction) settings
@@ -157,10 +161,12 @@ def _install_cache_callbacks(
                 if getattr(pr, "end_of_prompt", False):
                     generation_batch = getattr(self, "_generation_batch", None)
                     if generation_batch is not None:
-                        for idx, uid in enumerate(getattr(generation_batch, "uids", [])):
+                        for idx, uid in enumerate(
+                            getattr(generation_batch, "uids", [])
+                        ):
                             if uid == pr.uid:
-                                extract_cache = (
-                                    lambda idx=idx, generation_batch=generation_batch: generation_batch.extract_cache(idx)
+                                extract_cache = lambda idx=idx, generation_batch=generation_batch: generation_batch.extract_cache(
+                                    idx
                                 )
                                 break
                 else:
@@ -168,8 +174,8 @@ def _install_cache_callbacks(
                     if prompt_batch is not None:
                         for idx, uid in enumerate(getattr(prompt_batch, "uids", [])):
                             if uid == pr.uid:
-                                extract_cache = (
-                                    lambda idx=idx, prompt_batch=prompt_batch: prompt_batch.extract_cache(idx)
+                                extract_cache = lambda idx=idx, prompt_batch=prompt_batch: prompt_batch.extract_cache(
+                                    idx
                                 )
                                 break
 
@@ -540,9 +546,7 @@ def _install_mtp(
 
         # Filter finished sequences from generation batch
         if draft_end_uids:
-            keep = [
-                e for e, u in enumerate(gen.uids) if u not in draft_end_uids
-            ]
+            keep = [e for e, u in enumerate(gen.uids) if u not in draft_end_uids]
             gen.filter(keep)
 
         return prompt_resps, augmented
@@ -763,7 +767,11 @@ class Scheduler:
         )
         # prompt_progress_callback was removed in mlx-lm rebase
         import inspect
-        if "prompt_progress_callback" in inspect.signature(BatchGenerator.__init__).parameters:
+
+        if (
+            "prompt_progress_callback"
+            in inspect.signature(BatchGenerator.__init__).parameters
+        ):
             bg_kwargs["prompt_progress_callback"] = _prefill_progress
         bg = BatchGenerator(**bg_kwargs)
 
@@ -772,9 +780,34 @@ class Scheduler:
         # prefill_step_size — no need for the old _install_chunked_prefill.
         if self.memory_aware_cache is not None:
             prompt_cache_cb = self._make_prompt_cache_save_callback()
+            prompt_progress_cb = None
+            if self.config.mid_prefill_save_interval > 0:
+                mid_prefill_cb = self._make_mid_prefill_save_callback(
+                    self.config.mid_prefill_save_interval
+                )
+
+                def _prompt_progress_save(
+                    uid,
+                    processed_tokens,
+                    extract_cache,
+                    end_of_segment,
+                    end_of_prompt,
+                ):
+                    if end_of_prompt or extract_cache is None:
+                        return
+                    try:
+                        mid_prefill_cb(uid, processed_tokens, extract_cache())
+                    except Exception:
+                        logger.debug(
+                            "[mid_prefill_cache] prompt progress save failed",
+                            exc_info=True,
+                        )
+
+                prompt_progress_cb = _prompt_progress_save
             _install_cache_callbacks(
                 bg,
                 prompt_cache_save=prompt_cache_cb,
+                prompt_progress_save=prompt_progress_cb,
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,

@@ -260,6 +260,103 @@ class TestSchedulerBasic:
         with pytest.raises(ValueError, match="already exists"):
             scheduler.add_request(request)
 
+    def test_mid_prefill_save_stores_prefix_boundary_cache(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Prefix-boundary progress must still persist a reusable prompt cache."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(use_memory_aware_cache=False),
+        )
+        scheduler.memory_aware_cache = MagicMock()
+        scheduler.memory_aware_cache.store = MagicMock(return_value=True)
+        scheduler.memory_aware_cache.remove = MagicMock()
+
+        request = Request(
+            request_id="test-1",
+            prompt="Hello world",
+            sampling_params=SamplingParams(max_tokens=10),
+        )
+        request.prompt_token_ids = [10, 11, 12, 13, 14]
+        request.prefix_boundary = 3
+        request.cached_tokens = 0
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[7] = request.request_id
+
+        monkeypatch.setattr(
+            scheduler,
+            "_extract_cache_states",
+            lambda raw_cache: [{"state": "state", "meta_state": "meta"}],
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_reconstruct_cache_from_states",
+            lambda extracted_states: ["reconstructed-cache"],
+        )
+
+        callback = scheduler._make_mid_prefill_save_callback(save_interval=8192)
+
+        callback(7, 2, ["ignored-cache"])
+        scheduler.memory_aware_cache.store.assert_not_called()
+
+        callback(7, 3, ["ignored-cache"])
+        scheduler.memory_aware_cache.store.assert_called_once_with(
+            [10, 11, 12], ["reconstructed-cache"]
+        )
+        assert request._mid_prefill_last_save == 3
+        assert request._mid_prefill_cache_key == (10, 11, 12)
+
+    def test_create_batch_generator_wires_mid_prefill_progress_save(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Native prefill_step_size chunking must still call the local saver."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                use_memory_aware_cache=False,
+                mid_prefill_save_interval=1024,
+            ),
+        )
+        scheduler.memory_aware_cache = MagicMock()
+
+        captured_callbacks = {}
+
+        class FakeBatchGenerator:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        def fake_install_cache_callbacks(batch_gen, **kwargs):
+            captured_callbacks.update(kwargs)
+
+        mid_prefill_cb = MagicMock()
+
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            "vllm_mlx.scheduler._install_cache_callbacks",
+            fake_install_cache_callbacks,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_make_prompt_cache_save_callback",
+            lambda: MagicMock(),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_make_mid_prefill_save_callback",
+            lambda interval: mid_prefill_cb,
+        )
+
+        scheduler._create_batch_generator(SamplingParams(max_tokens=8))
+
+        assert callable(captured_callbacks["prompt_progress_save"])
+        captured_callbacks["prompt_progress_save"](7, 3, lambda: ["cache"], True, False)
+        mid_prefill_cb.assert_called_once_with(7, 3, ["cache"])
+
+        captured_callbacks["prompt_progress_save"](7, 5, lambda: ["cache"], True, True)
+        assert mid_prefill_cb.call_count == 1
+
     def test_abort_waiting_request(self, mock_model, mock_tokenizer):
         """Test aborting a waiting request (deferred abort pattern)."""
         scheduler = Scheduler(
