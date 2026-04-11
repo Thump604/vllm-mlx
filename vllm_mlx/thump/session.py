@@ -68,6 +68,7 @@ class SessionSubstrate:
         cls,
         model: Any,
         *,
+        block_size_tokens: int = 16,
         block_capacity: int,
         root_dir: str | Path | None = None,
         lib_path: str | Path | None = None,
@@ -91,7 +92,7 @@ class SessionSubstrate:
             else:
                 variant = 1
             geometry = BlockGeometry(
-                block_size_tokens=16,
+                block_size_tokens=block_size_tokens,
                 num_kv_heads=attn.n_kv_heads,
                 head_dim=attn.head_dim,
                 group_size=attn.n_heads // attn.n_kv_heads,

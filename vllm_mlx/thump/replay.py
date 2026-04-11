@@ -221,6 +221,7 @@ class ReplayRunner:
         *,
         thump_lib_path: str | Path | None = None,
         draft_model_path: str | Path | None = None,
+        block_size_tokens: int = 1,
     ) -> None:
         install_gemma4_capture_patch()
         outer_model, tokenizer = _load_strict_false(
@@ -232,6 +233,10 @@ class ReplayRunner:
         self.tokenizer = tokenizer
         self.model_path = str(model_path)
         self.thump_lib_path = thump_lib_path
+        # Token-sized blocks keep the offline replay slice honest: the
+        # remaining parity gap is in suffix reuse after splice, not in
+        # coarse block-level key quantization.
+        self.block_size_tokens = block_size_tokens
         self.draft_model = None
         if draft_model_path is not None:
             draft_outer, _ = _load_strict_false(
@@ -241,8 +246,9 @@ class ReplayRunner:
             self.draft_model = draft_outer.language_model
 
     def build_trace_tokens(
-        self, trace: ReplayTrace, *, block_size: int = 16
+        self, trace: ReplayTrace, *, block_size: int | None = None
     ) -> TraceTokens:
+        block_size = block_size or self.block_size_tokens
         pad_token_id = _choose_pad_token(self.tokenizer)
         prefix = list(self.tokenizer.encode(trace.prefix_text))
         insert = list(self.tokenizer.encode(trace.insert_text))
@@ -388,9 +394,12 @@ class ReplayRunner:
                 prefix_collector.joined(),
                 suffix_collector.joined(),
             )
-            total_blocks = math.ceil(len(tokens.updated_prompt) / 16) + 8
+            total_blocks = (
+                math.ceil(len(tokens.updated_prompt) / self.block_size_tokens) + 8
+            )
             session = SessionSubstrate.from_gemma4_model(
                 self.model,
+                block_size_tokens=self.block_size_tokens,
                 block_capacity=total_blocks,
                 lib_path=self.thump_lib_path,
             )
