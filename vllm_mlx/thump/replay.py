@@ -186,6 +186,7 @@ class ReplayTrace:
     composition_threshold: int = 256
     prefill_step_size: int = 256
     capture_step_size: int | None = None
+    thump_refresh_tail_tokens: int = 0
     expected_substrings: list[str] | None = None
 
     @classmethod
@@ -270,6 +271,7 @@ class ReplayComparison:
     composition_threshold: int
     prefill_step_size: int
     capture_step_size: int
+    thump_refresh_tail_tokens: int
     tail_without_last_tokens: int
     max_rotating_size: int
     composition_control_viable: bool
@@ -528,6 +530,7 @@ class ReplayRunner:
         session_start = time.perf_counter()
         try:
             capture_step_size = trace.capture_step_size or trace.prefill_step_size
+            refresh_tail_tokens = max(0, int(trace.thump_refresh_tail_tokens))
             timings_ms: dict[str, float] = {}
             prefix_cache = self.model.make_cache()
             prefix_collector = CaptureCollector()
@@ -632,14 +635,29 @@ class ReplayRunner:
                 splice_ms = (time.perf_counter() - start) * 1000.0
                 timings_ms["splice_ms"] = timings_ms.get("splice_ms", 0.0) + splice_ms
                 start = time.perf_counter()
+                prompt_without_last = tokens.updated_prompt_for_edit(edit_index)[:-1]
+                refresh_count = min(refresh_tail_tokens, len(prompt_without_last))
                 materialized_cache = session.materialize_prompt_cache(
                     self.model,
-                    upto_tokens=len(tokens.updated_prompt_for_edit(edit_index)) - 1,
+                    upto_tokens=len(prompt_without_last) - refresh_count,
                 )
                 materialize_ms = (time.perf_counter() - start) * 1000.0
                 timings_ms["materialize_ms"] = (
                     timings_ms.get("materialize_ms", 0.0) + materialize_ms
                 )
+                refresh_ms = 0.0
+                if refresh_count:
+                    start = time.perf_counter()
+                    _prefill_tokens(
+                        self.model,
+                        prompt_without_last[-refresh_count:],
+                        materialized_cache,
+                        prefill_step_size=trace.prefill_step_size,
+                    )
+                    refresh_ms = (time.perf_counter() - start) * 1000.0
+                    timings_ms["refresh_prefill_ms"] = (
+                        timings_ms.get("refresh_prefill_ms", 0.0) + refresh_ms
+                    )
                 decode_start = time.perf_counter()
                 continuation_ms, output_text, output_tokens = self._decode_from_cache(
                     materialized_cache,
@@ -657,7 +675,13 @@ class ReplayRunner:
                 ) + max(
                     0.0,
                     post_edit_ms
-                    - (delta_prefill_ms + splice_ms + materialize_ms + decode_ms),
+                    - (
+                        delta_prefill_ms
+                        + splice_ms
+                        + materialize_ms
+                        + refresh_ms
+                        + decode_ms
+                    ),
                 )
                 edit_continuations_ms.append(continuation_ms)
                 edit_post_edit_totals_ms.append(post_edit_ms)
@@ -679,7 +703,11 @@ class ReplayRunner:
                 session_total_ms=session_total_ms,
                 output_text=edit_output_texts[-1],
                 output_tokens=edit_output_tokens[-1],
-                re_prefill_avoided_tokens=max(0, len(tokens.suffix) - 1)
+                re_prefill_avoided_tokens=max(
+                    0,
+                    (len(tokens.suffix) - 1)
+                    - min(refresh_tail_tokens, len(tokens.suffix) - 1),
+                )
                 * tokens.edit_count,
                 fallback_count=0,
                 fallback_reason=None,
@@ -748,6 +776,7 @@ class ReplayRunner:
             composition_threshold=trace.composition_threshold,
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=trace.capture_step_size or trace.prefill_step_size,
+            thump_refresh_tail_tokens=trace.thump_refresh_tail_tokens,
             tail_without_last_tokens=len(tokens.tail_without_last),
             max_rotating_size=self.max_rotating_size,
             composition_control_viable=len(tokens.tail_without_last)

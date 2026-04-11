@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--thump-lib")
     parser.add_argument("--composition-threshold", type=int)
     parser.add_argument("--keep-pct", type=float)
+    parser.add_argument("--thump-refresh-tail-tokens", type=int)
     args = parser.parse_args()
 
     trace = ReplayTrace.from_path(args.trace)
@@ -28,6 +29,8 @@ def main() -> None:
         trace.composition_threshold = args.composition_threshold
     if args.keep_pct is not None:
         trace.keep_pct = args.keep_pct
+    if args.thump_refresh_tail_tokens is not None:
+        trace.thump_refresh_tail_tokens = args.thump_refresh_tail_tokens
     runner = ReplayRunner(
         args.model_path,
         thump_lib_path=args.thump_lib,

@@ -36,6 +36,31 @@ def _next_token(runner: ReplayRunner, cache: list[object], token_id: int) -> int
     return int(token)
 
 
+def _decode_tokens(
+    runner: ReplayRunner,
+    cache: list[object],
+    token_id: int,
+    *,
+    max_new_tokens: int,
+) -> list[int]:
+    _continuation_ms, _output_text, output_tokens = runner._decode_from_cache(
+        cache,
+        token_id,
+        max_new_tokens=max_new_tokens,
+        start_time=0.0,
+    )
+    return output_tokens
+
+
+def _first_diverging_token_index(left: list[int], right: list[int]) -> int | None:
+    for index, (left_token, right_token) in enumerate(zip(left, right)):
+        if left_token != right_token:
+            return index
+    if len(left) != len(right):
+        return min(len(left), len(right))
+    return None
+
+
 def _diff_summary(
     *,
     layer_idx: int,
@@ -98,6 +123,12 @@ def probe_splice_limit(
         prefill_step_size=trace.prefill_step_size,
     )
     baseline_next = _next_token(runner, baseline_cache, tokens.last_prompt_token)
+    baseline_decode = _decode_tokens(
+        runner,
+        clone_prompt_cache(baseline_cache),
+        tokens.last_prompt_token,
+        max_new_tokens=trace.max_new_tokens,
+    )
 
     full_collector = CaptureCollector()
     full_capture_cache = runner.model.make_cache()
@@ -126,6 +157,12 @@ def probe_splice_limit(
         runner,
         full_roundtrip_cache,
         tokens.last_prompt_token,
+    )
+    full_roundtrip_decode = _decode_tokens(
+        runner,
+        clone_prompt_cache(full_roundtrip_cache),
+        tokens.last_prompt_token,
+        max_new_tokens=trace.max_new_tokens,
     )
 
     prefix_cache = runner.model.make_cache()
@@ -183,6 +220,12 @@ def probe_splice_limit(
         live_recompute_cache,
         tokens.last_prompt_token,
     )
+    live_recompute_decode = _decode_tokens(
+        runner,
+        clone_prompt_cache(live_recompute_cache),
+        tokens.last_prompt_token,
+        max_new_tokens=trace.max_new_tokens,
+    )
     splice_session.splice_insert_from_capture(
         len(tokens.prefix),
         insert_collector.joined(),
@@ -196,6 +239,12 @@ def probe_splice_limit(
         runner,
         splice_roundtrip_cache,
         tokens.last_prompt_token,
+    )
+    splice_roundtrip_decode = _decode_tokens(
+        runner,
+        clone_prompt_cache(splice_roundtrip_cache),
+        tokens.last_prompt_token,
+        max_new_tokens=trace.max_new_tokens,
     )
 
     sampled_layers = [0, 1, 2, 5, 29]
@@ -298,12 +347,33 @@ def probe_splice_limit(
             "updated_prompt_tokens": len(tokens.updated_prompt),
         },
         "baseline_next_token": baseline_next,
+        "baseline_decode_tokens": baseline_decode,
         "full_roundtrip_next_token": full_roundtrip_next,
+        "full_roundtrip_decode_tokens": full_roundtrip_decode,
         "splice_roundtrip_next_token": splice_roundtrip_next,
+        "splice_roundtrip_decode_tokens": splice_roundtrip_decode,
         "live_recompute_next_token": live_recompute_next,
+        "live_recompute_decode_tokens": live_recompute_decode,
         "full_roundtrip_exact": baseline_next == full_roundtrip_next,
         "splice_roundtrip_exact": baseline_next == splice_roundtrip_next,
         "live_recompute_exact": baseline_next == live_recompute_next,
+        "full_roundtrip_decode_exact": baseline_decode == full_roundtrip_decode,
+        "splice_roundtrip_decode_exact": baseline_decode == splice_roundtrip_decode,
+        "live_recompute_decode_exact": baseline_decode == live_recompute_decode,
+        "first_diverging_full_roundtrip_decode_index": _first_diverging_token_index(
+            baseline_decode,
+            full_roundtrip_decode,
+        ),
+        "first_diverging_splice_roundtrip_decode_index": (
+            _first_diverging_token_index(
+                baseline_decode,
+                splice_roundtrip_decode,
+            )
+        ),
+        "first_diverging_live_recompute_decode_index": _first_diverging_token_index(
+            baseline_decode,
+            live_recompute_decode,
+        ),
         "layer0_suffix_exact_before_thump": (
             layer0_direct["k_max_abs_diff"] == 0.0
             and layer0_direct["v_max_abs_diff"] == 0.0
