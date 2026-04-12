@@ -13,7 +13,6 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.generate import generate_step
 
 from vllm_mlx.specprefill import cleanup_rope
 from vllm_mlx.utils.tokenizer import _load_strict_false
@@ -69,6 +68,44 @@ def _prefill_tokens(
         mx.clear_cache()
 
 
+def _replay_tokens_exact(
+    model: Any,
+    tokens: list[int],
+    cache: list[Any],
+    *,
+    collector: CaptureCollector | None = None,
+) -> None:
+    if not tokens:
+        return
+    for token_id in tokens:
+        context = capture_into(collector) if collector is not None else nullcontext()
+        with context:
+            model(mx.array([int(token_id)], dtype=mx.int32)[None], cache=cache)
+        mx.eval([c.state for c in cache if hasattr(c, "state")])
+        mx.clear_cache()
+
+
+def _reconstruct_tokens(
+    model: Any,
+    tokens: list[int],
+    cache: list[Any],
+    *,
+    prefill_step_size: int,
+    exact_replay: bool = False,
+    collector: CaptureCollector | None = None,
+) -> None:
+    if exact_replay:
+        _replay_tokens_exact(model, tokens, cache, collector=collector)
+        return
+    _prefill_tokens(
+        model,
+        tokens,
+        cache,
+        prefill_step_size=prefill_step_size,
+        collector=collector,
+    )
+
+
 def _merge_captures(
     left: dict[int, LayerCapture],
     right: dict[int, LayerCapture],
@@ -102,25 +139,25 @@ def _decode_tokens(
     output_tokens: list[int] = []
     continuation_ms: float | None = None
     decode_start = time.perf_counter()
-    generator = generate_step(
-        mx.array([last_token], dtype=mx.int32),
-        model,
-        max_tokens=max_new_tokens,
-        sampler=_sampler,
-        prompt_cache=cache,
-        prefill_step_size=1,
-    )
     eos_ids = getattr(tokenizer, "eos_token_id", None)
     eos_set = set(eos_ids if isinstance(eos_ids, list) else [eos_ids])
-    context = capture_into(collector) if collector is not None else nullcontext()
-    with context:
-        for token, _logprobs in generator:
-            token_id = int(token)
-            output_tokens.append(token_id)
-            if continuation_ms is None:
-                continuation_ms = (time.perf_counter() - decode_start) * 1000.0
-            if token_id in eos_set:
-                break
+    input_token = int(last_token)
+    for _ in range(max_new_tokens):
+        context = capture_into(collector) if collector is not None else nullcontext()
+        with context:
+            logits = model(mx.array([input_token], dtype=mx.int32)[None], cache=cache)
+        logits = logits[:, -1, :]
+        token = _sampler(logits)
+        mx.eval(token)
+        mx.eval([c.state for c in cache if hasattr(c, "state")])
+        token_id = int(token.item())
+        output_tokens.append(token_id)
+        if continuation_ms is None:
+            continuation_ms = (time.perf_counter() - decode_start) * 1000.0
+        if token_id in eos_set:
+            break
+        input_token = token_id
+        mx.clear_cache()
     return continuation_ms or 0.0, tokenizer.decode(output_tokens), output_tokens
 
 
@@ -133,6 +170,7 @@ class SessionRecoveryTrace:
     description: str = ""
     prefill_step_size: int = 128
     capture_step_size: int | None = None
+    exact_replay: bool = False
 
     @classmethod
     def from_path(cls, path: str | Path) -> "SessionRecoveryTrace":
@@ -254,11 +292,12 @@ class SessionRecoveryRunner:
         prefix_cache = self.model.make_cache()
         prefix_collector = CaptureCollector()
         prefix_prefill_start = time.perf_counter()
-        _prefill_tokens(
+        _reconstruct_tokens(
             self.model,
             prefix_tokens,
             prefix_cache,
             prefill_step_size=capture_step_size,
+            exact_replay=trace.exact_replay,
             collector=prefix_collector,
         )
         checkpoint_rss_telemetry["prefix_prefill_latency_ms"] = (
@@ -427,11 +466,12 @@ class SessionRecoveryRunner:
         session_start = time.perf_counter()
         cache = self.model.make_cache()
         rebuild_start = time.perf_counter()
-        _prefill_tokens(
+        _reconstruct_tokens(
             self.model,
             artifact.prompt_tokens + artifact.seed_tokens[:-1],
             cache,
             prefill_step_size=trace.prefill_step_size,
+            exact_replay=trace.exact_replay,
         )
         rebuild_latency_ms = (time.perf_counter() - rebuild_start) * 1000.0
         continuation_ms, output_text, output_tokens = _decode_tokens(

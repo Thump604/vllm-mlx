@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from mlx_lm.models.cache import KVCache
+import mlx.core as mx
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from vllm_mlx.thump.adapter import BlockGeometry, RopeConfig
 from vllm_mlx.thump.capture import LayerCapture
@@ -11,6 +12,8 @@ from vllm_mlx.thump.session import (
     SessionSubstrate,
     _deinterleave_split_rotary_pairs,
     _interleave_split_rotary_pairs,
+    _restore_rotating_cache_layout,
+    _rotating_cache_next_index,
 )
 from vllm_mlx.thump.recovery import (
     CheckpointArtifact,
@@ -23,6 +26,11 @@ from vllm_mlx.thump.recovery import (
 class _DummyModel:
     def make_cache(self):
         return [KVCache()]
+
+
+class _SlidingDummyModel:
+    def make_cache(self):
+        return [RotatingKVCache(max_size=4, keep=0)]
 
 
 def test_session_substrate_splice_and_materialize_round_trip(tmp_path):
@@ -212,6 +220,59 @@ def test_nontraditional_rope_layout_helpers_round_trip():
         interleaved[0, 0],
         np.array([0, 2, 1, 3, 4, 5, 6, 7], dtype=np.float16),
     )
+
+
+def test_restore_rotating_cache_layout_round_trip():
+    temporal = np.arange(4, dtype=np.float16).reshape(1, 1, 4, 1)
+    restored, idx = _restore_rotating_cache_layout(
+        temporal,
+        offset=6,
+        max_size=4,
+        keep=0,
+    )
+    assert idx == _rotating_cache_next_index(6, 4, 0) == 2
+    cache = RotatingKVCache(max_size=4, keep=0)
+    cache.keys = mx.array(restored, dtype=mx.float16)
+    cache.values = mx.array(restored, dtype=mx.float16)
+    cache.offset = 6
+    cache._idx = idx
+    reordered = np.asarray(cache._temporal_order(cache.values))
+    assert np.array_equal(reordered, temporal)
+
+    next_token = mx.array([[[[9.0]]]], dtype=mx.float16)
+    cache.update_and_fetch(next_token, next_token)
+    after = np.asarray(cache._temporal_order(cache.values))
+    expected = np.array([[[[1.0], [2.0], [3.0], [9.0]]]], dtype=np.float16)
+    assert np.array_equal(after, expected)
+
+
+def test_session_substrate_restores_rotating_cache_internal_state(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(
+        layer_index=0,
+        layer_type="sliding_attention",
+        geometry=geometry,
+        window_size=4,
+    )
+    session = SessionSubstrate([spec], block_capacity=8, root_dir=tmp_path)
+    values = np.arange(20, dtype=np.float16).reshape(20, 1, 1)
+    values = np.broadcast_to(values, (20, 2, 8)).copy()
+    capture = LayerCapture(keys=values.copy(), values=values.copy())
+    session.initialize_from_capture({0: capture}, total_tokens=20)
+
+    cache = session.materialize_prompt_cache(_SlidingDummyModel(), upto_tokens=20)[0]
+    assert cache.offset == 20
+    assert cache._idx == 4
+    restored = np.asarray(cache._temporal_order(cache.values))
+    restored_tokens = np.transpose(restored[0], (1, 0, 2))[..., 0]
+    expected = np.array([[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]], dtype=np.float16)
+    assert np.allclose(restored_tokens, expected, atol=0.75)
 
 
 def test_build_recovery_comparison_emits_first_class_telemetry():

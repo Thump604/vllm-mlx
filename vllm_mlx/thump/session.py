@@ -59,6 +59,54 @@ def _deinterleave_split_rotary_pairs(keys: np.ndarray, rotated_dims: int) -> np.
     return out
 
 
+def _rotating_cache_next_index(offset: int, max_size: int, keep: int) -> int:
+    """Reconstruct the internal write pointer for a full RotatingKVCache."""
+    if offset <= max_size:
+        return offset
+    ring = max_size - keep
+    if ring <= 0:
+        return max_size
+    overflow = offset - max_size
+    rem = overflow % ring
+    return max_size if rem == 0 else keep + rem
+
+
+def _restore_rotating_cache_layout(
+    temporal: np.ndarray,
+    *,
+    offset: int,
+    max_size: int,
+    keep: int,
+) -> tuple[np.ndarray, int]:
+    """Invert RotatingKVCache._temporal_order for an already-full cache."""
+    idx = _rotating_cache_next_index(offset, max_size, keep)
+    if offset <= max_size or temporal.shape[2] < max_size:
+        return temporal, idx
+
+    out = np.array(temporal, copy=True)
+    if keep > 0:
+        tail = out[..., keep:, :]
+    else:
+        tail = out
+    ring = tail.shape[2]
+    if ring == 0:
+        return out, idx
+
+    rotate = idx - keep
+    if rotate <= 0 or rotate >= ring:
+        return out, idx
+
+    restored_tail = np.concatenate(
+        [tail[..., ring - rotate :, :], tail[..., : ring - rotate, :]],
+        axis=2,
+    )
+    if keep > 0:
+        out[..., keep:, :] = restored_tail
+    else:
+        out = restored_tail
+    return out, idx
+
+
 @dataclass(frozen=True)
 class LayerSpec:
     layer_index: int
@@ -467,6 +515,25 @@ class SessionSubstrate:
             if cache_max is not None:
                 alloc_tokens = min(alloc_tokens, cache_max)
 
+            restore_idx = min(upto_tokens, alloc_tokens)
+            if isinstance(cache, RotatingKVCache):
+                keep = int(getattr(cache, "keep", 0))
+                max_size = int(getattr(cache, "max_size", alloc_tokens))
+                restored_k, restore_idx = _restore_rotating_cache_layout(
+                    np.asarray(keys),
+                    offset=upto_tokens,
+                    max_size=max_size,
+                    keep=keep,
+                )
+                restored_v, _ = _restore_rotating_cache_layout(
+                    np.asarray(values),
+                    offset=upto_tokens,
+                    max_size=max_size,
+                    keep=keep,
+                )
+                keys = mx.array(restored_k, dtype=keys.dtype)
+                values = mx.array(restored_v, dtype=values.dtype)
+
             if hasattr(cache, "keys") and hasattr(cache, "values"):
                 padded_k = mx.zeros(
                     (keys.shape[0], keys.shape[1], alloc_tokens, keys.shape[3]),
@@ -483,7 +550,7 @@ class SessionSubstrate:
                 if hasattr(cache, "offset"):
                     cache.offset = upto_tokens
                 if hasattr(cache, "_idx"):
-                    cache._idx = min(upto_tokens, alloc_tokens)
+                    cache._idx = restore_idx
             else:
                 cache.state = (keys, values)
             if isinstance(cache, RotatingKVCache):
@@ -491,7 +558,7 @@ class SessionSubstrate:
                     str(cache.keep),
                     str(cache.max_size),
                     str(upto_tokens),
-                    str(min(upto_tokens, alloc_tokens)),
+                    str(restore_idx),
                 )
         return caches
 
