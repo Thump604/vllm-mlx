@@ -9,12 +9,23 @@ from pathlib import Path
 
 import numpy as np
 
-_DEFAULT_LIB_PATH = Path(
-    os.environ.get(
-        "VLLM_MLX_THUMP_LIB",
-        "/Users/David/code/thump-stack/build/libthump_runtime.dylib",
-    )
-)
+_DEFAULT_PACKAGE_PREFIX = Path("/opt/ai-runtime/run/thump-runtime-1.3")
+_DEFAULT_BUILD_LIB = Path("/Users/David/code/thump-stack/build/libthump_runtime.dylib")
+
+
+def _default_lib_path() -> Path:
+    explicit = os.environ.get("VLLM_MLX_THUMP_LIB")
+    if explicit:
+        return Path(explicit)
+    prefix = os.environ.get("VLLM_MLX_THUMP_PREFIX")
+    if prefix:
+        candidate = Path(prefix) / "lib" / "libthump_runtime.dylib"
+        if candidate.exists():
+            return candidate
+    package_candidate = _DEFAULT_PACKAGE_PREFIX / "lib" / "libthump_runtime.dylib"
+    if package_candidate.exists():
+        return package_candidate
+    return _DEFAULT_BUILD_LIB
 
 
 class ThumpRuntimeError(RuntimeError):
@@ -271,7 +282,7 @@ class SessionBankEntry:
 
 
 def _load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
-    lib_path = Path(path) if path is not None else _DEFAULT_LIB_PATH
+    lib_path = Path(path) if path is not None else _default_lib_path()
     lib = ctypes.CDLL(str(lib_path))
 
     void_pp = ctypes.POINTER(ctypes.c_void_p)

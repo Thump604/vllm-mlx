@@ -25,14 +25,65 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def _resolved_thump_lib(args: argparse.Namespace) -> str | None:
+    if args.thump_lib:
+        return args.thump_lib
+    if args.thump_prefix:
+        return str(Path(args.thump_prefix) / "lib" / "libthump_runtime.dylib")
+    return None
+
+
 def _run_subprocess(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, check=True, env=env)
+
+
+def _with_thump_runtime_env(
+    env: dict[str, str] | None,
+    *,
+    thump_prefix: str | None = None,
+) -> dict[str, str]:
+    merged = dict(os.environ if env is None else env)
+    if thump_prefix:
+        lib_dir = str(Path(thump_prefix) / "lib")
+        existing = merged.get("DYLD_LIBRARY_PATH")
+        merged["DYLD_LIBRARY_PATH"] = (
+            f"{lib_dir}:{existing}" if existing else lib_dir
+        )
+        merged.setdefault("VLLM_MLX_THUMP_PREFIX", thump_prefix)
+    return merged
+
+
+def _run_thumpctl_json(
+    *,
+    thumpctl_path: str,
+    command: str,
+    manifest_path: str,
+    thump_prefix: str | None,
+) -> dict:
+    proc = subprocess.run(
+        [thumpctl_path, command, manifest_path, "--json"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=_with_thump_runtime_env(None, thump_prefix=thump_prefix),
+    )
+    payload = {
+        "command": command,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+    try:
+        payload["json"] = json.loads(proc.stdout) if proc.stdout else None
+    except json.JSONDecodeError:
+        payload["json"] = None
+    return payload
 
 
 def _checkpoint_mode(args: argparse.Namespace) -> None:
     runner = SessionRecoveryRunner(
         args.model_path,
-        thump_lib_path=args.thump_lib or None,
+        thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
     trace = SessionRecoveryTrace.from_path(args.trace)
@@ -43,7 +94,7 @@ def _checkpoint_mode(args: argparse.Namespace) -> None:
 def _restore_mode(args: argparse.Namespace) -> None:
     runner = SessionRecoveryRunner(
         args.model_path,
-        thump_lib_path=args.thump_lib or None,
+        thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
     trace = SessionRecoveryTrace.from_path(args.trace)
@@ -55,7 +106,7 @@ def _restore_mode(args: argparse.Namespace) -> None:
 def _cold_mode(args: argparse.Namespace) -> None:
     runner = SessionRecoveryRunner(
         args.model_path,
-        thump_lib_path=args.thump_lib or None,
+        thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
     trace = SessionRecoveryTrace.from_path(args.trace)
@@ -86,7 +137,9 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
         "--block-size-tokens",
         str(args.block_size_tokens),
     ]
-    if args.thump_lib:
+    if args.thump_prefix:
+        base_cmd.extend(["--thump-prefix", args.thump_prefix])
+    elif args.thump_lib:
         base_cmd.extend(["--thump-lib", args.thump_lib])
 
     _run_subprocess(
@@ -100,6 +153,32 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
             str(checkpoint_json),
         ]
     )
+
+    operator_validation = None
+    if args.thumpctl:
+        manifest_path = json.loads(checkpoint_json.read_text())["manifest_path"]
+        operator_validation = {
+            "thump_prefix": args.thump_prefix,
+            "thumpctl_path": args.thumpctl,
+            "inspect": _run_thumpctl_json(
+                thumpctl_path=args.thumpctl,
+                command="inspect",
+                manifest_path=manifest_path,
+                thump_prefix=args.thump_prefix,
+            ),
+            "validate_session": _run_thumpctl_json(
+                thumpctl_path=args.thumpctl,
+                command="validate-session",
+                manifest_path=manifest_path,
+                thump_prefix=args.thump_prefix,
+            ),
+            "scale": _run_thumpctl_json(
+                thumpctl_path=args.thumpctl,
+                command="scale",
+                manifest_path=manifest_path,
+                thump_prefix=args.thump_prefix,
+            ),
+        }
 
     restore_env = os.environ.copy()
     restore_env[FEATURE_FLAG_ENV] = "1"
@@ -137,7 +216,10 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
         restore=restore,
         cold_rebuild=cold,
     )
-    _write_json(output_path, comparison.to_dict())
+    payload = comparison.to_dict()
+    if operator_validation is not None:
+        payload["operator_validation"] = operator_validation
+    _write_json(output_path, payload)
 
 
 def main() -> None:
@@ -153,6 +235,8 @@ def main() -> None:
     parser.add_argument("--bundle-dir")
     parser.add_argument("--checkpoint-json")
     parser.add_argument("--thump-lib")
+    parser.add_argument("--thump-prefix")
+    parser.add_argument("--thumpctl")
     parser.add_argument("--block-size-tokens", type=int, default=1)
     args = parser.parse_args()
 
