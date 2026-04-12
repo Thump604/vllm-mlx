@@ -19,6 +19,9 @@ from vllm_mlx.thump.recovery import (
     CheckpointArtifact,
     RecoveryRunResult,
     SessionRecoveryTrace,
+    _build_sampler,
+    _decode_tokens,
+    _encode_prompt_tokens,
     build_recovery_comparison,
 )
 
@@ -31,6 +34,87 @@ class _DummyModel:
 class _SlidingDummyModel:
     def make_cache(self):
         return [RotatingKVCache(max_size=4, keep=0)]
+
+
+class _TokenizerWithBos:
+    bos_token = "<bos>"
+
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, prompt_text, add_special_tokens=True):
+        self.calls.append((prompt_text, add_special_tokens))
+        return [101, 102]
+
+
+class _TokenizerWithoutSpecialArg:
+    bos_token = "<bos>"
+
+    def encode(self, prompt_text):
+        return [201, 202]
+
+
+class _DecodeTokenizer:
+    eos_token_id = None
+
+    def decode(self, tokens):
+        return ",".join(str(token) for token in tokens)
+
+
+class _DecodeModel:
+    def __call__(self, prompt, cache=None):
+        return mx.zeros((1, 1, 4), dtype=mx.float32)
+
+
+def test_encode_prompt_tokens_matches_engine_special_token_policy():
+    tokenizer = _TokenizerWithBos()
+    tokens = _encode_prompt_tokens(tokenizer, "hello")
+    assert tokens == [101, 102]
+    assert tokenizer.calls == [("hello", True)]
+
+    tokenizer = _TokenizerWithBos()
+    tokens = _encode_prompt_tokens(tokenizer, "<bos>hello")
+    assert tokens == [101, 102]
+    assert tokenizer.calls == [("<bos>hello", False)]
+
+
+def test_encode_prompt_tokens_falls_back_when_tokenizer_lacks_special_arg():
+    tokenizer = _TokenizerWithoutSpecialArg()
+    assert _encode_prompt_tokens(tokenizer, "hello") == [201, 202]
+
+
+def test_build_sampler_uses_argmax_at_zero_temperature():
+    sampler = _build_sampler(temperature=0.0, top_p=0.95, top_k=64, min_p=0.0)
+    logits = mx.array([[1.0, 3.0, 2.0]], dtype=mx.float32)
+    token = sampler(logits)
+    assert int(token.item()) == 1
+
+
+def test_decode_tokens_uses_supplied_sampler_and_sampling_seed(monkeypatch):
+    seeds = []
+
+    def fake_seed(value):
+        seeds.append(value)
+
+    monkeypatch.setattr(mx.random, "seed", fake_seed)
+
+    def fake_sampler(_logits):
+        return mx.array([2], dtype=mx.int32)
+
+    continuation_ms, output_text, output_tokens = _decode_tokens(
+        _DecodeModel(),
+        _DecodeTokenizer(),
+        [],
+        1,
+        max_new_tokens=2,
+        sampler=fake_sampler,
+        sampling_seed=123,
+    )
+
+    assert continuation_ms >= 0.0
+    assert seeds == [123]
+    assert output_tokens == [2, 2]
+    assert output_text == "2,2"
 
 
 def test_session_substrate_splice_and_materialize_round_trip(tmp_path):

@@ -13,6 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
+from mlx_lm.sample_utils import make_sampler
 
 from vllm_mlx.specprefill import cleanup_rope
 from vllm_mlx.utils.tokenizer import _load_strict_false
@@ -34,6 +35,34 @@ def session_recovery_enabled() -> bool:
 
 def _sampler(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
+
+
+def _build_sampler(
+    *,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+):
+    if temperature == 0.0:
+        return _sampler
+    return make_sampler(
+        temp=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+    )
+
+
+def _encode_prompt_tokens(tokenizer: Any, prompt_text: str) -> list[int]:
+    add_special = True
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token is not None:
+        add_special = not prompt_text.startswith(bos_token)
+    try:
+        return list(tokenizer.encode(prompt_text, add_special_tokens=add_special))
+    except TypeError:
+        return list(tokenizer.encode(prompt_text))
 
 
 def _current_rss_bytes() -> int:
@@ -134,11 +163,15 @@ def _decode_tokens(
     last_token: int,
     *,
     max_new_tokens: int,
+    sampler: Any = _sampler,
+    sampling_seed: int | None = None,
     collector: CaptureCollector | None = None,
 ) -> tuple[float, str, list[int]]:
     output_tokens: list[int] = []
     continuation_ms: float | None = None
     decode_start = time.perf_counter()
+    if sampling_seed is not None:
+        mx.random.seed(int(sampling_seed))
     eos_ids = getattr(tokenizer, "eos_token_id", None)
     eos_set = set(eos_ids if isinstance(eos_ids, list) else [eos_ids])
     input_token = int(last_token)
@@ -147,7 +180,7 @@ def _decode_tokens(
         with context:
             logits = model(mx.array([input_token], dtype=mx.int32)[None], cache=cache)
         logits = logits[:, -1, :]
-        token = _sampler(logits)
+        token = sampler(logits)
         mx.eval(token)
         mx.eval([c.state for c in cache if hasattr(c, "state")])
         token_id = int(token.item())
@@ -172,6 +205,19 @@ class SessionRecoveryTrace:
     capture_step_size: int | None = None
     exact_replay: bool = False
     exact_hot_restart: bool = False
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    sampling_seed: int | None = 7
+
+    def seed_sampling_seed(self) -> int | None:
+        return self.sampling_seed
+
+    def continuation_sampling_seed(self) -> int | None:
+        if self.sampling_seed is None:
+            return None
+        return int(self.sampling_seed) + 1
 
     @classmethod
     def from_path(cls, path: str | Path) -> "SessionRecoveryTrace":
@@ -272,10 +318,18 @@ class SessionRecoveryRunner:
         self.model_id_hash = model_id_hash_for_path(model_path)
 
     def build_prompt_tokens(self, trace: SessionRecoveryTrace) -> list[int]:
-        tokens = list(self.tokenizer.encode(trace.prompt_text))
+        tokens = _encode_prompt_tokens(self.tokenizer, trace.prompt_text)
         if not tokens:
             raise ValueError("prompt_text must produce at least one token")
         return tokens
+
+    def build_sampler(self, trace: SessionRecoveryTrace):
+        return _build_sampler(
+            temperature=float(trace.temperature),
+            top_p=float(trace.top_p),
+            top_k=int(trace.top_k),
+            min_p=float(trace.min_p),
+        )
 
     def create_checkpoint(
         self,
@@ -314,6 +368,8 @@ class SessionRecoveryRunner:
             prefix_cache,
             last_prompt_token,
             max_new_tokens=trace.seed_new_tokens,
+            sampler=self.build_sampler(trace),
+            sampling_seed=trace.seed_sampling_seed(),
             collector=seed_collector,
         )
         checkpoint_rss_telemetry["seed_decode_latency_ms"] = (
@@ -446,6 +502,8 @@ class SessionRecoveryRunner:
                 cache,
                 artifact.seed_tokens[-1],
                 max_new_tokens=trace.continue_new_tokens,
+                sampler=self.build_sampler(trace),
+                sampling_seed=trace.continuation_sampling_seed(),
             )
             session.close()
             cleanup_rope(self.model)
@@ -490,6 +548,8 @@ class SessionRecoveryRunner:
             cache,
             artifact.seed_tokens[-1],
             max_new_tokens=trace.continue_new_tokens,
+            sampler=self.build_sampler(trace),
+            sampling_seed=trace.continuation_sampling_seed(),
         )
         cleanup_rope(self.model)
         return RecoveryRunResult(
