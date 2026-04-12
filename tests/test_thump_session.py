@@ -12,6 +12,12 @@ from vllm_mlx.thump.session import (
     _deinterleave_split_rotary_pairs,
     _interleave_split_rotary_pairs,
 )
+from vllm_mlx.thump.recovery import (
+    CheckpointArtifact,
+    RecoveryRunResult,
+    SessionRecoveryTrace,
+    build_recovery_comparison,
+)
 
 
 class _DummyModel:
@@ -206,3 +212,59 @@ def test_nontraditional_rope_layout_helpers_round_trip():
         interleaved[0, 0],
         np.array([0, 2, 1, 3, 4, 5, 6, 7], dtype=np.float16),
     )
+
+
+def test_build_recovery_comparison_emits_first_class_telemetry():
+    trace = SessionRecoveryTrace(name="demo", prompt_text="hello")
+    artifact = CheckpointArtifact(
+        trace_name="demo",
+        model_path="/tmp/model",
+        manifest_path="/tmp/session.tsmf",
+        root_dir="/tmp",
+        prompt_tokens=[1, 2, 3],
+        seed_tokens=[4, 5],
+        prompt_token_count=3,
+        generated_tokens=2,
+        context_tokens=4,
+        artifact_size_bytes=1234,
+        model_id_hash=1,
+        session_id=2,
+        sequence_id=3,
+        block_size_tokens=1,
+        prefill_step_size=128,
+        capture_step_size=128,
+        checkpoint_latency_ms=12.5,
+    )
+    restore = RecoveryRunResult(
+        variant="restore",
+        validate_latency_ms=4.0,
+        validate_materialize_latency_ms=9.0,
+        cold_rebuild_latency_ms=0.0,
+        continuation_latency_ms=2.0,
+        output_text="ok",
+        output_tokens=[7, 8],
+        fallback_count=0,
+        fallback_reason=None,
+        session_total_ms=20.0,
+    )
+    cold = RecoveryRunResult(
+        variant="cold_rebuild",
+        validate_latency_ms=0.0,
+        validate_materialize_latency_ms=0.0,
+        cold_rebuild_latency_ms=30.0,
+        continuation_latency_ms=2.5,
+        output_text="ok",
+        output_tokens=[7, 8],
+        fallback_count=0,
+        fallback_reason=None,
+        session_total_ms=40.0,
+    )
+
+    comparison = build_recovery_comparison(trace, artifact, restore=restore, cold_rebuild=cold)
+
+    assert comparison.go_no_go == "GO"
+    assert comparison.telemetry["checkpoint_latency_ms"] == 12.5
+    assert comparison.telemetry["restore_mode"] == "restore"
+    assert comparison.telemetry["artifact_size_bytes"] == 1234
+    assert comparison.telemetry["exact_fidelity"] is True
+    assert comparison.telemetry["fallback_count"] == 0

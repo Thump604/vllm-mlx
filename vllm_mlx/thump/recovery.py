@@ -159,6 +159,7 @@ class CheckpointArtifact:
     block_size_tokens: int
     prefill_step_size: int
     capture_step_size: int
+    checkpoint_latency_ms: float = 0.0
 
     @classmethod
     def from_path(cls, path: str | Path) -> "CheckpointArtifact":
@@ -191,6 +192,7 @@ class RecoveryComparison:
     restore_meaningfully_avoids_rebuild: bool
     fallback_rate: float
     go_no_go: str
+    telemetry: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -264,6 +266,7 @@ class SessionRecoveryRunner:
             int((context_tokens + self.block_size_tokens - 1) / self.block_size_tokens)
             + 8,
         )
+        checkpoint_start = time.perf_counter()
         session = SessionSubstrate.from_gemma4_model(
             self.model,
             block_size_tokens=self.block_size_tokens,
@@ -283,6 +286,7 @@ class SessionRecoveryRunner:
             prompt_tokens=len(prompt_tokens),
             generated_tokens=len(seed_tokens),
         )
+        checkpoint_latency_ms = (time.perf_counter() - checkpoint_start) * 1000.0
         session.close()
         cleanup_rope(self.model)
         return CheckpointArtifact(
@@ -302,6 +306,7 @@ class SessionRecoveryRunner:
             block_size_tokens=self.block_size_tokens,
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=capture_step_size,
+            checkpoint_latency_ms=checkpoint_latency_ms,
         )
 
     def restore_and_continue(
@@ -414,6 +419,21 @@ def build_recovery_comparison(
         < cold_rebuild.cold_rebuild_latency_ms
     )
     go_no_go = "GO" if avoids_rebuild else "NO_GO"
+    telemetry = {
+        "checkpoint_latency_ms": artifact.checkpoint_latency_ms,
+        "restore_mode": restore.variant,
+        "restore_validate_latency_ms": restore.validate_latency_ms,
+        "restore_validate_materialize_latency_ms": restore.validate_materialize_latency_ms,
+        "cold_rebuild_latency_ms": cold_rebuild.cold_rebuild_latency_ms,
+        "artifact_size_bytes": artifact.artifact_size_bytes,
+        "prompt_token_count": artifact.prompt_token_count,
+        "context_tokens": artifact.context_tokens,
+        "generated_tokens": artifact.generated_tokens,
+        "exact_fidelity": exact_fidelity,
+        "fallback_count": restore.fallback_count,
+        "fallback_rate": fallback_rate,
+        "fallback_reason": restore.fallback_reason,
+    }
     return RecoveryComparison(
         model_path=artifact.model_path,
         trace_name=trace.name,
@@ -425,4 +445,5 @@ def build_recovery_comparison(
         restore_meaningfully_avoids_rebuild=avoids_rebuild,
         fallback_rate=fallback_rate,
         go_no_go=go_no_go,
+        telemetry=telemetry,
     )

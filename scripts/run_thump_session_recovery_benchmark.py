@@ -217,7 +217,39 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
         cold_rebuild=cold,
     )
     payload = comparison.to_dict()
+    telemetry = payload.setdefault("telemetry", {})
+    telemetry["thump_package_prefix"] = args.thump_prefix
+    telemetry["thumpctl_path"] = args.thumpctl
     if operator_validation is not None:
+        inspect_json = operator_validation.get("inspect", {}).get("json") or {}
+        if inspect_json:
+            artifact_metrics = {
+                key: inspect_json.get(key)
+                for key in (
+                    "artifact_kind",
+                    "bank_count",
+                    "changed_bank_count",
+                    "manifest_bytes",
+                    "data_bytes",
+                    "total_bytes",
+                    "layout_kind",
+                    "live_block_count",
+                    "live_block_capacity",
+                    "estimated_full_snapshot_bytes",
+                    "estimated_compact_snapshot_bytes",
+                )
+            }
+            payload["checkpoint"]["artifact_metrics"] = artifact_metrics
+            telemetry["artifact_metrics"] = artifact_metrics
+        validate_json = operator_validation.get("validate_session", {}).get("json") or {}
+        telemetry["operator_validation"] = {
+            "inspect_ok": operator_validation.get("inspect", {}).get("returncode") == 0,
+            "validate_session_ok": validate_json.get("ok"),
+            "validate_session_reason": (validate_json.get("diagnostic") or {}).get(
+                "reason"
+            ),
+            "scale_ok": operator_validation.get("scale", {}).get("returncode") == 0,
+        }
         payload["operator_validation"] = operator_validation
     _write_json(output_path, payload)
 
