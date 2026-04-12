@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -34,6 +35,16 @@ def session_recovery_enabled() -> bool:
 
 def _sampler(logits: mx.array) -> mx.array:
     return mx.argmax(logits, axis=-1)
+
+
+def _current_rss_bytes() -> int:
+    proc = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(os.getpid())],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return int(proc.stdout.strip()) * 1024
 
 
 def _prefill_tokens(
@@ -160,6 +171,7 @@ class CheckpointArtifact:
     prefill_step_size: int
     capture_step_size: int
     checkpoint_latency_ms: float = 0.0
+    checkpoint_rss_telemetry: dict[str, int | float] | None = None
 
     @classmethod
     def from_path(cls, path: str | Path) -> "CheckpointArtifact":
@@ -235,9 +247,13 @@ class SessionRecoveryRunner:
         prefix_tokens = prompt_tokens[:-1]
         last_prompt_token = prompt_tokens[-1]
         capture_step_size = trace.capture_step_size or trace.prefill_step_size
+        checkpoint_rss_telemetry: dict[str, int | float] = {
+            "rss_before_prefill_bytes": _current_rss_bytes(),
+        }
 
         prefix_cache = self.model.make_cache()
         prefix_collector = CaptureCollector()
+        prefix_prefill_start = time.perf_counter()
         _prefill_tokens(
             self.model,
             prefix_tokens,
@@ -245,7 +261,12 @@ class SessionRecoveryRunner:
             prefill_step_size=capture_step_size,
             collector=prefix_collector,
         )
+        checkpoint_rss_telemetry["prefix_prefill_latency_ms"] = (
+            time.perf_counter() - prefix_prefill_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_prefix_prefill_bytes"] = _current_rss_bytes()
         seed_collector = CaptureCollector()
+        seed_decode_start = time.perf_counter()
         _continuation_ms, _seed_text, seed_tokens = _decode_tokens(
             self.model,
             self.tokenizer,
@@ -254,12 +275,21 @@ class SessionRecoveryRunner:
             max_new_tokens=trace.seed_new_tokens,
             collector=seed_collector,
         )
+        checkpoint_rss_telemetry["seed_decode_latency_ms"] = (
+            time.perf_counter() - seed_decode_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_seed_decode_bytes"] = _current_rss_bytes()
         if not seed_tokens:
             raise RuntimeError("seed decode produced no tokens")
 
+        capture_merge_start = time.perf_counter()
         full_capture = _merge_captures(
             prefix_collector.joined(), seed_collector.joined()
         )
+        checkpoint_rss_telemetry["capture_merge_latency_ms"] = (
+            time.perf_counter() - capture_merge_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_capture_merge_bytes"] = _current_rss_bytes()
         context_tokens = len(prompt_tokens) + len(seed_tokens) - 1
         total_blocks = max(
             8,
@@ -267,6 +297,7 @@ class SessionRecoveryRunner:
             + 8,
         )
         checkpoint_start = time.perf_counter()
+        session_init_start = time.perf_counter()
         session = SessionSubstrate.from_gemma4_model(
             self.model,
             block_size_tokens=self.block_size_tokens,
@@ -274,10 +305,20 @@ class SessionRecoveryRunner:
             root_dir=bundle_dir,
             lib_path=self.thump_lib_path,
         )
+        checkpoint_rss_telemetry["session_init_latency_ms"] = (
+            time.perf_counter() - session_init_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_session_init_bytes"] = _current_rss_bytes()
+        capture_write_start = time.perf_counter()
         session.initialize_from_capture(full_capture, total_tokens=context_tokens)
+        checkpoint_rss_telemetry["capture_write_latency_ms"] = (
+            time.perf_counter() - capture_write_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_capture_write_bytes"] = _current_rss_bytes()
         session_id = int(time.time_ns() & 0xFFFFFFFFFFFFFFFF)
         sequence_id = int((time.time_ns() ^ os.getpid()) & 0xFFFFFFFFFFFFFFFF)
         manifest_path = Path(bundle_dir) / "session.tsmf"
+        checkpoint_write_start = time.perf_counter()
         checkpoint = session.checkpoint(
             manifest_path,
             model_id_hash=self.model_id_hash,
@@ -286,8 +327,18 @@ class SessionRecoveryRunner:
             prompt_tokens=len(prompt_tokens),
             generated_tokens=len(seed_tokens),
         )
+        checkpoint_rss_telemetry["checkpoint_write_latency_ms"] = (
+            time.perf_counter() - checkpoint_write_start
+        ) * 1000.0
+        checkpoint_rss_telemetry["rss_after_checkpoint_write_bytes"] = _current_rss_bytes()
         checkpoint_latency_ms = (time.perf_counter() - checkpoint_start) * 1000.0
         session.close()
+        checkpoint_rss_telemetry["rss_after_session_close_bytes"] = _current_rss_bytes()
+        checkpoint_rss_telemetry["checkpoint_peak_rss_bytes"] = max(
+            int(value)
+            for key, value in checkpoint_rss_telemetry.items()
+            if key.startswith("rss_")
+        )
         cleanup_rope(self.model)
         return CheckpointArtifact(
             trace_name=trace.name,
@@ -307,6 +358,7 @@ class SessionRecoveryRunner:
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=capture_step_size,
             checkpoint_latency_ms=checkpoint_latency_ms,
+            checkpoint_rss_telemetry=checkpoint_rss_telemetry,
         )
 
     def restore_and_continue(
@@ -421,6 +473,10 @@ def build_recovery_comparison(
     go_no_go = "GO" if avoids_rebuild else "NO_GO"
     telemetry = {
         "checkpoint_latency_ms": artifact.checkpoint_latency_ms,
+        "checkpoint_rss_telemetry": artifact.checkpoint_rss_telemetry or {},
+        "checkpoint_peak_rss_bytes": (
+            (artifact.checkpoint_rss_telemetry or {}).get("checkpoint_peak_rss_bytes")
+        ),
         "restore_mode": restore.variant,
         "restore_validate_latency_ms": restore.validate_latency_ms,
         "restore_validate_materialize_latency_ms": restore.validate_materialize_latency_ms,

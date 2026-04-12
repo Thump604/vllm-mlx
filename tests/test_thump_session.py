@@ -234,6 +234,11 @@ def test_build_recovery_comparison_emits_first_class_telemetry():
         prefill_step_size=128,
         capture_step_size=128,
         checkpoint_latency_ms=12.5,
+        checkpoint_rss_telemetry={
+            "rss_before_prefill_bytes": 100,
+            "rss_after_capture_merge_bytes": 250,
+            "checkpoint_peak_rss_bytes": 250,
+        },
     )
     restore = RecoveryRunResult(
         variant="restore",
@@ -264,6 +269,8 @@ def test_build_recovery_comparison_emits_first_class_telemetry():
 
     assert comparison.go_no_go == "GO"
     assert comparison.telemetry["checkpoint_latency_ms"] == 12.5
+    assert comparison.telemetry["checkpoint_rss_telemetry"]["rss_before_prefill_bytes"] == 100
+    assert comparison.telemetry["checkpoint_peak_rss_bytes"] == 250
     assert comparison.telemetry["restore_mode"] == "restore"
     assert comparison.telemetry["artifact_size_bytes"] == 1234
     assert comparison.telemetry["exact_fidelity"] is True
