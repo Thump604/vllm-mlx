@@ -9,8 +9,13 @@ from pathlib import Path
 
 import numpy as np
 
-_DEFAULT_PACKAGE_PREFIX = Path("/opt/ai-runtime/run/thump-runtime-1.3")
+_DEFAULT_PACKAGE_PREFIX = Path("/opt/ai-runtime/run/thump-runtime-1.5")
 _DEFAULT_BUILD_LIB = Path("/Users/David/code/thump-stack/build/libthump_runtime.dylib")
+
+THUMP_RT_BANK_ENTRY_FLAG_HAS_EXACT_SIDECAR = 1 << 0
+THUMP_RT_BANK_MODE_FP8 = 1
+THUMP_RT_BANK_MODE_EXACT_FP16_SIDECAR = 2
+THUMP_RT_BANK_MODE_EXACT_BF16_SIDECAR = 3
 
 
 def _default_lib_path() -> Path:
@@ -97,8 +102,15 @@ THUMP_RT_SESSION_BANK_PATH_MAX = 192
 class _CSessionBankEntry(ctypes.Structure):
     _fields_ = [
         ("layer_index", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("bank_mode", ctypes.c_uint32),
         ("reserved0", ctypes.c_uint32),
+        ("exact_stored_bytes", ctypes.c_uint64),
+        ("exact_crc32", ctypes.c_uint32),
+        ("exact_version_major", ctypes.c_uint16),
+        ("exact_version_minor", ctypes.c_uint16),
         ("bank_relpath", ctypes.c_char * THUMP_RT_SESSION_BANK_PATH_MAX),
+        ("exact_relpath", ctypes.c_char * THUMP_RT_SESSION_BANK_PATH_MAX),
     ]
 
 
@@ -263,22 +275,53 @@ class SessionManifest:
 class SessionBankEntry:
     layer_index: int
     bank_relpath: str
+    flags: int = 0
+    bank_mode: int = THUMP_RT_BANK_MODE_FP8
+    exact_stored_bytes: int = 0
+    exact_crc32: int = 0
+    exact_version_major: int = 0
+    exact_version_minor: int = 0
+    exact_relpath: str = ""
 
     def to_c(self) -> _CSessionBankEntry:
-        encoded = os.fsencode(self.bank_relpath)
-        if len(encoded) >= THUMP_RT_SESSION_BANK_PATH_MAX:
+        encoded_bank = os.fsencode(self.bank_relpath)
+        encoded_exact = os.fsencode(self.exact_relpath)
+        if len(encoded_bank) >= THUMP_RT_SESSION_BANK_PATH_MAX:
             raise ValueError("bank_relpath exceeds adapter limit")
+        if len(encoded_exact) >= THUMP_RT_SESSION_BANK_PATH_MAX:
+            raise ValueError("exact_relpath exceeds adapter limit")
         entry = _CSessionBankEntry()
         entry.layer_index = self.layer_index
+        entry.flags = self.flags
+        entry.bank_mode = self.bank_mode
         entry.reserved0 = 0
-        entry.bank_relpath = encoded
+        entry.exact_stored_bytes = self.exact_stored_bytes
+        entry.exact_crc32 = self.exact_crc32
+        entry.exact_version_major = self.exact_version_major
+        entry.exact_version_minor = self.exact_version_minor
+        entry.bank_relpath = encoded_bank
+        entry.exact_relpath = encoded_exact
         return entry
 
     @classmethod
     def from_c(cls, entry: _CSessionBankEntry) -> "SessionBankEntry":
-        raw = bytes(entry.bank_relpath)
-        path = raw.split(b"\0", 1)[0].decode()
-        return cls(layer_index=int(entry.layer_index), bank_relpath=path)
+        raw_bank = bytes(entry.bank_relpath)
+        raw_exact = bytes(entry.exact_relpath)
+        return cls(
+            layer_index=int(entry.layer_index),
+            bank_relpath=raw_bank.split(b"\0", 1)[0].decode(),
+            flags=int(entry.flags),
+            bank_mode=int(entry.bank_mode),
+            exact_stored_bytes=int(entry.exact_stored_bytes),
+            exact_crc32=int(entry.exact_crc32),
+            exact_version_major=int(entry.exact_version_major),
+            exact_version_minor=int(entry.exact_version_minor),
+            exact_relpath=raw_exact.split(b"\0", 1)[0].decode(),
+        )
+
+    @property
+    def has_exact_sidecar(self) -> bool:
+        return bool(self.flags & THUMP_RT_BANK_ENTRY_FLAG_HAS_EXACT_SIDECAR)
 
 
 def _load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
@@ -395,6 +438,22 @@ def _load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint16),
     ]
     lib.thump_rt_write_blocks_fp16.restype = ctypes.c_int
+    lib.thump_rt_write_blocks_exact_fp16.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    lib.thump_rt_write_blocks_exact_fp16.restype = ctypes.c_int
+    lib.thump_rt_write_blocks_exact_bf16.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    lib.thump_rt_write_blocks_exact_bf16.restype = ctypes.c_int
     lib.thump_rt_materialize_range.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint32,
@@ -403,6 +462,22 @@ def _load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint16),
     ]
     lib.thump_rt_materialize_range.restype = ctypes.c_int
+    lib.thump_rt_materialize_range_exact.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    lib.thump_rt_materialize_range_exact.restype = ctypes.c_int
+    lib.thump_rt_materialize_range_exact_bf16.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    lib.thump_rt_materialize_range_exact_bf16.restype = ctypes.c_int
     return lib
 
 
@@ -673,36 +748,67 @@ class RuntimeHandle:
         return ids
 
     def write_blocks(
-        self, block_ids: np.ndarray, k_fp16: np.ndarray, v_fp16: np.ndarray
+        self,
+        block_ids: np.ndarray,
+        k_fp16: np.ndarray,
+        v_fp16: np.ndarray,
+        *,
+        exact: bool = False,
+        exact_dtype: str = "fp16",
     ) -> None:
         block_ids = np.ascontiguousarray(block_ids.astype(np.uint32, copy=False))
         k_bits = _as_u16(k_fp16)
         v_bits = _as_u16(v_fp16)
+        if exact and exact_dtype == "bf16":
+            fn = self._lib.thump_rt_write_blocks_exact_bf16
+            op = "thump_rt_write_blocks_exact_bf16"
+        elif exact:
+            fn = self._lib.thump_rt_write_blocks_exact_fp16
+            op = "thump_rt_write_blocks_exact_fp16"
+        else:
+            fn = self._lib.thump_rt_write_blocks_fp16
+            op = "thump_rt_write_blocks_fp16"
         _check(
-            self._lib.thump_rt_write_blocks_fp16(
+            fn(
                 self._handle,
                 block_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
                 block_ids.shape[0],
                 k_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
                 v_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             ),
-            "thump_rt_write_blocks_fp16",
+            op,
         )
 
     def materialize_range(
-        self, start_index: int, count: int
+        self,
+        start_index: int,
+        count: int,
+        *,
+        exact: bool = False,
+        exact_dtype: str = "fp16",
     ) -> tuple[np.ndarray, np.ndarray]:
         elems = self.block_elements * count
         k_bits = np.zeros(elems, dtype=np.uint16)
         v_bits = np.zeros(elems, dtype=np.uint16)
+        if exact and exact_dtype == "bf16":
+            fn = self._lib.thump_rt_materialize_range_exact_bf16
+            op = "thump_rt_materialize_range_exact_bf16"
+        elif exact:
+            fn = self._lib.thump_rt_materialize_range_exact
+            op = "thump_rt_materialize_range_exact"
+        else:
+            fn = self._lib.thump_rt_materialize_range
+            op = "thump_rt_materialize_range"
         _check(
-            self._lib.thump_rt_materialize_range(
+            fn(
                 self._handle,
                 start_index,
                 count,
                 k_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
                 v_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             ),
-            "thump_rt_materialize_range",
+            op,
         )
+        if exact and exact_dtype == "bf16":
+            return k_bits, v_bits
         return k_bits.view(np.float16), v_bits.view(np.float16)

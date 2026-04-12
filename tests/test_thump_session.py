@@ -211,6 +211,178 @@ def test_session_substrate_checkpoint_and_attach_round_trip(tmp_path):
     restored.close()
 
 
+def test_session_substrate_initialize_from_live_kv_cache_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(layer_index=0, layer_type="full_attention", geometry=geometry)
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=8,
+        root_dir=tmp_path,
+        exact_hot_restart=True,
+    )
+
+    cache = KVCache()
+    values = np.arange(20, dtype=np.float16).reshape(20, 1, 1)
+    values = np.broadcast_to(values, (20, 2, 8)).copy()
+    keys = values + np.float16(100)
+    cache.keys = mx.array(np.transpose(keys[None, ...], (0, 2, 1, 3)), dtype=mx.float16)
+    cache.values = mx.array(
+        np.transpose(values[None, ...], (0, 2, 1, 3)), dtype=mx.float16
+    )
+    cache.offset = 20
+
+    session.initialize_from_live_cache([cache], total_tokens=20)
+    restored = session.materialize_prompt_cache(_DummyModel(), upto_tokens=20)[0]
+    restored_keys, restored_values = restored.state
+    restored_value_bits = np.transpose(
+        np.array(restored_values.view(mx.uint16))[0], (1, 0, 2)
+    )
+    restored_key_bits = np.transpose(
+        np.array(restored_keys.view(mx.uint16))[0], (1, 0, 2)
+    )
+    expected_value_bits = np.transpose(np.array(cache.values.view(mx.uint16))[0], (1, 0, 2))
+    expected_key_bits = np.transpose(np.array(cache.keys.view(mx.uint16))[0], (1, 0, 2))
+    assert np.array_equal(restored_value_bits, expected_value_bits)
+    assert np.array_equal(restored_key_bits, expected_key_bits)
+
+
+def test_session_substrate_initialize_from_live_bf16_kv_cache_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(layer_index=0, layer_type="full_attention", geometry=geometry)
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=8,
+        root_dir=tmp_path,
+        exact_hot_restart=True,
+    )
+
+    cache = KVCache()
+    values = np.arange(20, dtype=np.float32).reshape(20, 1, 1)
+    values = np.broadcast_to(values, (20, 2, 8)).copy()
+    keys = values + np.float32(100)
+    cache.keys = mx.array(
+        np.transpose(keys[None, ...], (0, 2, 1, 3)), dtype=mx.bfloat16
+    )
+    cache.values = mx.array(
+        np.transpose(values[None, ...], (0, 2, 1, 3)), dtype=mx.bfloat16
+    )
+    cache.offset = 20
+
+    session.initialize_from_live_cache([cache], total_tokens=20)
+    restored = session.materialize_prompt_cache(_DummyModel(), upto_tokens=20)[0]
+    restored_keys, restored_values = restored.state
+    restored_value_bits = np.transpose(
+        np.array(restored_values.view(mx.uint16))[0], (1, 0, 2)
+    )
+    restored_key_bits = np.transpose(
+        np.array(restored_keys.view(mx.uint16))[0], (1, 0, 2)
+    )
+    expected_value_bits = np.transpose(
+        np.array(cache.values.view(mx.uint16))[0], (1, 0, 2)
+    )
+    expected_key_bits = np.transpose(
+        np.array(cache.keys.view(mx.uint16))[0], (1, 0, 2)
+    )
+    assert np.array_equal(restored_value_bits, expected_value_bits)
+    assert np.array_equal(restored_key_bits, expected_key_bits)
+
+
+def test_session_substrate_initialize_from_live_rotating_cache_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(
+        layer_index=0,
+        layer_type="sliding_attention",
+        geometry=geometry,
+        window_size=4,
+    )
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=8,
+        root_dir=tmp_path,
+        exact_hot_restart=True,
+    )
+
+    cache = RotatingKVCache(max_size=4, keep=0)
+    for token in range(20):
+        value = mx.full((1, 2, 1, 8), float(token), dtype=mx.float16)
+        key = value + np.float16(100)
+        cache.update_and_fetch(key, value)
+
+    session.initialize_from_live_cache([cache], total_tokens=20)
+    restored = session.materialize_prompt_cache(_SlidingDummyModel(), upto_tokens=20)[0]
+    restored_values = np.array(restored._temporal_order(restored.values).astype(mx.float32))
+    restored_keys = np.array(restored._temporal_order(restored.keys).astype(mx.float32))
+    restored_values = np.transpose(restored_values[0], (1, 0, 2))[..., 0]
+    restored_keys = np.transpose(restored_keys[0], (1, 0, 2))[..., 0]
+    expected_values = np.array(
+        [[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]],
+        dtype=np.float16,
+    )
+    expected_keys = expected_values + np.float16(100)
+    assert np.allclose(restored_values, expected_values, atol=0.1)
+    assert np.allclose(restored_keys, expected_keys, atol=0.1)
+
+
+def test_session_substrate_initialize_from_live_bf16_rotating_cache_round_trip(tmp_path):
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    spec = LayerSpec(
+        layer_index=0,
+        layer_type="sliding_attention",
+        geometry=geometry,
+        window_size=4,
+    )
+    session = SessionSubstrate(
+        [spec],
+        block_capacity=8,
+        root_dir=tmp_path,
+        exact_hot_restart=True,
+    )
+
+    cache = RotatingKVCache(max_size=4, keep=0)
+    for token in range(20):
+        value = mx.full((1, 2, 1, 8), float(token), dtype=mx.bfloat16)
+        key = value + np.float32(100)
+        cache.update_and_fetch(key, value)
+
+    session.initialize_from_live_cache([cache], total_tokens=20)
+    restored = session.materialize_prompt_cache(_SlidingDummyModel(), upto_tokens=20)[0]
+    restored_values = np.array(restored._temporal_order(restored.values).astype(mx.float32))
+    restored_keys = np.array(restored._temporal_order(restored.keys).astype(mx.float32))
+    restored_values = np.transpose(restored_values[0], (1, 0, 2))[..., 0]
+    restored_keys = np.transpose(restored_keys[0], (1, 0, 2))[..., 0]
+    expected_values = np.array(
+        [[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]],
+        dtype=np.float32,
+    )
+    expected_keys = expected_values + np.float32(100)
+    assert np.allclose(restored_values, expected_values, atol=0.1)
+    assert np.allclose(restored_keys, expected_keys, atol=0.1)
+
+
 def test_nontraditional_rope_layout_helpers_round_trip():
     keys = np.arange(16, dtype=np.float16).reshape(2, 1, 8)
     interleaved = _interleave_split_rotary_pairs(keys, 4)

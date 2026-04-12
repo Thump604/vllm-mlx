@@ -80,13 +80,19 @@ def _run_thumpctl_json(
     return payload
 
 
+def _load_trace(args: argparse.Namespace) -> SessionRecoveryTrace:
+    trace = SessionRecoveryTrace.from_path(args.trace)
+    trace.exact_hot_restart = args.exact_hot_restart
+    return trace
+
+
 def _checkpoint_mode(args: argparse.Namespace) -> None:
     runner = SessionRecoveryRunner(
         args.model_path,
         thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
-    trace = SessionRecoveryTrace.from_path(args.trace)
+    trace = _load_trace(args)
     artifact = runner.create_checkpoint(trace, bundle_dir=args.bundle_dir)
     _write_json(Path(args.output), artifact.__dict__)
 
@@ -97,7 +103,7 @@ def _restore_mode(args: argparse.Namespace) -> None:
         thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
-    trace = SessionRecoveryTrace.from_path(args.trace)
+    trace = _load_trace(args)
     artifact = CheckpointArtifact.from_path(args.checkpoint_json)
     result = runner.restore_and_continue(trace, artifact)
     _write_json(Path(args.output), result.__dict__)
@@ -109,7 +115,7 @@ def _cold_mode(args: argparse.Namespace) -> None:
         thump_lib_path=_resolved_thump_lib(args),
         block_size_tokens=args.block_size_tokens,
     )
-    trace = SessionRecoveryTrace.from_path(args.trace)
+    trace = _load_trace(args)
     artifact = CheckpointArtifact.from_path(args.checkpoint_json)
     result = runner.cold_rebuild_and_continue(trace, artifact)
     _write_json(Path(args.output), result.__dict__)
@@ -137,6 +143,8 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
         "--block-size-tokens",
         str(args.block_size_tokens),
     ]
+    if args.exact_hot_restart:
+        base_cmd.append("--exact-hot-restart")
     if args.thump_prefix:
         base_cmd.extend(["--thump-prefix", args.thump_prefix])
     elif args.thump_lib:
@@ -206,7 +214,7 @@ def _benchmark_mode(args: argparse.Namespace) -> None:
         ]
     )
 
-    trace = SessionRecoveryTrace.from_path(trace_path)
+    trace = _load_trace(args)
     artifact = CheckpointArtifact.from_path(checkpoint_json)
     restore = RecoveryRunResult(**json.loads(restore_json.read_text()))
     cold = RecoveryRunResult(**json.loads(cold_json.read_text()))
@@ -270,6 +278,7 @@ def main() -> None:
     parser.add_argument("--thump-prefix")
     parser.add_argument("--thumpctl")
     parser.add_argument("--block-size-tokens", type=int, default=1)
+    parser.add_argument("--exact-hot-restart", action="store_true")
     args = parser.parse_args()
 
     if args.mode == "checkpoint":

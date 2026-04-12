@@ -171,6 +171,7 @@ class SessionRecoveryTrace:
     prefill_step_size: int = 128
     capture_step_size: int | None = None
     exact_replay: bool = False
+    exact_hot_restart: bool = False
 
     @classmethod
     def from_path(cls, path: str | Path) -> "SessionRecoveryTrace":
@@ -208,6 +209,7 @@ class CheckpointArtifact:
     block_size_tokens: int
     prefill_step_size: int
     capture_step_size: int
+    exact_hot_restart: bool = False
     checkpoint_latency_ms: float = 0.0
     checkpoint_rss_telemetry: dict[str, int | float] | None = None
 
@@ -290,7 +292,7 @@ class SessionRecoveryRunner:
         }
 
         prefix_cache = self.model.make_cache()
-        prefix_collector = CaptureCollector()
+        prefix_collector = None if trace.exact_hot_restart else CaptureCollector()
         prefix_prefill_start = time.perf_counter()
         _reconstruct_tokens(
             self.model,
@@ -304,7 +306,7 @@ class SessionRecoveryRunner:
             time.perf_counter() - prefix_prefill_start
         ) * 1000.0
         checkpoint_rss_telemetry["rss_after_prefix_prefill_bytes"] = _current_rss_bytes()
-        seed_collector = CaptureCollector()
+        seed_collector = None if trace.exact_hot_restart else CaptureCollector()
         seed_decode_start = time.perf_counter()
         _continuation_ms, _seed_text, seed_tokens = _decode_tokens(
             self.model,
@@ -321,10 +323,12 @@ class SessionRecoveryRunner:
         if not seed_tokens:
             raise RuntimeError("seed decode produced no tokens")
 
+        full_capture: dict[int, LayerCapture] | None = None
         capture_merge_start = time.perf_counter()
-        full_capture = _merge_captures(
-            prefix_collector.joined(), seed_collector.joined()
-        )
+        if prefix_collector is not None and seed_collector is not None:
+            full_capture = _merge_captures(
+                prefix_collector.joined(), seed_collector.joined()
+            )
         checkpoint_rss_telemetry["capture_merge_latency_ms"] = (
             time.perf_counter() - capture_merge_start
         ) * 1000.0
@@ -343,13 +347,17 @@ class SessionRecoveryRunner:
             block_capacity=total_blocks,
             root_dir=bundle_dir,
             lib_path=self.thump_lib_path,
+            exact_hot_restart=trace.exact_hot_restart,
         )
         checkpoint_rss_telemetry["session_init_latency_ms"] = (
             time.perf_counter() - session_init_start
         ) * 1000.0
         checkpoint_rss_telemetry["rss_after_session_init_bytes"] = _current_rss_bytes()
         capture_write_start = time.perf_counter()
-        session.initialize_from_capture(full_capture, total_tokens=context_tokens)
+        if trace.exact_hot_restart:
+            session.initialize_from_live_cache(prefix_cache, total_tokens=context_tokens)
+        else:
+            session.initialize_from_capture(full_capture, total_tokens=context_tokens)
         checkpoint_rss_telemetry["capture_write_latency_ms"] = (
             time.perf_counter() - capture_write_start
         ) * 1000.0
@@ -396,6 +404,7 @@ class SessionRecoveryRunner:
             block_size_tokens=self.block_size_tokens,
             prefill_step_size=trace.prefill_step_size,
             capture_step_size=capture_step_size,
+            exact_hot_restart=trace.exact_hot_restart,
             checkpoint_latency_ms=checkpoint_latency_ms,
             checkpoint_rss_telemetry=checkpoint_rss_telemetry,
         )
@@ -421,6 +430,7 @@ class SessionRecoveryRunner:
                 block_size_tokens=artifact.block_size_tokens,
                 lib_path=self.thump_lib_path,
                 expected_model_id_hash=artifact.model_id_hash,
+                require_exact_hot_restart=artifact.exact_hot_restart,
             )
             validate_latency_ms = (time.perf_counter() - validate_start) * 1000.0
             cache = session.materialize_prompt_cache(
@@ -522,6 +532,7 @@ def build_recovery_comparison(
         "restore_validate_materialize_latency_ms": restore.validate_materialize_latency_ms,
         "cold_rebuild_latency_ms": cold_rebuild.cold_rebuild_latency_ms,
         "artifact_size_bytes": artifact.artifact_size_bytes,
+        "exact_hot_restart": artifact.exact_hot_restart,
         "prompt_token_count": artifact.prompt_token_count,
         "context_tokens": artifact.context_tokens,
         "generated_tokens": artifact.generated_tokens,
