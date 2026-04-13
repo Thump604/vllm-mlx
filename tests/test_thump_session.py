@@ -7,13 +7,23 @@ import numpy as np
 import pytest
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-from vllm_mlx.thump.adapter import BlockGeometry, RopeConfig
+from vllm_mlx.thump.adapter import (
+    BlockGeometry,
+    LinearStateSpec as AdapterLinearStateSpec,
+    RopeConfig,
+    THUMP_RT_BANK_ENTRY_FLAG_HAS_EXACT_SIDECAR,
+    THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
+    THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION,
+    THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+    RuntimeHandle,
+)
 from vllm_mlx.thump.capture import LayerCapture
 from vllm_mlx.thump.session import (
     LayerSpec,
     SessionSubstrate,
+    _LayerBank,
     _cache_temporal_tokens,
     _deinterleave_split_rotary_pairs,
     _interleave_split_rotary_pairs,
@@ -337,7 +347,9 @@ def test_session_substrate_initialize_from_live_kv_cache_round_trip(tmp_path):
     restored_key_bits = np.transpose(
         np.array(restored_keys.view(mx.uint16))[0], (1, 0, 2)
     )
-    expected_value_bits = np.transpose(np.array(cache.values.view(mx.uint16))[0], (1, 0, 2))
+    expected_value_bits = np.transpose(
+        np.array(cache.values.view(mx.uint16))[0], (1, 0, 2)
+    )
     expected_key_bits = np.transpose(np.array(cache.keys.view(mx.uint16))[0], (1, 0, 2))
     assert np.array_equal(restored_value_bits, expected_value_bits)
     assert np.array_equal(restored_key_bits, expected_key_bits)
@@ -383,9 +395,7 @@ def test_session_substrate_initialize_from_live_bf16_kv_cache_round_trip(tmp_pat
     expected_value_bits = np.transpose(
         np.array(cache.values.view(mx.uint16))[0], (1, 0, 2)
     )
-    expected_key_bits = np.transpose(
-        np.array(cache.keys.view(mx.uint16))[0], (1, 0, 2)
-    )
+    expected_key_bits = np.transpose(np.array(cache.keys.view(mx.uint16))[0], (1, 0, 2))
     assert np.array_equal(restored_value_bits, expected_value_bits)
     assert np.array_equal(restored_key_bits, expected_key_bits)
 
@@ -429,7 +439,9 @@ def test_session_substrate_initialize_from_live_rotating_cache_round_trip(tmp_pa
 
     session.initialize_from_live_cache([cache], total_tokens=20)
     restored = session.materialize_prompt_cache(_SlidingDummyModel(), upto_tokens=20)[0]
-    restored_values = np.array(restored._temporal_order(restored.values).astype(mx.float32))
+    restored_values = np.array(
+        restored._temporal_order(restored.values).astype(mx.float32)
+    )
     restored_keys = np.array(restored._temporal_order(restored.keys).astype(mx.float32))
     restored_values = np.transpose(restored_values[0], (1, 0, 2))[..., 0]
     restored_keys = np.transpose(restored_keys[0], (1, 0, 2))[..., 0]
@@ -442,7 +454,9 @@ def test_session_substrate_initialize_from_live_rotating_cache_round_trip(tmp_pa
     assert np.allclose(restored_keys, expected_keys, atol=0.1)
 
 
-def test_session_substrate_initialize_from_live_bf16_rotating_cache_round_trip(tmp_path):
+def test_session_substrate_initialize_from_live_bf16_rotating_cache_round_trip(
+    tmp_path,
+):
     geometry = BlockGeometry(
         block_size_tokens=16,
         num_kv_heads=2,
@@ -471,7 +485,9 @@ def test_session_substrate_initialize_from_live_bf16_rotating_cache_round_trip(t
 
     session.initialize_from_live_cache([cache], total_tokens=20)
     restored = session.materialize_prompt_cache(_SlidingDummyModel(), upto_tokens=20)[0]
-    restored_values = np.array(restored._temporal_order(restored.values).astype(mx.float32))
+    restored_values = np.array(
+        restored._temporal_order(restored.values).astype(mx.float32)
+    )
     restored_keys = np.array(restored._temporal_order(restored.keys).astype(mx.float32))
     restored_values = np.transpose(restored_values[0], (1, 0, 2))[..., 0]
     restored_keys = np.transpose(restored_keys[0], (1, 0, 2))[..., 0]
@@ -544,7 +560,9 @@ def test_session_substrate_restores_rotating_cache_internal_state(tmp_path):
     assert cache._idx == 4
     restored = np.asarray(cache._temporal_order(cache.values))
     restored_tokens = np.transpose(restored[0], (1, 0, 2))[..., 0]
-    expected = np.array([[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]], dtype=np.float16)
+    expected = np.array(
+        [[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]], dtype=np.float16
+    )
     assert np.allclose(restored_tokens, expected, atol=0.75)
 
 
@@ -601,7 +619,9 @@ def test_gemma4_layer_specs_loads_layer_types_from_model_path_config(tmp_path):
         rope=rope,
     )
     model = SimpleNamespace(
-        args=SimpleNamespace(rope_parameters=None, sliding_window=None, layer_types=None),
+        args=SimpleNamespace(
+            rope_parameters=None, sliding_window=None, layer_types=None
+        ),
         config=SimpleNamespace(),
         layers=[
             SimpleNamespace(layer_type="full_attention", self_attn=attn),
@@ -665,9 +685,57 @@ def test_session_substrate_model_family_detects_gemma_and_qwen_variants(tmp_path
     assert SessionSubstrate.model_family(qwen_model, model_path=tmp_path) == "qwen3_5"
 
 
-def test_session_substrate_from_model_rejects_qwen_family_until_adapter_lands():
+def test_qwen3_5_layer_specs_map_linear_and_full_attention_layers():
+    rope = SimpleNamespace(base=10_000_000.0, traditional=False)
+    full_attn = SimpleNamespace(
+        num_key_value_heads=4,
+        num_attention_heads=24,
+        head_dim=256,
+        rope=rope,
+    )
+    linear_attn = SimpleNamespace(
+        conv_kernel_size=4,
+        conv_dim=10240,
+        num_v_heads=48,
+        head_v_dim=128,
+        head_k_dim=128,
+    )
+    model = SimpleNamespace(
+        args=SimpleNamespace(
+            rope_theta=10_000_000.0,
+            partial_rotary_factor=0.25,
+            layer_types=["linear_attention", "full_attention"],
+        ),
+        config=SimpleNamespace(model_type="qwen3_5_text"),
+        layers=[
+            SimpleNamespace(is_linear=True, linear_attn=linear_attn),
+            SimpleNamespace(is_linear=False, self_attn=full_attn),
+        ],
+    )
+
+    specs = SessionSubstrate.layer_specs_for_model(model, block_size_tokens=16)
+
+    assert specs[0].layer_state_kind == THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM
+    assert specs[0].linear_state_spec == AdapterLinearStateSpec(
+        conv_batch=1,
+        conv_history=3,
+        conv_channels=10240,
+        ssm_batch=1,
+        ssm_heads=48,
+        ssm_value_dim=128,
+        ssm_key_dim=128,
+    )
+    assert specs[1].layer_state_kind == THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION
+    assert specs[1].geometry is not None
+    assert specs[1].geometry.num_kv_heads == 4
+    assert specs[1].geometry.group_size == 6
+    assert specs[1].geometry.rope.partial_rotary_factor == 0.25
+    assert specs[1].rope_traditional is False
+
+
+def test_session_substrate_from_model_rejects_qwen_without_exact_hot_restart():
     qwen_model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
-    with pytest.raises(NotImplementedError, match="qwen3_5"):
+    with pytest.raises(NotImplementedError, match="exact_hot_restart"):
         SessionSubstrate.from_model(qwen_model, block_capacity=8)
 
 
@@ -722,11 +790,16 @@ def test_build_recovery_comparison_emits_first_class_telemetry():
         session_total_ms=40.0,
     )
 
-    comparison = build_recovery_comparison(trace, artifact, restore=restore, cold_rebuild=cold)
+    comparison = build_recovery_comparison(
+        trace, artifact, restore=restore, cold_rebuild=cold
+    )
 
     assert comparison.go_no_go == "GO"
     assert comparison.telemetry["checkpoint_latency_ms"] == 12.5
-    assert comparison.telemetry["checkpoint_rss_telemetry"]["rss_before_prefill_bytes"] == 100
+    assert (
+        comparison.telemetry["checkpoint_rss_telemetry"]["rss_before_prefill_bytes"]
+        == 100
+    )
     assert comparison.telemetry["checkpoint_peak_rss_bytes"] == 250
     assert comparison.telemetry["restore_mode"] == "restore"
     assert comparison.telemetry["artifact_size_bytes"] == 1234
@@ -824,7 +897,9 @@ def test_recovery_runner_restore_passes_model_path(monkeypatch, tmp_path):
     runner.block_size_tokens = 16
     runner.model_id_hash = 123
 
-    trace = SessionRecoveryTrace(name="demo", prompt_text="hello", continue_new_tokens=1)
+    trace = SessionRecoveryTrace(
+        name="demo", prompt_text="hello", continue_new_tokens=1
+    )
     artifact = CheckpointArtifact(
         trace_name="demo",
         model_path=runner.model_path,
@@ -931,3 +1006,231 @@ def test_recovery_runner_capture_patch_rejects_qwen_family(monkeypatch):
                 exact_hot_restart=False,
             )
         )
+
+
+def test_qwen_linear_exact_checkpoint_writes_linear_state_artifact(
+    monkeypatch, tmp_path
+):
+    spec = LayerSpec(
+        layer_index=0,
+        layer_type="linear_attention",
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+        linear_state_spec=AdapterLinearStateSpec(
+            conv_batch=1,
+            conv_history=3,
+            conv_channels=4,
+            ssm_batch=1,
+            ssm_heads=2,
+            ssm_value_dim=3,
+            ssm_key_dim=5,
+        ),
+    )
+    substrate = SessionSubstrate.__new__(SessionSubstrate)
+    substrate.layer_specs = [spec]
+    substrate.block_size_tokens = 16
+    substrate.root_dir = tmp_path
+    substrate.exact_hot_restart = True
+    substrate.lib_path = "/tmp/libthump.dylib"
+    substrate._banks = {
+        0: _LayerBank(
+            spec=spec,
+            path=tmp_path / "layer-00.linearf32",
+            handle=None,
+            bank_mode=THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
+        )
+    }
+    substrate.total_tokens = 0
+    substrate.last_checkpoint = None
+
+    cache = ArraysCache(size=2)
+    conv = mx.array(
+        np.arange(12, dtype=np.uint16).reshape(1, 3, 4),
+        dtype=mx.uint16,
+    ).view(mx.bfloat16)
+    ssm = mx.array(np.arange(30, dtype=np.float32).reshape(1, 2, 3, 5))
+    cache.state = [conv, ssm]
+
+    substrate.initialize_from_live_cache([cache], total_tokens=12)
+
+    seen: dict[str, object] = {}
+
+    def _fake_write_linear_state(
+        path, sequence_id, meta, linear_spec, conv_state, ssm_state, *, lib_path=None
+    ):
+        seen["path"] = path
+        seen["sequence_id"] = sequence_id
+        seen["meta"] = meta
+        seen["linear_spec"] = linear_spec
+        seen["conv_state"] = conv_state.copy()
+        seen["ssm_state"] = ssm_state.copy()
+        seen["lib_path"] = lib_path
+
+    def _fake_write_manifest(path, manifest, banks, *, lib_path=None):
+        seen["manifest_path"] = path
+        seen["manifest"] = manifest
+        seen["banks"] = banks
+        seen["manifest_lib_path"] = lib_path
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.write_linear_state_f32", _fake_write_linear_state
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.write_session_manifest", _fake_write_manifest
+    )
+
+    substrate.checkpoint(
+        tmp_path / "session.tsmf",
+        model_id_hash=11,
+        session_id=22,
+        sequence_id=33,
+        prompt_tokens=12,
+        generated_tokens=4,
+    )
+
+    assert seen["linear_spec"] == spec.linear_state_spec
+    assert seen["lib_path"] == substrate.lib_path
+    assert seen["meta"].layer_index == 0
+    assert seen["sequence_id"] == 33
+    assert seen["conv_state"].shape == (12,)
+    assert seen["ssm_state"].shape == (30,)
+    assert seen["banks"][0].bank_mode == THUMP_RT_BANK_MODE_LINEAR_SSM_F32
+    assert seen["banks"][0].layer_state_kind == THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM
+    assert seen["manifest_lib_path"] == substrate.lib_path
+
+
+def test_qwen_linear_materialize_prompt_cache_restores_arrays_cache(
+    monkeypatch, tmp_path
+):
+    spec = LayerSpec(
+        layer_index=0,
+        layer_type="linear_attention",
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+        linear_state_spec=AdapterLinearStateSpec(
+            conv_batch=1,
+            conv_history=3,
+            conv_channels=4,
+            ssm_batch=1,
+            ssm_heads=2,
+            ssm_value_dim=3,
+            ssm_key_dim=5,
+        ),
+    )
+    substrate = SessionSubstrate.__new__(SessionSubstrate)
+    substrate.layer_specs = [spec]
+    substrate.block_size_tokens = 16
+    substrate.root_dir = tmp_path
+    substrate.exact_hot_restart = True
+    substrate.lib_path = "/tmp/libthump.dylib"
+    substrate._banks = {
+        0: _LayerBank(
+            spec=spec,
+            path=tmp_path / "layer-00.linearf32",
+            handle=None,
+            bank_mode=THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
+        )
+    }
+    substrate.total_tokens = 0
+    substrate.last_checkpoint = None
+
+    conv_bits = np.arange(12, dtype=np.uint16)
+    ssm_state = np.arange(30, dtype=np.float32)
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.materialize_linear_state_f32",
+        lambda path, linear_spec, *, lib_path=None: (
+            SimpleNamespace(layer_index=0),
+            conv_bits,
+            ssm_state,
+        ),
+    )
+
+    model = SimpleNamespace(make_cache=lambda: [ArraysCache(size=2)])
+    caches = substrate.materialize_prompt_cache(model, upto_tokens=12)
+    conv, ssm = caches[0].state
+
+    assert isinstance(caches[0], ArraysCache)
+    assert conv.dtype == mx.bfloat16
+    assert ssm.dtype == mx.float32
+    assert conv.shape == (1, 3, 4)
+    assert ssm.shape == (1, 2, 3, 5)
+
+
+def test_attach_from_manifest_counts_linear_state_as_exact(monkeypatch, tmp_path):
+    linear_spec = LayerSpec(
+        layer_index=0,
+        layer_type="linear_attention",
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+        linear_state_spec=AdapterLinearStateSpec(
+            conv_batch=1,
+            conv_history=3,
+            conv_channels=4,
+            ssm_batch=1,
+            ssm_heads=2,
+            ssm_value_dim=3,
+            ssm_key_dim=5,
+        ),
+    )
+    geometry = BlockGeometry(
+        block_size_tokens=16,
+        num_kv_heads=2,
+        head_dim=8,
+        group_size=1,
+        rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+    )
+    kv_spec = LayerSpec(
+        layer_index=3,
+        layer_type="full_attention",
+        geometry=geometry,
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION,
+    )
+    manifest = SimpleNamespace(
+        model_id_hash=7,
+        session_id=8,
+        sequence_id=9,
+        prompt_tokens=10,
+        generated_tokens=3,
+    )
+    entries = [
+        SimpleNamespace(
+            layer_index=0,
+            bank_relpath="layer-00.linearf32",
+            bank_mode=THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
+            layer_state_kind=THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+            has_exact_sidecar=False,
+        ),
+        SimpleNamespace(
+            layer_index=3,
+            bank_relpath="layer-03.thump",
+            bank_mode=0,
+            layer_state_kind=THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION,
+            has_exact_sidecar=True,
+        ),
+    ]
+
+    class _FakeHandle:
+        def validate_session_snapshot(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.validate_session_manifest",
+        lambda *args, **kwargs: (manifest, entries),
+    )
+    monkeypatch.setattr(
+        RuntimeHandle,
+        "attach",
+        classmethod(lambda cls, path, lib_path=None: _FakeHandle()),
+    )
+
+    restored, checkpoint = SessionSubstrate.attach_from_manifest(
+        [linear_spec, kv_spec],
+        tmp_path / "session.tsmf",
+        require_exact_hot_restart=True,
+    )
+
+    assert restored.exact_hot_restart is True
+    assert restored._banks[0].handle is None
+    assert restored._banks[3].handle is not None
+    assert checkpoint.context_tokens == 12

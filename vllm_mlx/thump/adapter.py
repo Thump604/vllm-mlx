@@ -6,6 +6,7 @@ import ctypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -16,6 +17,12 @@ THUMP_RT_BANK_ENTRY_FLAG_HAS_EXACT_SIDECAR = 1 << 0
 THUMP_RT_BANK_MODE_FP8 = 1
 THUMP_RT_BANK_MODE_EXACT_FP16_SIDECAR = 2
 THUMP_RT_BANK_MODE_EXACT_BF16_SIDECAR = 3
+THUMP_RT_BANK_MODE_LINEAR_SSM_F32 = 4
+THUMP_RT_LAYER_STATE_KIND_UNKNOWN = 0
+THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION = 1
+THUMP_RT_LAYER_STATE_KIND_ROTATING_KV = 2
+THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM = 3
+THUMP_RT_LAYER_STATE_KIND_OTHER = 4
 
 
 def _default_lib_path() -> Path:
@@ -99,12 +106,25 @@ class _CSessionManifest(ctypes.Structure):
 THUMP_RT_SESSION_BANK_PATH_MAX = 192
 
 
+class _CLinearStateSpec(ctypes.Structure):
+    _fields_ = [
+        ("conv_batch", ctypes.c_uint32),
+        ("conv_history", ctypes.c_uint32),
+        ("conv_channels", ctypes.c_uint32),
+        ("ssm_batch", ctypes.c_uint32),
+        ("ssm_heads", ctypes.c_uint32),
+        ("ssm_value_dim", ctypes.c_uint32),
+        ("ssm_key_dim", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+    ]
+
+
 class _CSessionBankEntry(ctypes.Structure):
     _fields_ = [
         ("layer_index", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("bank_mode", ctypes.c_uint32),
-        ("reserved0", ctypes.c_uint32),
+        ("layer_state_kind", ctypes.c_uint32),
         ("exact_stored_bytes", ctypes.c_uint64),
         ("exact_crc32", ctypes.c_uint32),
         ("exact_version_major", ctypes.c_uint16),
@@ -272,11 +292,47 @@ class SessionManifest:
 
 
 @dataclass(frozen=True)
+class LinearStateSpec:
+    conv_batch: int
+    conv_history: int
+    conv_channels: int
+    ssm_batch: int
+    ssm_heads: int
+    ssm_value_dim: int
+    ssm_key_dim: int
+
+    def to_c(self) -> _CLinearStateSpec:
+        return _CLinearStateSpec(
+            conv_batch=self.conv_batch,
+            conv_history=self.conv_history,
+            conv_channels=self.conv_channels,
+            ssm_batch=self.ssm_batch,
+            ssm_heads=self.ssm_heads,
+            ssm_value_dim=self.ssm_value_dim,
+            ssm_key_dim=self.ssm_key_dim,
+            reserved0=0,
+        )
+
+    @classmethod
+    def from_c(cls, spec: _CLinearStateSpec) -> "LinearStateSpec":
+        return cls(
+            conv_batch=int(spec.conv_batch),
+            conv_history=int(spec.conv_history),
+            conv_channels=int(spec.conv_channels),
+            ssm_batch=int(spec.ssm_batch),
+            ssm_heads=int(spec.ssm_heads),
+            ssm_value_dim=int(spec.ssm_value_dim),
+            ssm_key_dim=int(spec.ssm_key_dim),
+        )
+
+
+@dataclass(frozen=True)
 class SessionBankEntry:
     layer_index: int
     bank_relpath: str
     flags: int = 0
     bank_mode: int = THUMP_RT_BANK_MODE_FP8
+    layer_state_kind: int = THUMP_RT_LAYER_STATE_KIND_UNKNOWN
     exact_stored_bytes: int = 0
     exact_crc32: int = 0
     exact_version_major: int = 0
@@ -294,7 +350,7 @@ class SessionBankEntry:
         entry.layer_index = self.layer_index
         entry.flags = self.flags
         entry.bank_mode = self.bank_mode
-        entry.reserved0 = 0
+        entry.layer_state_kind = self.layer_state_kind
         entry.exact_stored_bytes = self.exact_stored_bytes
         entry.exact_crc32 = self.exact_crc32
         entry.exact_version_major = self.exact_version_major
@@ -312,6 +368,7 @@ class SessionBankEntry:
             bank_relpath=raw_bank.split(b"\0", 1)[0].decode(),
             flags=int(entry.flags),
             bank_mode=int(entry.bank_mode),
+            layer_state_kind=int(entry.layer_state_kind),
             exact_stored_bytes=int(entry.exact_stored_bytes),
             exact_crc32=int(entry.exact_crc32),
             exact_version_major=int(entry.exact_version_major),
@@ -386,6 +443,34 @@ def _load_library(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_uint32),
     ]
     lib.thump_rt_validate_session_manifest.restype = ctypes.c_int
+    if hasattr(lib, "thump_rt_linear_state_element_counts"):
+        lib.thump_rt_linear_state_element_counts.argtypes = [
+            ctypes.POINTER(_CLinearStateSpec),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.thump_rt_linear_state_element_counts.restype = ctypes.c_int
+    if hasattr(lib, "thump_rt_write_linear_state_f32"):
+        lib.thump_rt_write_linear_state_f32.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_uint64,
+            ctypes.POINTER(_CSessionMetadata),
+            ctypes.POINTER(_CLinearStateSpec),
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        lib.thump_rt_write_linear_state_f32.restype = ctypes.c_int
+    if hasattr(lib, "thump_rt_materialize_linear_state_f32"):
+        lib.thump_rt_materialize_linear_state_f32.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(_CSessionMetadata),
+            ctypes.POINTER(_CLinearStateSpec),
+            ctypes.POINTER(ctypes.c_uint16),
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64,
+        ]
+        lib.thump_rt_materialize_linear_state_f32.restype = ctypes.c_int
     lib.thump_rt_block_capacity.argtypes = [ctypes.c_void_p]
     lib.thump_rt_block_capacity.restype = ctypes.c_uint32
     lib.thump_rt_sequence_length.argtypes = [ctypes.c_void_p]
@@ -486,10 +571,102 @@ def _check(status: int, op: str) -> None:
         raise ThumpRuntimeError(f"{op} failed with status {status}")
 
 
+def _require_symbol(lib: ctypes.CDLL, name: str) -> Any:
+    symbol = getattr(lib, name, None)
+    if symbol is None:
+        raise NotImplementedError(
+            f"Thump runtime library {lib._name} does not expose {name}"
+        )
+    return symbol
+
+
 def _as_u16(arr: np.ndarray) -> np.ndarray:
     if arr.dtype == np.uint16:
         return np.ascontiguousarray(arr)
     return np.ascontiguousarray(arr.astype(np.float16, copy=False).view(np.uint16))
+
+
+def linear_state_element_counts(
+    spec: LinearStateSpec,
+    *,
+    lib_path: str | os.PathLike[str] | None = None,
+) -> tuple[int, int]:
+    lib = _load_library(lib_path)
+    fn = _require_symbol(lib, "thump_rt_linear_state_element_counts")
+    conv_elements = ctypes.c_uint64(0)
+    ssm_elements = ctypes.c_uint64(0)
+    spec_c = spec.to_c()
+    _check(
+        fn(
+            ctypes.byref(spec_c),
+            ctypes.byref(conv_elements),
+            ctypes.byref(ssm_elements),
+        ),
+        "thump_rt_linear_state_element_counts",
+    )
+    return int(conv_elements.value), int(ssm_elements.value)
+
+
+def write_linear_state_f32(
+    path: str | os.PathLike[str],
+    sequence_id: int,
+    meta: SessionMetadata,
+    spec: LinearStateSpec,
+    conv_state_bf16: np.ndarray,
+    ssm_state_f32: np.ndarray,
+    *,
+    lib_path: str | os.PathLike[str] | None = None,
+) -> None:
+    lib = _load_library(lib_path)
+    fn = _require_symbol(lib, "thump_rt_write_linear_state_f32")
+    spec_c = spec.to_c()
+    meta_c = meta.to_c()
+    conv_bits = np.ascontiguousarray(conv_state_bf16.astype(np.uint16, copy=False))
+    ssm = np.ascontiguousarray(ssm_state_f32.astype(np.float32, copy=False))
+    _check(
+        fn(
+            os.fsencode(path),
+            sequence_id,
+            ctypes.byref(meta_c),
+            ctypes.byref(spec_c),
+            conv_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            ssm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        ),
+        "thump_rt_write_linear_state_f32",
+    )
+
+
+def materialize_linear_state_f32(
+    path: str | os.PathLike[str],
+    spec: LinearStateSpec,
+    *,
+    lib_path: str | os.PathLike[str] | None = None,
+) -> tuple[SessionMetadata, np.ndarray, np.ndarray]:
+    lib = _load_library(lib_path)
+    fn = _require_symbol(lib, "thump_rt_materialize_linear_state_f32")
+    meta = _CSessionMetadata()
+    spec_c = spec.to_c()
+    conv_capacity, ssm_capacity = linear_state_element_counts(spec, lib_path=lib_path)
+    conv = np.zeros(conv_capacity, dtype=np.uint16)
+    ssm = np.zeros(ssm_capacity, dtype=np.float32)
+    _check(
+        fn(
+            os.fsencode(path),
+            ctypes.byref(meta),
+            ctypes.byref(spec_c),
+            conv.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            conv_capacity,
+            ssm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ssm_capacity,
+        ),
+        "thump_rt_materialize_linear_state_f32",
+    )
+    actual = LinearStateSpec.from_c(spec_c)
+    if actual != spec:
+        raise ThumpRuntimeError(
+            "thump_rt_materialize_linear_state_f32 returned unexpected linear state spec"
+        )
+    return SessionMetadata.from_c(meta), conv, ssm
 
 
 def _manifest_round_trip(
