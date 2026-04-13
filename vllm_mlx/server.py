@@ -104,8 +104,15 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
-from .thump.qwen_pilot import qwen_pilot_enabled
 from .tool_parsers import ToolParserManager
+
+try:
+    from .thump.qwen_pilot import qwen_pilot_enabled
+except ImportError:
+
+    def qwen_pilot_enabled():
+        return False
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -174,10 +181,15 @@ def _resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, o
 def _should_force_content_response(request: ChatCompletionRequest) -> bool:
     """Whether parser output should be coerced back into assistant content."""
     kwargs = _resolve_chat_template_kwargs(request)
-    return (
-        kwargs.get("enable_thinking") is False
-        or kwargs.get("force_nonempty_content") is True
-    )
+    if kwargs.get("force_nonempty_content") is True:
+        return True
+    if kwargs.get("enable_thinking") is False:
+        return True
+    # Default-on for Qwen models: thinking output often traps the answer
+    # in reasoning_content with empty visible content.
+    if _model_path and "qwen" in _model_path.lower():
+        return kwargs.get("force_nonempty_content") is not False
+    return False
 
 
 # Global MCP manager
@@ -1639,9 +1651,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "stop": request.stop,
     }
     if engine.is_mllm:
-        chat_kwargs["preserve_native_tool_format"] = (
-            engine.preserve_native_tool_format
-        )
+        chat_kwargs["preserve_native_tool_format"] = engine.preserve_native_tool_format
 
     chat_template_kwargs = _resolve_chat_template_kwargs(request)
     if chat_template_kwargs:
@@ -2050,9 +2060,7 @@ async def create_response(raw_request: Request):
         "raw_output": True,
     }
     if engine.is_mllm:
-        chat_kwargs["preserve_native_tool_format"] = (
-            engine.preserve_native_tool_format
-        )
+        chat_kwargs["preserve_native_tool_format"] = engine.preserve_native_tool_format
     if tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(tools)
 
@@ -2271,9 +2279,7 @@ async def create_anthropic_message(
         "raw_output": True,
     }
     if engine.is_mllm:
-        chat_kwargs["preserve_native_tool_format"] = (
-            engine.preserve_native_tool_format
-        )
+        chat_kwargs["preserve_native_tool_format"] = engine.preserve_native_tool_format
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
@@ -2437,9 +2443,7 @@ async def _stream_anthropic_messages(
         "stop": openai_request.stop,
     }
     if engine.is_mllm:
-        chat_kwargs["preserve_native_tool_format"] = (
-            engine.preserve_native_tool_format
-        )
+        chat_kwargs["preserve_native_tool_format"] = engine.preserve_native_tool_format
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
@@ -2704,7 +2708,11 @@ async def stream_chat_completion(
             # Pipe content through tool parser (reasoning + tool coexistence)
             if tool_parser and content_delta:
                 probe_text = tool_accumulated_text[-4:] + content_delta
-                if not tool_markup_possible and "<" not in probe_text and "call:" not in probe_text:
+                if (
+                    not tool_markup_possible
+                    and "<" not in probe_text
+                    and "call:" not in probe_text
+                ):
                     tool_accumulated_text += content_delta
                     # No tool markup yet, emit content + reasoning normally
                 else:
@@ -2805,7 +2813,11 @@ async def stream_chat_completion(
                 # which could start tool markup (e.g. <tool_call>). This avoids
                 # per-token string scanning on the growing accumulated text.
                 probe_text = tool_accumulated_text[-4:] + delta_text
-                if not tool_markup_possible and "<" not in probe_text and "call:" not in probe_text:
+                if (
+                    not tool_markup_possible
+                    and "<" not in probe_text
+                    and "call:" not in probe_text
+                ):
                     tool_accumulated_text += delta_text
                     # No tool markup yet, fall through to normal chunk emission
                 else:
