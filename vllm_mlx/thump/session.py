@@ -1073,11 +1073,19 @@ class SessionSubstrate:
                 bank.handle.sequence_id = sequence_id
                 bank.handle.set_session_metadata(metadata)
                 bank.handle.validate_session_snapshot()
+            manifest_bank_mode = bank.bank_mode
+            if bank.spec.linear_state_spec is None and manifest_bank_mode in (
+                THUMP_RT_BANK_MODE_EXACT_BF16_SIDECAR,
+                THUMP_RT_BANK_MODE_EXACT_FP16_SIDECAR,
+            ):
+                # The native manifest writer probes exact sidecars from the bank path
+                # during normalization. Raw entries must arrive as FP8/non-exact.
+                manifest_bank_mode = THUMP_RT_BANK_MODE_FP8
             bank_entries.append(
                 SessionBankEntry(
                     layer_index=layer_idx,
                     bank_relpath=bank.path.relative_to(self.root_dir).as_posix(),
-                    bank_mode=bank.bank_mode,
+                    bank_mode=manifest_bank_mode,
                     layer_state_kind=bank.spec.layer_state_kind,
                 )
             )

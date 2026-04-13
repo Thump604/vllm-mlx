@@ -14,6 +14,8 @@ from vllm_mlx.thump.adapter import (
     LinearStateSpec as AdapterLinearStateSpec,
     RopeConfig,
     THUMP_RT_BANK_ENTRY_FLAG_HAS_EXACT_SIDECAR,
+    THUMP_RT_BANK_MODE_EXACT_BF16_SIDECAR,
+    THUMP_RT_BANK_MODE_FP8,
     THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
     THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION,
     THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
@@ -1095,6 +1097,119 @@ def test_qwen_linear_exact_checkpoint_writes_linear_state_artifact(
     assert seen["ssm_state"].shape == (30,)
     assert seen["banks"][0].bank_mode == THUMP_RT_BANK_MODE_LINEAR_SSM_F32
     assert seen["banks"][0].layer_state_kind == THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM
+    assert seen["manifest_lib_path"] == substrate.lib_path
+
+
+def test_exact_checkpoint_manifest_uses_probeable_mode_for_kv_banks(
+    monkeypatch, tmp_path
+):
+    linear_spec = LayerSpec(
+        layer_index=0,
+        layer_type="linear_attention",
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM,
+        linear_state_spec=AdapterLinearStateSpec(
+            conv_batch=1,
+            conv_history=3,
+            conv_channels=4,
+            ssm_batch=1,
+            ssm_heads=2,
+            ssm_value_dim=3,
+            ssm_key_dim=5,
+        ),
+    )
+    kv_spec = LayerSpec(
+        layer_index=1,
+        layer_type="full_attention",
+        geometry=BlockGeometry(
+            block_size_tokens=16,
+            num_kv_heads=1,
+            head_dim=2,
+            group_size=1,
+            rope=RopeConfig(variant=0, theta=1.0, partial_rotary_factor=0.0),
+        ),
+        layer_state_kind=THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION,
+    )
+
+    class _FakeHandle:
+        def __init__(self):
+            self.sequence_id = 0
+            self.metadata = None
+            self.validated = False
+
+        def set_session_metadata(self, metadata):
+            self.metadata = metadata
+
+        def validate_session_snapshot(self):
+            self.validated = True
+
+    fake_handle = _FakeHandle()
+    substrate = SessionSubstrate.__new__(SessionSubstrate)
+    substrate.layer_specs = [linear_spec, kv_spec]
+    substrate.block_size_tokens = 16
+    substrate.root_dir = tmp_path
+    substrate.exact_hot_restart = True
+    substrate.lib_path = "/tmp/libthump.dylib"
+    substrate._banks = {
+        0: _LayerBank(
+            spec=linear_spec,
+            path=tmp_path / "layer-00.linearf32",
+            handle=None,
+            bank_mode=THUMP_RT_BANK_MODE_LINEAR_SSM_F32,
+            linear_state=(
+                linear_spec.linear_state_spec,
+                np.arange(12, dtype=np.uint16),
+                np.arange(30, dtype=np.float32),
+            ),
+        ),
+        1: _LayerBank(
+            spec=kv_spec,
+            path=tmp_path / "layer-01.thump",
+            handle=fake_handle,
+            bank_mode=THUMP_RT_BANK_MODE_EXACT_BF16_SIDECAR,
+        ),
+    }
+    substrate.total_tokens = 0
+    substrate.last_checkpoint = None
+
+    seen: dict[str, object] = {}
+
+    def _fake_write_linear_state(
+        path, sequence_id, meta, linear_state_spec, conv_state, ssm_state, *, lib_path=None
+    ):
+        seen["linear_path"] = path
+        seen["linear_spec"] = linear_state_spec
+
+    def _fake_write_manifest(path, manifest, banks, *, lib_path=None):
+        seen["manifest_path"] = path
+        seen["banks"] = banks
+        seen["manifest_lib_path"] = lib_path
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.write_linear_state_f32", _fake_write_linear_state
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.session.write_session_manifest", _fake_write_manifest
+    )
+
+    substrate.checkpoint(
+        tmp_path / "session.tsmf",
+        model_id_hash=11,
+        session_id=22,
+        sequence_id=33,
+        prompt_tokens=12,
+        generated_tokens=4,
+    )
+
+    linear_entry, kv_entry = seen["banks"]
+    assert linear_entry.bank_mode == THUMP_RT_BANK_MODE_LINEAR_SSM_F32
+    assert linear_entry.layer_state_kind == THUMP_RT_LAYER_STATE_KIND_LINEAR_SSM
+    assert kv_entry.bank_mode == THUMP_RT_BANK_MODE_FP8
+    assert kv_entry.flags == 0
+    assert kv_entry.exact_relpath == ""
+    assert kv_entry.layer_state_kind == THUMP_RT_LAYER_STATE_KIND_KV_ATTENTION
+    assert fake_handle.sequence_id == 33
+    assert fake_handle.metadata.layer_index == 1
+    assert fake_handle.validated is True
     assert seen["manifest_lib_path"] == substrate.lib_path
 
 
