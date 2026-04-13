@@ -1,4 +1,4 @@
-"""Offline Gemma 4 Thump session restart-recovery harness."""
+"""Offline Thump session restart-recovery harness."""
 
 from __future__ import annotations
 
@@ -304,7 +304,6 @@ class SessionRecoveryRunner:
         thump_lib_path: str | Path | None = None,
         block_size_tokens: int = 1,
     ) -> None:
-        install_gemma4_capture_patch()
         outer_model, tokenizer = _load_strict_false(
             str(model_path),
             {"trust_remote_code": True},
@@ -316,6 +315,18 @@ class SessionRecoveryRunner:
         self.thump_lib_path = thump_lib_path
         self.block_size_tokens = block_size_tokens
         self.model_id_hash = model_id_hash_for_path(model_path)
+
+    def _ensure_capture_patch(self, trace: SessionRecoveryTrace) -> None:
+        if trace.exact_hot_restart:
+            return
+        family = SessionSubstrate.model_family(self.model, model_path=self.model_path)
+        if family == "gemma4":
+            install_gemma4_capture_patch()
+            return
+        raise NotImplementedError(
+            "Thump recovery capture patch is only implemented for gemma4 today; "
+            f"detected {family} family"
+        )
 
     def build_prompt_tokens(self, trace: SessionRecoveryTrace) -> list[int]:
         tokens = _encode_prompt_tokens(self.tokenizer, trace.prompt_text)
@@ -337,6 +348,7 @@ class SessionRecoveryRunner:
         *,
         bundle_dir: str | Path,
     ) -> CheckpointArtifact:
+        self._ensure_capture_patch(trace)
         prompt_tokens = self.build_prompt_tokens(trace)
         prefix_tokens = prompt_tokens[:-1]
         last_prompt_token = prompt_tokens[-1]
@@ -397,7 +409,7 @@ class SessionRecoveryRunner:
         )
         checkpoint_start = time.perf_counter()
         session_init_start = time.perf_counter()
-        session = SessionSubstrate.from_gemma4_model(
+        session = SessionSubstrate.from_model(
             self.model,
             block_size_tokens=self.block_size_tokens,
             block_capacity=total_blocks,
@@ -481,7 +493,7 @@ class SessionRecoveryRunner:
         session_start = time.perf_counter()
         try:
             validate_start = time.perf_counter()
-            session, _checkpoint = SessionSubstrate.attach_gemma4_checkpoint(
+            session, _checkpoint = SessionSubstrate.attach_checkpoint(
                 self.model,
                 artifact.manifest_path,
                 block_size_tokens=artifact.block_size_tokens,

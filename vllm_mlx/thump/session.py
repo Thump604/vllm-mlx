@@ -1,4 +1,4 @@
-"""Runtime-side SessionSubstrate for the first Thump replay slice."""
+"""Runtime-side SessionSubstrate for Thump continuity."""
 
 from __future__ import annotations
 
@@ -241,7 +241,18 @@ def _bundle_artifact_bytes(root_dir: Path) -> int:
     return sum(path.stat().st_size for path in root_dir.iterdir() if path.is_file())
 
 
-def _load_text_config_from_model_path(model_path: str | Path | None) -> dict[str, Any]:
+_THUMP_GEMMA4_MODEL_TYPES = frozenset({"gemma4", "gemma4_text"})
+_THUMP_QWEN35_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+)
+
+
+def _load_model_config_from_model_path(model_path: str | Path | None) -> dict[str, Any]:
     if model_path is None:
         return {}
     config_path = Path(model_path) / "config.json"
@@ -251,10 +262,41 @@ def _load_text_config_from_model_path(model_path: str | Path | None) -> dict[str
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_text_config_from_model_path(model_path: str | Path | None) -> dict[str, Any]:
+    payload = _load_model_config_from_model_path(model_path)
     text_config = payload.get("text_config")
     if isinstance(text_config, dict):
         return text_config
     return payload if isinstance(payload, dict) else {}
+
+
+def _normalized_model_type(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _model_type_candidates(
+    model: Any,
+    *,
+    model_path: str | Path | None = None,
+) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        normalized = _normalized_model_type(value)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    config = getattr(model, "config", None)
+    add(getattr(config, "model_type", None))
+    payload = _load_model_config_from_model_path(model_path)
+    add(payload.get("model_type"))
+    text_config = payload.get("text_config")
+    if isinstance(text_config, dict):
+        add(text_config.get("model_type"))
+    return candidates
 
 
 class SessionSubstrate:
@@ -290,6 +332,27 @@ class SessionSubstrate:
             )
         self.total_tokens = 0
         self.last_checkpoint: SessionCheckpoint | None = None
+
+    @staticmethod
+    def model_family(
+        model: Any,
+        *,
+        model_path: str | Path | None = None,
+    ) -> str:
+        candidates = _model_type_candidates(model, model_path=model_path)
+        for model_type in candidates:
+            if model_type in _THUMP_GEMMA4_MODEL_TYPES:
+                return "gemma4"
+            if model_type in _THUMP_QWEN35_MODEL_TYPES or model_type.startswith(
+                "qwen3_5"
+            ):
+                return "qwen3_5"
+        detected = candidates[0] if candidates else "<unknown>"
+        raise NotImplementedError(
+            "Thump session substrate does not support "
+            f"model_type={detected!r}; only gemma4 and qwen3_5 families are "
+            "recognized at this boundary"
+        )
 
     @staticmethod
     def gemma4_layer_specs(
@@ -387,7 +450,27 @@ class SessionSubstrate:
         return layer_specs
 
     @classmethod
-    def from_gemma4_model(
+    def layer_specs_for_model(
+        cls,
+        model: Any,
+        *,
+        block_size_tokens: int = 16,
+        model_path: str | Path | None = None,
+    ) -> list[LayerSpec]:
+        family = cls.model_family(model, model_path=model_path)
+        if family == "gemma4":
+            return cls.gemma4_layer_specs(
+                model,
+                block_size_tokens=block_size_tokens,
+                model_path=model_path,
+            )
+        raise NotImplementedError(
+            "Thump session layer-spec extraction is only implemented for gemma4 "
+            f"today; detected {family} family"
+        )
+
+    @classmethod
+    def from_model(
         cls,
         model: Any,
         *,
@@ -399,7 +482,7 @@ class SessionSubstrate:
         model_path: str | Path | None = None,
     ) -> "SessionSubstrate":
         return cls(
-            cls.gemma4_layer_specs(
+            cls.layer_specs_for_model(
                 model,
                 block_size_tokens=block_size_tokens,
                 model_path=model_path,
@@ -408,6 +491,52 @@ class SessionSubstrate:
             root_dir=root_dir,
             lib_path=lib_path,
             exact_hot_restart=exact_hot_restart,
+        )
+
+    @classmethod
+    def from_gemma4_model(
+        cls,
+        model: Any,
+        *,
+        block_size_tokens: int = 16,
+        block_capacity: int,
+        root_dir: str | Path | None = None,
+        lib_path: str | Path | None = None,
+        exact_hot_restart: bool = False,
+        model_path: str | Path | None = None,
+    ) -> "SessionSubstrate":
+        return cls.from_model(
+            model,
+            block_size_tokens=block_size_tokens,
+            block_capacity=block_capacity,
+            root_dir=root_dir,
+            lib_path=lib_path,
+            exact_hot_restart=exact_hot_restart,
+            model_path=model_path,
+        )
+
+    @classmethod
+    def attach_checkpoint(
+        cls,
+        model: Any,
+        manifest_path: str | Path,
+        *,
+        block_size_tokens: int = 16,
+        lib_path: str | Path | None = None,
+        expected_model_id_hash: int | None = None,
+        require_exact_hot_restart: bool = False,
+        model_path: str | Path | None = None,
+    ) -> tuple["SessionSubstrate", SessionCheckpoint]:
+        return cls.attach_from_manifest(
+            cls.layer_specs_for_model(
+                model,
+                block_size_tokens=block_size_tokens,
+                model_path=model_path,
+            ),
+            manifest_path,
+            lib_path=lib_path,
+            expected_model_id_hash=expected_model_id_hash,
+            require_exact_hot_restart=require_exact_hot_restart,
         )
 
     @classmethod
@@ -490,16 +619,14 @@ class SessionSubstrate:
         require_exact_hot_restart: bool = False,
         model_path: str | Path | None = None,
     ) -> tuple["SessionSubstrate", SessionCheckpoint]:
-        return cls.attach_from_manifest(
-            cls.gemma4_layer_specs(
-                model,
-                block_size_tokens=block_size_tokens,
-                model_path=model_path,
-            ),
+        return cls.attach_checkpoint(
+            model,
             manifest_path,
+            block_size_tokens=block_size_tokens,
             lib_path=lib_path,
             expected_model_id_hash=expected_model_id_hash,
             require_exact_hot_restart=require_exact_hot_restart,
+            model_path=model_path,
         )
 
     def close(self) -> None:

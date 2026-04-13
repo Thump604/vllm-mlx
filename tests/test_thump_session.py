@@ -648,6 +648,29 @@ def test_gemma4_layer_specs_loads_layer_types_from_model_path_config(tmp_path):
     assert specs[1].geometry.rope.partial_rotary_factor == 0.25
 
 
+def test_session_substrate_model_family_detects_gemma_and_qwen_variants(tmp_path):
+    gemma_model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_text"))
+    assert SessionSubstrate.model_family(gemma_model) == "gemma4"
+
+    qwen_model = SimpleNamespace(config=SimpleNamespace(model_type=None))
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe_text"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert SessionSubstrate.model_family(qwen_model, model_path=tmp_path) == "qwen3_5"
+
+
+def test_session_substrate_from_model_rejects_qwen_family_until_adapter_lands():
+    qwen_model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
+    with pytest.raises(NotImplementedError, match="qwen3_5"):
+        SessionSubstrate.from_model(qwen_model, block_capacity=8)
+
+
 def test_build_recovery_comparison_emits_first_class_telemetry():
     trace = SessionRecoveryTrace(name="demo", prompt_text="hello")
     artifact = CheckpointArtifact(
@@ -782,7 +805,7 @@ def test_recovery_runner_checkpoint_passes_model_path(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         SessionSubstrate,
-        "from_gemma4_model",
+        "from_model",
         _fake_from_gemma4_model,
     )
 
@@ -847,17 +870,64 @@ def test_recovery_runner_restore_passes_model_path(monkeypatch, tmp_path):
         def close(self):
             return None
 
-    def _fake_attach_gemma4_checkpoint(*args, **kwargs):
+    def _fake_attach_checkpoint(*args, **kwargs):
         seen["model_path"] = kwargs["model_path"]
         return _FakeSession(), object()
 
     monkeypatch.setattr(
         SessionSubstrate,
-        "attach_gemma4_checkpoint",
-        _fake_attach_gemma4_checkpoint,
+        "attach_checkpoint",
+        _fake_attach_checkpoint,
     )
 
     result = runner.restore_and_continue(trace, artifact)
 
     assert result.variant == "restore"
     assert seen["model_path"] == runner.model_path
+
+
+def test_recovery_runner_capture_patch_is_exact_hot_restart_gated(monkeypatch):
+    runner = SessionRecoveryRunner.__new__(SessionRecoveryRunner)
+    runner.model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    runner.model_path = "/tmp/model"
+
+    seen: list[str] = []
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery.install_gemma4_capture_patch",
+        lambda: seen.append("patched"),
+    )
+
+    runner._ensure_capture_patch(
+        SessionRecoveryTrace(name="exact", prompt_text="hello", exact_hot_restart=True)
+    )
+    assert seen == []
+
+    runner._ensure_capture_patch(
+        SessionRecoveryTrace(
+            name="capture",
+            prompt_text="hello",
+            exact_hot_restart=False,
+        )
+    )
+    assert seen == ["patched"]
+
+
+def test_recovery_runner_capture_patch_rejects_qwen_family(monkeypatch):
+    runner = SessionRecoveryRunner.__new__(SessionRecoveryRunner)
+    runner.model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
+    runner.model_path = "/tmp/model"
+
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery.install_gemma4_capture_patch",
+        lambda: None,
+    )
+
+    with pytest.raises(NotImplementedError, match="qwen3_5"):
+        runner._ensure_capture_patch(
+            SessionRecoveryTrace(
+                name="capture",
+                prompt_text="hello",
+                exact_hot_restart=False,
+            )
+        )
