@@ -124,6 +124,72 @@ class TestMLLMHelperFunctions:
         assert not is_url("/path/to/file.jpg")
         assert not is_url("data:image/png;base64,AAAA")
 
+    def test_patch_gemma_tool_replay_chat_template(self):
+        """Tool-result followups should start a fresh model turn."""
+        from vllm_mlx.models.mllm import _patch_gemma_tool_replay_chat_template
+
+        original = (
+            "{%- set prev_nt = namespace(role=None, found=false) -%}\n"
+            "    {%- set continue_same_model_turn = "
+            "(role == 'model' and prev_nt.role == 'assistant') -%}\n"
+            "    {%- if not continue_same_model_turn -%}\n"
+            "{%- if add_generation_prompt -%}\n"
+            "    {%- if ns.prev_message_type != 'tool_response' and "
+            "ns.prev_message_type != 'tool_call' -%}\n"
+            "        {{- '<|turn>model\\n' -}}\n"
+            "    {%- endif -%}\n"
+            "{%- endif -%}\n"
+        )
+
+        patched = _patch_gemma_tool_replay_chat_template(original)
+
+        assert "prev_msg_role" in patched
+        assert "prev_msg_role != 'tool'" in patched
+        assert patched.count("continue_same_model_turn") == 2
+        assert "ns.prev_message_type != 'tool_call'" in patched
+        assert "ns.prev_message_type != 'tool_response' and" not in patched
+        assert _patch_gemma_tool_replay_chat_template(patched) == patched
+
+    def test_patch_gemma_tool_replay_chat_template_old_generation_clause(self):
+        """Older Gemma templates should also reopen generation after tool results."""
+        from vllm_mlx.models.mllm import _patch_gemma_tool_replay_chat_template
+
+        original = (
+            "{%- if add_generation_prompt -%}\n"
+            "    {%- if ns.prev_message_type != 'tool_response' -%}\n"
+            "        {{- '<|turn>model\\n' -}}\n"
+            "    {%- endif -%}\n"
+            "{%- endif -%}\n"
+        )
+
+        patched = _patch_gemma_tool_replay_chat_template(original)
+
+        assert "ns.prev_message_type != 'tool_call'" in patched
+        assert "ns.prev_message_type != 'tool_response'" not in patched
+
+    def test_append_completion_cue_to_tool_content_is_idempotent(self):
+        from vllm_mlx.models.mllm import (
+            _GEMMA_TOOL_RESULT_COMPLETION_CUE,
+            _append_completion_cue_to_tool_content,
+        )
+
+        content = [{"type": "text", "text": "Successfully created /tmp/hello.txt."}]
+
+        patched = _append_completion_cue_to_tool_content(
+            content, _GEMMA_TOOL_RESULT_COMPLETION_CUE
+        )
+
+        assert patched[-1] == {
+            "type": "text",
+            "text": _GEMMA_TOOL_RESULT_COMPLETION_CUE,
+        }
+        assert (
+            _append_completion_cue_to_tool_content(
+                patched, _GEMMA_TOOL_RESULT_COMPLETION_CUE
+            )
+            == patched
+        )
+
 
 class TestMLLMThinkingPropagation:
     """Unit tests for thinking-mode propagation in MLLM chat paths."""
@@ -145,6 +211,7 @@ class TestMLLMThinkingPropagation:
             config={"model_type": "gemma4"}, language_model=None
         )
         model.model_name = "test-model"
+        model._thump_qwen_pilot = None
         return model
 
     def test_chat_passes_enable_thinking_to_template_and_generate(self, monkeypatch):
@@ -241,6 +308,165 @@ class TestMLLMThinkingPropagation:
         assert chunks[0].text == "chunk"
         assert calls["template"]["enable_thinking"] is False
         assert calls["stream_generate"]["enable_thinking"] is False
+
+    def test_chat_preserves_native_tool_replay(self, monkeypatch):
+        from types import SimpleNamespace
+        from vllm_mlx.models.mllm import _GEMMA_TOOL_RESULT_COMPLETION_CUE
+
+        calls = {}
+
+        def fake_generate(*args, **kwargs):
+            calls["generate"] = kwargs
+            return SimpleNamespace(text="ok", prompt_tokens=12, generation_tokens=3)
+
+        def fake_apply_chat_template(
+            processor, config, prompt, add_generation_prompt=True, **kwargs
+        ):
+            calls["template"] = {
+                "prompt": prompt,
+                "kwargs": kwargs,
+            }
+            return "FORMATTED"
+
+        fake_root = types.ModuleType("mlx_vlm")
+        fake_root.generate = fake_generate
+        fake_generate_mod = types.ModuleType("mlx_vlm.generate")
+        fake_generate_mod.apply_chat_template = fake_apply_chat_template
+        fake_models = types.ModuleType("mlx_vlm.models")
+        fake_cache = types.ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *_args, **_kwargs: None
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate_mod)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        model = self._build_model()
+        model.chat(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "create the file"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Need to write the file first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": (
+                                    '{"content":"HELLO",'
+                                    '"file_path":"/tmp/hello.txt"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Successfully created /tmp/hello.txt.",
+                        }
+                    ],
+                },
+            ],
+            max_tokens=32,
+            temperature=1.0,
+            preserve_native_tool_format=True,
+        )
+
+        prompt = calls["template"]["prompt"]
+        assert prompt[2]["role"] == "assistant"
+        assert prompt[2]["reasoning_content"] == "Need to write the file first."
+        assert prompt[2]["tool_calls"][0]["function"]["name"] == "write_file"
+        assert prompt[2]["tool_calls"][0]["function"]["arguments"] == {
+            "content": "HELLO",
+            "file_path": "/tmp/hello.txt",
+        }
+        assert prompt[3]["role"] == "tool"
+        assert prompt[3]["tool_call_id"] == "call_1"
+        assert prompt[3]["content"] == [
+            {"type": "text", "text": "Successfully created /tmp/hello.txt."},
+            {"type": "text", "text": _GEMMA_TOOL_RESULT_COMPLETION_CUE},
+        ]
+
+    def test_chat_flattens_tool_result_parts_without_stringifying_list(self, monkeypatch):
+        from types import SimpleNamespace
+
+        calls = {}
+
+        def fake_generate(*args, **kwargs):
+            calls["generate"] = kwargs
+            return SimpleNamespace(text="ok", prompt_tokens=12, generation_tokens=3)
+
+        def fake_apply_chat_template(
+            processor, config, prompt, add_generation_prompt=True, **kwargs
+        ):
+            calls["template"] = {
+                "prompt": prompt,
+                "kwargs": kwargs,
+            }
+            return "FORMATTED"
+
+        fake_root = types.ModuleType("mlx_vlm")
+        fake_root.generate = fake_generate
+        fake_generate_mod = types.ModuleType("mlx_vlm.generate")
+        fake_generate_mod.apply_chat_template = fake_apply_chat_template
+        fake_models = types.ModuleType("mlx_vlm.models")
+        fake_cache = types.ModuleType("mlx_vlm.models.cache")
+        fake_cache.make_prompt_cache = lambda *_args, **_kwargs: None
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate_mod)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+        monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+
+        model = self._build_model()
+        model.chat(
+            [
+                {"role": "user", "content": "create the file"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"content":"HELLO"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Successfully created /tmp/hello.txt.",
+                        }
+                    ],
+                },
+            ],
+            max_tokens=32,
+            temperature=1.0,
+            preserve_native_tool_format=False,
+        )
+
+        prompt = calls["template"]["prompt"]
+        assert prompt[1]["role"] == "assistant"
+        assert "[Calling tool: write_file(" in prompt[1]["content"]
+        assert prompt[2]["role"] == "user"
+        assert prompt[2]["content"] == (
+            "[Tool Result (call_1)]: Successfully created /tmp/hello.txt."
+        )
 
 
 class TestMLXMultimodalLMDetection:

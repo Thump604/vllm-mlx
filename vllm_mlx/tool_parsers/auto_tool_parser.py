@@ -65,8 +65,9 @@ class AutoToolParser(ToolParser):
         tool_calls: list[dict[str, Any]] = []
         cleaned_text = model_output
 
-        # 1. Try Gemma 4 format (most distinctive marker)
-        if "<|tool_call>" in model_output:
+        # 1. Try Gemma 4 format first. Some Gemma 4 responses omit the
+        # delimiter tokens and emit bare call:name{...} blocks.
+        if "<|tool_call>" in model_output or "call:" in model_output:
             gemma_parser = Gemma4ToolParser()
             result = gemma_parser.extract_tool_calls(model_output, request)
             if result.tools_called:

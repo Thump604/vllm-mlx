@@ -159,6 +159,29 @@ class TestGemma4ToolParserExtract:
         assert len(result.tool_calls) == 1
         assert json.loads(result.tool_calls[0]["arguments"]) == {"path": "/tmp/foo"}
 
+    def test_bare_tool_call_without_delimiters(self):
+        output = 'call:write_file{content:<|"|>HELLO<|"|>,file_path:<|"|>/tmp/hello.txt<|"|>}'
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.content is None
+        assert result.tool_calls[0]["name"] == "write_file"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {
+            "content": "HELLO",
+            "file_path": "/tmp/hello.txt",
+        }
+
+    def test_content_before_bare_tool_call(self):
+        output = (
+            "I'll create that now.\n"
+            'call:write_file{content:<|"|>HELLO<|"|>,file_path:<|"|>/tmp/hello.txt<|"|>}'
+        )
+        result = self.parser.extract_tool_calls(output)
+        assert result.tools_called is True
+        assert result.content == "I'll create that now."
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "write_file"
+
     def test_string_with_colon(self):
         output = '<|tool_call>call:connect{url:<|"|>host:8080<|"|>}<tool_call|>'
         result = self.parser.extract_tool_calls(output)
@@ -228,6 +251,25 @@ class TestGemma4ToolParserStreaming:
         assert tool_call["type"] == "function"
         assert tool_call["index"] == 0
 
+    def test_streaming_emits_bare_call_on_balanced_brace(self):
+        result = self.parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text="call:write_file",
+            delta_text="call:write_file",
+        )
+        assert result is None
+
+        result = self.parser.extract_tool_calls_streaming(
+            previous_text="call:write_file",
+            current_text='call:write_file{content:<|"|>HELLO<|"|>,file_path:<|"|>/tmp/hello.txt<|"|>}',
+            delta_text='{content:<|"|>HELLO<|"|>,file_path:<|"|>/tmp/hello.txt<|"|>}',
+        )
+        assert result is not None
+        assert "tool_calls" in result
+        assert len(result["tool_calls"]) == 1
+        tool_call = result["tool_calls"][0]
+        assert tool_call["function"]["name"] == "write_file"
+
 
 class TestGemma4Registration:
     """Test parser registration and flags."""
@@ -252,3 +294,14 @@ class TestGemma4Registration:
 
         assert result.tools_called is True
         assert result.tool_calls[0]["name"] == "read_file"
+
+    def test_auto_parser_detects_bare_gemma4_format(self):
+        from vllm_mlx.tool_parsers import AutoToolParser
+
+        parser = AutoToolParser()
+        output = 'call:write_file{content:<|"|>HELLO<|"|>,file_path:<|"|>/tmp/hello.txt<|"|>}'
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called is True
+        assert result.tool_calls[0]["name"] == "write_file"

@@ -60,6 +60,24 @@ def _find_balanced_brace(text: str, start: int) -> int:
     return -1
 
 
+def _extract_tool_block(cleaned: str) -> tuple[str | None, str | None]:
+    """Return (content_before, tool_block) for Gemma tool syntax."""
+    start_idx = cleaned.find(TOOL_CALL_START)
+    if start_idx != -1:
+        content_before = cleaned[:start_idx].strip() or None
+        block_start = start_idx + len(TOOL_CALL_START)
+        end_idx = cleaned.find(TOOL_CALL_END, block_start)
+        if end_idx == -1:
+            return content_before, cleaned[block_start:]
+        return content_before, cleaned[block_start:end_idx]
+
+    call_match = _CALL_PREFIX.search(cleaned)
+    if not call_match:
+        return None, None
+
+    return cleaned[: call_match.start()].strip() or None, cleaned[call_match.start() :]
+
+
 def _gemma4_args_to_json(text: str) -> str:
     """Convert Gemma 4 tool call args into valid JSON."""
     strings: list[str] = []
@@ -87,26 +105,19 @@ def generate_tool_id() -> str:
 class Gemma4ToolParser(ToolParser):
     """Tool call parser for Gemma 4 models."""
 
+    SUPPORTS_NATIVE_TOOL_FORMAT = True
+
     def extract_tool_calls(
         self, model_output: str, request: dict[str, Any] | None = None
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from a complete Gemma 4 model response."""
         cleaned = self.strip_think_tags(model_output)
 
-        start_idx = cleaned.find(TOOL_CALL_START)
-        if start_idx == -1:
+        content_before, block = _extract_tool_block(cleaned)
+        if block is None:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
-
-        content_before = cleaned[:start_idx].strip() or None
-
-        block_start = start_idx + len(TOOL_CALL_START)
-        end_idx = cleaned.find(TOOL_CALL_END, block_start)
-        if end_idx == -1:
-            block = cleaned[block_start:]
-        else:
-            block = cleaned[block_start:end_idx]
 
         tool_calls: list[dict[str, Any]] = []
         pos = 0
@@ -164,10 +175,15 @@ class Gemma4ToolParser(ToolParser):
         request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Extract tool calls from streaming Gemma 4 model output."""
-        if TOOL_CALL_START not in current_text:
+        has_delimited_call = TOOL_CALL_START in current_text
+        has_bare_call = "call:" in current_text
+
+        if not has_delimited_call and not has_bare_call:
             return {"content": delta_text}
 
-        if TOOL_CALL_END in delta_text:
+        if has_delimited_call:
+            if TOOL_CALL_END not in current_text:
+                return None
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return {
@@ -184,5 +200,23 @@ class Gemma4ToolParser(ToolParser):
                         for i, tool_call in enumerate(result.tool_calls)
                     ]
                 }
+            return None
+
+        result = self.extract_tool_calls(current_text)
+        if result.tools_called:
+            return {
+                "tool_calls": [
+                    {
+                        "index": i,
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                    }
+                    for i, tool_call in enumerate(result.tool_calls)
+                ]
+            }
 
         return None

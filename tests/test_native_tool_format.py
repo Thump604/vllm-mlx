@@ -38,6 +38,7 @@ class TestNativeToolFormatCapability:
             FunctionaryToolParser,
             KimiToolParser,
             HermesToolParser,
+            Gemma4ToolParser,
         ]
         for parser_cls in native_parsers:
             assert (
@@ -53,7 +54,6 @@ class TestNativeToolFormatCapability:
             QwenToolParser,
             NemotronToolParser,
             xLAMToolParser,
-            Gemma4ToolParser,
             AutoToolParser,
         ]
         for parser_cls in non_native_parsers:
@@ -75,6 +75,7 @@ class TestNativeToolFormatCapability:
             "functionary",
             "kimi",
             "hermes",
+            "gemma4",
         ]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             assert (
@@ -82,7 +83,7 @@ class TestNativeToolFormatCapability:
             ), f"Parser '{name}' should support native format"
 
         # No native support
-        for name in ["qwen", "nemotron", "xlam", "gemma4", "auto"]:
+        for name in ["qwen", "nemotron", "xlam", "auto"]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             assert (
                 parser_cls.supports_native_format() is False
