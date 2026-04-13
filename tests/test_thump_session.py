@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -13,6 +14,7 @@ from vllm_mlx.thump.capture import LayerCapture
 from vllm_mlx.thump.session import (
     LayerSpec,
     SessionSubstrate,
+    _cache_temporal_tokens,
     _deinterleave_split_rotary_pairs,
     _interleave_split_rotary_pairs,
     _restore_rotating_cache_layout,
@@ -20,7 +22,9 @@ from vllm_mlx.thump.session import (
 )
 from vllm_mlx.thump.recovery import (
     CheckpointArtifact,
+    FEATURE_FLAG_ENV,
     RecoveryRunResult,
+    SessionRecoveryRunner,
     SessionRecoveryTrace,
     _build_sampler,
     _decode_tokens,
@@ -386,6 +390,16 @@ def test_session_substrate_initialize_from_live_bf16_kv_cache_round_trip(tmp_pat
     assert np.array_equal(restored_key_bits, expected_key_bits)
 
 
+def test_cache_temporal_tokens_rejects_mixed_key_value_dtypes():
+    cache = KVCache()
+    cache.keys = mx.zeros((1, 2, 4, 8), dtype=mx.bfloat16)
+    cache.values = mx.zeros((1, 2, 4, 8), dtype=mx.float32)
+    cache.offset = 4
+
+    with pytest.raises(ValueError, match="must use matching dtypes"):
+        _cache_temporal_tokens(cache)
+
+
 def test_session_substrate_initialize_from_live_rotating_cache_round_trip(tmp_path):
     geometry = BlockGeometry(
         block_size_tokens=16,
@@ -695,3 +709,155 @@ def test_build_recovery_comparison_emits_first_class_telemetry():
     assert comparison.telemetry["artifact_size_bytes"] == 1234
     assert comparison.telemetry["exact_fidelity"] is True
     assert comparison.telemetry["fallback_count"] == 0
+
+
+def test_recovery_runner_checkpoint_passes_model_path(monkeypatch, tmp_path):
+    runner = SessionRecoveryRunner.__new__(SessionRecoveryRunner)
+    runner.model = _DummyModel()
+    runner.tokenizer = _DecodeTokenizer()
+    runner.model_path = str(tmp_path / "model")
+    runner.thump_lib_path = "/tmp/libthump.dylib"
+    runner.block_size_tokens = 16
+    runner.model_id_hash = 123
+
+    trace = SessionRecoveryTrace(
+        name="demo",
+        prompt_text="hello",
+        exact_hot_restart=True,
+        seed_new_tokens=1,
+    )
+
+    monkeypatch.setattr(
+        SessionRecoveryRunner,
+        "build_prompt_tokens",
+        lambda self, _trace: [11, 12],
+    )
+    monkeypatch.setattr(
+        SessionRecoveryRunner,
+        "build_sampler",
+        lambda self, _trace: (lambda logits: mx.array([0], dtype=mx.int32)),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery._reconstruct_tokens",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery._decode_tokens",
+        lambda *args, **kwargs: (1.0, "seed", [13]),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery._current_rss_bytes",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery.cleanup_rope",
+        lambda _model: None,
+    )
+
+    seen: dict[str, object] = {}
+
+    class _FakeSession:
+        def initialize_from_live_cache(self, cache, *, total_tokens):
+            seen["total_tokens"] = total_tokens
+
+        def checkpoint(self, manifest_path, **kwargs):
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text("manifest\n", encoding="utf-8")
+            return SimpleNamespace(
+                manifest_path=manifest_path,
+                root_dir=manifest_path.parent,
+                context_tokens=2,
+                artifact_bytes=9,
+                model_id_hash=kwargs["model_id_hash"],
+                session_id=kwargs["session_id"],
+                sequence_id=kwargs["sequence_id"],
+            )
+
+        def close(self):
+            return None
+
+    def _fake_from_gemma4_model(*args, **kwargs):
+        seen["model_path"] = kwargs["model_path"]
+        return _FakeSession()
+
+    monkeypatch.setattr(
+        SessionSubstrate,
+        "from_gemma4_model",
+        _fake_from_gemma4_model,
+    )
+
+    artifact = runner.create_checkpoint(trace, bundle_dir=tmp_path / "bundle")
+
+    assert artifact.model_path == runner.model_path
+    assert seen["model_path"] == runner.model_path
+
+
+def test_recovery_runner_restore_passes_model_path(monkeypatch, tmp_path):
+    runner = SessionRecoveryRunner.__new__(SessionRecoveryRunner)
+    runner.model = _DummyModel()
+    runner.tokenizer = _DecodeTokenizer()
+    runner.model_path = str(tmp_path / "model")
+    runner.thump_lib_path = "/tmp/libthump.dylib"
+    runner.block_size_tokens = 16
+    runner.model_id_hash = 123
+
+    trace = SessionRecoveryTrace(name="demo", prompt_text="hello", continue_new_tokens=1)
+    artifact = CheckpointArtifact(
+        trace_name="demo",
+        model_path=runner.model_path,
+        manifest_path=str(tmp_path / "bundle" / "session.tsmf"),
+        root_dir=str(tmp_path / "bundle"),
+        prompt_tokens=[1, 2],
+        seed_tokens=[3],
+        prompt_token_count=2,
+        generated_tokens=1,
+        context_tokens=2,
+        artifact_size_bytes=9,
+        model_id_hash=123,
+        session_id=1,
+        sequence_id=2,
+        block_size_tokens=16,
+        prefill_step_size=128,
+        capture_step_size=128,
+        exact_hot_restart=True,
+    )
+
+    monkeypatch.setenv(FEATURE_FLAG_ENV, "1")
+    monkeypatch.setattr(
+        SessionRecoveryRunner,
+        "build_sampler",
+        lambda self, _trace: (lambda logits: mx.array([0], dtype=mx.int32)),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery._decode_tokens",
+        lambda *args, **kwargs: (1.0, "ok", [7]),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.thump.recovery.cleanup_rope",
+        lambda _model: None,
+    )
+
+    seen: dict[str, object] = {}
+
+    class _FakeSession:
+        def materialize_prompt_cache(self, model, *, upto_tokens):
+            seen["upto_tokens"] = upto_tokens
+            return []
+
+        def close(self):
+            return None
+
+    def _fake_attach_gemma4_checkpoint(*args, **kwargs):
+        seen["model_path"] = kwargs["model_path"]
+        return _FakeSession(), object()
+
+    monkeypatch.setattr(
+        SessionSubstrate,
+        "attach_gemma4_checkpoint",
+        _fake_attach_gemma4_checkpoint,
+    )
+
+    result = runner.restore_and_continue(trace, artifact)
+
+    assert result.variant == "restore"
+    assert seen["model_path"] == runner.model_path

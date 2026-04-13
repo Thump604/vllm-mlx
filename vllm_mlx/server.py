@@ -766,6 +766,8 @@ async def thump_qwen_pilot_checkpoint(request: ThumpQwenCheckpointRequest):
             qwen_session_id=request.session_id,
             workspace_path=request.workspace_path,
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -778,6 +780,8 @@ async def thump_qwen_pilot_arm_restore(request: ThumpQwenArmRestoreRequest):
     """Validate and arm a one-shot restored prompt cache for the next qwen turn."""
     try:
         return _get_thump_qwen_pilot_manager().arm_restore(request.artifact_path)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

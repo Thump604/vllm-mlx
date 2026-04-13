@@ -391,21 +391,32 @@ _GEMMA_TOOL_REPLAY_GENERATION_PATCH = (
 def _patch_gemma_tool_replay_chat_template(template: str) -> str:
     """Ensure OpenAI tool replay starts a fresh model turn after tool results."""
     updated = template
+    turn_already_patched = "prev_msg_role != 'tool'" in updated
+    generation_already_patched = _GEMMA_TOOL_REPLAY_GENERATION_PATCH in updated
+    turn_patched = turn_already_patched
+    generation_patched = generation_already_patched
 
-    if (
-        "prev_msg_role != 'tool'" not in updated
-        and _GEMMA_TOOL_REPLAY_TURN_NEEDLE in updated
-    ):
+    if not turn_already_patched and _GEMMA_TOOL_REPLAY_TURN_NEEDLE in updated:
         updated = updated.replace(
             _GEMMA_TOOL_REPLAY_TURN_NEEDLE, _GEMMA_TOOL_REPLAY_TURN_PATCH, 1
         )
+        turn_patched = True
 
     for needle in _GEMMA_TOOL_REPLAY_GENERATION_NEEDLES:
         if needle in updated:
             updated = updated.replace(
                 needle, _GEMMA_TOOL_REPLAY_GENERATION_PATCH, 1
             )
+            generation_patched = True
             break
+
+    if not turn_patched or not generation_patched:
+        logger.warning(
+            "Gemma tool replay template patch incomplete "
+            "(turn_patched=%s, generation_patched=%s)",
+            turn_patched,
+            generation_patched,
+        )
 
     return updated
 
@@ -1621,6 +1632,7 @@ class MLXMultimodalLM:
         else:
             formatted_prompt = prompt
 
+        chunk = None
         for chunk in stream_generate(
             self.model,
             self.processor,
@@ -2209,16 +2221,18 @@ class MLXMultimodalLM:
         yield MLLMOutput(
             text="",
             finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
+            prompt_tokens=getattr(chunk, "prompt_tokens", 0)
+            if chunk is not None
+            else 0,
             completion_tokens=token_count,
         )
 
         if self._thump_qwen_pilot is not None and prompt_cache_state is not None:
             self._thump_qwen_pilot.record_finished_prompt_state(
                 prompt_cache_state,
-                prompt_tokens=(
-                    getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0
-                ),
+                prompt_tokens=getattr(chunk, "prompt_tokens", 0)
+                if chunk is not None
+                else 0,
                 completion_tokens=token_count,
                 route="stream_chat",
             )

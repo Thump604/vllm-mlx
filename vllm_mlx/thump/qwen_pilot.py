@@ -20,7 +20,9 @@ from .session import SessionSubstrate, model_id_hash_for_path
 logger = logging.getLogger(__name__)
 
 FEATURE_FLAG_ENV = "VLLM_MLX_ENABLE_THUMP_QWEN_PILOT"
+ARTIFACT_ROOT_ENV = "VLLM_MLX_THUMP_QWEN_PILOT_ARTIFACT_ROOT"
 DEFAULT_BLOCK_SIZE_TOKENS = 16
+DEFAULT_ARTIFACT_ROOT = Path("/Volumes/Lexar/ai-runtime-run")
 SESSION_MANIFEST_NAME = "session.tsmf"
 PROMPT_STATE_NAME = "prompt-state.json"
 
@@ -45,6 +47,26 @@ def _stable_u64(value: str) -> int:
 
 def _artifact_bytes(root_dir: Path) -> int:
     return sum(path.stat().st_size for path in root_dir.iterdir() if path.is_file())
+
+
+def qwen_pilot_artifact_root() -> Path:
+    return Path(
+        os.environ.get(ARTIFACT_ROOT_ENV, str(DEFAULT_ARTIFACT_ROOT))
+    ).expanduser().resolve(strict=False)
+
+
+def resolve_qwen_pilot_artifact_dir(artifact_path: str | Path) -> Path:
+    artifact_dir = Path(artifact_path).expanduser()
+    if not artifact_dir.is_absolute():
+        raise PermissionError("artifact_path must be an absolute path")
+
+    resolved_root = qwen_pilot_artifact_root()
+    resolved_artifact = artifact_dir.resolve(strict=False)
+    if not resolved_artifact.is_relative_to(resolved_root):
+        raise PermissionError(
+            f"artifact_path must stay under {resolved_root}"
+        )
+    return resolved_artifact
 
 
 @dataclass
@@ -223,7 +245,7 @@ class QwenPilotManager:
         if latest is None:
             raise ValueError("no finished qwen pilot state is available to checkpoint")
 
-        artifact_dir = Path(artifact_path)
+        artifact_dir = resolve_qwen_pilot_artifact_dir(artifact_path)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = artifact_dir / SESSION_MANIFEST_NAME
         prompt_state_path = artifact_dir / PROMPT_STATE_NAME
@@ -313,7 +335,7 @@ class QwenPilotManager:
         artifact_path: str | Path,
     ) -> dict[str, Any]:
         """Validate + materialize a checkpoint into a one-shot prompt-cache restore."""
-        artifact_dir = Path(artifact_path)
+        artifact_dir = resolve_qwen_pilot_artifact_dir(artifact_path)
         prompt_state_path = artifact_dir / PROMPT_STATE_NAME
         manifest_path = artifact_dir / SESSION_MANIFEST_NAME
         payload = json.loads(prompt_state_path.read_text(encoding="utf-8"))

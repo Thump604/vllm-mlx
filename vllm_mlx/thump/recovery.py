@@ -404,6 +404,7 @@ class SessionRecoveryRunner:
             root_dir=bundle_dir,
             lib_path=self.thump_lib_path,
             exact_hot_restart=trace.exact_hot_restart,
+            model_path=self.model_path,
         )
         checkpoint_rss_telemetry["session_init_latency_ms"] = (
             time.perf_counter() - session_init_start
@@ -487,6 +488,7 @@ class SessionRecoveryRunner:
                 lib_path=self.thump_lib_path,
                 expected_model_id_hash=artifact.model_id_hash,
                 require_exact_hot_restart=artifact.exact_hot_restart,
+                model_path=self.model_path,
             )
             validate_latency_ms = (time.perf_counter() - validate_start) * 1000.0
             cache = session.materialize_prompt_cache(

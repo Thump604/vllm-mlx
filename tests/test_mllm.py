@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLX Multimodal Language Model (MLLM) wrapper."""
 
+import logging
 import platform
 import sys
 import types
@@ -166,6 +167,19 @@ class TestMLLMHelperFunctions:
 
         assert "ns.prev_message_type != 'tool_call'" in patched
         assert "ns.prev_message_type != 'tool_response'" not in patched
+
+    def test_patch_gemma_tool_replay_chat_template_warns_on_unmatched_template(
+        self, caplog
+    ):
+        from vllm_mlx.models.mllm import _patch_gemma_tool_replay_chat_template
+
+        with caplog.at_level(logging.WARNING):
+            patched = _patch_gemma_tool_replay_chat_template(
+                "{%- if add_generation_prompt -%}\n{{- '<|turn>model\\n' -}}\n"
+            )
+
+        assert patched == "{%- if add_generation_prompt -%}\n{{- '<|turn>model\\n' -}}\n"
+        assert "Gemma tool replay template patch incomplete" in caplog.text
 
     def test_append_completion_cue_to_tool_content_is_idempotent(self):
         from vllm_mlx.models.mllm import (

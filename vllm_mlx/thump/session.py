@@ -125,6 +125,11 @@ def _cache_temporal_tokens(cache: Any) -> tuple[np.ndarray, np.ndarray, str, int
             raise ValueError(f"cache {type(cache).__name__} has no material state")
         keys, values = state
 
+    if keys.dtype != values.dtype:
+        raise ValueError(
+            f"cache {type(cache).__name__} keys/values must use matching dtypes"
+        )
+
     if keys.dtype == mx.bfloat16 and values.dtype == mx.bfloat16:
         keys_bits = keys.view(mx.uint16)
         values_bits = values.view(mx.uint16)

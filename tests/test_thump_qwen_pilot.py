@@ -24,8 +24,14 @@ def _prompt_cache_state(token_ids: list[int], cache: list[object]) -> PromptCach
     return state
 
 
+@pytest.fixture
+def pilot_artifact_root(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_MLX_THUMP_QWEN_PILOT_ARTIFACT_ROOT", str(tmp_path))
+    return tmp_path
+
+
 def test_qwen_pilot_manager_checkpoint_and_restore_round_trip(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, pilot_artifact_root
 ):
     import vllm_mlx.thump.qwen_pilot as pilot
 
@@ -106,7 +112,7 @@ def test_qwen_pilot_manager_checkpoint_and_restore_round_trip(
 
 
 def test_qwen_pilot_manager_prefix_mismatch_falls_back(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, pilot_artifact_root
 ):
     import vllm_mlx.thump.qwen_pilot as pilot
 
@@ -148,8 +154,12 @@ def test_qwen_pilot_manager_prefix_mismatch_falls_back(
     assert consume["fallback_reason"] == "prompt_prefix_mismatch"
 
 
-def test_thump_qwen_pilot_endpoints_use_local_manager(monkeypatch: pytest.MonkeyPatch):
+def test_thump_qwen_pilot_endpoints_use_local_manager(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, pilot_artifact_root
+):
     import vllm_mlx.server as srv
+
+    artifact_path = tmp_path / "artifact"
 
     class _FakeManager:
         def status(self):
@@ -193,7 +203,7 @@ def test_thump_qwen_pilot_endpoints_use_local_manager(monkeypatch: pytest.Monkey
         checkpoint = client.post(
             "/_internal/thump/qwen/checkpoint",
             json={
-                "artifact_path": "/tmp/artifact",
+                "artifact_path": str(artifact_path),
                 "session_id": "fixed-session",
                 "workspace_path": "/tmp/workspace",
             },
@@ -203,7 +213,7 @@ def test_thump_qwen_pilot_endpoints_use_local_manager(monkeypatch: pytest.Monkey
 
         arm = client.post(
             "/_internal/thump/qwen/arm-restore",
-            json={"artifact_path": "/tmp/artifact"},
+            json={"artifact_path": str(artifact_path)},
         )
         assert arm.status_code == 200
         assert arm.json()["fallback_count"] == 0
@@ -213,7 +223,7 @@ def test_thump_qwen_pilot_endpoints_use_local_manager(monkeypatch: pytest.Monkey
 
 
 def test_qwen_pilot_restore_validation_failure_status_persists(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, pilot_artifact_root
 ):
     import vllm_mlx.thump.qwen_pilot as pilot
 
@@ -252,3 +262,70 @@ def test_qwen_pilot_restore_validation_failure_status_persists(
     consume = manager.status()["last_consume_status"]
     assert consume["status"] == "restore_validation_failed"
     assert consume["fallback_reason"] == "bf16 materialize failed"
+
+
+def test_qwen_pilot_manager_rejects_artifact_outside_allowed_root(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, pilot_artifact_root
+):
+    manager = QwenPilotManager(
+        language_model=_FakeLanguageModel(),
+        model_path="/tmp/fake-gemma",
+    )
+    manager.record_finished_prompt_state(
+        _prompt_cache_state([11, 12, 13], [object()]),
+        prompt_tokens=2,
+        completion_tokens=1,
+        route="chat",
+    )
+
+    outside_path = tmp_path.parent / "outside-artifact"
+    with pytest.raises(PermissionError, match="artifact_path must stay under"):
+        manager.checkpoint_latest_finished(outside_path)
+
+
+def test_thump_qwen_pilot_endpoints_reject_disallowed_artifact_path(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm_mlx.server as srv
+
+    class _FakeManager:
+        def status(self):
+            return {"enabled": True, "armed_restore": None}
+
+        def checkpoint_latest_finished(
+            self, artifact_path, *, qwen_session_id=None, workspace_path=None
+        ):
+            raise PermissionError("artifact_path must stay under /allowed")
+
+        def arm_restore(self, artifact_path):
+            raise PermissionError("artifact_path must stay under /allowed")
+
+    fake_engine = SimpleNamespace(
+        is_mllm=True,
+        get_stats=lambda: {"engine_type": "batched"},
+        _mllm_instance=SimpleNamespace(
+            get_thump_qwen_pilot_manager=lambda: _FakeManager()
+        ),
+    )
+
+    previous_engine = srv._engine
+    previous_model = srv._model_name
+    monkeypatch.setenv("VLLM_MLX_ENABLE_THUMP_QWEN_PILOT", "1")
+    srv._engine = fake_engine
+    srv._model_name = "fake-gemma"
+    try:
+        client = TestClient(srv.app)
+        checkpoint = client.post(
+            "/_internal/thump/qwen/checkpoint",
+            json={"artifact_path": "/tmp/artifact"},
+        )
+        assert checkpoint.status_code == 403
+
+        arm = client.post(
+            "/_internal/thump/qwen/arm-restore",
+            json={"artifact_path": "/tmp/artifact"},
+        )
+        assert arm.status_code == 403
+    finally:
+        srv._engine = previous_engine
+        srv._model_name = previous_model
