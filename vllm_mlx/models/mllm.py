@@ -29,6 +29,11 @@ import numpy as np
 import requests
 
 from vllm_mlx.mllm_cache import MLLMPrefixCacheManager
+from vllm_mlx.thump.qwen_pilot import (
+    QwenPilotManager,
+    qwen_pilot_enabled,
+    qwen_pilot_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -721,6 +726,7 @@ class MLXMultimodalLM:
         self.config = None
         self._loaded = False
         self._video_native = False
+        self._thump_qwen_pilot: QwenPilotManager | None = None
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -745,6 +751,18 @@ class MLXMultimodalLM:
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
+            if qwen_pilot_enabled():
+                language_model = getattr(self.model, "language_model", None)
+                if language_model is not None and qwen_pilot_supported(language_model):
+                    self._thump_qwen_pilot = QwenPilotManager(
+                        language_model=language_model,
+                        model_path=self.model_name,
+                    )
+                    logger.info("Thump qwen pilot enabled for Gemma MLLM chat path")
+                else:
+                    logger.warning(
+                        "Thump qwen pilot requested, but model is not a supported Gemma path"
+                    )
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
@@ -771,6 +789,10 @@ class MLXMultimodalLM:
         if hasattr(self.processor, "tokenizer"):
             return self.processor.tokenizer
         return self.processor
+
+    def get_thump_qwen_pilot_manager(self) -> QwenPilotManager | None:
+        """Expose the narrow qwen_code pilot manager to the local admin surface."""
+        return self._thump_qwen_pilot
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process image inputs and return local file paths."""
@@ -1510,6 +1532,11 @@ class MLXMultimodalLM:
             else self.processor
         )
         token_ids = tokenizer.encode(formatted_prompt)
+        prompt_cache_state = None
+        if self._thump_qwen_pilot is not None and not all_images:
+            prompt_cache_state = self._thump_qwen_pilot.build_request_prompt_cache_state(
+                token_ids
+            )
 
         # Check prefix cache
         if use_cache and self._cache_manager is not None and all_images:
@@ -1617,6 +1644,7 @@ class MLXMultimodalLM:
             temperature=temperature,
             verbose=False,
             prompt_cache=prompt_cache,
+            prompt_cache_state=prompt_cache_state,
             enable_thinking=enable_thinking,
             **_vlm_kwargs,
         )
@@ -1696,6 +1724,14 @@ class MLXMultimodalLM:
             output_text = str(result)
             prompt_tokens = 0
             generation_tokens = 0
+
+        if self._thump_qwen_pilot is not None and prompt_cache_state is not None:
+            self._thump_qwen_pilot.record_finished_prompt_state(
+                prompt_cache_state,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=generation_tokens,
+                route="chat",
+            )
 
         return MLLMOutput(
             text=output_text,
@@ -1892,6 +1928,17 @@ class MLXMultimodalLM:
 
         prompt_cache = None
         cache_hit = False
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+        token_ids = tokenizer.encode(formatted_prompt)
+        prompt_cache_state = None
+        if self._thump_qwen_pilot is not None and not all_images:
+            prompt_cache_state = self._thump_qwen_pilot.build_request_prompt_cache_state(
+                token_ids
+            )
 
         if use_cache and self._cache_manager is not None and all_images:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
@@ -1919,6 +1966,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temperature=temperature,
             prompt_cache=prompt_cache,
+            prompt_cache_state=prompt_cache_state,
             enable_thinking=enable_thinking,
             **kwargs,
         ):
@@ -1941,6 +1989,16 @@ class MLXMultimodalLM:
             prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
             completion_tokens=token_count,
         )
+
+        if self._thump_qwen_pilot is not None and prompt_cache_state is not None:
+            self._thump_qwen_pilot.record_finished_prompt_state(
+                prompt_cache_state,
+                prompt_tokens=(
+                    getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0
+                ),
+                completion_tokens=token_count,
+                route="stream_chat",
+            )
 
     def describe_image(
         self,

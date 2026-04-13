@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import tempfile
 from dataclasses import dataclass
@@ -235,6 +236,22 @@ def _bundle_artifact_bytes(root_dir: Path) -> int:
     return sum(path.stat().st_size for path in root_dir.iterdir() if path.is_file())
 
 
+def _load_text_config_from_model_path(model_path: str | Path | None) -> dict[str, Any]:
+    if model_path is None:
+        return {}
+    config_path = Path(model_path) / "config.json"
+    if not config_path.is_file():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    text_config = payload.get("text_config")
+    if isinstance(text_config, dict):
+        return text_config
+    return payload if isinstance(payload, dict) else {}
+
+
 class SessionSubstrate:
     """One logical editable session mirrored across per-layer Thump banks."""
 
@@ -274,27 +291,70 @@ class SessionSubstrate:
         model: Any,
         *,
         block_size_tokens: int = 16,
+        model_path: str | Path | None = None,
     ) -> list[LayerSpec]:
-        args = model.args
+        args = getattr(model, "args", None)
+        config = getattr(model, "config", None)
+        rope_parameters = getattr(args, "rope_parameters", None)
+        if rope_parameters is None:
+            rope_parameters = getattr(config, "rope_parameters", {}) or {}
+        text_config = _load_text_config_from_model_path(model_path)
+        if not rope_parameters:
+            rope_parameters = text_config.get("rope_parameters", {}) or {}
+        sliding_window = getattr(args, "sliding_window", None)
+        if sliding_window is None:
+            sliding_window = getattr(config, "sliding_window", None)
+        if sliding_window is None:
+            sliding_window = text_config.get("sliding_window")
+        configured_layer_types = getattr(args, "layer_types", None)
+        if configured_layer_types is None:
+            configured_layer_types = getattr(config, "layer_types", None)
+        if configured_layer_types is not None:
+            configured_layer_types = list(configured_layer_types)
+            if len(configured_layer_types) != len(model.layers):
+                configured_layer_types = None
+        if configured_layer_types is None:
+            file_layer_types = text_config.get("layer_types")
+            if file_layer_types is not None:
+                file_layer_types = list(file_layer_types)
+                if len(file_layer_types) == len(model.layers):
+                    configured_layer_types = file_layer_types
         layer_specs: list[LayerSpec] = []
         for layer_idx, layer in enumerate(model.layers):
             attn = layer.self_attn
-            layer_key = (
-                "sliding_attention"
-                if layer.layer_type == "sliding_attention"
+            configured_layer_type = None
+            if configured_layer_types is not None:
+                configured_layer_type = str(configured_layer_types[layer_idx])
+            runtime_layer_type = str(
+                configured_layer_type or getattr(layer, "layer_type", "") or ""
+            )
+            layer_type = (
+                runtime_layer_type
+                if runtime_layer_type in {"sliding_attention", "full_attention"}
                 else "full_attention"
             )
-            rope_params = dict(args.rope_parameters.get(layer_key, {}))
+            layer_key = layer_type
+            rope_params = dict(rope_parameters.get(layer_key, {}))
             rope = attn.rope
-            rope_dims = int(getattr(rope, "dims", attn.head_dim))
-            partial = float(rope_dims) / float(attn.head_dim)
+            rope_partial = rope_params.get("partial_rotary_factor")
+            if rope_partial is not None:
+                partial = float(rope_partial)
+                rope_dims = max(1, int(round(float(attn.head_dim) * partial)))
+            else:
+                rope_dims = int(getattr(rope, "dims", attn.head_dim))
+                partial = float(rope_dims) / float(attn.head_dim)
             rope_type = rope_params.get("rope_type", "default")
-            if rope_type == "proportional":
-                variant = 3
-            elif partial < 1.0:
+            if partial < 1.0:
                 variant = 2
+            elif rope_type == "proportional":
+                variant = 3
             else:
                 variant = 1
+            theta = rope_params.get("rope_theta")
+            if theta is None:
+                theta = getattr(rope, "base", None)
+            if theta is None:
+                theta = 10000.0
             geometry = BlockGeometry(
                 block_size_tokens=block_size_tokens,
                 num_kv_heads=attn.n_kv_heads,
@@ -302,19 +362,17 @@ class SessionSubstrate:
                 group_size=attn.n_heads // attn.n_kv_heads,
                 rope=RopeConfig(
                     variant=variant,
-                    theta=float(
-                        getattr(rope, "base", rope_params.get("rope_theta", 10000.0))
-                    ),
+                    theta=float(theta),
                     partial_rotary_factor=partial,
                 ),
             )
             window_size = (
-                args.sliding_window if layer.layer_type == "sliding_attention" else None
+                sliding_window if layer_type == "sliding_attention" else None
             )
             layer_specs.append(
                 LayerSpec(
                     layer_index=layer_idx,
-                    layer_type=layer.layer_type,
+                    layer_type=layer_type,
                     geometry=geometry,
                     window_size=window_size,
                     rotary_dims=rope_dims,
@@ -333,9 +391,14 @@ class SessionSubstrate:
         root_dir: str | Path | None = None,
         lib_path: str | Path | None = None,
         exact_hot_restart: bool = False,
+        model_path: str | Path | None = None,
     ) -> "SessionSubstrate":
         return cls(
-            cls.gemma4_layer_specs(model, block_size_tokens=block_size_tokens),
+            cls.gemma4_layer_specs(
+                model,
+                block_size_tokens=block_size_tokens,
+                model_path=model_path,
+            ),
             block_capacity=block_capacity,
             root_dir=root_dir,
             lib_path=lib_path,
@@ -420,9 +483,14 @@ class SessionSubstrate:
         lib_path: str | Path | None = None,
         expected_model_id_hash: int | None = None,
         require_exact_hot_restart: bool = False,
+        model_path: str | Path | None = None,
     ) -> tuple["SessionSubstrate", SessionCheckpoint]:
         return cls.attach_from_manifest(
-            cls.gemma4_layer_specs(model, block_size_tokens=block_size_tokens),
+            cls.gemma4_layer_specs(
+                model,
+                block_size_tokens=block_size_tokens,
+                model_path=model_path,
+            ),
             manifest_path,
             lib_path=lib_path,
             expected_model_id_hash=expected_model_id_hash,

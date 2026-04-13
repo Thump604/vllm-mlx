@@ -54,6 +54,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
@@ -103,6 +104,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .thump.qwen_pilot import qwen_pilot_enabled
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -288,6 +290,16 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 
+class ThumpQwenCheckpointRequest(BaseModel):
+    artifact_path: str
+    session_id: str | None = None
+    workspace_path: str | None = None
+
+
+class ThumpQwenArmRestoreRequest(BaseModel):
+    artifact_path: str
+
+
 class RateLimiter:
     """Simple in-memory rate limiter using sliding window."""
 
@@ -371,11 +383,48 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return True
 
 
+def _is_localhost_client(host: str | None) -> bool:
+    return host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+async def verify_thump_qwen_pilot_local_request(request: Request):
+    """Gate the narrow qwen pilot control surface to localhost and default-off."""
+    if not qwen_pilot_enabled():
+        raise HTTPException(status_code=404, detail="Thump qwen pilot is disabled")
+    client_host = request.client.host if request.client else None
+    if not _is_localhost_client(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail="Thump qwen pilot endpoints are localhost-only",
+        )
+    return True
+
+
 def get_engine() -> BaseEngine:
     """Get the loaded engine, raising error if not loaded."""
     if _engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     return _engine
+
+
+def _get_thump_qwen_pilot_manager():
+    """Resolve the active qwen pilot manager from the loaded engine."""
+    engine = get_engine()
+    mllm_instance = getattr(engine, "_mllm_instance", None)
+    if mllm_instance is None or not hasattr(
+        mllm_instance, "get_thump_qwen_pilot_manager"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Current engine does not expose the Thump qwen pilot manager",
+        )
+    manager = mllm_instance.get_thump_qwen_pilot_manager()
+    if manager is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Thump qwen pilot manager is unavailable for the current model",
+        )
+    return manager
 
 
 def _validate_model_name(request_model: str) -> None:
@@ -656,6 +705,7 @@ def _json_safe(value, depth: int = 0):
 async def health():
     """Health check endpoint."""
     mcp_info = None
+    thump_qwen_pilot = None
     if _mcp_manager is not None:
         connected = sum(
             1 for s in _mcp_manager.get_server_status() if s.state.value == "connected"
@@ -674,6 +724,16 @@ async def health():
         logger.exception("Failed to collect health engine stats")
         engine_stats = {"engine_type": "unknown", "error": str(exc)}
 
+    try:
+        if qwen_pilot_enabled() and _engine is not None:
+            manager = _get_thump_qwen_pilot_manager()
+            thump_qwen_pilot = manager.status()
+    except HTTPException:
+        thump_qwen_pilot = {"enabled": True, "status": "unavailable"}
+    except Exception as exc:
+        logger.exception("Failed to collect thump qwen pilot health state")
+        thump_qwen_pilot = {"enabled": True, "status": "error", "error": str(exc)}
+
     return {
         "status": "healthy",
         "model_loaded": _engine is not None,
@@ -681,7 +741,47 @@ async def health():
         "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
         "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
+        "thump_qwen_pilot": thump_qwen_pilot,
     }
+
+
+@app.get(
+    "/_internal/thump/qwen/status",
+    dependencies=[Depends(verify_thump_qwen_pilot_local_request)],
+)
+async def thump_qwen_pilot_status():
+    """Inspect the in-memory pilot state for the current Gemma lane."""
+    return _get_thump_qwen_pilot_manager().status()
+
+
+@app.post(
+    "/_internal/thump/qwen/checkpoint",
+    dependencies=[Depends(verify_thump_qwen_pilot_local_request)],
+)
+async def thump_qwen_pilot_checkpoint(request: ThumpQwenCheckpointRequest):
+    """Checkpoint the latest completed qwen pilot turn into a Thump artifact."""
+    try:
+        return _get_thump_qwen_pilot_manager().checkpoint_latest_finished(
+            request.artifact_path,
+            qwen_session_id=request.session_id,
+            workspace_path=request.workspace_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    "/_internal/thump/qwen/arm-restore",
+    dependencies=[Depends(verify_thump_qwen_pilot_local_request)],
+)
+async def thump_qwen_pilot_arm_restore(request: ThumpQwenArmRestoreRequest):
+    """Validate and arm a one-shot restored prompt cache for the next qwen turn."""
+    try:
+        return _get_thump_qwen_pilot_manager().arm_restore(request.artifact_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/v1/status")

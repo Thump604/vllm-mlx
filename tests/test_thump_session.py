@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import numpy as np
 
 import mlx.core as mx
@@ -529,6 +532,106 @@ def test_session_substrate_restores_rotating_cache_internal_state(tmp_path):
     restored_tokens = np.transpose(restored[0], (1, 0, 2))[..., 0]
     expected = np.array([[16.0, 16.0], [17.0, 17.0], [18.0, 18.0], [19.0, 19.0]], dtype=np.float16)
     assert np.allclose(restored_tokens, expected, atol=0.75)
+
+
+def test_gemma4_layer_specs_prefers_configured_layer_types_over_runtime_attrs():
+    rope = SimpleNamespace(dims=256, traditional=True, base=10000.0)
+    attn = SimpleNamespace(
+        n_kv_heads=8,
+        n_heads=16,
+        head_dim=256,
+        rope=rope,
+    )
+    model = SimpleNamespace(
+        args=SimpleNamespace(
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1_000_000.0,
+                    "rope_type": "proportional",
+                },
+                "sliding_attention": {
+                    "rope_theta": 10_000.0,
+                    "rope_type": "default",
+                },
+            },
+            sliding_window=1024,
+            layer_types=["sliding_attention", "full_attention"],
+        ),
+        config=SimpleNamespace(),
+        layers=[
+            SimpleNamespace(layer_type="full_attention", self_attn=attn),
+            SimpleNamespace(layer_type="sliding_attention", self_attn=attn),
+        ],
+    )
+
+    specs = SessionSubstrate.gemma4_layer_specs(model, block_size_tokens=16)
+
+    assert [spec.layer_type for spec in specs] == [
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert specs[0].window_size == 1024
+    assert specs[1].window_size is None
+    assert specs[0].geometry.rope.variant == 1
+    assert specs[1].geometry.rope.variant == 2
+    assert specs[1].geometry.rope.partial_rotary_factor == 0.25
+
+
+def test_gemma4_layer_specs_loads_layer_types_from_model_path_config(tmp_path):
+    rope = SimpleNamespace(dims=256, traditional=True, base=10000.0)
+    attn = SimpleNamespace(
+        n_kv_heads=8,
+        n_heads=16,
+        head_dim=256,
+        rope=rope,
+    )
+    model = SimpleNamespace(
+        args=SimpleNamespace(rope_parameters=None, sliding_window=None, layer_types=None),
+        config=SimpleNamespace(),
+        layers=[
+            SimpleNamespace(layer_type="full_attention", self_attn=attn),
+            SimpleNamespace(layer_type="full_attention", self_attn=attn),
+        ],
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "sliding_window": 1024,
+                    "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1_000_000.0,
+                            "rope_type": "proportional",
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10_000.0,
+                            "rope_type": "default",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    specs = SessionSubstrate.gemma4_layer_specs(
+        model,
+        block_size_tokens=16,
+        model_path=tmp_path,
+    )
+
+    assert [spec.layer_type for spec in specs] == [
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert specs[0].window_size == 1024
+    assert specs[1].window_size is None
+    assert specs[0].geometry.rope.variant == 1
+    assert specs[1].geometry.rope.variant == 2
+    assert specs[1].geometry.rope.partial_rotary_factor == 0.25
 
 
 def test_build_recovery_comparison_emits_first_class_telemetry():
