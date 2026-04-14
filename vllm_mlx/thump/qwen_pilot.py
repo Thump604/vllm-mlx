@@ -50,9 +50,11 @@ def _artifact_bytes(root_dir: Path) -> int:
 
 
 def qwen_pilot_artifact_root() -> Path:
-    return Path(
-        os.environ.get(ARTIFACT_ROOT_ENV, str(DEFAULT_ARTIFACT_ROOT))
-    ).expanduser().resolve(strict=False)
+    return (
+        Path(os.environ.get(ARTIFACT_ROOT_ENV, str(DEFAULT_ARTIFACT_ROOT)))
+        .expanduser()
+        .resolve(strict=False)
+    )
 
 
 def resolve_qwen_pilot_artifact_dir(artifact_path: str | Path) -> Path:
@@ -63,9 +65,7 @@ def resolve_qwen_pilot_artifact_dir(artifact_path: str | Path) -> Path:
     resolved_root = qwen_pilot_artifact_root()
     resolved_artifact = artifact_dir.resolve(strict=False)
     if not resolved_artifact.is_relative_to(resolved_root):
-        raise PermissionError(
-            f"artifact_path must stay under {resolved_root}"
-        )
+        raise PermissionError(f"artifact_path must stay under {resolved_root}")
     return resolved_artifact
 
 
@@ -211,7 +211,9 @@ class QwenPilotManager:
                 return armed.prompt_cache_state
 
             fallback_reason = (
-                "no_new_suffix" if prefix_len == len(token_ids) else "prompt_prefix_mismatch"
+                "no_new_suffix"
+                if prefix_len == len(token_ids)
+                else "prompt_prefix_mismatch"
             )
             self._armed_restore = None
             self._last_consume_status = {

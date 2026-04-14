@@ -371,7 +371,9 @@ class SessionRecoveryRunner:
         checkpoint_rss_telemetry["prefix_prefill_latency_ms"] = (
             time.perf_counter() - prefix_prefill_start
         ) * 1000.0
-        checkpoint_rss_telemetry["rss_after_prefix_prefill_bytes"] = _current_rss_bytes()
+        checkpoint_rss_telemetry["rss_after_prefix_prefill_bytes"] = (
+            _current_rss_bytes()
+        )
         seed_collector = None if trace.exact_hot_restart else CaptureCollector()
         seed_decode_start = time.perf_counter()
         _continuation_ms, _seed_text, seed_tokens = _decode_tokens(
@@ -424,7 +426,9 @@ class SessionRecoveryRunner:
         checkpoint_rss_telemetry["rss_after_session_init_bytes"] = _current_rss_bytes()
         capture_write_start = time.perf_counter()
         if trace.exact_hot_restart:
-            session.initialize_from_live_cache(prefix_cache, total_tokens=context_tokens)
+            session.initialize_from_live_cache(
+                prefix_cache, total_tokens=context_tokens
+            )
         else:
             session.initialize_from_capture(full_capture, total_tokens=context_tokens)
         checkpoint_rss_telemetry["capture_write_latency_ms"] = (
@@ -446,7 +450,9 @@ class SessionRecoveryRunner:
         checkpoint_rss_telemetry["checkpoint_write_latency_ms"] = (
             time.perf_counter() - checkpoint_write_start
         ) * 1000.0
-        checkpoint_rss_telemetry["rss_after_checkpoint_write_bytes"] = _current_rss_bytes()
+        checkpoint_rss_telemetry["rss_after_checkpoint_write_bytes"] = (
+            _current_rss_bytes()
+        )
         checkpoint_latency_ms = (time.perf_counter() - checkpoint_start) * 1000.0
         session.close()
         checkpoint_rss_telemetry["rss_after_session_close_bytes"] = _current_rss_bytes()

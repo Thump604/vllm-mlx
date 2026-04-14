@@ -178,9 +178,7 @@ _GEMMA_TOOL_RESULT_COMPLETION_CUE = (
 )
 
 
-def _append_completion_cue_to_tool_content(
-    content: object, cue: str | None
-) -> object:
+def _append_completion_cue_to_tool_content(content: object, cue: str | None) -> object:
     """Append a text completion cue to native tool content without clobbering it."""
     if not cue:
         return content
@@ -383,9 +381,7 @@ _GEMMA_TOOL_REPLAY_GENERATION_NEEDLES = (
     "ns.prev_message_type != 'tool_call' -%}",
     "{%- if ns.prev_message_type != 'tool_response' -%}",
 )
-_GEMMA_TOOL_REPLAY_GENERATION_PATCH = (
-    "{%- if ns.prev_message_type != 'tool_call' -%}"
-)
+_GEMMA_TOOL_REPLAY_GENERATION_PATCH = "{%- if ns.prev_message_type != 'tool_call' -%}"
 
 
 def _patch_gemma_tool_replay_chat_template(template: str) -> str:
@@ -404,9 +400,7 @@ def _patch_gemma_tool_replay_chat_template(template: str) -> str:
 
     for needle in _GEMMA_TOOL_REPLAY_GENERATION_NEEDLES:
         if needle in updated:
-            updated = updated.replace(
-                needle, _GEMMA_TOOL_REPLAY_GENERATION_PATCH, 1
-            )
+            updated = updated.replace(needle, _GEMMA_TOOL_REPLAY_GENERATION_PATCH, 1)
             generation_patched = True
             break
 
@@ -1806,8 +1800,8 @@ class MLXMultimodalLM:
         token_ids = tokenizer.encode(formatted_prompt)
         prompt_cache_state = None
         if self._thump_qwen_pilot is not None and not all_images:
-            prompt_cache_state = self._thump_qwen_pilot.build_request_prompt_cache_state(
-                token_ids
+            prompt_cache_state = (
+                self._thump_qwen_pilot.build_request_prompt_cache_state(token_ids)
             )
 
         # Check prefix cache
@@ -2171,8 +2165,8 @@ class MLXMultimodalLM:
         token_ids = tokenizer.encode(formatted_prompt)
         prompt_cache_state = None
         if self._thump_qwen_pilot is not None and not all_images:
-            prompt_cache_state = self._thump_qwen_pilot.build_request_prompt_cache_state(
-                token_ids
+            prompt_cache_state = (
+                self._thump_qwen_pilot.build_request_prompt_cache_state(token_ids)
             )
 
         if use_cache and self._cache_manager is not None and all_images:
@@ -2221,18 +2215,18 @@ class MLXMultimodalLM:
         yield MLLMOutput(
             text="",
             finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0)
-            if chunk is not None
-            else 0,
+            prompt_tokens=(
+                getattr(chunk, "prompt_tokens", 0) if chunk is not None else 0
+            ),
             completion_tokens=token_count,
         )
 
         if self._thump_qwen_pilot is not None and prompt_cache_state is not None:
             self._thump_qwen_pilot.record_finished_prompt_state(
                 prompt_cache_state,
-                prompt_tokens=getattr(chunk, "prompt_tokens", 0)
-                if chunk is not None
-                else 0,
+                prompt_tokens=(
+                    getattr(chunk, "prompt_tokens", 0) if chunk is not None else 0
+                ),
                 completion_tokens=token_count,
                 route="stream_chat",
             )
