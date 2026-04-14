@@ -1054,6 +1054,7 @@ class BatchedEngine(BaseEngine):
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop or [],
+                response_format=kwargs.pop("response_format", None),
                 **kwargs,
             )
 
@@ -1116,6 +1117,7 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            response_format=kwargs.pop("response_format", None),
         )
 
         output = await self._engine.generate(
@@ -1582,6 +1584,7 @@ class BatchedEngine(BaseEngine):
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop or [],
+                response_format=kwargs.pop("response_format", None),
                 **kwargs,
             )
 
@@ -1664,6 +1667,7 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            response_format=kwargs.pop("response_format", None),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)

@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tupl
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .guided_decoding import GuidedDecodingFactory
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -242,6 +243,7 @@ class MLLMScheduler:
 
         # Batch generator (created lazily)
         self.batch_generator: Optional[MLLMBatchGenerator] = None
+        self._guided_decoding_factory: Optional[GuidedDecodingFactory] = None
 
         # Request management - following vLLM's design
         self.waiting: deque[MLLMRequest] = deque()  # Waiting queue (FCFS)
@@ -323,6 +325,34 @@ class MLLMScheduler:
                 specprefill_max_input=self._specprefill_max_input,
             )
 
+
+    def _get_guided_decoding_factory(self) -> GuidedDecodingFactory:
+        """Lazily initialize the guided-decoding factory for batched MLLM."""
+        self._ensure_batch_generator()
+        if self.batch_generator is None:
+            raise RuntimeError("MLLM batch generator not initialized")
+        if self._guided_decoding_factory is None:
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            self._guided_decoding_factory = GuidedDecodingFactory(
+                self.batch_generator.language_model,
+                tokenizer,
+            )
+        return self._guided_decoding_factory
+
+    def _build_request_logits_processors(
+        self, sampling_params: SamplingParams
+    ) -> Optional[List[Any]]:
+        """Build per-request guided-decoding processors for MLLM batching."""
+        if sampling_params.response_format is None:
+            return None
+        return self._get_guided_decoding_factory().build_processors(
+            sampling_params.response_format
+        )
+
     # ========== Sync API (step-based) ==========
 
     def add_request(
@@ -369,6 +399,7 @@ class MLLMScheduler:
             repetition_penalty=kwargs.get("repetition_penalty", 1.0) or 1.0,
             stop=stop,
             stop_token_ids=list(kwargs.get("stop_token_ids") or []),
+            response_format=kwargs.get("response_format", None),
         )
 
         request = MLLMRequest(
@@ -482,7 +513,10 @@ class MLLMScheduler:
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 stop_token_ids=list(request.sampling_params.stop_token_ids or []),
                 sampler=_build_sampler(request.sampling_params),
-                logits_processors=_build_logits_processors(request.sampling_params),
+                logits_processors=(
+                    (_build_logits_processors(request.sampling_params) or [])
+                    + (self._build_request_logits_processors(request.sampling_params) or [])
+                ) or None,
             )
             batch_requests.append(batch_req)
 

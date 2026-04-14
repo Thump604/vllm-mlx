@@ -24,6 +24,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -1012,6 +1013,7 @@ class MLXMultimodalLM:
         self._loaded = False
         self._video_native = False
         self._thump_qwen_pilot: QwenPilotManager | None = None
+        self._guided_decoding_factory = None
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1104,6 +1106,32 @@ class MLXMultimodalLM:
     def get_thump_qwen_pilot_manager(self) -> QwenPilotManager | None:
         """Expose the narrow qwen_code pilot manager to the local admin surface."""
         return self._thump_qwen_pilot
+
+    def _merge_guided_logits_processors(
+        self,
+        response_format: Any = None,
+        logits_processors: list | None = None,
+    ) -> list | None:
+        """Merge guided-decoding processors into the current processor list."""
+        if response_format is None:
+            return logits_processors
+
+        if self._guided_decoding_factory is None:
+            from ..guided_decoding import GuidedDecodingFactory
+
+            language_model = getattr(self.model, "language_model", self.model)
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            self._guided_decoding_factory = GuidedDecodingFactory(
+                language_model, tokenizer
+            )
+
+        guided_processors = self._guided_decoding_factory.build_processors(
+            response_format
+        )
+        if not guided_processors:
+            return logits_processors
+
+        return list(logits_processors or []) + list(guided_processors)
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process image inputs and return local file paths."""
@@ -1601,6 +1629,16 @@ class MLXMultimodalLM:
             yield output.text
             return
 
+        response_format = kwargs.pop("response_format", None)
+        existing_logits_processors = kwargs.pop("logits_processors", None)
+        if response_format is not None:
+            kwargs["logits_processors"] = self._merge_guided_logits_processors(
+                response_format,
+                existing_logits_processors,
+            )
+        elif existing_logits_processors is not None:
+            kwargs["logits_processors"] = existing_logits_processors
+
         images = images or []
         videos = videos or []
 
@@ -1687,6 +1725,15 @@ class MLXMultimodalLM:
         enable_thinking = _coerce_enable_thinking(
             kwargs.pop("enable_thinking", chat_template_kwargs.get("enable_thinking"))
         )
+        response_format = kwargs.pop("response_format", None)
+        existing_logits_processors = kwargs.pop("logits_processors", None)
+        if response_format is not None:
+            kwargs["logits_processors"] = self._merge_guided_logits_processors(
+                response_format,
+                existing_logits_processors,
+            )
+        elif existing_logits_processors is not None:
+            kwargs["logits_processors"] = existing_logits_processors
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
@@ -2034,6 +2081,16 @@ class MLXMultimodalLM:
             self.load()
 
         try:
+            response_format = kwargs.pop("response_format", None)
+            existing_logits_processors = kwargs.pop("logits_processors", None)
+            if response_format is not None:
+                kwargs["logits_processors"] = self._merge_guided_logits_processors(
+                    response_format,
+                    existing_logits_processors,
+                )
+            elif existing_logits_processors is not None:
+                kwargs["logits_processors"] = existing_logits_processors
+
             from mlx_vlm import stream_generate
             from mlx_vlm.generate import apply_chat_template
         except ImportError:
