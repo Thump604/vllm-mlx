@@ -25,6 +25,7 @@ from .api.utils import is_mllm_model
 from .engine.base import BaseEngine
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
+from .runtime_config import RegistryDocument, load_registry_document
 from .scheduler import SchedulerConfig
 from .utils.download import DownloadConfig, ensure_model_downloaded
 
@@ -286,6 +287,10 @@ def load_registry_config(
 ) -> tuple[RegistryManagerConfig, dict[str, RegisteredModel]]:
     """Load and validate the models registry YAML file."""
     raw = yaml.safe_load(Path(config_path).read_text()) or {}
+    if raw.get("schema_version") == 1:
+        document = load_registry_document(config_path)
+        return _load_registry_contract_config(document)
+
     models = raw.get("models")
     if not isinstance(models, list) or not models:
         raise ValueError("models-config must define a non-empty 'models' list")
@@ -359,6 +364,59 @@ def load_registry_config(
             reasoning_parser=item.get("reasoning_parser"),
             enable_thinking_default=item.get("enable_thinking_default"),
             force_nonempty_content=item.get("force_nonempty_content"),
+        )
+
+    return manager, registry
+
+
+def _load_registry_contract_config(
+    document: RegistryDocument,
+) -> tuple[RegistryManagerConfig, dict[str, RegisteredModel]]:
+    """Project the Phase 1 registry contract into the current model manager."""
+    memory_budget_gb = document.policy_defaults.memory_budget_gb
+    if memory_budget_gb is None:
+        raise ValueError(
+            "registry.yaml policy_defaults.memory_budget_gb is required for "
+            "registry-backed runtime loading"
+        )
+
+    contention = document.policy_defaults.contention_policy
+    manager = RegistryManagerConfig(
+        memory_budget_bytes=int(memory_budget_gb * (1024**3)),
+        policy=ContentionPolicy(
+            strategy=contention.strategy,
+            wait_timeout_s=contention.wait_timeout_s,
+            preempt_after_s=contention.preempt_after_s,
+        ),
+    )
+
+    registry: dict[str, RegisteredModel] = {}
+    for model in document.models.values():
+        specprefill = model.serving_profile.specprefill
+        registry[model.id] = RegisteredModel(
+            name=model.id,
+            source=model.source,
+            preload=False,
+            continuous_batching=model.serving_profile.continuous_batching,
+            force_mllm=(
+                model.serving_profile.force_mllm
+                if model.serving_profile.force_mllm is not None
+                else model.multimodal
+            ),
+            enable_mtp=model.supports_mtp,
+            prefill_step_size=model.serving_profile.prefill_step_size,
+            specprefill_enabled=(specprefill.enabled if specprefill else None),
+            specprefill_threshold=(specprefill.threshold if specprefill else None),
+            specprefill_keep_pct=(specprefill.keep_pct if specprefill else None),
+            specprefill_draft_model=(
+                model.draft_model.source if model.draft_model is not None else None
+            ),
+            estimated_memory_bytes=int(model.estimated_memory_gb * (1024**3)),
+            enable_auto_tool_choice=model.serving_profile.enable_auto_tool_choice,
+            tool_call_parser=model.serving_profile.tool_call_parser,
+            reasoning_parser=model.serving_profile.reasoning_parser,
+            enable_thinking_default=model.serving_profile.enable_thinking_default,
+            force_nonempty_content=model.serving_profile.force_nonempty_content,
         )
 
     return manager, registry

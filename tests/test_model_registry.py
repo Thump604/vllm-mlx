@@ -19,6 +19,7 @@ from vllm_mlx.model_registry import (
     RegistryServeDefaults,
     ResolvedModelConfig,
     ServingProfile,
+    load_registry_config,
 )
 from vllm_mlx.utils.download import DownloadConfig
 
@@ -279,6 +280,68 @@ async def test_different_models_do_not_run_concurrently_by_default(tmp_path):
 
     assert created["alpha"].started == 1
     assert created["beta"].started == 1
+
+
+def test_load_registry_config_accepts_phase1_contract_schema(tmp_path):
+    config_path = tmp_path / "registry.yaml"
+    config_path.write_text("""
+schema_version: 1
+policy_defaults:
+  memory_budget_gb: 96
+  contention_policy:
+    strategy: wait_then_preempt
+    wait_timeout_s: 15
+models:
+  - id: qwen3.5-27b
+    display_name: Qwen 3.5 27B
+    source: /models/qwen27
+    family: qwen3.5
+    architecture: dense
+    execution_class: shared_candidate
+    estimated_memory_gb: 31
+    supports_mtp: true
+    multimodal: true
+    serving_profile:
+      force_mllm: true
+      continuous_batching: true
+      prefill_step_size: 256
+      tool_call_parser: qwen3_coder
+      reasoning_parser: qwen3
+      enable_auto_tool_choice: true
+      enable_thinking_default: true
+      specprefill:
+        enabled: true
+        threshold: 8192
+        keep_pct: 0.3
+    draft_model:
+      id: qwen3.5-2b-draft
+      source: /models/qwen2b
+      estimated_memory_gb: 3
+model_presets:
+  - id: coding-quality
+    display_name: Coding (Quality)
+    model_id: qwen3.5-27b
+    priority_class: interactive
+    sampling_profile:
+      temperature: 0.6
+      top_p: 0.95
+      enable_thinking: true
+    request_policy:
+      max_tokens: 32768
+      timeout_s: 2400
+service_presets: []
+discussion_profiles: []
+""")
+
+    manager, registry = load_registry_config(config_path, _defaults())
+
+    assert manager.memory_budget_bytes == 96 * (1024**3)
+    assert manager.policy.strategy == "wait_then_preempt"
+    assert registry["qwen3.5-27b"].tool_call_parser == "qwen3_coder"
+    assert registry["qwen3.5-27b"].reasoning_parser == "qwen3"
+    assert registry["qwen3.5-27b"].enable_mtp is True
+    assert registry["qwen3.5-27b"].force_mllm is True
+    assert registry["qwen3.5-27b"].specprefill_draft_model == "/models/qwen2b"
 
 
 @pytest.mark.asyncio
