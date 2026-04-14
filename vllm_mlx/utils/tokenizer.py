@@ -66,6 +66,7 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
             )
             return _load_strict_false(model_name, tokenizer_config)
         raise
+    return model, tokenizer
 
 
 def _load_strict_false(model_name: str, tokenizer_config: dict = None):

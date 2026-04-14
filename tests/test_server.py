@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible API server."""
 
+import asyncio
+import json
 import platform
 import sys
-import json
 
 import pytest
 
@@ -326,6 +327,60 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
+class TestServeCli:
+    """Test serve CLI argument parsing."""
+
+    def test_tool_call_parser_accepts_harmony_aliases(self):
+        """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "harmony",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.tool_call_parser == "harmony"
+        assert args.enable_auto_tool_choice is True
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "gpt-oss",
+            ]
+        )
+
+        assert args.tool_call_parser == "gpt-oss"
+
+    def test_models_config_allows_registry_backed_serve(self):
+        """Registry-backed serving should not require a positional model."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "--models-config",
+                "/tmp/models.yaml",
+                "--continuous-batching",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.model is None
+        assert args.models_config == "/tmp/models.yaml"
+        assert args.continuous_batching is True
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
@@ -333,6 +388,128 @@ class TestCompletionRequest:
 
 class TestHelperFunctions:
     """Test server helper functions."""
+
+    def test_list_models_prefers_model_manager_registry(self, monkeypatch):
+        """Registry-backed mode should expose configured models through /v1/models."""
+        import vllm_mlx.server as server
+
+        class FakeManager:
+            def list_models(self):
+                return [
+                    {"id": "fast", "status": "loaded"},
+                    {"id": "smart", "status": "unloaded"},
+                ]
+
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_model_name", None)
+
+        response = asyncio.run(server.list_models())
+
+        assert [model.id for model in response.data] == ["fast", "smart"]
+
+    def test_validate_model_name_checks_registry_when_present(self, monkeypatch):
+        """Registry-backed validation should accept registered names and reject unknown ones."""
+        from fastapi import HTTPException
+        import vllm_mlx.server as server
+
+        class FakeManager:
+            _registry = {"fast": object(), "smart": object()}
+
+            def has_model(self, name):
+                return name in self._registry
+
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_model_name", None)
+
+        server._validate_model_name("fast")
+
+        with pytest.raises(HTTPException) as exc_info:
+            server._validate_model_name("missing")
+
+        assert exc_info.value.status_code == 404
+        assert "fast" in exc_info.value.detail
+
+    def test_build_reasoning_parser_uses_configured_name_and_engine_tokenizer(
+        self, monkeypatch
+    ):
+        """Per-request reasoning parser instances should be built from the configured parser name."""
+        import vllm_mlx.server as server
+        from vllm_mlx.model_registry import ServingProfile
+
+        class FakeParser:
+            def __init__(self, tokenizer=None):
+                self.tokenizer = tokenizer
+
+        class FakeEngine:
+            tokenizer = object()
+
+        monkeypatch.setattr(server, "_reasoning_parser_name", "fake")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "get_reasoning_parser", lambda name: FakeParser)
+
+        parser = server._build_reasoning_parser(
+            FakeEngine(),
+            ServingProfile(reasoning_parser="fake"),
+        )
+
+        assert isinstance(parser, FakeParser)
+        assert parser.tokenizer is FakeEngine.tokenizer
+
+    def test_acquire_request_model_uses_registry_serving_profile(self, monkeypatch):
+        """Registry-backed acquisition should return the selected model's serving profile."""
+        import vllm_mlx.server as server
+        from vllm_mlx.model_registry import ServingProfile
+
+        class FakeEngine:
+            preserve_native_tool_format = False
+
+        class FakeLease:
+            def __init__(self, model_name, tool_parser, reasoning_parser):
+                self.engine = FakeEngine()
+                self.config = type(
+                    "Config",
+                    (),
+                    {
+                        "resolved_source": f"/models/{model_name}",
+                        "serving_profile": ServingProfile(
+                            enable_auto_tool_choice=True,
+                            tool_call_parser=tool_parser,
+                            reasoning_parser=reasoning_parser,
+                        ),
+                    },
+                )()
+
+            async def release(self):
+                return None
+
+        class FakeManager:
+            _registry = {"gemma": object(), "qwen": object()}
+
+            def has_model(self, name):
+                return name in self._registry
+
+            async def acquire(self, name):
+                if name == "gemma":
+                    return FakeLease(name, "gemma4", "gemma4")
+                return FakeLease(name, "qwen3_coder", "qwen3")
+
+        monkeypatch.setattr(server, "_model_manager", FakeManager())
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(
+            server,
+            "_detect_native_tool_support",
+            lambda profile: profile.tool_call_parser == "qwen3_coder",
+        )
+
+        gemma_ctx = asyncio.run(server._acquire_request_model("gemma"))
+        qwen_ctx = asyncio.run(server._acquire_request_model("qwen"))
+
+        assert gemma_ctx.serving_profile.tool_call_parser == "gemma4"
+        assert gemma_ctx.serving_profile.reasoning_parser == "gemma4"
+        assert qwen_ctx.serving_profile.tool_call_parser == "qwen3_coder"
+        assert qwen_ctx.serving_profile.reasoning_parser == "qwen3"
+        assert gemma_ctx.engine.preserve_native_tool_format is False
+        assert qwen_ctx.engine.preserve_native_tool_format is True
 
     def test_is_mllm_model_patterns(self):
         """Test MLLM model detection patterns."""
@@ -753,9 +930,7 @@ class TestAPIKeyVerification:
 
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
-                )
+                asyncio.run(server.verify_api_key(credentials))
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
@@ -781,9 +956,7 @@ class TestAPIKeyVerification:
             )
 
             # Should not raise any exception
-            result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
-            )
+            result = asyncio.run(server.verify_api_key(credentials))
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:

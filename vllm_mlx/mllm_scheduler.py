@@ -285,9 +285,20 @@ class MLLMScheduler:
         """
         eos = getattr(self.model.config, "eos_token_id", None)
         if eos is None:
+            eos = getattr(self.model.config, "eos_token_ids", None)
+        if eos is None:
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            eos = getattr(tokenizer, "eos_token_ids", None)
+            if eos is None:
+                eos = getattr(tokenizer, "eos_token_id", None)
+        if eos is None:
             raise ValueError(
                 f"Model {type(self.model).__name__} has no eos_token_id in "
-                f"its config; cannot determine generation stop tokens."
+                f"its config or tokenizer; cannot determine generation stop tokens."
             )
         if isinstance(eos, (list, tuple, set)):
             return {int(t) for t in eos}

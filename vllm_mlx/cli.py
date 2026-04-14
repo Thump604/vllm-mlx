@@ -27,9 +27,20 @@ def serve_command(args):
     # Import unified server
     from . import server
     from .scheduler import SchedulerConfig
-    from .server import RateLimiter, app, load_model
+    from .model_registry import RegistryServeDefaults, ServingProfile
+    from .server import RateLimiter, app, load_model, load_model_registry
 
     logger = logging.getLogger(__name__)
+
+    if args.models_config and args.model:
+        print("Error: use either positional MODEL or --models-config, not both")
+        sys.exit(1)
+    if not args.models_config and not args.model:
+        print("Error: MODEL is required unless --models-config is provided")
+        sys.exit(1)
+    if args.models_config and args.served_model_name:
+        print("Error: --served-model-name cannot be used with --models-config")
+        sys.exit(1)
 
     # Validate tool calling arguments
     if args.enable_auto_tool_choice and not args.tool_call_parser:
@@ -66,6 +77,7 @@ def serve_command(args):
 
             parser_cls = get_parser(args.reasoning_parser)
             server._reasoning_parser = parser_cls()
+            server._reasoning_parser_name = args.reasoning_parser
             logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
         except KeyError as e:
             print(f"Error: {e}")
@@ -81,6 +93,7 @@ def serve_command(args):
             sys.exit(1)
     else:
         server._reasoning_parser = None
+        server._reasoning_parser_name = None
 
     # Security summary at startup
     print("=" * 60)
@@ -105,7 +118,24 @@ def serve_command(args):
         print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
-    print(f"Loading model: {args.model}")
+    # Pre-download model with retry/timeout
+    from .api.utils import is_mllm_model
+    from .utils.download import DownloadConfig, ensure_model_downloaded
+
+    download_config = DownloadConfig(
+        download_timeout=getattr(args, "download_timeout", 300),
+        max_retries=getattr(args, "download_retries", 3),
+        offline=getattr(args, "offline", False),
+    )
+    if args.model:
+        ensure_model_downloaded(
+            args.model,
+            config=download_config,
+            is_mllm=is_mllm_model(args.model),
+        )
+        print(f"Loading model: {args.model}")
+    else:
+        print(f"Loading models config: {args.models_config}")
     print(f"Default max tokens: {args.max_tokens}")
 
     # Store MCP config path for FastAPI startup
@@ -189,22 +219,47 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
-    # Load model with unified server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        scheduler_config=scheduler_config,
-        stream_interval=args.stream_interval if args.continuous_batching else 1,
-        max_tokens=args.max_tokens,
-        force_mllm=args.mllm,
-        served_model_name=args.served_model_name,
-        mtp=args.enable_mtp,
-        prefill_step_size=args.prefill_step_size,
-        specprefill_enabled=args.specprefill,
-        specprefill_threshold=args.specprefill_threshold,
-        specprefill_keep_pct=args.specprefill_keep_pct,
-        specprefill_draft_model=args.specprefill_draft_model,
-    )
+    gpu_memory_utilization = getattr(args, "gpu_memory_utilization", 0.90)
+
+    if args.models_config:
+        defaults = RegistryServeDefaults(
+            continuous_batching=args.continuous_batching,
+            force_mllm=getattr(args, "mllm", False),
+            enable_mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            gpu_memory_utilization=gpu_memory_utilization,
+            scheduler_config=scheduler_config,
+            max_tokens=args.max_tokens,
+            download_config=download_config,
+            serving_profile=ServingProfile(
+                enable_auto_tool_choice=args.enable_auto_tool_choice,
+                tool_call_parser=args.tool_call_parser,
+                reasoning_parser=args.reasoning_parser,
+            ),
+        )
+        load_model_registry(args.models_config, defaults=defaults)
+    else:
+        # Load model with unified server
+        load_model(
+            args.model,
+            use_batching=args.continuous_batching,
+            scheduler_config=scheduler_config,
+            stream_interval=args.stream_interval if args.continuous_batching else 1,
+            max_tokens=args.max_tokens,
+            force_mllm=getattr(args, "mllm", False),
+            served_model_name=args.served_model_name,
+            mtp=args.enable_mtp,
+            prefill_step_size=args.prefill_step_size,
+            specprefill_enabled=args.specprefill,
+            specprefill_threshold=args.specprefill_threshold,
+            specprefill_keep_pct=args.specprefill_keep_pct,
+            specprefill_draft_model=args.specprefill_draft_model,
+        )
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
@@ -593,7 +648,7 @@ def bench_kv_cache_command(args):
     )
 
 
-def main():
+def create_parser():
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -607,7 +662,13 @@ Examples:
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Start OpenAI-compatible server")
-    serve_parser.add_argument("model", type=str, help="Model to serve")
+    serve_parser.add_argument("model", nargs="?", type=str, help="Model to serve")
+    serve_parser.add_argument(
+        "--models-config",
+        type=str,
+        default=None,
+        help="YAML file describing a registry of models for lazy multi-model serving",
+    )
     serve_parser.add_argument(
         "--served-model-name",
         type=str,
@@ -703,6 +764,13 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
+    )
+    serve_parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of device memory reserved for runtime allocations "
+        "(0.0-1.0, default: 0.90).",
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(
@@ -832,19 +900,23 @@ Examples:
             "qwen3_coder",
             "llama",
             "hermes",
+            "harmony",
+            "gpt-oss",
             "deepseek",
             "kimi",
             "granite",
             "nemotron",
             "xlam",
             "functionary",
-            "glm47",
             "gemma4",
+            "glm47",
+            "minimax",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, kimi, granite, nemotron, xlam, functionary, glm47, gemma4. "
+            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
+            "xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
         ),
     )
@@ -888,6 +960,24 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Download options
+    serve_parser.add_argument(
+        "--download-timeout",
+        type=int,
+        default=300,
+        help="Per-file download timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--download-retries",
+        type=int,
+        default=3,
+        help="Number of download retry attempts (default: 3)",
+    )
+    serve_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode — only use locally cached models",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
@@ -1023,6 +1113,11 @@ Examples:
         default=64,
         help="Quantization group size (default: 64)",
     )
+    return parser
+
+
+def main():
+    parser = create_parser()
 
     args = parser.parse_args()
 

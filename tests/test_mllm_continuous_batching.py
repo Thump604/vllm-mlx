@@ -1114,6 +1114,20 @@ class TestMLLMSchedulerConfig:
         assert config.enable_vision_cache is True
         assert config.vision_cache_size == 100
 
+    def test_scheduler_falls_back_to_tokenizer_stop_tokens_when_config_missing(self):
+        """Some VLM configs omit eos_token_id even though the tokenizer carries it."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=None))
+        tokenizer = SimpleNamespace(eos_token_id=None, eos_token_ids={7, 11})
+        processor = SimpleNamespace(tokenizer=tokenizer)
+
+        scheduler = MLLMScheduler(model, processor)
+
+        assert scheduler.stop_tokens == {7, 11}
+
     def test_custom_config(self):
         """Test custom configuration."""
         from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
