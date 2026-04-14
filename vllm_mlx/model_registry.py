@@ -496,6 +496,16 @@ class ModelManager:
                 same_model_future = self._loading.get(model_name, None)
                 if same_model_future is not None:
                     same_model_future = same_model_future.future
+                elif self._has_conflicting_active_model_locked(model_name):
+                    cancel_tasks = self._maybe_preempt_conflicting_model_locked(
+                        requested_model=model_name,
+                        start=start,
+                    )
+                    if not cancel_tasks and not self._should_wait_locked(start):
+                        raise RuntimeError(
+                            f"Cannot serve '{model_name}' while another model is active"
+                        )
+                    wait_timeout = self._remaining_wait_timeout(start)
                 elif model_name in self._unloading:
                     wait_timeout = self._remaining_wait_timeout(start)
                 else:
@@ -701,6 +711,48 @@ class ModelManager:
             projected_bytes -= loaded.config.estimated_memory_bytes
 
         return selected
+
+    def _has_conflicting_active_model_locked(self, requested_model: str) -> bool:
+        """Whether another loaded model currently has active requests.
+
+        Different MLX/Metal model families are not safe to execute concurrently in
+        one process; registry mode therefore serializes execution across distinct
+        loaded engines while still allowing same-model concurrency.
+        """
+        return any(
+            name != requested_model and loaded.active_requests > 0
+            for name, loaded in self._loaded.items()
+        )
+
+    def _maybe_preempt_conflicting_model_locked(
+        self,
+        *,
+        requested_model: str,
+        start: float,
+    ) -> set[asyncio.Task[Any]]:
+        """Preempt other active models when policy allows it."""
+        if not self._should_preempt_locked(start):
+            return set()
+
+        cancel_tasks: set[asyncio.Task[Any]] = set()
+        candidates = sorted(
+            (
+                loaded
+                for name, loaded in self._loaded.items()
+                if name != requested_model and loaded.active_requests > 0
+            ),
+            key=lambda item: item.last_used_at,
+        )
+
+        for loaded in candidates:
+            if loaded.preempting:
+                continue
+            loaded.preempting = True
+            cancel_tasks.update(loaded.active_tasks)
+
+        if cancel_tasks:
+            self._condition.notify_all()
+        return cancel_tasks
 
     def _maybe_preempt_locked(
         self,

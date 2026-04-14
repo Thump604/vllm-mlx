@@ -238,6 +238,50 @@ async def test_preempt_policy_cancels_active_request_and_loads_waiting_model(tmp
 
 
 @pytest.mark.asyncio
+async def test_different_models_do_not_run_concurrently_by_default(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 4, "beta": 4})
+    created: dict[str, FakeEngine] = {}
+
+    def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+        engine = FakeEngine(config)
+        created[config.entry.name] = engine
+        return engine
+
+    manager = ModelManager(
+        _manager_config(budget_gb=12, wait_timeout_s=1.0),
+        registry,
+        _defaults(),
+        engine_factory=engine_factory,
+    )
+
+    acquired = asyncio.Event()
+    released = asyncio.Event()
+
+    async def hold_alpha() -> None:
+        lease = await manager.acquire("alpha")
+        acquired.set()
+        try:
+            await released.wait()
+        finally:
+            await lease.release()
+
+    alpha_task = asyncio.create_task(hold_alpha())
+    await acquired.wait()
+
+    beta_task = asyncio.create_task(manager.acquire("beta"))
+    await asyncio.sleep(0.05)
+    assert not beta_task.done()
+
+    released.set()
+    beta_lease = await asyncio.wait_for(beta_task, timeout=1.0)
+    await beta_lease.release()
+    await alpha_task
+
+    assert created["alpha"].started == 1
+    assert created["beta"].started == 1
+
+
+@pytest.mark.asyncio
 async def test_non_local_registry_entry_requires_explicit_memory_estimate():
     registry = {
         "remote": RegisteredModel(
