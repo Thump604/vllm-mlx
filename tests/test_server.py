@@ -361,6 +361,25 @@ class TestServeCli:
 
         assert args.tool_call_parser == "gpt-oss"
 
+    def test_tool_call_parser_accepts_qwen3_xml_alias(self):
+        """Legacy qwen3_xml config should remain accepted by the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "Qwen3.5-122B-A10B-VLM-MTP-5bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "qwen3_xml",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.tool_call_parser == "qwen3_xml"
+        assert args.enable_auto_tool_choice is True
+
     def test_models_config_allows_registry_backed_serve(self):
         """Registry-backed serving should not require a positional model."""
         from vllm_mlx.cli import create_parser
