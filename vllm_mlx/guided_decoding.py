@@ -124,27 +124,50 @@ class GuidedDecodingFactory:
         # Outlines expects (input_ids: mx.array, logits: mx.array).
         return [_wrap_outlines_processor(processor)]
 
-    def build_raw_processors(
+    def build_serial_processors(
         self,
         response_format: Any | dict[str, Any] | None,
     ) -> list[Any] | None:
-        """Build raw Outlines processors for serial stream_generate path.
+        """Build processors for serial stream_generate path.
 
-        The serial path in mlx-lm already handles token tracking and passes
-        (tokens: mx.array, logits: mx.array) — no wrapping needed.
+        The serial path accumulates tokens starting from the last prefill
+        chunk (not just generated tokens). The wrapper strips the prompt
+        prefix so the FSM only sees generated tokens.
         """
         schema = response_format_to_schema(response_format)
         if schema is None:
             return None
 
         from outlines.backends import get_json_schema_logits_processor
+        from outlines_core import Index, Vocabulary
+        import outlines_core as oc
 
         processor = get_json_schema_logits_processor(
             None,
             self._outlines_model,
             json.dumps(schema, separators=(",", ":"), ensure_ascii=False),
         )
-        return [processor]
+
+        # Get initial allowed tokens from the FSM index for the manual
+        # first-call mask (processor can't handle empty sequence).
+        tok = self._outlines_model.mlx_tokenizer
+        vocab_dict = {}
+        for tid in range(tok.vocab_size):
+            ts = tok.convert_ids_to_tokens(tid)
+            if ts is not None:
+                vocab_dict.setdefault(ts, []).append(tid)
+        v = Vocabulary(tok.eos_token_id, vocab_dict)
+        idx = Index(
+            oc.json_schema.build_regex_from_schema(
+                json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+            ),
+            v,
+        )
+        initial_allowed = list(idx.get_allowed_tokens(idx.get_initial_state()))
+
+        return [
+            _wrap_outlines_serial(processor, allowed_initial_tokens=initial_allowed)
+        ]
 
 
 def _wrap_outlines_processor(processor):
@@ -160,24 +183,20 @@ def _wrap_outlines_processor(processor):
 
     def wrapped(token_ids, logits):
         nonlocal prompt_len
-        import logging
-
-        _log = logging.getLogger("vllm_mlx.guided_decoding")
         if isinstance(token_ids, list):
             if prompt_len is None:
                 prompt_len = len(token_ids)
-                _log.info("Guided wrapper: prompt_len=%d", prompt_len)
             generated = token_ids[prompt_len:]
-            _log.info(
-                "Guided wrapper: generated=%d tokens, first_few=%s",
-                len(generated),
-                generated[:5],
-            )
-            token_ids = (
-                mx.array(generated, dtype=mx.int32)
-                if generated
-                else mx.zeros((0,), dtype=mx.int32)
-            )
+            if not generated:
+                # No generated tokens yet — first call does processor._setup
+                # via (1, 0) empty batch. Subsequent empty calls skip.
+                if processor.is_first_token:
+                    token_ids = mx.zeros((1, 0), dtype=mx.int32)
+                else:
+                    return logits
+            else:
+                # Only pass the LAST generated token (processor is stateful)
+                token_ids = mx.array([generated[-1]], dtype=mx.int32)[None, :]
         result = processor(token_ids, logits)
         # Debug: check if masking is effective
         if _log.isEnabledFor(logging.DEBUG):
@@ -189,5 +208,41 @@ def _wrap_outlines_processor(processor):
             finite = np.isfinite(r)
             _log.debug("Guided: %d/%d tokens allowed (non-inf)", finite.sum(), len(r))
         return result
+
+    return wrapped
+
+
+def _wrap_outlines_serial(processor, allowed_initial_tokens: list[int]):
+    """Wrapper for serial stream_generate path.
+
+    mlx-lm's serial generate accumulates tokens as mx.array starting from
+    the last prefill chunk. The FSM must only see generated tokens, not the
+    prompt suffix. Track the initial token count and slice.
+
+    On the first call (no generated tokens), manually apply the initial-state
+    mask instead of calling the processor (which requires at least one token).
+    """
+    import mlx.core as mx
+
+    prompt_len = None
+
+    def wrapped(token_ids, logits):
+        nonlocal prompt_len
+        if len(token_ids.shape) == 1:
+            token_ids = token_ids[None, :]
+
+        cur_len = token_ids.shape[1]
+
+        if prompt_len is None:
+            prompt_len = cur_len
+            empty = mx.zeros((1, 0), dtype=mx.int32)
+            return processor(empty, logits)
+
+        n_generated = cur_len - prompt_len
+        if n_generated <= 0:
+            return logits
+
+        generated = token_ids[:, prompt_len:]
+        return processor(generated, logits)
 
     return wrapped

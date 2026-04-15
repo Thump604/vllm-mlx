@@ -2271,7 +2271,7 @@ class BatchedEngine(BaseEngine):
                     )
                 # Use raw processors for serial stream_generate (it handles
                 # token tracking internally — no wrapper needed)
-                guided_processors = self._text_guided_factory.build_raw_processors(
+                guided_processors = self._text_guided_factory.build_serial_processors(
                     response_format
                 )
                 if guided_processors:
