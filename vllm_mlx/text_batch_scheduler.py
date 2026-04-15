@@ -135,9 +135,11 @@ class TextBatchScheduler:
         prompt_cache_entries: int = DEFAULT_PROMPT_CACHE_ENTRIES,
         specprefill_threshold: int | None = None,
         specprefill_keep_pct: float | None = None,
+        model_path: str | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        self._model_path = model_path
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
         self._gpu_lock = gpu_lock
         self._base_stop_tokens = set(stop_tokens or set())
@@ -650,9 +652,19 @@ class TextBatchScheduler:
         ):
             from .guided_decoding import GuidedDecodingFactory
 
-            self._guided_decoding_factory = GuidedDecodingFactory(
-                self._model, self._tokenizer
-            )
+            # Outlines MLXLM expects a full HF PreTrainedTokenizer with
+            # eos_token_id, eos_token, all_special_tokens on its _tokenizer
+            # backend. Load a fresh HF tokenizer from model path to guarantee
+            # compatibility — this only loads tokenizer files, not weights.
+            if self._model_path:
+                from transformers import AutoTokenizer
+
+                tok = AutoTokenizer.from_pretrained(
+                    self._model_path, trust_remote_code=True
+                )
+            else:
+                tok = self.tokenizer
+            self._guided_decoding_factory = GuidedDecodingFactory(self.model, tok)
         return self._guided_decoding_factory
 
     def _build_state_machine(

@@ -640,6 +640,7 @@ class BatchedEngine(BaseEngine):
                     prefill_step_size=self._prefill_step_size,
                     specprefill_threshold=self._specprefill_threshold,
                     specprefill_keep_pct=self._specprefill_keep_pct,
+                    model_path=self._model_name,
                 )
                 if self._text_scheduler_route_enabled:
                     await self._text_scheduler.start()
@@ -849,13 +850,18 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
+        response_format: Any | None = None,
     ) -> bool:
         """Gate the foundation scheduler to a safe canary subset."""
-        if not self._text_scheduler_route_enabled:
-            return False
         if self._text_scheduler is None or self._text_model is None:
             return False
         if _has_any_media(messages, images, videos):
+            return False
+        # Guided decoding requires BatchGenerator for logits_processors.
+        # Force text scheduler path even when canary is disabled.
+        if response_format is not None:
+            return True
+        if not self._text_scheduler_route_enabled:
             return False
         return True
 
@@ -1800,6 +1806,7 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             images=images,
             videos=videos,
+            response_format=kwargs.get("response_format"),
         ):
             logger.info("Text-only request → TextBatchScheduler [non-streaming]")
             last_output = None
@@ -1820,21 +1827,14 @@ class BatchedEngine(BaseEngine):
         if self._text_model is not None and not _has_any_media(
             messages, images, videos
         ):
-            # Guided decoding requires BatchGenerator (serial stream_generate
-            # doesn't support logits_processors). Route through MLLM scheduler.
-            if kwargs.get("response_format") is not None and self._mllm_scheduler:
-                logger.info(
-                    "Guided decoding request → MLLM scheduler (BatchGenerator required)"
-                )
-            else:
-                return await self._chat_text_model(
-                    messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    tools=tools,
-                    **kwargs,
-                )
+            return await self._chat_text_model(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                **kwargs,
+            )
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
@@ -2085,6 +2085,7 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             images=images,
             videos=videos,
+            response_format=kwargs.get("response_format"),
         ):
             logger.info("Text-only request → TextBatchScheduler [streaming]")
             async for output in self._text_scheduler.submit(
