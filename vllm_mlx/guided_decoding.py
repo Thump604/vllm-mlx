@@ -84,6 +84,24 @@ class GuidedDecodingFactory:
                 "Structured output guided decoding requires the 'outlines' package"
             ) from exc
 
+        # Outlines TransformerTokenizer reads eos_token_id, eos_token, and
+        # all_special_tokens from tokenizer._tokenizer (the raw backend).
+        # Modern transformers keeps these on the wrapper only. Patch them
+        # onto the raw backend so Outlines can find them.
+        inner = getattr(tokenizer, "_tokenizer", None)
+        if inner is not None:
+            for attr in (
+                "eos_token_id",
+                "eos_token",
+                "pad_token_id",
+                "pad_token",
+                "all_special_tokens",
+            ):
+                if not hasattr(inner, attr):
+                    val = getattr(tokenizer, attr, None)
+                    if val is not None:
+                        setattr(inner, attr, val)
+
         self._outlines_model = from_mlxlm(model, tokenizer)
 
     def build_processors(
@@ -102,4 +120,18 @@ class GuidedDecodingFactory:
             self._outlines_model,
             json.dumps(schema, separators=(",", ":"), ensure_ascii=False),
         )
-        return [processor]
+        # Wrap: BatchGenerator passes (tokens: list, logits: mx.array) but
+        # Outlines expects (input_ids: mx.array, logits: mx.array).
+        return [_wrap_outlines_processor(processor)]
+
+
+def _wrap_outlines_processor(processor):
+    """Adapt Outlines processor to BatchGenerator's (list, mx.array) interface."""
+    import mlx.core as mx
+
+    def wrapped(token_ids, logits):
+        if isinstance(token_ids, list):
+            token_ids = mx.array(token_ids)
+        return processor(token_ids, logits)
+
+    return wrapped
