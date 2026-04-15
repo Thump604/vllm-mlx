@@ -1820,14 +1820,21 @@ class BatchedEngine(BaseEngine):
         if self._text_model is not None and not _has_any_media(
             messages, images, videos
         ):
-            return await self._chat_text_model(
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=tools,
-                **kwargs,
-            )
+            # Guided decoding requires BatchGenerator (serial stream_generate
+            # doesn't support logits_processors). Route through MLLM scheduler.
+            if kwargs.get("response_format") is not None and self._mllm_scheduler:
+                logger.info(
+                    "Guided decoding request → MLLM scheduler (BatchGenerator required)"
+                )
+            else:
+                return await self._chat_text_model(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    tools=tools,
+                    **kwargs,
+                )
 
         # Extract images/videos from messages (OpenAI multimodal format)
         # Note: We only use extracted media here, messages are already processed by server
@@ -2213,10 +2220,11 @@ class BatchedEngine(BaseEngine):
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_sampler
 
-        # Per-request template/specprefill overrides (from extra_body)
+        # Per-request template/specprefill/guided overrides (from extra_body)
         chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+        response_format = kwargs.pop("response_format", None)
 
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
@@ -2256,8 +2264,27 @@ class BatchedEngine(BaseEngine):
                 messages, **template_kwargs
             )
 
-        # Build sampler
+        # Build sampler and guided decoding processors
         sampler = make_sampler(temp=temperature, top_p=top_p)
+        guided_processors = None
+        if response_format is not None:
+            try:
+                from ..guided_decoding import GuidedDecodingFactory
+
+                if not hasattr(self, "_text_guided_factory"):
+                    self._text_guided_factory = GuidedDecodingFactory(
+                        self._text_model, self._text_tokenizer
+                    )
+                guided_processors = self._text_guided_factory.build_processors(
+                    response_format
+                )
+                if guided_processors:
+                    logger.info(
+                        "Guided decoding active: %d processors for response_format",
+                        len(guided_processors),
+                    )
+            except Exception as exc:
+                logger.warning("Failed to build guided decoding processors: %s", exc)
         max_tokens = max_tokens or 4096
 
         # Check MTP support — used by all generation paths below
@@ -2482,6 +2509,7 @@ class BatchedEngine(BaseEngine):
                             prompt=y0.reshape(-1),
                             max_tokens=max_tokens - 1,
                             sampler=sampler,
+                            logits_processors=guided_processors,
                             mtp=_has_mtp,
                             prompt_cache=gen_cache,
                             prefill_step_size=prefill_step_size,
@@ -2538,6 +2566,7 @@ class BatchedEngine(BaseEngine):
                     prompt=suffix_array,
                     max_tokens=max_tokens,
                     sampler=sampler,
+                    logits_processors=guided_processors,
                     mtp=_has_mtp,
                     num_draft_tokens=1,
                     prompt_cache=restored_cache,
@@ -2555,6 +2584,7 @@ class BatchedEngine(BaseEngine):
                     prompt=prompt,
                     max_tokens=max_tokens,
                     sampler=sampler,
+                    logits_processors=guided_processors,
                     mtp=_has_mtp,
                     num_draft_tokens=1,
                     prefill_step_size=prefill_step_size,
