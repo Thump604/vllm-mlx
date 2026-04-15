@@ -76,6 +76,7 @@ class RequestState:
     frequency_penalty: float = 0.0
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
+    response_format: Any = None
     uid: Optional[int] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -142,7 +143,9 @@ class TextBatchScheduler:
         self._base_stop_tokens = set(stop_tokens or set())
         self._draft_model = draft_model
         self._enable_mtp = bool(
-            enable_mtp and hasattr(model, "mtp") and getattr(model, "mtp", None) is not None
+            enable_mtp
+            and hasattr(model, "mtp")
+            and getattr(model, "mtp", None) is not None
         )
         self._cache_memory_limit_bytes = int(cache_memory_mb * 1024 * 1024)
         self._max_active_tokens = int(max_active_tokens)
@@ -252,6 +255,7 @@ class TextBatchScheduler:
         presence_penalty = float(kwargs.pop("presence_penalty", 0.0) or 0.0)
         repetition_penalty = float(kwargs.pop("repetition_penalty", 1.0) or 1.0)
         frequency_penalty = float(kwargs.pop("frequency_penalty", 0.0) or 0.0)
+        response_format = kwargs.pop("response_format", None)
 
         chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -279,6 +283,7 @@ class TextBatchScheduler:
             frequency_penalty=frequency_penalty,
             stop=stop_list,
             stop_token_ids=list(stop_token_ids),
+            response_format=response_format,
         )
         self.requests[request_id] = state
 
@@ -365,7 +370,10 @@ class TextBatchScheduler:
             completion_batch_size=self._completion_batch_size,
             prefill_step_size=self._prefill_step_size,
         )
-        if "prompt_progress_callback" in inspect.signature(BatchGenerator.__init__).parameters:
+        if (
+            "prompt_progress_callback"
+            in inspect.signature(BatchGenerator.__init__).parameters
+        ):
             bg_kwargs["prompt_progress_callback"] = self._log_prefill_progress
 
         batch_generator = BatchGenerator(**bg_kwargs)
@@ -477,7 +485,10 @@ class TextBatchScheduler:
         prefix_boundary: int,
     ) -> list[list[int]]:
         if 0 < prefix_boundary < len(token_ids):
-            return [list(token_ids[:prefix_boundary]), list(token_ids[prefix_boundary:])]
+            return [
+                list(token_ids[:prefix_boundary]),
+                list(token_ids[prefix_boundary:]),
+            ]
         return [list(token_ids)]
 
     def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
@@ -497,12 +508,14 @@ class TextBatchScheduler:
         )
 
     def _check_compute_budget(self, new_request_tokens: int) -> bool:
-        return (self._active_token_count + new_request_tokens) <= self._max_active_tokens
+        return (
+            self._active_token_count + new_request_tokens
+        ) <= self._max_active_tokens
 
     def _admit(self, state: RequestState) -> bool:
-        return self._check_memory_budget(state.resident_token_cost) and self._check_compute_budget(
-            state.active_token_cost
-        )
+        return self._check_memory_budget(
+            state.resident_token_cost
+        ) and self._check_compute_budget(state.active_token_cost)
 
     def _should_use_cooperative_specprefill(
         self,
@@ -534,7 +547,9 @@ class TextBatchScheduler:
                 cache_to_use = None
                 remaining_tokens = list(state.token_ids)
 
-        if cache_to_use is not None and not self._cache_supports_batched_history(cache_to_use):
+        if cache_to_use is not None and not self._cache_supports_batched_history(
+            cache_to_use
+        ):
             logger.warning(
                 "TextBatchScheduler prefix cache for %s uses non-batchable history cache; "
                 "falling back to uncached prompt admission",
@@ -548,7 +563,9 @@ class TextBatchScheduler:
         state.cached_tokens = cached_tokens
         state.prefix_cache_saved = cached_tokens >= state.prefix_boundary > 0
         state.prepared_cache = cache_to_use
-        state.prepared_all_tokens = list(state.token_ids[:cached_tokens]) if cached_tokens > 0 else []
+        state.prepared_all_tokens = (
+            list(state.token_ids[:cached_tokens]) if cached_tokens > 0 else []
+        )
         state.prepared_segments = self._build_insert_segments(
             state.token_ids,
             state.prefix_boundary,
@@ -565,7 +582,9 @@ class TextBatchScheduler:
         else:
             state.cooperative_specprefill_tokens = []
             state.cooperative_specprefill_position_offset = 0
-            state.active_token_cost = sum(len(segment) for segment in state.prepared_segments)
+            state.active_token_cost = sum(
+                len(segment) for segment in state.prepared_segments
+            )
         state.resident_token_cost = state.prompt_tokens
 
     def _build_insert_segments(
@@ -591,7 +610,9 @@ class TextBatchScheduler:
     def _cache_supports_batched_history(cache_state: Any) -> bool:
         if not cache_state:
             return True
-        return all(hasattr(layer, "merge") for layer in cache_state if layer is not None)
+        return all(
+            hasattr(layer, "merge") for layer in cache_state if layer is not None
+        )
 
     def _build_sampler(self, state: RequestState):
         return make_sampler(
@@ -602,7 +623,7 @@ class TextBatchScheduler:
         )
 
     def _build_logits_processors(self, state: RequestState) -> list[Any]:
-        return make_logits_processors(
+        processors = make_logits_processors(
             repetition_penalty=(
                 state.repetition_penalty if state.repetition_penalty != 1.0 else None
             ),
@@ -613,8 +634,30 @@ class TextBatchScheduler:
                 state.frequency_penalty if state.frequency_penalty != 0.0 else None
             ),
         )
+        if state.response_format is not None:
+            guided = self._get_guided_decoding_factory().build_processors(
+                state.response_format
+            )
+            if guided:
+                processors = (processors or []) + guided
+        return processors
 
-    def _build_state_machine(self, state: RequestState) -> Optional[SequenceStateMachine]:
+    def _get_guided_decoding_factory(self):
+        """Lazily initialize guided decoding for the text batch scheduler."""
+        if (
+            not hasattr(self, "_guided_decoding_factory")
+            or self._guided_decoding_factory is None
+        ):
+            from .guided_decoding import GuidedDecodingFactory
+
+            self._guided_decoding_factory = GuidedDecodingFactory(
+                self._model, self._tokenizer
+            )
+        return self._guided_decoding_factory
+
+    def _build_state_machine(
+        self, state: RequestState
+    ) -> Optional[SequenceStateMachine]:
         if not state.stop:
             return None
 
@@ -627,7 +670,9 @@ class TextBatchScheduler:
         if not transitions:
             return None
 
-        return SequenceStateMachine(transitions={"normal": transitions}, initial="normal")
+        return SequenceStateMachine(
+            transitions={"normal": transitions}, initial="normal"
+        )
 
     def _begin_admitted_request(self, state: RequestState) -> None:
         if state.admitted:
@@ -665,7 +710,9 @@ class TextBatchScheduler:
             uid = self._engine.insert_segments(
                 [state.prepared_segments],
                 max_tokens=[state.max_tokens],
-                caches=[state.prepared_cache] if state.prepared_cache is not None else None,
+                caches=(
+                    [state.prepared_cache] if state.prepared_cache is not None else None
+                ),
                 all_tokens=[list(state.prepared_all_tokens)],
                 samplers=[sampler],
                 logits_processors=[logits_processors] if logits_processors else None,
@@ -686,7 +733,9 @@ class TextBatchScheduler:
                     state.token_ids,
                     state.prefix_boundary,
                 )
-                state.active_token_cost = sum(len(segment) for segment in state.prepared_segments)
+                state.active_token_cost = sum(
+                    len(segment) for segment in state.prepared_segments
+                )
                 state.resident_token_cost = state.prompt_tokens
                 try:
                     uid = self._engine.insert_segments(
@@ -694,8 +743,12 @@ class TextBatchScheduler:
                         max_tokens=[state.max_tokens],
                         all_tokens=[list(state.prepared_all_tokens)],
                         samplers=[sampler],
-                        logits_processors=[logits_processors] if logits_processors else None,
-                        state_machines=[state_machine] if state_machine is not None else None,
+                        logits_processors=(
+                            [logits_processors] if logits_processors else None
+                        ),
+                        state_machines=(
+                            [state_machine] if state_machine is not None else None
+                        ),
                     )[0]
                 except Exception as retry_exc:
                     logger.exception(
@@ -704,7 +757,9 @@ class TextBatchScheduler:
                     )
                     return False, str(retry_exc)
             else:
-                logger.exception("TextBatchScheduler failed to start request %s", state.request_id)
+                logger.exception(
+                    "TextBatchScheduler failed to start request %s", state.request_id
+                )
                 return False, str(exc)
 
         if not already_admitted:
@@ -805,7 +860,9 @@ class TextBatchScheduler:
         if not self._cooperative_specprefill:
             return
         self._cooperative_specprefill = deque(
-            queued_id for queued_id in self._cooperative_specprefill if queued_id != request_id
+            queued_id
+            for queued_id in self._cooperative_specprefill
+            if queued_id != request_id
         )
 
     def _sample_first_token(
@@ -841,7 +898,9 @@ class TextBatchScheduler:
 
         return finish_reason, state_machine
 
-    def _fallback_from_cooperative_specprefill(self, state: RequestState, reason: str) -> None:
+    def _fallback_from_cooperative_specprefill(
+        self, state: RequestState, reason: str
+    ) -> None:
         session = state.cooperative_specprefill_session
         if session is not None:
             try:
@@ -865,7 +924,9 @@ class TextBatchScheduler:
             state.token_ids,
             state.prefix_boundary,
         )
-        state.active_token_cost = sum(len(segment) for segment in state.prepared_segments)
+        state.active_token_cost = sum(
+            len(segment) for segment in state.prepared_segments
+        )
         state.resident_token_cost = state.prompt_tokens
         self._num_specprefill_fallbacks += 1
         logger.warning(
@@ -1031,7 +1092,9 @@ class TextBatchScheduler:
                 final_detok.finalize()
                 state.output_text = final_detok.text
             else:
-                state.output_text = self._actual_tokenizer.decode(state.output_token_ids)
+                state.output_text = self._actual_tokenizer.decode(
+                    state.output_token_ids
+                )
             output.text = state.output_text
 
             self._latency_samples.append((time.monotonic() - state.created_at) * 1000.0)
@@ -1085,14 +1148,18 @@ class TextBatchScheduler:
             try:
                 self._engine.close()
             except Exception as exc:
-                logger.debug("Ignoring EngineWrapper close failure after loop error: %s", exc)
+                logger.debug(
+                    "Ignoring EngineWrapper close failure after loop error: %s", exc
+                )
         self._engine = None
         self._batch_generator = None
         self._cooperative_specprefill.clear()
         self._active_token_count = 0
         self._current_cache_bytes = 0
 
-    def _offer_final_output(self, state: RequestState, output: GenerationOutput) -> None:
+    def _offer_final_output(
+        self, state: RequestState, output: GenerationOutput
+    ) -> None:
         try:
             state.queue.put_nowait(output)
             return
@@ -1122,10 +1189,13 @@ class TextBatchScheduler:
             state.cooperative_specprefill_session = None
 
         if state.admitted:
-            self._active_token_count = max(0, self._active_token_count - state.active_token_cost)
+            self._active_token_count = max(
+                0, self._active_token_count - state.active_token_cost
+            )
             self._current_cache_bytes = max(
                 0,
-                self._current_cache_bytes - self._estimate_kv_bytes(state.resident_token_cost),
+                self._current_cache_bytes
+                - self._estimate_kv_bytes(state.resident_token_cost),
             )
             state.admitted = False
 
@@ -1162,7 +1232,9 @@ class TextBatchScheduler:
             try:
                 self._engine.remove([state.uid])
             except Exception:
-                logger.debug("Ignoring remove failure for detached request %s", request_id)
+                logger.debug(
+                    "Ignoring remove failure for detached request %s", request_id
+                )
 
         output = GenerationOutput(
             text=state.output_text,
@@ -1222,7 +1294,7 @@ class TextBatchScheduler:
         if not extracted_cache:
             return
 
-        prefix_tokens = list(state.token_ids[:state.prefix_boundary])
+        prefix_tokens = list(state.token_ids[: state.prefix_boundary])
         stored = self._prefix_cache.store(
             prefix_tokens,
             extracted_cache,
@@ -1282,7 +1354,9 @@ class TextBatchScheduler:
         stats: dict[str, Any] = {
             "running": self._running,
             "active_requests": sum(
-                1 for state in self.requests.values() if state.admitted and not state.finished
+                1
+                for state in self.requests.values()
+                if state.admitted and not state.finished
             ),
             "pending_requests": sum(
                 1
@@ -1290,7 +1364,9 @@ class TextBatchScheduler:
                 if not state.admitted and not state.deferred and not state.finished
             ),
             "deferred_requests": sum(
-                1 for state in self.requests.values() if state.deferred and not state.finished
+                1
+                for state in self.requests.values()
+                if state.deferred and not state.finished
             ),
             "active_token_count": self._active_token_count,
             "max_active_tokens": self._max_active_tokens,
