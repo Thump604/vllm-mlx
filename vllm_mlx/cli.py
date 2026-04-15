@@ -181,6 +181,9 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # SSD cache tiering
+            ssd_cache_dir=args.ssd_cache_dir,
+            ssd_cache_max_gb=args.ssd_cache_max_gb,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -748,6 +751,19 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    # SSD cache tiering options
+    serve_parser.add_argument(
+        "--ssd-cache-dir",
+        type=str,
+        default=None,
+        help="Directory for SSD KV cache tier (default: disabled)",
+    )
+    serve_parser.add_argument(
+        "--ssd-cache-max-gb",
+        type=float,
+        default=10.0,
+        help="Maximum SSD cache size in GB (default: 10.0)",
     )
     serve_parser.add_argument(
         "--stream-interval",
