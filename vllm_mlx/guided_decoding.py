@@ -124,6 +124,28 @@ class GuidedDecodingFactory:
         # Outlines expects (input_ids: mx.array, logits: mx.array).
         return [_wrap_outlines_processor(processor)]
 
+    def build_raw_processors(
+        self,
+        response_format: Any | dict[str, Any] | None,
+    ) -> list[Any] | None:
+        """Build raw Outlines processors for serial stream_generate path.
+
+        The serial path in mlx-lm already handles token tracking and passes
+        (tokens: mx.array, logits: mx.array) — no wrapping needed.
+        """
+        schema = response_format_to_schema(response_format)
+        if schema is None:
+            return None
+
+        from outlines.backends import get_json_schema_logits_processor
+
+        processor = get_json_schema_logits_processor(
+            None,
+            self._outlines_model,
+            json.dumps(schema, separators=(",", ":"), ensure_ascii=False),
+        )
+        return [processor]
+
 
 def _wrap_outlines_processor(processor):
     """Adapt Outlines processor to BatchGenerator's (list, mx.array) interface.
@@ -138,16 +160,34 @@ def _wrap_outlines_processor(processor):
 
     def wrapped(token_ids, logits):
         nonlocal prompt_len
+        import logging
+
+        _log = logging.getLogger("vllm_mlx.guided_decoding")
         if isinstance(token_ids, list):
             if prompt_len is None:
-                # First call: token_ids is the prompt. Record its length
-                # and pass empty generated sequence to start the FSM.
                 prompt_len = len(token_ids)
-                generated = mx.array([], dtype=mx.int32)
-            else:
-                # Subsequent calls: slice off the prompt prefix
-                generated = mx.array(token_ids[prompt_len:])
-            token_ids = generated
-        return processor(token_ids, logits)
+                _log.info("Guided wrapper: prompt_len=%d", prompt_len)
+            generated = token_ids[prompt_len:]
+            _log.info(
+                "Guided wrapper: generated=%d tokens, first_few=%s",
+                len(generated),
+                generated[:5],
+            )
+            token_ids = (
+                mx.array(generated, dtype=mx.int32)
+                if generated
+                else mx.zeros((0,), dtype=mx.int32)
+            )
+        result = processor(token_ids, logits)
+        # Debug: check if masking is effective
+        if _log.isEnabledFor(logging.DEBUG):
+            import numpy as np
+
+            r = np.array(
+                result.tolist()[0] if len(result.shape) == 2 else result.tolist()
+            )
+            finite = np.isfinite(r)
+            _log.debug("Guided: %d/%d tokens allowed (non-inf)", finite.sum(), len(r))
+        return result
 
     return wrapped

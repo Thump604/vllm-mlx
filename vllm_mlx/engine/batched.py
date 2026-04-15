@@ -850,17 +850,12 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         images: list[str] | None = None,
         videos: list[str] | None = None,
-        response_format: Any | None = None,
     ) -> bool:
         """Gate the foundation scheduler to a safe canary subset."""
         if self._text_scheduler is None or self._text_model is None:
             return False
         if _has_any_media(messages, images, videos):
             return False
-        # Guided decoding requires BatchGenerator for logits_processors.
-        # Force text scheduler path even when canary is disabled.
-        if response_format is not None:
-            return True
         if not self._text_scheduler_route_enabled:
             return False
         return True
@@ -1806,7 +1801,6 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             images=images,
             videos=videos,
-            response_format=kwargs.get("response_format"),
         ):
             logger.info("Text-only request → TextBatchScheduler [non-streaming]")
             last_output = None
@@ -2085,7 +2079,6 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             images=images,
             videos=videos,
-            response_format=kwargs.get("response_format"),
         ):
             logger.info("Text-only request → TextBatchScheduler [streaming]")
             async for output in self._text_scheduler.submit(
@@ -2276,7 +2269,9 @@ class BatchedEngine(BaseEngine):
                     self._text_guided_factory = GuidedDecodingFactory(
                         self._text_model, self._text_tokenizer
                     )
-                guided_processors = self._text_guided_factory.build_processors(
+                # Use raw processors for serial stream_generate (it handles
+                # token tracking internally — no wrapper needed)
+                guided_processors = self._text_guided_factory.build_raw_processors(
                     response_format
                 )
                 if guided_processors:
