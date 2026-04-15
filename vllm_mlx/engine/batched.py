@@ -13,6 +13,7 @@ LLM engine), so text-only requests must also be routed through it.
 
 import asyncio
 import logging
+import time
 import os
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -233,6 +234,7 @@ class BatchedEngine(BaseEngine):
             specprefill_keep_pct: Fraction of tokens to keep (default 0.3)
         """
         self._model_name = model_name
+        self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
@@ -2655,6 +2657,7 @@ class BatchedEngine(BaseEngine):
         stats = {
             "engine_type": "batched",
             "model_name": self._model_name,
+            "uptime_seconds": time.time() - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
             "running": self._loaded,
