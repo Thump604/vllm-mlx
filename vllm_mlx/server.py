@@ -62,7 +62,12 @@ from pydantic import BaseModel
 # Import from new modular API
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
-from .api.anthropic_models import AnthropicRequest
+from .api.anthropic_models import (
+    AnthropicRequest,
+    AnthropicResponse,
+    AnthropicResponseContentBlock,
+    AnthropicUsage,
+)
 from .metrics import metrics as _metrics
 from .api.models import (
     AssistantMessage,  # noqa: F401
@@ -3451,6 +3456,17 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
 # =============================================================================
 # Anthropic Messages API Endpoints
 # =============================================================================
+
+
+def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
+    """Convert OpenAI finish_reason to Anthropic stop_reason."""
+    mapping = {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+        "content_filter": "end_turn",
+    }
+    return mapping.get(openai_reason or "", "end_turn")
 
 
 @app.post("/v1/messages")
