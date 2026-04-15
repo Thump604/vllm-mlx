@@ -54,6 +54,7 @@ from dataclasses import dataclass
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from fastapi.routing import Match
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -61,6 +62,7 @@ from pydantic import BaseModel
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
 from .api.anthropic_models import AnthropicRequest
+from .metrics import metrics as _metrics
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -437,6 +439,66 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     if not secrets.compare_digest(credentials.credentials, _api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
+
+
+def _metrics_result_from_status(status_code: int) -> str:
+    """Map HTTP-ish status codes to low-cardinality inference results."""
+    if status_code == 499:
+        return "client_closed"
+    if status_code == 504:
+        return "timeout"
+    if status_code >= 500:
+        return "error"
+    return "success"
+
+
+def _metrics_path_for_request(request: Request) -> str:
+    """Prefer route templates over raw URLs to keep metrics cardinality bounded."""
+    route = request.scope.get("route")
+    if route is not None:
+        path = getattr(route, "path", None)
+        if path:
+            return str(path)
+    for candidate in app.router.routes:
+        match, _ = candidate.matches(request.scope)
+        if match in (Match.FULL, Match.PARTIAL):
+            path = getattr(candidate, "path", None)
+            if path:
+                return str(path)
+    return "__unmatched__"
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Capture generic HTTP request metrics when enabled."""
+    if not _metrics.enabled:
+        return await call_next(request)
+
+    method = request.method
+    path = _metrics_path_for_request(request)
+    if path == "/metrics":
+        return await call_next(request)
+
+    start_time = time.perf_counter()
+    _metrics.observe_http_start(method=method, path=path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        _metrics.observe_http_finish(
+            method=method,
+            path=path,
+            status_code=500,
+            duration=time.perf_counter() - start_time,
+        )
+        raise
+
+    _metrics.observe_http_finish(
+        method=method,
+        path=path,
+        status_code=response.status_code,
+        duration=time.perf_counter() - start_time,
+    )
+    return response
 
 
 def get_engine() -> BaseEngine:
@@ -875,6 +937,19 @@ def _json_safe(value, depth: int = 0):
         except Exception:
             return repr(value)
     return repr(value)
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus scrape endpoint (disabled by default)."""
+    if not _metrics.enabled:
+        raise HTTPException(status_code=404, detail="Metrics endpoint is disabled")
+
+    payload, content_type = _metrics.render_metrics(
+        engine=_engine,
+        mcp_manager=_mcp_manager,
+    )
+    return Response(content=payload, headers={"Content-Type": content_type})
 
 
 @app.get("/health")
@@ -1539,6 +1614,18 @@ async def _wait_with_disconnect(
 )
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
+    tracker = _metrics.track_inference("completions", stream=request.stream)
+    try:
+        return await _create_completion_inner(request, raw_request, tracker)
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception:
+        tracker.finish(result="error")
+        raise
+
+
+async def _create_completion_inner(request, raw_request, tracker):
     model_ctx = await _acquire_request_model(request.model)
     engine = model_ctx.engine
 
@@ -1557,6 +1644,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
+    rep_penalty = request.repetition_penalty
+
     if request.stream:
         return StreamingResponse(
             _stream_with_model_context(
@@ -1566,7 +1655,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         engine,
                         prompts[0],
                         request,
-                        repetition_penalty=comp_rep_penalty,
+                        repetition_penalty=rep_penalty,
                     ),
                     raw_request,
                 ),
@@ -1593,8 +1682,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 "presence_penalty": request.presence_penalty or 0.0,
                 "stop": request.stop,
             }
-            if comp_rep_penalty is not None:
-                generate_kwargs["repetition_penalty"] = comp_rep_penalty
+            if rep_penalty is not None:
+                generate_kwargs["repetition_penalty"] = rep_penalty
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -1628,6 +1717,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
+    tracker.finish(
+        result="success",
+        prompt_tokens=total_prompt_tokens,
+        completion_tokens=total_completion_tokens,
+    )
     return CompletionResponse(
         model=model_ctx.model_name,
         choices=choices,
@@ -1685,6 +1779,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     }
     ```
     """
+    tracker = _metrics.track_inference("chat_completions", stream=request.stream)
+    try:
+        return await _create_chat_completion_inner(request, raw_request, tracker)
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception:
+        tracker.finish(result="error")
+        raise
+
+
+async def _create_chat_completion_inner(
+    request: ChatCompletionRequest, raw_request: Request, tracker
+):
     model_ctx = await _acquire_request_model(request.model)
     engine = model_ctx.engine
 
@@ -1816,20 +1924,32 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
     if request.stream:
-        return StreamingResponse(
-            _stream_with_model_context(
-                model_ctx,
-                _disconnect_guard(
-                    stream_chat_completion(
-                        engine,
-                        messages,
-                        request,
-                        model_ctx=model_ctx,
-                        **chat_kwargs,
+
+        async def _tracked_stream():
+            try:
+                async for chunk in _stream_with_model_context(
+                    model_ctx,
+                    _disconnect_guard(
+                        stream_chat_completion(
+                            engine,
+                            messages,
+                            request,
+                            model_ctx=model_ctx,
+                            **chat_kwargs,
+                        ),
+                        raw_request,
                     ),
-                    raw_request,
-                ),
-            ),
+                ):
+                    if not tracker._ttft_observed:
+                        tracker.observe_ttft()
+                    yield chunk
+                tracker.finish(result="success")
+            except Exception:
+                tracker.finish(result="error")
+                raise
+
+        return StreamingResponse(
+            _tracked_stream(),
             media_type="text/event-stream",
         )
 
@@ -1908,6 +2028,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
+    tracker.finish(
+        result="success",
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+    )
     return ChatCompletionResponse(
         model=model_ctx.model_name,
         choices=[
@@ -2399,6 +2524,18 @@ async def create_anthropic_message(
 
     Supports both streaming and non-streaming modes.
     """
+    tracker = _metrics.track_inference("anthropic_messages", stream=False)
+    try:
+        return await _create_anthropic_message_inner(request, tracker)
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception:
+        tracker.finish(result="error")
+        raise
+
+
+async def _create_anthropic_message_inner(request: Request, tracker):
     # Parse the raw body to handle Anthropic request format.
     # Some clients (e.g. Claude Code) may send JSON with invalid escape
     # sequences like \s, \d in regex patterns within tool definitions.
@@ -2570,6 +2707,11 @@ async def create_anthropic_message(
         "tool_calls" if tool_calls else output.finish_reason
     )
 
+    tracker.finish(
+        result="success",
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+    )
     anthropic_response = AnthropicResponse(
         model=model_ctx.model_name,
         content=content_blocks,
