@@ -3070,8 +3070,8 @@ def _responses_input_to_messages(request):
     return messages
 
 
-def _responses_tools_to_chat(tools):
-    """Translate Responses API tool format (flat) to chat completions format (nested)."""
+def _responses_tools_to_chat_STALE(tools):
+    """STALE — replaced by _responses_tools_to_chat_tools. Keeping temporarily to find cleanup boundary."""
     if not tools:
         return None
     result = []
@@ -3091,26 +3091,19 @@ def _responses_tools_to_chat(tools):
     return result or None
 
 
-@app.post(
-    "/v1/responses",
-    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
-)
-async def create_response(raw_request: Request):
-    """
-    OpenAI Responses API — translates to chat/completions internally.
-
-    Accepts the Responses API format (input, instructions, max_output_tokens)
-    and returns the Responses API response format (output items, output_text).
-    Supports both streaming and non-streaming.
-    """
+# REMOVED: stale create_response that was superseded by the proper
+# implementation below. The old version used wrong type names and
+# a manual chat translation instead of _run_responses_request.
+async def _create_response_STALE(raw_request: Request):
+    """STALE — replaced by the proper create_response below."""
     from .api.responses_models import (
-        ResponseFunctionCall,
+        ResponseFunctionCallItem as ResponseFunctionCall,
         ResponseObject,
-        ResponseOutputMessage,
-        ResponseOutputText,
+        ResponseMessageItem as ResponseOutputMessage,
+        ResponseTextContentPart as ResponseOutputText,
         ResponseReasoningItem,
         ResponsesRequest,
-        ResponseUsage,
+        ResponsesUsage as ResponseUsage,
     )
 
     body = await raw_request.json()
