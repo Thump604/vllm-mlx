@@ -134,6 +134,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .guided_decoding import uses_guided_decoding
+from .message_utils import _normalize_messages
 from .model_registry import (
     ModelLease,
     ModelManager,
@@ -3102,7 +3103,7 @@ async def create_response(raw_request: Request):
     and returns the Responses API response format (output items, output_text).
     Supports both streaming and non-streaming.
     """
-    from .api.models import (
+    from .api.responses_models import (
         ResponseFunctionCall,
         ResponseObject,
         ResponseOutputMessage,
