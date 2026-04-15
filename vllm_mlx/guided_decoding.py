@@ -126,12 +126,28 @@ class GuidedDecodingFactory:
 
 
 def _wrap_outlines_processor(processor):
-    """Adapt Outlines processor to BatchGenerator's (list, mx.array) interface."""
+    """Adapt Outlines processor to BatchGenerator's (list, mx.array) interface.
+
+    BatchGenerator passes the full token history (prompt + generated) but
+    Outlines' FSM expects only generated tokens. Track the prompt length
+    on the first call and slice subsequent calls to generated-only.
+    """
     import mlx.core as mx
 
+    prompt_len = None
+
     def wrapped(token_ids, logits):
+        nonlocal prompt_len
         if isinstance(token_ids, list):
-            token_ids = mx.array(token_ids)
+            if prompt_len is None:
+                # First call: token_ids is the prompt. Record its length
+                # and pass empty generated sequence to start the FSM.
+                prompt_len = len(token_ids)
+                generated = mx.array([], dtype=mx.int32)
+            else:
+                # Subsequent calls: slice off the prompt prefix
+                generated = mx.array(token_ids[prompt_len:])
+            token_ids = generated
         return processor(token_ids, logits)
 
     return wrapped
