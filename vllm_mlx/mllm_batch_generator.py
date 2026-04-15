@@ -520,8 +520,15 @@ class MLLMBatchGenerator:
         """Apply request-specific processors and sampler to one row of logits."""
         if request.logits_processors:
             context_tokens = self._request_context_tokens(request)
+            mx.eval(logits)
+            logger.info("SAMPLE-DBG: prompt=%d output=%d ctx=%d last=%s", len(request.prompt_token_ids or []), len(request.output_tokens), len(context_tokens), context_tokens[-1] if context_tokens else 'empty')
+            pre_top = logits.argmax().item()
             for processor in request.logits_processors:
                 logits = processor(context_tokens, logits)
+            mx.eval(logits)
+            post_top = logits.argmax().item()
+            finite = (logits > -1e30).sum().item()
+            logger.info("MLLM-LP: ctx=%d pre_top=%d post_top=%d finite=%d", len(context_tokens), pre_top, post_top, finite)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampler = request.sampler or self.sampler
@@ -1036,8 +1043,10 @@ class MLLMBatchGenerator:
                 last_logits = logits[:, -1, :]
                 sampled, logprobs = self._sample_request(specprefill_req, last_logits)
                 mx.eval(sampled, logprobs)
-                first_tokens.append(sampled.item())
+                first_token = sampled.item()
+                first_tokens.append(first_token)
                 all_logprobs.append(logprobs.squeeze(0))
+                specprefill_req.output_tokens.append(first_token)
 
             self._stats.prompt_time += time.perf_counter() - tic
             return (
@@ -1068,8 +1077,12 @@ class MLLMBatchGenerator:
 
                 mx.eval(sampled, logprobs)
 
-                first_tokens.append(sampled.item())
+                first_token = sampled.item()
+                first_tokens.append(first_token)
                 all_logprobs.append(logprobs.squeeze(0))
+                # Record prefill token so logits_processors see it in
+                # _request_context_tokens during the generation loop.
+                req.output_tokens.append(first_token)
 
             per_request_caches.append(request_cache)
 

@@ -180,33 +180,31 @@ def _wrap_outlines_processor(processor):
     import mlx.core as mx
 
     prompt_len = None
+    last_advanced_count = 0  # how many generated tokens we've advanced through
 
     def wrapped(token_ids, logits):
-        nonlocal prompt_len
+        nonlocal prompt_len, last_advanced_count
         if isinstance(token_ids, list):
             if prompt_len is None:
                 prompt_len = len(token_ids)
             generated = token_ids[prompt_len:]
-            if not generated:
-                # No generated tokens yet — first call does processor._setup
-                # via (1, 0) empty batch. Subsequent empty calls skip.
-                if processor.is_first_token:
-                    token_ids = mx.zeros((1, 0), dtype=mx.int32)
-                else:
-                    return logits
+            n_gen = len(generated)
+            if n_gen == 0:
+                # Prefill: initialize FSM
+                token_ids = mx.zeros((1, 0), dtype=mx.int32)
+            elif n_gen <= last_advanced_count:
+                # No NEW tokens since last advance — re-apply current mask
+                # without advancing. Use bias_logits directly.
+                mx.eval(logits)
+                return processor.bias_logits(1, logits)
             else:
-                # Only pass the LAST generated token (processor is stateful)
-                token_ids = mx.array([generated[-1]], dtype=mx.int32)[None, :]
+                # Advance with only the tokens we haven't seen yet
+                new_tokens = generated[last_advanced_count:]
+                last_advanced_count = n_gen
+                token_ids = mx.array(new_tokens, dtype=mx.int32)[None, :]
+        mx.eval(logits)
         result = processor(token_ids, logits)
-        # Debug: check if masking is effective
-        if _log.isEnabledFor(logging.DEBUG):
-            import numpy as np
-
-            r = np.array(
-                result.tolist()[0] if len(result.shape) == 2 else result.tolist()
-            )
-            finite = np.isfinite(r)
-            _log.debug("Guided: %d/%d tokens allowed (non-inf)", finite.sum(), len(r))
+        mx.eval(result)
         return result
 
     return wrapped
@@ -242,7 +240,9 @@ def _wrap_outlines_serial(processor, allowed_initial_tokens: list[int]):
         if n_generated <= 0:
             return logits
 
-        generated = token_ids[:, prompt_len:]
-        return processor(generated, logits)
+        # Only pass the LAST generated token — processor advances
+        # its internal Guide state incrementally, one token at a time.
+        last_tok = token_ids[:, -1:]
+        return processor(last_tok, logits)
 
     return wrapped
