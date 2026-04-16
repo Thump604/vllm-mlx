@@ -1202,6 +1202,10 @@ async def _run_responses_request(
     """Execute a Responses API request against the backend chat engine."""
     engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
 
+    # Request raw output so reasoning/tool parsers see unstripped text.
+    # The server applies clean_output_text() itself after parsing.
+    chat_kwargs["raw_output"] = True
+
     timeout = _default_timeout
     output = await _wait_with_disconnect(
         engine.chat(messages=messages, **chat_kwargs),
@@ -1651,7 +1655,6 @@ def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
         else json.dumps(payload)
     )
     return f"event: {event_type}\ndata: {data}\n\n"
-
 
 
 def _detect_native_tool_support(profile: ServingProfile) -> bool:
@@ -2886,6 +2889,9 @@ async def _create_chat_completion_inner(
         )
 
     # Non-streaming response with timing and timeout
+    # Request raw output so reasoning/tool parsers see unstripped text.
+    chat_kwargs["raw_output"] = True
+
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
@@ -3580,6 +3586,9 @@ async def _create_anthropic_message_inner(request: Request, tracker):
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Request raw output so reasoning/tool parsers see unstripped text.
+    chat_kwargs["raw_output"] = True
 
     start_time = time.perf_counter()
     timeout = _default_timeout

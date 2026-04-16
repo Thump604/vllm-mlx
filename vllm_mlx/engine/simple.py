@@ -293,6 +293,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        raw_output = bool(kwargs.pop("raw_output", False))
+
         last_output: GenerationOutput | None = None
         async for output in self.stream_generate(
             prompt=prompt,
@@ -307,7 +309,7 @@ class SimpleEngine(BaseEngine):
         if last_output is None:
             return GenerationOutput(text="", finish_reason="stop")
 
-        text = clean_output_text(last_output.text)
+        text = last_output.text if raw_output else clean_output_text(last_output.text)
         return GenerationOutput(
             text=text,
             tokens=list(last_output.tokens),
@@ -507,7 +509,11 @@ class SimpleEngine(BaseEngine):
                 **stream_kwargs,
             ):
                 final_output = output
-            text = clean_output_text(final_output.text)
+            text = (
+                final_output.text
+                if raw_output
+                else clean_output_text(final_output.text)
+            )
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -573,6 +579,11 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        # Accept raw_output so it doesn't leak into sub-calls via **kwargs.
+        # stream_chat already yields raw text; the flag is consumed here for
+        # API consistency with chat() / generate().
+        kwargs.pop("raw_output", None)
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
 
