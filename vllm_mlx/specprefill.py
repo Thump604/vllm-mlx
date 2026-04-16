@@ -882,6 +882,7 @@ def sparse_prefill(
             chunk = min(step_size, n - processed - 1)
             model(prompt[processed : processed + chunk][None], cache=cache)
             mx.eval([c.state for c in cache])
+            mx.synchronize()
             processed += chunk
             mx.clear_cache()
 
