@@ -116,6 +116,25 @@ class Gemma4ReasoningParser(ReasoningParser):
         self._in_reasoning = False
         self._stream_plain_pending = ""
 
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Flush any buffered partial-control-token text at end of stream.
+
+        When the plain-content streaming path holds back a partial control
+        token suffix (e.g. a trailing ``<|chan`` that might complete into
+        ``<|channel>``), finalize emits it so the client doesn't lose text.
+        """
+        if not self._stream_plain_pending:
+            return None
+        pending = self._stream_plain_pending
+        self._stream_plain_pending = ""
+        # Clean any control tokens that happen to be in the pending text
+        content = _CONTROL_TOKEN_RE.sub("", pending)
+        content = _CONTROL_LINE_RE.sub("", content)
+        content = _INLINE_THOUGHT_SUFFIX_RE.sub("", content)
+        if not content:
+            return None
+        return DeltaMessage(content=content)
+
     def _extract_reasoning_prefixed(
         self,
         text: str,

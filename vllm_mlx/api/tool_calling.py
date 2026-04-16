@@ -22,6 +22,34 @@ from ..guided_decoding import normalize_response_format
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 
+def _looks_like_tool_call(obj: Any) -> bool:
+    """
+    Heuristic: decide whether a parsed JSON object really represents a tool
+    call as opposed to user data that happens to carry a ``"name"`` field.
+
+    The OpenAI tool-call wire format ALWAYS has both ``"name"`` and
+    ``"arguments"``. Accepting bare ``{"name": ...}`` (previous behaviour)
+    caused ``response_format={"type": "json_schema"}`` payloads with a
+    ``name`` field to be hijacked as fake tool calls (observed on
+    MiniMax-M2: ``{"name": "John", "age": 25}`` -> ``function.name="John"``).
+
+    Args:
+        obj: Parsed JSON object.
+
+    Returns:
+        True if obj looks like a tool call, False otherwise.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if "name" not in obj or "arguments" not in obj:
+        return False
+    if not isinstance(obj["name"], str) or not obj["name"]:
+        return False
+    # ``arguments`` must be a JSON-encoded string or a dict per OpenAI spec.
+    args = obj["arguments"]
+    return isinstance(args, (dict, str))
+
+
 def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     """
     Parse raw JSON tool calls from model output.
@@ -30,6 +58,9 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     - Single JSON object: {"name": "func", "arguments": {...}}
     - Multiple objects separated by commas: {...}, {...}
     - JSON array: [{...}, {...}]
+
+    Only accepts objects that carry both ``name`` AND ``arguments`` fields
+    to avoid hijacking user data emitted via ``response_format``.
 
     Args:
         text: Raw model output text
@@ -46,11 +77,13 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     if text.startswith("["):
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list) and all(
-                isinstance(item, dict) and "name" in item for item in parsed
+            if (
+                isinstance(parsed, list)
+                and parsed
+                and all(_looks_like_tool_call(item) for item in parsed)
             ):
                 return [
-                    {"name": item["name"], "arguments": item.get("arguments", {})}
+                    {"name": item["name"], "arguments": item["arguments"]}
                     for item in parsed
                 ]
         except json.JSONDecodeError:
@@ -72,9 +105,9 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
                 json_str = text[start : i + 1]
                 try:
                     obj = json.loads(json_str)
-                    if isinstance(obj, dict) and "name" in obj:
+                    if _looks_like_tool_call(obj):
                         tool_calls.append(
-                            {"name": obj["name"], "arguments": obj.get("arguments", {})}
+                            {"name": obj["name"], "arguments": obj["arguments"]}
                         )
                 except json.JSONDecodeError:
                     pass
@@ -239,8 +272,13 @@ def parse_tool_calls(
     # The user may want to see the model's reasoning process
 
     # Fallback: Raw JSON tool calls (lowest priority)
-    # Only try if no other formats matched
-    if not tool_calls:
+    # Only try if no other formats matched AND the caller actually asked for
+    # tools. When ``tools`` is not set, a bare JSON response is user data
+    # (e.g. from ``response_format``), not a tool invocation -- the fallback
+    # would otherwise hijack ``{"name": "John", ...}`` into a fake
+    # ``function.name="John"`` tool call (observed on MiniMax-M2).
+    tools_requested = bool(request and request.get("tools"))
+    if not tool_calls and tools_requested:
         raw_json_calls = _parse_raw_json_tool_calls(cleaned_text)
         if raw_json_calls:
             for call_data in raw_json_calls:
@@ -369,14 +407,145 @@ def validate_json_schema(
         return False, str(e.message)
 
 
+def _scan_balanced_json(text: str, start: int) -> Optional[str]:
+    """
+    Walk forward from ``start`` (which must point at ``{`` or ``[``) and
+    return the substring that represents the first balanced JSON value,
+    respecting strings and escapes. Returns ``None`` if the opening bracket
+    is never closed (truncated output).
+    """
+    if start < 0 or start >= len(text):
+        return None
+    opener = text[start]
+    if opener not in "{[":
+        return None
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _repair_truncated_json(fragment: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempt to parse a JSON fragment whose closing brackets were cut off
+    (e.g. because the model hit ``max_tokens`` mid-object).
+
+    Strategy: scan once to determine the open-bracket stack and whether we
+    ended mid-string, then try a handful of repair candidates in order of
+    likelihood:
+
+      1. Close unterminated string, close brackets.
+      2. Also strip a dangling ``,`` / ``:`` before closing.
+      3. Also drop a dangling key (``"k":`` or bare ``"k"``) before closing.
+      4. Drop a dangling partial token (number / true / fals / nul) before
+         closing.
+
+    Returns the first candidate that ``json.loads`` accepts, or ``None``.
+    """
+    if not fragment:
+        return None
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in fragment:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack and (
+                (ch == "}" and stack[-1] == "{") or (ch == "]" and stack[-1] == "[")
+            ):
+                stack.pop()
+    if not stack and not in_string:
+        return None  # Nothing to repair -- caller already tried json.loads.
+
+    def _close(text: str) -> str:
+        for opener in reversed(stack):
+            text += "}" if opener == "{" else "]"
+        return text
+
+    # Base: close unterminated string if any.
+    base = fragment
+    if in_string:
+        if escape:
+            base = base[:-1]  # drop trailing backslash so closing quote sticks
+        base += '"'
+
+    candidates: list[str] = []
+
+    # 1. Close brackets directly.
+    candidates.append(_close(base))
+
+    # 2. Strip a dangling separator (trailing ``,`` / ``:`` / whitespace).
+    stripped_sep = re.sub(r"[,:\s]+$", "", base)
+    if stripped_sep != base:
+        candidates.append(_close(stripped_sep))
+
+    # 3. Drop a dangling key (``"k":`` or bare ``"k"``) inside an object.
+    if stack and stack[-1] == "{":
+        no_key = re.sub(r',?\s*"[^"]*"\s*:?\s*$', "", stripped_sep)
+        if no_key != stripped_sep:
+            candidates.append(_close(no_key))
+
+    # 4. Drop a dangling partial scalar (number / keyword / literal).
+    no_scalar = re.sub(
+        r",?\s*(?:-?\d+(?:\.\d*)?(?:[eE][+-]?\d*)?|t|tr|tru|f|fa|fal|fals|n|nu|nul)$",
+        "",
+        stripped_sep,
+    )
+    if no_scalar != stripped_sep:
+        candidates.append(_close(no_scalar))
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
     Extract JSON from model output text.
 
-    Tries multiple strategies:
+    Tries multiple strategies, in order of specificity:
+
     1. Parse entire text as JSON
-    2. Extract JSON from markdown code blocks
-    3. Find JSON object/array in text
+    2. Extract JSON from complete markdown code blocks (``` ... ```)
+    3. Extract JSON from an unterminated markdown code block (``` json\\n{ ... )
+       -- handles the common "chatty + truncation" failure mode where the
+       model starts a ```json fence, never closes it, then hits max_tokens.
+    4. Balanced-brace scan for the first ``{`` or ``[`` in the text
+    5. Repair truncated JSON by closing unclosed brackets/strings
 
     Args:
         text: Raw model output text
@@ -392,7 +561,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: Extract from markdown code blocks
+    # Strategy 2: Extract from complete markdown code blocks
     # Match ```json ... ``` or ``` ... ```
     code_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     matches = re.findall(code_block_pattern, text)
@@ -402,21 +571,172 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             continue
 
-    # Strategy 3: Find JSON object or array in text
-    # Look for { ... } or [ ... ]
-    json_patterns = [
-        r"(\{[\s\S]*\})",  # Object
-        r"(\[[\s\S]*\])",  # Array
-    ]
-    for pattern in json_patterns:
-        match = re.search(pattern, text)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
+    # Strategy 3: Unterminated markdown fence -- take everything after the
+    # last ``` opener. Common truncation case for chatty models.
+    unterminated_fence = re.search(r"```(?:json)?\s*\n?([\s\S]*)$", text)
+    fenced_candidate: Optional[str] = None
+    if unterminated_fence:
+        fenced_candidate = unterminated_fence.group(1).strip()
+        # Drop a trailing ``` if it slipped through the greedy match.
+        if fenced_candidate.endswith("```"):
+            fenced_candidate = fenced_candidate[:-3].strip()
+        try:
+            return json.loads(fenced_candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: Balanced-brace scan for the first JSON value anywhere.
+    # Preserves correctness better than a greedy regex (which would grab
+    # everything between the first ``{`` and the last ``}``).
+    for opener in ("{", "["):
+        idx = text.find(opener)
+        while idx != -1:
+            candidate = _scan_balanced_json(text, idx)
+            if candidate is not None:
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            idx = text.find(opener, idx + 1)
+
+    # Strategy 5: Repair a truncated JSON prefix. Try the fenced candidate
+    # first (usually starts right at ``{``), then fall back to the earliest
+    # ``{``/``[`` in the full text.
+    candidates = []
+    if fenced_candidate:
+        candidates.append(fenced_candidate)
+    for opener in ("{", "["):
+        idx = text.find(opener)
+        if idx != -1:
+            candidates.append(text[idx:])
+    for fragment in candidates:
+        repaired = _repair_truncated_json(fragment)
+        if repaired is not None:
+            return repaired
 
     return None
+
+
+class StreamingJsonFenceStripper:
+    """Strip markdown code fences from streamed content when response_format is set.
+
+    Without guided decoding, chat models often wrap their JSON output in markdown
+    fences (```json ... ```) even when the system prompt says not to. The non-
+    streaming path strips those via ``extract_json_from_text`` / ``parse_json_output``,
+    but the streaming path used to emit the raw deltas, so clients got
+    ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
+    their structured output in markdown (e.g. Gemma 4).
+
+    This filter buffers just enough text to detect:
+      * a leading fence like ``"```"``, ``"```json"``, ``"```\\n"`` or
+        ``"```json\\n"`` (with optional leading whitespace), possibly split
+        across SSE deltas, and
+      * a trailing fence like ``"```"`` or ``"\\n```\\n"`` on stream end.
+
+    Leading-whitespace and leading fences are consumed; trailing fences are
+    dropped in :meth:`finalize`. Non-fenced content passes through with at most
+    a ``_TAIL_HOLDBACK``-char delay.
+    """
+
+    # Opening fence forms to strip, longest first (longest match wins).
+    _OPENINGS = ("```json\n", "```json", "```\n", "```")
+    # Characters held back at the tail to detect a trailing fence across deltas.
+    # 5 covers ``"\n```\n"``.
+    _TAIL_HOLDBACK = 5
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._past_opening: bool = False
+
+    def feed(self, delta: str) -> str:
+        """Append a content delta and return the portion safe to emit now."""
+        if not delta:
+            return ""
+
+        self._buf += delta
+
+        if not self._past_opening:
+            ls = self._buf.lstrip()
+            if not ls:
+                # Still only whitespace -- wait for content.
+                return ""
+
+            # If ``ls`` is a strict prefix of any opening (shorter than the
+            # opening), the rest of the fence might still arrive in the next
+            # delta -- keep buffering.
+            for opening in self._OPENINGS:
+                if len(ls) < len(opening) and opening.startswith(ls):
+                    return ""
+
+            # Try to match a complete opening fence (longest first).
+            matched: Optional[str] = None
+            for opening in self._OPENINGS:
+                if ls.startswith(opening):
+                    matched = opening
+                    break
+
+            if matched is not None:
+                # Drop the fence and any immediate whitespace that followed.
+                self._buf = ls[len(matched) :].lstrip()
+            else:
+                # Not a fence -- keep the stripped text.
+                self._buf = ls
+            self._past_opening = True
+
+        # Dynamic holdback: walk backwards across any trailing whitespace and
+        # backticks so a closing fence cannot straddle the emit boundary, and
+        # additionally keep at least ``_TAIL_HOLDBACK`` chars to absorb fences
+        # that span delta boundaries.
+        buf = self._buf
+        i = len(buf)
+        while i > 0 and (buf[i - 1] == "`" or buf[i - 1].isspace()):
+            i -= 1
+        safe_end = min(i, len(buf) - self._TAIL_HOLDBACK)
+        if safe_end <= 0:
+            return ""
+
+        to_emit = buf[:safe_end]
+        self._buf = buf[safe_end:]
+        return to_emit
+
+    def finalize(self) -> str:
+        """Flush the remaining buffer, dropping any trailing fence."""
+        tail = self._buf
+        self._buf = ""
+        if not tail:
+            return ""
+
+        if not self._past_opening:
+            # Stream ended before we ever transitioned past the (potential)
+            # opening -- either drop a strict-prefix fence that never finished
+            # arriving, or strip a complete leading fence.
+            ls = tail.lstrip()
+            # Check strict-prefix FIRST: ``"```js"`` is a prefix of
+            # ``"```json\n"`` and should be dropped entirely rather than
+            # partially matched by the bare ``"```"`` opening.
+            is_partial_prefix = False
+            for opening in self._OPENINGS:
+                if len(ls) < len(opening) and opening.startswith(ls):
+                    is_partial_prefix = True
+                    break
+            if is_partial_prefix:
+                ls = ""
+            else:
+                matched: Optional[str] = None
+                for opening in self._OPENINGS:
+                    if ls.startswith(opening):
+                        matched = opening
+                        break
+                if matched is not None:
+                    ls = ls[len(matched) :].lstrip()
+            tail = ls
+            self._past_opening = True
+
+        stripped = tail.rstrip()
+        for closing in ("\n```", "```"):
+            if stripped.endswith(closing):
+                return stripped[: -len(closing)].rstrip()
+        return tail
 
 
 def parse_json_output(
@@ -501,10 +821,19 @@ def build_json_system_prompt(
     if format_type == "text":
         return None
 
+    strict_rules = (
+        "Output rules (STRICT):\n"
+        "- Your first character MUST be `{` (or `[`).\n"
+        "- Your last character MUST be `}` (or `]`).\n"
+        "- Do NOT wrap the JSON in a markdown code block (no ``` fences).\n"
+        "- Do NOT prepend any preamble such as "
+        '"Here is the JSON" or "Let me format this".\n'
+        "- Do NOT include comments, trailing explanations, or chain-of-thought.\n"
+    )
+
     if format_type == "json_object":
         return (
-            "You must respond with valid JSON only. "
-            "Do not include any explanation or text outside the JSON object."
+            "You must respond with a single valid JSON value only.\n\n" + strict_rules
         )
 
     if format_type == "json_schema":
@@ -513,13 +842,11 @@ def build_json_system_prompt(
         name = json_schema_spec.get("name", "response")
         description = json_schema_spec.get("description", "")
 
-        prompt = f"You must respond with valid JSON matching the '{name}' schema."
+        prompt = f"You must respond with a single valid JSON value matching the '{name}' schema."
         if description:
             prompt += f" {description}"
-        prompt += (
-            f"\n\nJSON Schema:\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-            "Respond with only the JSON object, no additional text or explanation."
-        )
+        prompt += f"\n\nJSON Schema:\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
+        prompt += strict_rules
         return prompt
 
     return None
