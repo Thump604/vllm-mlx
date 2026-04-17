@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field, computed_field
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -196,16 +196,11 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
-
-    @computed_field
-    @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
 
 
 class ChatCompletionChoice(BaseModel):
@@ -444,24 +439,16 @@ class EmbeddingResponse(BaseModel):
 class ChatCompletionChunkDelta(BaseModel):
     """Delta content in a streaming chunk.
 
-    Note: reasoning/reasoning_content are excluded when None so that
-    clients using @ai-sdk/openai-compatible (OpenCode, Kilo) don't choke
-    on unknown fields.  When reasoning IS present, both ``reasoning`` and
-    ``reasoning_content`` appear in the JSON for backwards compatibility.
+    Note: reasoning_content is excluded when None so that clients using
+    @ai-sdk/openai-compatible (OpenCode, Kilo) don't choke on unknown
+    fields.  Only ``reasoning_content`` is emitted (not a separate
+    ``reasoning`` field) for OpenAI SDK compatibility.
     """
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
-    )
+    reasoning_content: str | None = None
     tool_calls: list[dict] | None = None
-
-    @computed_field
-    @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field."""
-        return self.reasoning
 
 
 class ChatCompletionChunkChoice(BaseModel):

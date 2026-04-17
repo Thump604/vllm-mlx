@@ -3011,7 +3011,7 @@ async def _create_chat_completion_inner(
             ChatCompletionChoice(
                 message=AssistantMessage(
                     content=clean_output_text(cleaned_text) if cleaned_text else None,
-                    reasoning=reasoning_text,
+                    reasoning_content=reasoning_text,
                     tool_calls=tool_calls,
                 ),
                 finish_reason=finish_reason,
@@ -4285,7 +4285,7 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            reasoning=reasoning,
+                                            reasoning_content=reasoning,
                                         ),
                                         finish_reason=(
                                             output.finish_reason
@@ -4308,7 +4308,7 @@ async def stream_chat_completion(
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
                                         tool_calls=tool_result["tool_calls"],
-                                        reasoning=reasoning,
+                                        reasoning_content=reasoning,
                                     ),
                                     finish_reason=(
                                         "tool_calls" if output.finished else None
@@ -4340,7 +4340,7 @@ async def stream_chat_completion(
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
                             content=content_delta if content_delta else None,
-                            reasoning=reasoning,
+                            reasoning_content=reasoning,
                         ),
                         finish_reason=(
                             "tool_calls"

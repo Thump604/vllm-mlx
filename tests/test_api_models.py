@@ -300,15 +300,22 @@ class TestChatCompletion:
     def test_assistant_message_reasoning(self):
         msg = AssistantMessage(
             content="The answer is 42.",
-            reasoning="I thought about it carefully.",
+            reasoning_content="I thought about it carefully.",
         )
         assert msg.content == "The answer is 42."
-        assert msg.reasoning == "I thought about it carefully."
         assert msg.reasoning_content == "I thought about it carefully."
+        # Only reasoning_content should appear in serialized output
+        d = msg.model_dump(exclude_none=True)
+        assert "reasoning_content" in d
+        assert "reasoning" not in d
+
+    def test_assistant_message_reasoning_via_alias(self):
+        """Accept reasoning= as input alias for backwards compat."""
+        msg = AssistantMessage(reasoning="via alias")
+        assert msg.reasoning_content == "via alias"
 
     def test_assistant_message_no_reasoning(self):
         msg = AssistantMessage(content="Hello")
-        assert msg.reasoning is None
         assert msg.reasoning_content is None
 
     def test_assistant_message_with_tool_calls(self):
@@ -585,9 +592,12 @@ class TestStreamingModels:
         assert delta.content is None
 
     def test_chunk_delta_reasoning(self):
-        delta = ChatCompletionChunkDelta(reasoning="thinking...")
-        assert delta.reasoning == "thinking..."
+        delta = ChatCompletionChunkDelta(reasoning_content="thinking...")
         assert delta.reasoning_content == "thinking..."
+        # Only reasoning_content should appear in serialized output
+        d = delta.model_dump(exclude_none=True)
+        assert "reasoning_content" in d
+        assert "reasoning" not in d
 
     def test_chunk_delta_tool_calls(self):
         delta = ChatCompletionChunkDelta(
@@ -641,10 +651,10 @@ class TestModelSerialization:
     """Tests for model serialization (model_dump / JSON)."""
 
     def test_assistant_message_serializes_reasoning_content(self):
-        msg = AssistantMessage(content="Answer", reasoning="Thought")
-        data = msg.model_dump()
+        msg = AssistantMessage(content="Answer", reasoning_content="Thought")
+        data = msg.model_dump(exclude_none=True)
         assert data["reasoning_content"] == "Thought"
-        assert data["reasoning"] == "Thought"
+        assert "reasoning" not in data  # Only reasoning_content in output
 
     def test_chat_completion_response_json(self):
         resp = ChatCompletionResponse(
@@ -660,9 +670,10 @@ class TestModelSerialization:
         assert "Hi!" in json_str
 
     def test_chunk_delta_serializes_reasoning_content(self):
-        delta = ChatCompletionChunkDelta(reasoning="thinking")
-        data = delta.model_dump()
+        delta = ChatCompletionChunkDelta(reasoning_content="thinking")
+        data = delta.model_dump(exclude_none=True)
         assert data["reasoning_content"] == "thinking"
+        assert "reasoning" not in data  # Only reasoning_content in output
 
     def test_response_format_json_schema_alias(self):
         schema = ResponseFormatJsonSchema(

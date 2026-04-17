@@ -69,10 +69,10 @@ def emit_shell_vars(registry_path: str, state_path: str) -> None:
     preset = resolved.model_preset
     sp = model.serving_profile
 
-    # The model source is an absolute path — extract the directory name
-    # (the mode.json reader uses a relative name under MODELS_ROOT)
-    source_path = Path(model.source)
-    mode_model = source_path.name if source_path.is_absolute() else model.source
+    # Preserve the full model source path so the launcher can resolve it
+    # directly.  The old mode.json reader uses basename under MODELS_ROOT,
+    # but the registry contract allows arbitrary absolute paths.
+    mode_model = model.source
 
     # Served model name is the registry ID
     served_name = model.id
@@ -104,10 +104,7 @@ def emit_shell_vars(registry_path: str, state_path: str) -> None:
     sp_keep_pct = specprefill.keep_pct if specprefill else None
     sp_draft = None
     if model.draft_model is not None:
-        draft_path = Path(model.draft_model.source)
-        sp_draft = (
-            draft_path.name if draft_path.is_absolute() else model.draft_model.source
-        )
+        sp_draft = model.draft_model.source
 
     # Sampling from preset (if set)
     mode_temp = None
