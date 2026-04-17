@@ -174,6 +174,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Enable/disable thinking mode (also accepted in chat_template_kwargs)
+    enable_thinking: bool | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters

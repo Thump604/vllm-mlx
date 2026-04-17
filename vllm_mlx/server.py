@@ -213,6 +213,9 @@ def _resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, o
         merged.update(extra_kwargs)
     if request.chat_template_kwargs:
         merged.update(request.chat_template_kwargs)
+    # Top-level enable_thinking takes precedence (client SDK compat)
+    if request.enable_thinking is not None and "enable_thinking" not in merged:
+        merged["enable_thinking"] = request.enable_thinking
     return merged
 
 
