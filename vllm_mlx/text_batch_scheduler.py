@@ -25,7 +25,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, List, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator, SequenceStateMachine
@@ -77,6 +77,7 @@ class RequestState:
     stop: list[str] = field(default_factory=list)
     stop_token_ids: list[int] = field(default_factory=list)
     response_format: Any = None
+    logits_processors: Optional[List[Callable]] = None
     uid: Optional[int] = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -258,6 +259,7 @@ class TextBatchScheduler:
         repetition_penalty = float(kwargs.pop("repetition_penalty", 1.0) or 1.0)
         frequency_penalty = float(kwargs.pop("frequency_penalty", 0.0) or 0.0)
         response_format = kwargs.pop("response_format", None)
+        logits_processors = kwargs.pop("logits_processors", None)
 
         chat_template_kwargs = kwargs.pop("chat_template_kwargs", None)
         prompt = self._apply_chat_template(
@@ -286,6 +288,7 @@ class TextBatchScheduler:
             stop=stop_list,
             stop_token_ids=list(stop_token_ids),
             response_format=response_format,
+            logits_processors=list(logits_processors) if logits_processors else None,
         )
         self.requests[request_id] = state
 
@@ -636,36 +639,9 @@ class TextBatchScheduler:
                 state.frequency_penalty if state.frequency_penalty != 0.0 else None
             ),
         )
-        if state.response_format is not None:
-            guided = self._get_guided_decoding_factory().build_processors(
-                state.response_format
-            )
-            if guided:
-                processors = (processors or []) + guided
+        if state.logits_processors:
+            processors = (processors or []) + list(state.logits_processors)
         return processors
-
-    def _get_guided_decoding_factory(self):
-        """Lazily initialize guided decoding for the text batch scheduler."""
-        if (
-            not hasattr(self, "_guided_decoding_factory")
-            or self._guided_decoding_factory is None
-        ):
-            from .guided_decoding import GuidedDecodingFactory
-
-            # Outlines MLXLM expects a full HF PreTrainedTokenizer with
-            # eos_token_id, eos_token, all_special_tokens on its _tokenizer
-            # backend. Load a fresh HF tokenizer from model path to guarantee
-            # compatibility — this only loads tokenizer files, not weights.
-            if self._model_path:
-                from transformers import AutoTokenizer
-
-                tok = AutoTokenizer.from_pretrained(
-                    self._model_path, trust_remote_code=True
-                )
-            else:
-                tok = self.tokenizer
-            self._guided_decoding_factory = GuidedDecodingFactory(self.model, tok)
-        return self._guided_decoding_factory
 
     def _build_state_machine(
         self, state: RequestState

@@ -2223,6 +2223,7 @@ class BatchedEngine(BaseEngine):
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
         response_format = kwargs.pop("response_format", None)
+        guided_processors = kwargs.pop("logits_processors", None) or None
 
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
@@ -2262,29 +2263,8 @@ class BatchedEngine(BaseEngine):
                 messages, **template_kwargs
             )
 
-        # Build sampler and guided decoding processors
+        # Build sampler; guided_processors are injected by server.py via logits_processors
         sampler = make_sampler(temp=temperature, top_p=top_p)
-        guided_processors = None
-        if response_format is not None:
-            try:
-                from ..guided_decoding import GuidedDecodingFactory
-
-                if not hasattr(self, "_text_guided_factory"):
-                    self._text_guided_factory = GuidedDecodingFactory(
-                        self._text_model, self._text_tokenizer
-                    )
-                # Use raw processors for serial stream_generate (it handles
-                # token tracking internally — no wrapper needed)
-                guided_processors = self._text_guided_factory.build_serial_processors(
-                    response_format
-                )
-                if guided_processors:
-                    logger.info(
-                        "Guided decoding active: %d processors for response_format",
-                        len(guided_processors),
-                    )
-            except Exception as exc:
-                logger.warning("Failed to build guided decoding processors: %s", exc)
         max_tokens = max_tokens or 4096
 
         # Check MTP support — used by all generation paths below
