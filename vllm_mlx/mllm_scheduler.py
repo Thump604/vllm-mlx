@@ -377,7 +377,9 @@ class MLLMScheduler:
             temperature: Sampling temperature
             top_p: Top-p sampling
             request_id: Optional custom request ID
-            **kwargs: Additional generation parameters
+            **kwargs: Additional generation parameters.  ``logits_processors``
+                — list of callables ``(tokens, logits) -> logits`` applied
+                during sampling (e.g. constrained JSON decoding).
 
         Returns:
             Request ID for tracking
@@ -400,6 +402,7 @@ class MLLMScheduler:
             stop=stop,
             stop_token_ids=list(kwargs.get("stop_token_ids") or []),
             response_format=kwargs.get("response_format", None),
+            logits_processors=kwargs.get("logits_processors", None),
         )
 
         request = MLLMRequest(
@@ -516,6 +519,7 @@ class MLLMScheduler:
                 logits_processors=(
                     (_build_logits_processors(request.sampling_params) or [])
                     + (self._build_request_logits_processors(request.sampling_params) or [])
+                    + (request.sampling_params.logits_processors or [])
                 ) or None,
             )
             batch_requests.append(batch_req)

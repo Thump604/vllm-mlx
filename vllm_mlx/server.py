@@ -139,7 +139,7 @@ from .api.utils import (
     is_mllm_model,  # noqa: F401
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
-from .guided_decoding import uses_guided_decoding
+from .api.tool_calling import build_json_logits_processor
 from .message_utils import _normalize_messages
 from .model_registry import (
     ModelLease,
@@ -350,13 +350,18 @@ def _get_cache_dir() -> str:
     return cache_dir
 
 
-def _should_use_guided_decoding(request: ChatCompletionRequest) -> bool:
-    """Return True when structured output should use token-level guidance."""
-    if request.response_format is None:
-        return False
-    if request.tools and request.tool_choice != "none":
-        return False
-    return uses_guided_decoding(request.response_format)
+def _get_engine_tokenizer(engine) -> object | None:
+    """Return the tokenizer backing ``engine``, if exposed.
+
+    Different engine classes store the tokenizer under different attributes.
+    We try the common ones and return ``None`` if nothing matches, so that
+    optional features like constrained decoding can degrade gracefully.
+    """
+    for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
+        tok = getattr(engine, attr, None)
+        if tok is not None:
+            return tok
+    return None
 
 
 async def lifespan(app: FastAPI):
@@ -2794,18 +2799,36 @@ async def _create_chat_completion_inner(
             if has_media:
                 break
 
-    # Handle response_format. Use true token-level guided decoding when
-    # tools are not active; otherwise keep the prompt-instruction fallback.
+    # Handle response_format — inject system prompt and optionally build a
+    # grammar-guided logits processor for token-level constrained decoding.
     response_format = request.response_format
-    try:
-        guided_decoding = _should_use_guided_decoding(request)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    if response_format and not guided_decoding:
+    json_logits_processor = None
+    if response_format:
         json_instruction = build_json_system_prompt(response_format)
         if json_instruction:
-            # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
+
+        # Build constrained-decoding logits processor when tools are not
+        # active (tool markup cannot comply with a JSON grammar).
+        if not (request.tools and request.tool_choice != "none"):
+            tokenizer_obj = _get_engine_tokenizer(engine)
+            if tokenizer_obj is not None:
+                try:
+                    json_logits_processor = build_json_logits_processor(
+                        response_format, tokenizer_obj
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to build JSON logits processor: %s", exc)
+                    json_logits_processor = None
+                if json_logits_processor is not None:
+                    logger.info(
+                        "Constrained decoding enabled for response_format.type=%s",
+                        (
+                            getattr(response_format, "type", None)
+                            if not isinstance(response_format, dict)
+                            else response_format.get("type")
+                        ),
+                    )
 
     # Prepare kwargs
     chat_kwargs = {
@@ -2855,12 +2878,19 @@ async def _create_chat_completion_inner(
     if specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = specprefill_keep_pct
 
-    if guided_decoding:
-        chat_kwargs["response_format"] = response_format
-
     # Add tools if provided
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    # Wire constrained decoding logits processor if available.
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        # Constrained decoding is incompatible with reasoning parsers:
+        # the model cannot emit <think> tags when forced to produce JSON.
+        if request.enable_thinking is None:
+            request.enable_thinking = False
+            chat_kwargs["enable_thinking"] = False
 
     if request.stream:
 
@@ -3593,6 +3623,29 @@ async def _create_anthropic_message_inner(request: Request, tracker):
 
     # Request raw output so reasoning/tool parsers see unstripped text.
     chat_kwargs["raw_output"] = True
+
+    # Build constrained decoding for response_format (if present on the
+    # Anthropic request and forwarded through the adapter).
+    response_format = openai_request.response_format
+    json_logits_processor = None
+    if response_format:
+        if not (openai_request.tools and openai_request.tool_choice != "none"):
+            tokenizer_obj = _get_engine_tokenizer(engine)
+            if tokenizer_obj is not None:
+                try:
+                    json_logits_processor = build_json_logits_processor(
+                        response_format, tokenizer_obj
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to build JSON logits processor (Anthropic): %s", exc
+                    )
+                    json_logits_processor = None
+
+    if json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        chat_kwargs["enable_thinking"] = False
 
     start_time = time.perf_counter()
     timeout = _default_timeout

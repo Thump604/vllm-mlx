@@ -122,6 +122,9 @@ class MLLMBatchRequest:
     repetition_penalty: float = 1.0
     stop_token_ids: List[int] = field(default_factory=list)
     sampler: Optional[Callable[[mx.array], mx.array]] = None
+    # Extra logits processors (e.g. JSON schema constrained decoding).
+    # Merged with built-in repetition/presence penalty processors in
+    # ``_prefill_batch``.
     logits_processors: Optional[List[Callable[[List[int], mx.array], mx.array]]] = None
 
     # Processed inputs (set after vision preprocessing)
@@ -1108,7 +1111,10 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors (guided decoding + penalties)
+        # Build per-request logits processors (guided decoding + penalties).
+        # Combines built-in (repetition_penalty, presence_penalty) with any
+        # caller-supplied processors (e.g. JSON schema constrained decoding
+        # via ``lm-format-enforcer``).
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         batch_logits_processors = []
@@ -1117,6 +1123,7 @@ class MLLMBatchGenerator:
             combined_lp = list(req.logits_processors or [])
             need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
             need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            combined: List[Callable] = []
             if need_rep or need_pres:
                 lp_kwargs = {}
                 if need_rep:

@@ -183,6 +183,9 @@ class MLXLanguageModel:
             presence_penalty: Additive penalty for token presence
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
+            logits_processors: Optional externally-supplied logits processors
+                (e.g. JSON schema constrained decoding).  Merged with built-in
+                penalty processors.
 
         Returns:
             GenerationOutput with generated text and tokens

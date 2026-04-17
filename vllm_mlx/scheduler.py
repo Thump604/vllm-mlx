@@ -1491,7 +1491,17 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
-            lp = self._build_request_logits_processors(request.sampling_params)
+            # Build per-request logits_processors from guided decoding,
+            # repetition_penalty, and any caller-supplied extras (e.g.
+            # JSON schema constrained decoding via lm-format-enforcer).
+            lp = list(self._build_request_logits_processors(request.sampling_params) or [])
+            extra_lp = request.sampling_params.logits_processors or []
+            if extra_lp:
+                lp.extend(extra_lp)
+                logger.info(
+                    f"[logits_proc] request={request.request_id[:12]} "
+                    f"extra_processors={len(extra_lp)}"
+                )
 
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
@@ -1502,6 +1512,7 @@ class Scheduler:
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    logits_processors=[lp] if lp else [[]],
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1518,6 +1529,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        logits_processors=[lp] if lp else [[]],
                     )
                 else:
                     raise

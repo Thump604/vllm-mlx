@@ -1058,6 +1058,7 @@ class BatchedEngine(BaseEngine):
                 top_p=top_p,
                 stop=stop or [],
                 response_format=kwargs.pop("response_format", None),
+                logits_processors=kwargs.pop("logits_processors", None),
                 **kwargs,
             )
 
@@ -1121,6 +1122,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             stop=stop or [],
             response_format=kwargs.pop("response_format", None),
+            logits_processors=kwargs.pop("logits_processors", None),
         )
 
         output = await self._engine.generate(
@@ -1588,6 +1590,7 @@ class BatchedEngine(BaseEngine):
                 top_p=top_p,
                 stop=stop or [],
                 response_format=kwargs.pop("response_format", None),
+                logits_processors=kwargs.pop("logits_processors", None),
                 **kwargs,
             )
 
@@ -1671,6 +1674,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             stop=stop or [],
             response_format=kwargs.pop("response_format", None),
+            logits_processors=kwargs.pop("logits_processors", None),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
