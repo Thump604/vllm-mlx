@@ -263,6 +263,7 @@ def serve_command(args):
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            trust_remote_code=getattr(args, "trust_remote_code", False),
         )
 
     # Start server

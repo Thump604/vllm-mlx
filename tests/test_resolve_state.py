@@ -189,7 +189,7 @@ def test_qwen_preset_emits_correct_vars(tmp_path):
     state = _write_state(tmp_path, "coding-quality")
     v = _capture_shell_vars(tmp_path, reg, state)
 
-    assert v["MODE_MODEL"] == "Qwen3.5-27B-VLM-MTP-8bit"
+    assert v["MODE_MODEL"] == "/Users/David/ai-models/mlx_models/Qwen3.5-27B-VLM-MTP-8bit"
     assert v["SERVED_MODEL_NAME"] == "qwen3.5-27b"
     assert v["THINK"] == "true"
     assert v["TOOL_PARSER"] == "qwen3_coder"
@@ -200,7 +200,7 @@ def test_qwen_preset_emits_correct_vars(tmp_path):
     assert v["SPECPREFILL_ENABLED"] == "true"
     assert v["SPECPREFILL_THRESHOLD"] == "8192"
     assert v["SPECPREFILL_KEEP_PCT"] == "0.3"
-    assert v["SPECPREFILL_DRAFT_MODEL"] == "Qwen3.5-2B-OptiQ-4bit"
+    assert v["SPECPREFILL_DRAFT_MODEL"] == "/Users/David/ai-models/mlx_models/Qwen3.5-2B-OptiQ-4bit"
     assert v["MODE_TEMP"] == "0.6"
     assert v["MODE_TOP_P"] == "0.95"
     assert v["KV_QUANTIZE"] == "true"
@@ -227,7 +227,7 @@ def test_gemma_preset_emits_correct_vars(tmp_path):
     )
     v = _capture_shell_vars(tmp_path, reg, state_path)
 
-    assert v["MODE_MODEL"] == "gemma-4-26B-A4B-it-6bit"
+    assert v["MODE_MODEL"] == "/Users/David/ai-models/mlx_models/gemma-4-26B-A4B-it-6bit"
     assert v["SERVED_MODEL_NAME"] == "gemma-4-26b-a4b-it"
     assert v["TOOL_PARSER"] == "gemma4"
     assert v["REASONING_PARSER"] == "gemma4"

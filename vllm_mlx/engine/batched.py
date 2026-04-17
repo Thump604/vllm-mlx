@@ -493,12 +493,15 @@ class BatchedEngine(BaseEngine):
 
                 from mlx_lm import load as mlx_lm_load
 
-                draft_path = str(
-                    Path.home()
-                    / "ai-models"
-                    / "mlx_models"
-                    / self._specprefill_draft_model_path
-                )
+                if os.path.isabs(self._specprefill_draft_model_path):
+                    draft_path = self._specprefill_draft_model_path
+                else:
+                    draft_path = str(
+                        Path.home()
+                        / "ai-models"
+                        / "mlx_models"
+                        / self._specprefill_draft_model_path
+                    )
                 self._draft_model, _ = mlx_lm_load(draft_path)
                 logger.info(
                     "SpecPrefill draft model loaded (MLLM path): %s "
@@ -608,12 +611,15 @@ class BatchedEngine(BaseEngine):
 
                 from mlx_lm import load as mlx_lm_load
 
-                draft_path = str(
-                    Path.home()
-                    / "ai-models"
-                    / "mlx_models"
-                    / self._specprefill_draft_model_path
-                )
+                if os.path.isabs(self._specprefill_draft_model_path):
+                    draft_path = self._specprefill_draft_model_path
+                else:
+                    draft_path = str(
+                        Path.home()
+                        / "ai-models"
+                        / "mlx_models"
+                        / self._specprefill_draft_model_path
+                    )
                 self._draft_model, _ = mlx_lm_load(draft_path)
                 logger.info(
                     "SpecPrefill draft model loaded: %s (threshold=%d, keep=%.0f%%)",
@@ -735,12 +741,15 @@ class BatchedEngine(BaseEngine):
 
                 from mlx_lm import load as mlx_lm_load
 
-                draft_path = str(
-                    Path.home()
-                    / "ai-models"
-                    / "mlx_models"
-                    / self._specprefill_draft_model_path
-                )
+                if os.path.isabs(self._specprefill_draft_model_path):
+                    draft_path = self._specprefill_draft_model_path
+                else:
+                    draft_path = str(
+                        Path.home()
+                        / "ai-models"
+                        / "mlx_models"
+                        / self._specprefill_draft_model_path
+                    )
                 self._draft_model, draft_tokenizer = mlx_lm_load(draft_path)
                 # Compatibility check: vocab + special tokens must match the
                 # target. SpecPrefill encodes with self._tokenizer and passes

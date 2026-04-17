@@ -1737,6 +1737,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    trust_remote_code: bool = False,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -1778,6 +1779,7 @@ def load_model(
             specprefill_draft_model_path=specprefill_draft_model,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            trust_remote_code=trust_remote_code,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -1793,6 +1795,7 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            trust_remote_code=trust_remote_code,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

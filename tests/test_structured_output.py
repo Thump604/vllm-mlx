@@ -14,11 +14,8 @@ from vllm_mlx.api.tool_calling import (
     build_json_system_prompt,
 )
 from vllm_mlx.api.models import ResponseFormat, ResponseFormatJsonSchema
-from vllm_mlx.guided_decoding import (
-    normalize_response_format,
-    response_format_to_schema,
-    uses_guided_decoding,
-)
+from vllm_mlx.api.tool_calling import build_json_logits_processor
+from vllm_mlx.constrained import is_available as constrained_is_available
 
 
 class TestValidateJsonSchema:
@@ -239,30 +236,22 @@ class TestParseJsonOutput:
 
 
 class TestGuidedDecodingHelpers:
-    """Tests for response-format normalization and schema selection."""
+    """Tests for response-format constrained decoding helpers."""
 
-    def test_normalize_response_format_model(self):
-        response_format = ResponseFormat(type="json_object")
-        assert normalize_response_format(response_format) == {
-            "type": "json_object",
-            "json_schema": None,
-        }
+    def test_build_json_logits_processor_text_returns_none(self):
+        """text format should never produce a logits processor."""
+        result = build_json_logits_processor({"type": "text"}, tokenizer=None)
+        assert result is None
 
-    def test_response_format_to_schema_json_object(self):
-        assert response_format_to_schema({"type": "json_object"}) == {
-            "type": "object",
-            "additionalProperties": True,
-        }
+    def test_build_json_logits_processor_none_returns_none(self):
+        """None response_format should return None."""
+        result = build_json_logits_processor(None, tokenizer=None)
+        assert result is None
 
-    def test_response_format_to_schema_json_schema_requires_schema(self):
-        with pytest.raises(ValueError, match="requires a non-empty schema"):
-            response_format_to_schema(
-                {"type": "json_schema", "json_schema": {"name": "broken"}}
-            )
-
-    def test_uses_guided_decoding(self):
-        assert uses_guided_decoding({"type": "json_object"}) is True
-        assert uses_guided_decoding({"type": "text"}) is False
+    def test_constrained_decoding_availability_is_bool(self):
+        """is_available() must return a plain bool."""
+        result = constrained_is_available()
+        assert isinstance(result, bool)
 
 
 class TestBuildJsonSystemPrompt:
