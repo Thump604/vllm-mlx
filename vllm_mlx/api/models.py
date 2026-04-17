@@ -440,7 +440,13 @@ class EmbeddingResponse(BaseModel):
 
 
 class ChatCompletionChunkDelta(BaseModel):
-    """Delta content in a streaming chunk."""
+    """Delta content in a streaming chunk.
+
+    Note: reasoning/reasoning_content are excluded when None so that
+    clients using @ai-sdk/openai-compatible (OpenCode, Kilo) don't choke
+    on unknown fields.  When reasoning IS present, both ``reasoning`` and
+    ``reasoning_content`` appear in the JSON for backwards compatibility.
+    """
 
     role: str | None = None
     content: str | None = None
@@ -452,7 +458,7 @@ class ChatCompletionChunkDelta(BaseModel):
     @computed_field
     @property
     def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
+        """Alias for reasoning field."""
         return self.reasoning
 
 

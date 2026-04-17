@@ -4106,7 +4106,7 @@ async def stream_chat_completion(
             )
         ],
     )
-    yield f"data: {first_chunk.model_dump_json()}\n\n"
+    yield f"data: {first_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
@@ -4240,7 +4240,7 @@ async def stream_chat_completion(
                                 ],
                                 usage=get_usage(output) if output.finished else None,
                             )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
+                            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         continue
 
                     if "tool_calls" in tool_result:
@@ -4261,7 +4261,7 @@ async def stream_chat_completion(
                             ],
                             usage=get_usage(output) if output.finished else None,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         continue
 
                     # Tool parser returned content (not tool calls)
@@ -4295,7 +4295,7 @@ async def stream_chat_completion(
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         else:
             # Standard path without reasoning parsing
             content = delta_text
@@ -4357,7 +4357,7 @@ async def stream_chat_completion(
                             ],
                             usage=get_usage(output) if output.finished else None,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         continue
 
                     # Normal content from tool parser
@@ -4388,7 +4388,7 @@ async def stream_chat_completion(
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
     # (e.g., </tool_call> never arrived - incomplete tool call)
@@ -4423,7 +4423,7 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {tool_chunk.model_dump_json()}\n\n"
+            yield f"data: {tool_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Log throughput
     elapsed = time.perf_counter() - start_time
@@ -4444,7 +4444,7 @@ async def stream_chat_completion(
                 total_tokens=prompt_tokens + completion_tokens,
             ),
         )
-        yield f"data: {usage_chunk.model_dump_json()}\n\n"
+        yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     yield "data: [DONE]\n\n"
 
