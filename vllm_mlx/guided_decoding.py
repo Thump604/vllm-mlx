@@ -69,8 +69,14 @@ def response_format_to_schema(
 def uses_guided_decoding(
     response_format: Any | dict[str, Any] | None,
 ) -> bool:
-    """Return True when a response format should engage guided decoding."""
-    return response_format_to_schema(response_format) is not None
+    """Return True when a response format should engage guided decoding.
+
+    DISABLED: Outlines FSM is incompatible with MLX stream eval (mlx-lm#1157,
+    outlines#1847). All response_format requests fall through to the
+    prompt-instruction path. See janhilgard's #362 (lm-format-enforcer) for a
+    compatible replacement.
+    """
+    return False
 
 
 class GuidedDecodingFactory:
