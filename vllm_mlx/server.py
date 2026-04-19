@@ -235,6 +235,48 @@ def _apply_serving_profile_defaults(
     return merged
 
 
+# Minimum max_tokens when thinking is enabled. Thinking models need
+# headroom for reasoning tokens before producing content. Per Unsloth
+# docs (https://unsloth.ai/docs/models/qwen3.6): "Adequate Output
+# Length: 32,768 tokens for most queries."
+_THINKING_MIN_MAX_TOKENS = 16384
+
+
+def _apply_thinking_max_tokens_floor(
+    max_tokens: int,
+    request,
+    profile: ServingProfile,
+) -> int:
+    """Enforce a minimum max_tokens when thinking is enabled.
+
+    When thinking mode is active (either from the request or the model's
+    serving profile default), a low max_tokens causes the reasoning to
+    consume the entire budget, leaving content as null.  This silently
+    raises max_tokens to the thinking floor so clients don't have to
+    know about thinking token budgets.
+    """
+    if max_tokens >= _THINKING_MIN_MAX_TOKENS:
+        return max_tokens
+
+    kwargs = _apply_serving_profile_defaults(request, profile)
+    thinking_on = kwargs.get("enable_thinking")
+
+    # If thinking is explicitly disabled by the client, respect their budget
+    if thinking_on is False:
+        return max_tokens
+
+    # If thinking is on (default or explicit), enforce the floor
+    if thinking_on is True or thinking_on is None:
+        logger.debug(
+            "Raising max_tokens from %d to %d (thinking mode active)",
+            max_tokens,
+            _THINKING_MIN_MAX_TOKENS,
+        )
+        return _THINKING_MIN_MAX_TOKENS
+
+    return max_tokens
+
+
 def _global_serving_profile() -> ServingProfile:
     """Serving profile for single-model mode."""
     return ServingProfile(
@@ -2834,10 +2876,13 @@ async def _create_chat_completion_inner(
                     )
 
     # Prepare kwargs
+    resolved_max_tokens = _apply_thinking_max_tokens_floor(
+        _resolve_request_field(request, "max_tokens", _default_max_tokens),
+        request,
+        model_ctx.serving_profile,
+    )
     chat_kwargs = {
-        "max_tokens": _resolve_request_field(
-            request, "max_tokens", _default_max_tokens
-        ),
+        "max_tokens": resolved_max_tokens,
         "temperature": _resolve_temperature(
             _resolve_request_field(request, "temperature", None)
         ),
@@ -3601,8 +3646,13 @@ async def _create_anthropic_message_inner(request: Request, tracker):
     )
     messages = _normalize_messages(messages)
 
+    anthropic_max = _apply_thinking_max_tokens_floor(
+        openai_request.max_tokens or _default_max_tokens,
+        openai_request,
+        model_ctx.serving_profile,
+    )
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": anthropic_max,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
         "top_k": openai_request.top_k or 0,
@@ -3852,8 +3902,13 @@ async def _stream_anthropic_messages(
         preserve_native_format=engine.preserve_native_tool_format,
     )
 
+    stream_anthropic_max = _apply_thinking_max_tokens_floor(
+        openai_request.max_tokens or _default_max_tokens,
+        openai_request,
+        model_ctx.serving_profile,
+    )
     chat_kwargs = {
-        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "max_tokens": stream_anthropic_max,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
         "top_k": openai_request.top_k or 0,
