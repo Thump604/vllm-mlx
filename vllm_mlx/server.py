@@ -2976,9 +2976,14 @@ async def _create_chat_completion_inner(
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
         # Constrained decoding is incompatible with reasoning parsers:
         # the model cannot emit <think> tags when forced to produce JSON.
+        # Must disable thinking in BOTH the top-level key (for parser logic)
+        # AND inside chat_template_kwargs (for the actual chat template).
         if request.enable_thinking is None:
             request.enable_thinking = False
             chat_kwargs["enable_thinking"] = False
+            ctk = chat_kwargs.get("chat_template_kwargs")
+            if ctk is not None:
+                ctk["enable_thinking"] = False
 
     if request.stream:
 
@@ -3741,6 +3746,9 @@ async def _create_anthropic_message_inner(request: Request, tracker):
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
         chat_kwargs["enable_thinking"] = False
+        ctk = chat_kwargs.get("chat_template_kwargs")
+        if ctk is not None:
+            ctk["enable_thinking"] = False
 
     start_time = time.perf_counter()
     timeout = _default_timeout
