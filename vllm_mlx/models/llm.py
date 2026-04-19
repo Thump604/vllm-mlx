@@ -279,7 +279,9 @@ class MLXLanguageModel:
         accumulated_text = ""
 
         mtp_kwargs = {}
-        if self._mtp:
+        # Disable MTP when logits processors (constrained decoding) are active:
+        # draft tokens bypass the JSON schema enforcer's FSM. See vllm-mlx#375.
+        if self._mtp and not all_processors:
             mtp_kwargs["mtp"] = True
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache

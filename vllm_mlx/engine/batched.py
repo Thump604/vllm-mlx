@@ -2276,8 +2276,14 @@ class BatchedEngine(BaseEngine):
         sampler = make_sampler(temp=temperature, top_p=top_p)
         max_tokens = max_tokens or 4096
 
-        # Check MTP support — used by all generation paths below
-        _has_mtp = hasattr(self._text_model, "mtp_forward")
+        # Check MTP support — used by all generation paths below.
+        # MTP is disabled when logits processors (constrained decoding) are
+        # active: draft tokens from MTP bypass the JSON schema enforcer's FSM,
+        # corrupting its state and causing deadlocks. See vllm-mlx#375.
+        _has_mtp = (
+            hasattr(self._text_model, "mtp_forward")
+            and not guided_processors
+        )
 
         # --- System KV cache: find system prefix boundary ---
         # Detect template format and find first user turn marker.
