@@ -174,6 +174,10 @@ class RegistryModelConfig:
 class SamplingProfileConfig:
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     enable_thinking: bool | None = None
 
 
@@ -405,6 +409,14 @@ def _parse_sampling_profile(raw: Any, label: str) -> SamplingProfileConfig:
     return SamplingProfileConfig(
         temperature=_optional_float(mapping.get("temperature"), f"{label}.temperature"),
         top_p=_optional_float(mapping.get("top_p"), f"{label}.top_p"),
+        top_k=_optional_int(mapping.get("top_k"), f"{label}.top_k"),
+        min_p=_optional_float(mapping.get("min_p"), f"{label}.min_p"),
+        presence_penalty=_optional_float(
+            mapping.get("presence_penalty"), f"{label}.presence_penalty"
+        ),
+        repetition_penalty=_optional_float(
+            mapping.get("repetition_penalty"), f"{label}.repetition_penalty"
+        ),
         enable_thinking=_optional_bool(
             mapping.get("enable_thinking"), f"{label}.enable_thinking"
         ),

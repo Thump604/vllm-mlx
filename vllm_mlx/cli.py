@@ -70,6 +70,14 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        server._default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        server._default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        server._default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        server._default_repetition_penalty = args.default_repetition_penalty
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -979,6 +987,30 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (0 = disabled)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Override default presence_penalty for all requests",
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help="Override default repetition_penalty for all requests (1.0 = disabled)",
     )
     # Embedding model option
     serve_parser.add_argument(

@@ -165,6 +165,10 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_top_k: int | None = None  # Set via --default-top-k
+_default_min_p: float | None = None  # Set via --default-min-p
+_default_presence_penalty: float | None = None  # Set via --default-presence-penalty
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -186,6 +190,42 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_top_k(request_value: int | None) -> int:
+    """Resolve top_k: request > CLI default > fallback (0 = disabled)."""
+    if request_value is not None:
+        return request_value
+    if _default_top_k is not None:
+        return _default_top_k
+    return 0
+
+
+def _resolve_min_p(request_value: float | None) -> float:
+    """Resolve min_p: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_min_p is not None:
+        return _default_min_p
+    return 0.0
+
+
+def _resolve_presence_penalty(request_value: float | None) -> float:
+    """Resolve presence_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_presence_penalty is not None:
+        return _default_presence_penalty
+    return 0.0
+
+
+def _resolve_repetition_penalty(request_value: float | None) -> float:
+    """Resolve repetition_penalty: request > CLI default > fallback (1.0 = disabled)."""
+    if request_value is not None:
+        return request_value
+    if _default_repetition_penalty is not None:
+        return _default_repetition_penalty
+    return 1.0
 
 
 def _resolve_request_field(
@@ -1235,6 +1275,10 @@ def _prepare_responses_request(
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
+        "top_k": _resolve_top_k(None),
+        "min_p": _resolve_min_p(None),
+        "presence_penalty": _resolve_presence_penalty(None),
+        "repetition_penalty": _resolve_repetition_penalty(None),
     }
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
@@ -2658,13 +2702,14 @@ async def _create_completion_inner(request, raw_request, tracker):
                 "max_tokens": request.max_tokens or _default_max_tokens,
                 "temperature": _resolve_temperature(request.temperature),
                 "top_p": _resolve_top_p(request.top_p),
-                "top_k": request.top_k or 0,
-                "min_p": request.min_p or 0.0,
-                "presence_penalty": request.presence_penalty or 0.0,
+                "top_k": _resolve_top_k(request.top_k),
+                "min_p": _resolve_min_p(request.min_p),
+                "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
+                "repetition_penalty": _resolve_repetition_penalty(
+                    request.repetition_penalty
+                ),
                 "stop": request.stop,
             }
-            if rep_penalty is not None:
-                generate_kwargs["repetition_penalty"] = rep_penalty
             if request.specprefill is not None:
                 generate_kwargs["specprefill"] = request.specprefill
             if request.specprefill_keep_pct is not None:
@@ -2887,12 +2932,14 @@ async def _create_chat_completion_inner(
             _resolve_request_field(request, "temperature", None)
         ),
         "top_p": _resolve_top_p(_resolve_request_field(request, "top_p", None)),
-        "top_k": _resolve_request_field(request, "top_k", 0) or 0,
-        "min_p": _resolve_request_field(request, "min_p", 0.0) or 0.0,
-        "presence_penalty": _resolve_request_field(request, "presence_penalty", 0.0)
-        or 0.0,
-        "repetition_penalty": _resolve_request_field(request, "repetition_penalty", 1.0)
-        or 1.0,
+        "top_k": _resolve_top_k(_resolve_request_field(request, "top_k", None)),
+        "min_p": _resolve_min_p(_resolve_request_field(request, "min_p", None)),
+        "presence_penalty": _resolve_presence_penalty(
+            _resolve_request_field(request, "presence_penalty", None)
+        ),
+        "repetition_penalty": _resolve_repetition_penalty(
+            _resolve_request_field(request, "repetition_penalty", None)
+        ),
         "stop": request.stop,
     }
     if engine.is_mllm:
@@ -3653,12 +3700,14 @@ async def _create_anthropic_message_inner(request: Request, tracker):
     )
     chat_kwargs = {
         "max_tokens": anthropic_max,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
         "stop": openai_request.stop,
         "raw_output": True,
     }
@@ -3909,12 +3958,14 @@ async def _stream_anthropic_messages(
     )
     chat_kwargs = {
         "max_tokens": stream_anthropic_max,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
         "stop": openai_request.stop,
     }
     if engine.is_mllm:
@@ -4169,10 +4220,10 @@ async def stream_completion(
         max_tokens=request.max_tokens or _default_max_tokens,
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
-        top_k=request.top_k or 0,
-        min_p=request.min_p or 0.0,
-        presence_penalty=request.presence_penalty or 0.0,
-        repetition_penalty=request.repetition_penalty or 1.0,
+        top_k=_resolve_top_k(request.top_k),
+        min_p=_resolve_min_p(request.min_p),
+        presence_penalty=_resolve_presence_penalty(request.presence_penalty),
+        repetition_penalty=_resolve_repetition_penalty(request.repetition_penalty),
         stop=request.stop,
     ):
         data = {
@@ -4703,18 +4754,52 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for generation when not specified in request (0 = disabled)",
+    )
+    parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help="Default repetition_penalty for generation when not specified in request (1.0 = disabled)",
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
     global _default_temperature, _default_top_p
+    global _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        _default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        _default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -4736,6 +4821,23 @@ Examples:
     else:
         logger.warning("  Rate limiting: DISABLED - Use --rate-limit to enable")
     logger.info(f"  Request timeout: {args.timeout}s")
+    _sampling_parts = []
+    if _default_temperature is not None:
+        _sampling_parts.append(f"temp={_default_temperature}")
+    if _default_top_p is not None:
+        _sampling_parts.append(f"top_p={_default_top_p}")
+    if _default_top_k is not None:
+        _sampling_parts.append(f"top_k={_default_top_k}")
+    if _default_min_p is not None:
+        _sampling_parts.append(f"min_p={_default_min_p}")
+    if _default_presence_penalty is not None:
+        _sampling_parts.append(f"presence_penalty={_default_presence_penalty}")
+    if _default_repetition_penalty is not None:
+        _sampling_parts.append(f"repetition_penalty={_default_repetition_penalty}")
+    if _sampling_parts:
+        logger.info(f"  Sampling defaults: {', '.join(_sampling_parts)}")
+    else:
+        logger.info("  Sampling defaults: none (using fallbacks)")
     logger.info("=" * 60)
 
     # Set MCP config for lifespan

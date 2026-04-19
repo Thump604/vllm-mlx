@@ -57,6 +57,10 @@ def emit_shell_vars(registry_path: str, state_path: str) -> None:
         print("MODELS_CONFIG=''")
         print("MODE_TEMP=''")
         print("MODE_TOP_P=''")
+        print("MODE_TOP_K=''")
+        print("MODE_MIN_P=''")
+        print("MODE_PRESENCE_PENALTY=''")
+        print("MODE_REPETITION_PENALTY=''")
         print("KV_QUANTIZE=false")
         print("KV_QUANTIZE_BITS='8'")
         print("TEXT_BATCH_SCHEDULER_CANARY=false")
@@ -109,9 +113,17 @@ def emit_shell_vars(registry_path: str, state_path: str) -> None:
     # Sampling from preset (if set)
     mode_temp = None
     mode_top_p = None
+    mode_top_k = None
+    mode_min_p = None
+    mode_presence_penalty = None
+    mode_repetition_penalty = None
     if preset:
         mode_temp = preset.sampling_profile.temperature
         mode_top_p = preset.sampling_profile.top_p
+        mode_top_k = preset.sampling_profile.top_k
+        mode_min_p = preset.sampling_profile.min_p
+        mode_presence_penalty = preset.sampling_profile.presence_penalty
+        mode_repetition_penalty = preset.sampling_profile.repetition_penalty
 
     # KV quantization from model capabilities
     kv_quant = model.supports_kv_quant
@@ -140,6 +152,10 @@ def emit_shell_vars(registry_path: str, state_path: str) -> None:
     print(f"MODELS_CONFIG={_val(None)}")
     print(f"MODE_TEMP={_val(mode_temp)}")
     print(f"MODE_TOP_P={_val(mode_top_p)}")
+    print(f"MODE_TOP_K={_val(mode_top_k)}")
+    print(f"MODE_MIN_P={_val(mode_min_p)}")
+    print(f"MODE_PRESENCE_PENALTY={_val(mode_presence_penalty)}")
+    print(f"MODE_REPETITION_PENALTY={_val(mode_repetition_penalty)}")
     print(f"KV_QUANTIZE={_sq(str(kv_quant).lower())}")
     print(f"KV_QUANTIZE_BITS={_sq('8')}")
     print(f"TEXT_BATCH_SCHEDULER_CANARY=false")
