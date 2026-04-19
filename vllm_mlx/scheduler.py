@@ -1482,7 +1482,9 @@ class Scheduler:
             # Build per-request logits_processors from guided decoding,
             # repetition_penalty, and any caller-supplied extras (e.g.
             # JSON schema constrained decoding via lm-format-enforcer).
-            lp = list(self._build_request_logits_processors(request.sampling_params) or [])
+            lp = list(
+                self._build_request_logits_processors(request.sampling_params) or []
+            )
             extra_lp = request.sampling_params.logits_processors or []
             if extra_lp:
                 lp.extend(extra_lp)

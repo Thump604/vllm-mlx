@@ -187,10 +187,7 @@ class MLXLanguageModel:
         )
         all_processors = None
         if penalty_processors or logits_processors:
-            all_processors = (
-                (logits_processors or [])
-                + (penalty_processors or [])
-            )
+            all_processors = (logits_processors or []) + (penalty_processors or [])
 
         # Generate text
         output_text = generate(
@@ -264,10 +261,7 @@ class MLXLanguageModel:
         # Merge any externally-provided logits_processors with penalty processors
         all_processors = None
         if penalty_processors or logits_processors:
-            all_processors = (
-                (logits_processors or [])
-                + (penalty_processors or [])
-            )
+            all_processors = (logits_processors or []) + (penalty_processors or [])
 
         # Count prompt tokens once upfront
         if isinstance(prompt, str):

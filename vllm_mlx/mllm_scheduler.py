@@ -323,7 +323,6 @@ class MLLMScheduler:
                 specprefill_max_input=self._specprefill_max_input,
             )
 
-
     def _build_request_logits_processors(
         self, sampling_params: SamplingParams
     ) -> Optional[List[Any]]:
@@ -495,9 +494,13 @@ class MLLMScheduler:
                 sampler=_build_sampler(request.sampling_params),
                 logits_processors=(
                     (_build_logits_processors(request.sampling_params) or [])
-                    + (self._build_request_logits_processors(request.sampling_params) or [])
+                    + (
+                        self._build_request_logits_processors(request.sampling_params)
+                        or []
+                    )
                     + (request.sampling_params.logits_processors or [])
-                ) or None,
+                )
+                or None,
             )
             batch_requests.append(batch_req)
 

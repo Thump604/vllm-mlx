@@ -524,14 +524,26 @@ class MLLMBatchGenerator:
         if request.logits_processors:
             context_tokens = self._request_context_tokens(request)
             mx.eval(logits)
-            logger.info("SAMPLE-DBG: prompt=%d output=%d ctx=%d last=%s", len(request.prompt_token_ids or []), len(request.output_tokens), len(context_tokens), context_tokens[-1] if context_tokens else 'empty')
+            logger.info(
+                "SAMPLE-DBG: prompt=%d output=%d ctx=%d last=%s",
+                len(request.prompt_token_ids or []),
+                len(request.output_tokens),
+                len(context_tokens),
+                context_tokens[-1] if context_tokens else "empty",
+            )
             pre_top = logits.argmax().item()
             for processor in request.logits_processors:
                 logits = processor(context_tokens, logits)
             mx.eval(logits)
             post_top = logits.argmax().item()
             finite = (logits > -1e30).sum().item()
-            logger.info("MLLM-LP: ctx=%d pre_top=%d post_top=%d finite=%d", len(context_tokens), pre_top, post_top, finite)
+            logger.info(
+                "MLLM-LP: ctx=%d pre_top=%d post_top=%d finite=%d",
+                len(context_tokens),
+                pre_top,
+                post_top,
+                finite,
+            )
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampler = request.sampler or self.sampler
