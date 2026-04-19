@@ -2669,19 +2669,12 @@ async def _create_completion_inner(request, raw_request, tracker):
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
-    rep_penalty = request.repetition_penalty
-
     if request.stream:
         return StreamingResponse(
             _stream_with_model_context(
                 model_ctx,
                 _disconnect_guard(
-                    stream_completion(
-                        engine,
-                        prompts[0],
-                        request,
-                        repetition_penalty=rep_penalty,
-                    ),
+                    stream_completion(engine, prompts[0], request),
                     raw_request,
                 ),
             ),
