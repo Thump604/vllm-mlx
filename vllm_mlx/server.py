@@ -3005,24 +3005,46 @@ async def _create_chat_completion_inner(
 
     if _thinking_on and _budget_effective and _parser_has_tags:
         # Build unified thinking-aware processor.
-        from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
+        # Guard: only create when the engine has a TextModel path that
+        # supports logits_processors in mlx_stream_generate. The MLLM
+        # scheduler path cannot use the processor correctly (tokenizer
+        # threading issues + batch generator incompatibility).
+        _has_text_model = getattr(engine, "_text_model", None) is not None
+        if _has_text_model:
+            from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
 
-        _tokenizer = _get_engine_tokenizer(engine)
-        _tap = ThinkingAwareLogitsProcessor(
-            start_token_ids=_tokenizer.encode(
-                _req_parser.start_token, add_special_tokens=False
-            ),
-            end_token_ids=_tokenizer.encode(
-                _req_parser.end_token, add_special_tokens=False
-            ),
-            thinking_token_budget=_budget,
-            inner=json_logits_processor,
-            vocab_size=_tokenizer.vocab_size,
-            prompt_has_think_tag=_thinking_on,
-        )
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [_tap]
-        _thinking_proc = _tap
+            _tokenizer = _get_engine_tokenizer(engine)
+            try:
+                _tap = ThinkingAwareLogitsProcessor(
+                    start_token_ids=_tokenizer.encode(
+                        _req_parser.start_token, add_special_tokens=False
+                    ),
+                    end_token_ids=_tokenizer.encode(
+                        _req_parser.end_token, add_special_tokens=False
+                    ),
+                    thinking_token_budget=_budget,
+                    inner=json_logits_processor,
+                    vocab_size=_tokenizer.vocab_size,
+                    prompt_has_think_tag=_thinking_on,
+                )
+                existing = chat_kwargs.get("logits_processors") or []
+                chat_kwargs["logits_processors"] = list(existing) + [_tap]
+                _thinking_proc = _tap
+            except RuntimeError as _rt_err:
+                # Tokenizer "Already borrowed" from concurrent MLLM use
+                logger.warning(
+                    "ThinkingAwareLogitsProcessor creation failed "
+                    "(tokenizer contention): %s — proceeding without budget",
+                    _rt_err,
+                )
+        else:
+            # No TextModel path: thinking still works via template (model
+            # generates <think>...</think> naturally) but budget enforcement
+            # is not available. Log for visibility.
+            logger.info(
+                "ThinkingAwareLogitsProcessor skipped: no TextModel path "
+                "(MLLM scheduler handles thinking via template)"
+            )
     elif _thinking_on and not _budget_effective and json_logits_processor is not None:
         # Fallback: thinking + JSON but no budget -> force thinking off
         # (Session 105 compatibility behavior).
@@ -3847,24 +3869,29 @@ async def _create_anthropic_message_inner(request: Request, tracker):
     _thinking_proc = None
 
     if _thinking_on and _budget_effective and _parser_has_tags:
-        from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
+        _has_text_model = getattr(engine, "_text_model", None) is not None
+        if _has_text_model:
+            from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
 
-        _tokenizer = _get_engine_tokenizer(engine)
-        _tap = ThinkingAwareLogitsProcessor(
-            start_token_ids=_tokenizer.encode(
-                _req_parser.start_token, add_special_tokens=False
-            ),
-            end_token_ids=_tokenizer.encode(
-                _req_parser.end_token, add_special_tokens=False
-            ),
-            thinking_token_budget=_budget,
-            inner=json_logits_processor,
-            vocab_size=_tokenizer.vocab_size,
-            prompt_has_think_tag=_thinking_on,
-        )
-        existing = chat_kwargs.get("logits_processors") or []
-        chat_kwargs["logits_processors"] = list(existing) + [_tap]
-        _thinking_proc = _tap
+            _tokenizer = _get_engine_tokenizer(engine)
+            try:
+                _tap = ThinkingAwareLogitsProcessor(
+                    start_token_ids=_tokenizer.encode(
+                        _req_parser.start_token, add_special_tokens=False
+                    ),
+                    end_token_ids=_tokenizer.encode(
+                        _req_parser.end_token, add_special_tokens=False
+                    ),
+                    thinking_token_budget=_budget,
+                    inner=json_logits_processor,
+                    vocab_size=_tokenizer.vocab_size,
+                    prompt_has_think_tag=_thinking_on,
+                )
+                existing = chat_kwargs.get("logits_processors") or []
+                chat_kwargs["logits_processors"] = list(existing) + [_tap]
+                _thinking_proc = _tap
+            except RuntimeError:
+                pass  # Tokenizer contention; proceed without budget
     elif _thinking_on and not _budget_effective and json_logits_processor is not None:
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]

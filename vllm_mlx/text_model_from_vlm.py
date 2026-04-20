@@ -149,51 +149,32 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
 
             # Fix quantization mismatch: some model quants (e.g. Qwen 3.6
             # 8-bit) quantize MTP Linear layers on disk but nn.quantize()
-            # may miss them (quantization config absent or path/scales naming
-            # mismatch). Detect the problem directly: after load_weights, any
-            # Linear module whose weight is a dict (not mx.array) received
-            # quantized data into a non-quantized skeleton.
+            # may miss them during skeleton setup. Detect and fix: if any
+            # Linear module got dict-valued weights, rebuild with quantization.
             if hasattr(text_model, "mtp") and text_model.mtp is not None:
-                mtp_weight_names = set(name for name, _ in mtp_weights)
                 _broken_paths = []
                 for path, module in text_model.mtp.named_modules():
                     if not isinstance(module, nn.Linear):
                         continue
                     if isinstance(module, nn.QuantizedLinear):
                         continue
-                    # Check if weight is a dict (quantized data in non-quantized module)
-                    w = module.weight if hasattr(module, "weight") else None
+                    w = getattr(module, "weight", None)
                     if isinstance(w, dict):
                         full_path = f"mtp.{path}" if path else "mtp"
                         _broken_paths.append(full_path)
 
                 if _broken_paths:
                     logger.warning(
-                        "MTP quantization mismatch: %d modules have dict weights "
-                        "(quantized data in non-quantized Linear): %s",
+                        "MTP quantization mismatch in %d modules: %s. "
+                        "Disabling MTP for this model (MLLM scheduler "
+                        "will handle generation).",
                         len(_broken_paths),
-                        _broken_paths,
+                        _broken_paths[:5],
                     )
-                    # Determine quantization recipe from the loaded weights
-                    # (infer bits/group_size from scales shape).
-                    _q_recipe = quantization or {}
-                    _bits = _q_recipe.get("bits", 8)
-                    _group_size = _q_recipe.get("group_size", 64)
-                    for fp in _broken_paths:
-                        nn.quantize(
-                            text_model,
-                            class_predicate=lambda p, m, _fp=fp: (
-                                {"bits": _bits, "group_size": _group_size}
-                                if p == _fp
-                                else False
-                            ),
-                        )
-                    # Re-load weights into the now-quantized modules
-                    text_model.load_weights(mtp_weights, strict=False)
-                    logger.info(
-                        "Post-load quantization: fixed %d MTP modules",
-                        len(_broken_paths),
-                    )
+                    # Can't easily re-quantize after dict weights are loaded.
+                    # Disable MTP: the model still works via MLLM scheduler,
+                    # just without TextModel+MTP routing.
+                    text_model.mtp = None
         else:
             logger.warning("No MTP weights found in %s", model_path.name)
 
