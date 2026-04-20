@@ -2414,6 +2414,23 @@ class BatchedEngine(BaseEngine):
                 else:
                     return _run_cache_miss()
 
+            def _run_with_cache_streaming(emit):
+                """Like _run_with_cache but emits tokens via callback.
+
+                Returns prompt_token_count only (tokens are emitted, not collected).
+                """
+                if use_specprefill:
+                    try:
+                        return _run_specprefill_streaming(emit)
+                    except Exception as e:
+                        logger.error(
+                            "SpecPrefill failed, falling back to normal path: %s", e
+                        )
+                if cache_hit:
+                    return _run_cache_hit_streaming(emit)
+                else:
+                    return _run_cache_miss_streaming(emit)
+
             def _run_specprefill():
                 """Score tokens, sparse prefill, generate with MTP.
 
@@ -2694,6 +2711,153 @@ class BatchedEngine(BaseEngine):
                     prompt_tokens = results[0].prompt_tokens
                 return results, prompt_tokens
 
+            def _run_cache_hit_streaming(emit):
+                """Cache-hit path with incremental token emission."""
+                restored_cache = make_prompt_cache(self._text_model)
+                for layer_idx, snapshot_state in enumerate(self._system_kv_snapshot):
+                    if layer_idx < len(restored_cache):
+                        self._restore_cache_snapshot_entry(
+                            restored_cache[layer_idx], snapshot_state
+                        )
+                mx.eval([c.state for c in restored_cache if hasattr(c, "state")])
+                suffix_tokens = self._text_tokenizer.encode(suffix)
+                suffix_array = mx.array(suffix_tokens)
+                n_suffix = len(suffix_tokens)
+                logger.info(
+                    "System KV cache HIT: prefilling %d suffix tokens "
+                    "(skipped %d cached tokens)",
+                    n_suffix,
+                    self._system_kv_token_count,
+                )
+                _ptc = self._system_kv_token_count + n_suffix
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=suffix_array,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    logits_processors=guided_processors,
+                    mtp=_has_mtp,
+                    num_draft_tokens=1,
+                    prompt_cache=restored_cache,
+                    prefill_step_size=prefill_step_size,
+                ):
+                    emit(resp)
+                return _ptc
+
+            def _run_cache_miss_streaming(emit):
+                """Cache-miss path with incremental token emission."""
+                _can_retire = (
+                    guided_processors
+                    and not _has_mtp
+                    and hasattr(self._text_model, "mtp_forward")
+                    and any(
+                        hasattr(p, "is_retired")
+                        for p in (
+                            guided_processors
+                            if isinstance(guided_processors, list)
+                            else [guided_processors]
+                        )
+                    )
+                )
+
+                _token_count = 0
+                _last_resp = None
+
+                if _can_retire:
+                    shared_cache = make_prompt_cache(self._text_model)
+                    _retired = False
+                    for resp in mlx_stream_generate(
+                        self._text_model,
+                        self._text_tokenizer,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=guided_processors,
+                        mtp=False,
+                        num_draft_tokens=1,
+                        prefill_step_size=prefill_step_size,
+                        prompt_cache=shared_cache,
+                    ):
+                        emit(resp)
+                        _token_count += 1
+                        _last_resp = resp
+                        _retired = any(
+                            getattr(p, "is_retired", False)
+                            for p in (
+                                guided_processors
+                                if isinstance(guided_processors, list)
+                                else [guided_processors]
+                            )
+                        )
+                        if _retired:
+                            break
+
+                    if _retired and _token_count < max_tokens:
+                        remaining = max_tokens - _token_count
+                        last_tok = (
+                            _last_resp.token if hasattr(_last_resp, "token") else None
+                        )
+                        if last_tok is not None:
+                            seed = mx.array([last_tok])
+                        else:
+                            seed = self._text_tokenizer.encode(
+                                _last_resp.text if hasattr(_last_resp, "text") else ""
+                            )
+                            seed = mx.array(seed)
+                        for resp in mlx_stream_generate(
+                            self._text_model,
+                            self._text_tokenizer,
+                            prompt=seed,
+                            max_tokens=remaining,
+                            sampler=sampler,
+                            logits_processors=None,
+                            mtp=True,
+                            num_draft_tokens=1,
+                            prefill_step_size=prefill_step_size,
+                            prompt_cache=shared_cache,
+                        ):
+                            emit(resp)
+                            _token_count += 1
+                else:
+                    for resp in mlx_stream_generate(
+                        self._text_model,
+                        self._text_tokenizer,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=guided_processors,
+                        mtp=_has_mtp,
+                        num_draft_tokens=1,
+                        prefill_step_size=prefill_step_size,
+                    ):
+                        emit(resp)
+                        _token_count += 1
+                        _last_resp = resp
+
+                if prefix_hash is not None and system_prefix is not None:
+                    try:
+                        _snapshot_system_kv()
+                    except Exception as e:
+                        logger.warning("Failed to snapshot system KV cache: %s", e)
+
+                prompt_tokens = 0
+                if _last_resp and hasattr(_last_resp, "prompt_tokens"):
+                    prompt_tokens = _last_resp.prompt_tokens
+                return prompt_tokens
+
+            def _run_specprefill_streaming(emit):
+                """SpecPrefill path with incremental token emission."""
+                # SpecPrefill has a complex multi-phase setup, but the final
+                # generation (Phase 4) is a simple mlx_stream_generate call.
+                # Delegate to the batch version and emit from its results.
+                # This is a temporary compromise; full streaming from Phase 4
+                # can be done later if specprefill TTFT matters.
+                results, ptc = _run_specprefill()
+                for resp in results:
+                    emit(resp)
+                return ptc
+
             def _snapshot_system_kv():
                 """Prefill just the system prefix on a fresh cache and save snapshot."""
                 snapshot_cache = make_prompt_cache(self._text_model)
@@ -2726,20 +2890,20 @@ class BatchedEngine(BaseEngine):
                 )
 
             # --- Incremental streaming via queue ---
-            # Instead of collecting all tokens then yielding, stream tokens
-            # to the client as they are generated. This prevents the
-            # batch-then-yield timeout: clients see progressive output during
-            # thinking and content phases rather than silence for minutes.
+            # Stream tokens to the client as they are generated. The producer
+            # thread calls emit() for each token directly from the
+            # mlx_stream_generate loop, bypassing list collection.
             loop = asyncio.get_running_loop()
             _queue: asyncio.Queue = asyncio.Queue()
             _SENTINEL = object()
 
+            def _emit(resp):
+                """Called from generation thread for each token."""
+                loop.call_soon_threadsafe(_queue.put_nowait, resp)
+
             def _producer():
                 try:
-                    results, ptc = _run_with_cache()
-                    for resp in results:
-                        loop.call_soon_threadsafe(_queue.put_nowait, resp)
-                    # Send prompt_token_count as metadata after all tokens
+                    ptc = _run_with_cache_streaming(_emit)
                     loop.call_soon_threadsafe(_queue.put_nowait, ("_meta", ptc))
                 except Exception as e:
                     loop.call_soon_threadsafe(_queue.put_nowait, e)
