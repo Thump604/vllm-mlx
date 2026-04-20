@@ -2847,16 +2847,96 @@ class BatchedEngine(BaseEngine):
                 return prompt_tokens
 
             def _run_specprefill_streaming(emit):
-                """SpecPrefill path with incremental token emission."""
-                # SpecPrefill has a complex multi-phase setup, but the final
-                # generation (Phase 4) is a simple mlx_stream_generate call.
-                # Delegate to the batch version and emit from its results.
-                # This is a temporary compromise; full streaming from Phase 4
-                # can be done later if specprefill TTFT matters.
-                results, ptc = _run_specprefill()
-                for resp in results:
-                    emit(resp)
-                return ptc
+                """SpecPrefill path with incremental token emission.
+
+                Phases 1-3 (score, select, sparse prefill) are fast setup.
+                Phase 4 (generation) emits tokens incrementally via emit().
+                """
+                import time as _time
+                from types import SimpleNamespace as _NS
+
+                from ..specprefill import (
+                    cleanup_rope,
+                    score_tokens,
+                    select_chunks,
+                    sparse_prefill,
+                )
+
+                target_cache = make_prompt_cache(self._text_model)
+                if cache_hit:
+                    for layer_idx, snapshot_state in enumerate(
+                        self._system_kv_snapshot
+                    ):
+                        if layer_idx < len(target_cache):
+                            self._restore_cache_snapshot_entry(
+                                target_cache[layer_idx], snapshot_state
+                            )
+                    mx.eval([c.state for c in target_cache if hasattr(c, "state")])
+
+                try:
+                    # Phase 1-3: fast setup (score, select, sparse prefill)
+                    importance = score_tokens(
+                        self._draft_model,
+                        sp_tokens,
+                        prefill_step_size=prefill_step_size,
+                    )
+                    selected = select_chunks(
+                        importance,
+                        keep_pct=sp_keep_pct,
+                        chunk_size=self._specprefill_chunk_size,
+                    )
+                    logits = sparse_prefill(
+                        self._text_model,
+                        sp_tokens,
+                        selected,
+                        target_cache,
+                        prefill_step_size=prefill_step_size,
+                        position_offset=(
+                            self._system_kv_token_count if cache_hit else 0
+                        ),
+                    )
+
+                    # Phase 4: Generate — emit each token incrementally
+                    y0 = sampler(logits[:, -1, :])
+                    mx.eval(y0)
+
+                    if hasattr(self._text_model, "make_mtp_cache"):
+                        gen_cache = list(target_cache) + list(
+                            self._text_model.make_mtp_cache()
+                        )
+                    else:
+                        gen_cache = list(target_cache)
+
+                    y0_text = self._text_tokenizer.decode([y0.item()])
+                    eos_id = self._text_tokenizer.eos_token_id
+                    emit(
+                        _NS(
+                            text=y0_text,
+                            finish_reason=("stop" if y0.item() == eos_id else None),
+                        )
+                    )
+
+                    if y0.item() != eos_id:
+                        for resp in mlx_stream_generate(
+                            self._text_model,
+                            self._text_tokenizer,
+                            prompt=y0.reshape(-1),
+                            max_tokens=max_tokens - 1,
+                            sampler=sampler,
+                            logits_processors=guided_processors,
+                            mtp=_has_mtp,
+                            prompt_cache=gen_cache,
+                            prefill_step_size=prefill_step_size,
+                        ):
+                            emit(resp)
+
+                    return sp_n_total
+
+                finally:
+                    try:
+                        cleanup_rope(self._text_model)
+                    except Exception:
+                        pass
 
             def _snapshot_system_kv():
                 """Prefill just the system prefix on a fresh cache and save snapshot."""
