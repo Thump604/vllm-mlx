@@ -143,3 +143,104 @@ class TestPhaseTransitions:
         _feed_sequence(proc, [10, 11, 50, 51, 52])
         # 3 thinking tokens (50, 51, 52), start sequence not counted
         assert proc.thinking_tokens == 3
+
+
+class TestBudgetEnforcement:
+    def test_budget_forces_transition(self):
+        proc = _make_processor(budget=3)
+        # <think>(10,11) + 3 thinking tokens + should transition
+        _feed_sequence(proc, [10, 11, 50, 51, 52])
+        assert proc.state == Phase.TRANSITIONING
+        assert proc.thinking_tokens == 3
+
+    def test_transition_forces_end_sequence(self):
+        proc = _make_processor(budget=2)
+        # <think>(10,11) + 2 tokens -> transition
+        results = _feed_sequence(proc, [10, 11, 50, 51])
+        assert proc.state == Phase.TRANSITIONING
+        # Now feed through transition: should force end tokens [20, 21]
+        tokens_so_far = [10, 11, 50, 51]
+
+        # First transition token
+        tokens_so_far.append(0)  # placeholder, processor overrides logits
+        logits = proc(mx.array(tokens_so_far), _uniform_logits())
+        # Only token 20 should have logit 0, rest -inf
+        assert logits[20].item() == 0.0
+        assert logits[0].item() == float("-inf")
+
+        # Second transition token
+        tokens_so_far.append(0)
+        logits = proc(mx.array(tokens_so_far), _uniform_logits())
+        assert logits[21].item() == 0.0
+        assert proc.state == Phase.CONTENT
+
+    def test_forced_transition_tokens_not_counted(self):
+        proc = _make_processor(budget=2)
+        _feed_sequence(proc, [10, 11, 50, 51])  # 2 thinking tokens
+        assert proc.thinking_tokens == 2
+        # Feed through forced transition
+        _feed_sequence(proc, [20, 21])  # these are transition control tokens
+        assert proc.thinking_tokens == 2  # unchanged
+
+    def test_budget_zero_immediate_transition(self):
+        proc = _make_processor(budget=0)
+        _feed_sequence(proc, [10, 11])  # <think> detected
+        assert proc.state == Phase.TRANSITIONING
+        assert proc.thinking_tokens == 0
+
+    def test_natural_end_before_budget(self):
+        proc = _make_processor(budget=100)
+        _feed_sequence(proc, [10, 11, 50, 20, 21])  # natural </think>
+        assert proc.state == Phase.CONTENT
+        # tokens 50 and 20 are counted; end detection only fires when the
+        # full end sequence (20, 21) is matched, so 20 is counted before
+        # the match completes on 21.
+        assert proc.thinking_tokens == 2
+
+    def test_budget_boundary_allows_exactly_n(self):
+        proc = _make_processor(budget=5)
+        _feed_sequence(proc, [10, 11, 50, 51, 52, 53, 54])
+        # 5 thinking tokens (50-54), budget=5, next would exceed -> TRANSITIONING
+        assert proc.thinking_tokens == 5
+        assert proc.state == Phase.TRANSITIONING
+
+
+class TestInnerDelegation:
+    def test_inner_not_called_during_thinking(self):
+        calls = []
+
+        def mock_inner(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        proc = _make_processor(budget=100, inner=mock_inner)
+        _feed_sequence(proc, [10, 11, 50, 51])  # IDLE then THINKING
+        assert len(calls) == 0
+
+    def test_inner_called_during_content(self):
+        calls = []
+
+        def mock_inner(tokens, logits):
+            calls.append(len(tokens))
+            return logits * 2  # distinguishable modification
+
+        proc = _make_processor(budget=100, inner=mock_inner)
+        _feed_sequence(proc, [10, 11, 50, 20, 21])  # reach CONTENT
+        assert proc.state == Phase.CONTENT
+        # inner is called once during _feed_sequence when the end matcher
+        # fires on token 21 and state transitions to CONTENT.
+        assert len(calls) == 1
+
+        tokens = mx.array([10, 11, 50, 20, 21, 60])
+        logits = _uniform_logits()
+        result = proc(tokens, logits)
+        assert len(calls) == 2  # second call from explicit invocation
+        assert mx.array_equal(result, logits * 2)
+
+    def test_no_inner_passes_through_in_content(self):
+        proc = _make_processor(budget=100, inner=None)
+        _feed_sequence(proc, [10, 11, 50, 20, 21])  # reach CONTENT
+        logits = _uniform_logits()
+        tokens = mx.array([10, 11, 50, 20, 21, 60])
+        result = proc(tokens, logits)
+        assert mx.array_equal(result, logits)
