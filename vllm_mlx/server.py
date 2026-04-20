@@ -169,7 +169,9 @@ _default_top_k: int | None = None  # Set via --default-top-k
 _default_min_p: float | None = None  # Set via --default-min-p
 _default_presence_penalty: float | None = None  # Set via --default-presence-penalty
 _default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
-_default_thinking_token_budget: int | None = None  # Set via --default-thinking-token-budget
+_default_thinking_token_budget: int | None = (
+    None  # Set via --default-thinking-token-budget
+)
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -3166,7 +3168,9 @@ async def _create_chat_completion_inner(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             total_tokens=output.prompt_tokens + output.completion_tokens,
-            reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
+            reasoning_tokens=(
+                _thinking_proc.thinking_tokens if _thinking_proc is not None else None
+            ),
         ),
     )
 
@@ -3938,7 +3942,9 @@ async def _create_anthropic_message_inner(request: Request, tracker):
         usage=AnthropicUsage(
             input_tokens=output.prompt_tokens,
             output_tokens=output.completion_tokens,
-            reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
+            reasoning_tokens=(
+                _thinking_proc.thinking_tokens if _thinking_proc is not None else None
+            ),
         ),
     )
     return Response(
@@ -4707,7 +4713,11 @@ async def stream_chat_completion(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
-                reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
+                reasoning_tokens=(
+                    _thinking_proc.thinking_tokens
+                    if _thinking_proc is not None
+                    else None
+                ),
             ),
         )
         yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"

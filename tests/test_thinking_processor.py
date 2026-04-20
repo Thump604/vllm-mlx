@@ -440,9 +440,7 @@ class TestThinkingIntegration:
             "http://localhost:8080/v1/chat/completions",
             json={
                 "model": "qwen3.5-27b",
-                "messages": [
-                    {"role": "user", "content": 'Return {"answer": 42}'}
-                ],
+                "messages": [{"role": "user", "content": 'Return {"answer": 42}'}],
                 "max_tokens": 4096,
                 "thinking_token_budget": 200,
                 "response_format": {"type": "json_object"},
