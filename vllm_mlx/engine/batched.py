@@ -2265,7 +2265,9 @@ class BatchedEngine(BaseEngine):
         except (TypeError, Exception) as e:
             # Template may reject tools= or enable_thinking=, or tools format
             # may not match template expectations — retry without tools
-            logger.debug("Chat template error, retrying without tools: %s", e)
+            logger.warning(
+                "Chat template error (retrying without tools/enable_thinking): %s", e
+            )
             template_kwargs.pop("tools", None)
             template_kwargs.pop("enable_thinking", None)
             prompt = self._text_tokenizer.apply_chat_template(
@@ -2734,7 +2736,36 @@ class BatchedEngine(BaseEngine):
                 except Exception:
                     pass
                 raise
+            except Exception as exc:
+                logger.error(
+                    "Generation failed in _run_with_cache: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
             all_resps, prompt_token_count = result
+
+        logger.info(
+            "Generation complete: %d tokens, prompt_tokens=%d, " "mtp=%s, guided=%s",
+            len(all_resps),
+            prompt_token_count,
+            _has_mtp,
+            bool(guided_processors),
+        )
+        if all_resps:
+            first_text = all_resps[0].text if hasattr(all_resps[0], "text") else "?"
+            last_text = all_resps[-1].text if hasattr(all_resps[-1], "text") else "?"
+            last_fr = (
+                all_resps[-1].finish_reason
+                if hasattr(all_resps[-1], "finish_reason")
+                else "?"
+            )
+            logger.info(
+                "Generation tokens: first=%r last=%r last_finish_reason=%s",
+                first_text[:50] if first_text else "",
+                last_text[:50] if last_text else "",
+                last_fr,
+            )
 
         # Yield results as GenerationOutput
         accumulated_text = ""

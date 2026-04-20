@@ -3064,7 +3064,12 @@ async def _create_chat_completion_inner(
                         tracker.observe_ttft()
                     yield chunk
                 tracker.finish(result="success")
-            except Exception:
+            except Exception as _stream_exc:
+                logger.error(
+                    "Streaming chat completion failed: %s: %s",
+                    type(_stream_exc).__name__,
+                    _stream_exc,
+                )
                 tracker.finish(result="error")
                 raise
 
@@ -4459,7 +4464,9 @@ async def stream_chat_completion(
             logger.warning(f"Failed to init tool parser for streaming: {e}")
 
     # Stream content
+    _stream_output_count = 0
     async for output in engine.stream_chat(messages=messages, **kwargs):
+        _stream_output_count += 1
         delta_text = output.new_text
         last_output = output
 
@@ -4724,8 +4731,19 @@ async def stream_chat_completion(
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Chat completion (stream): {completion_tokens} tokens in "
+        f"{elapsed:.2f}s ({tokens_per_sec:.1f} tok/s), "
+        f"engine_outputs={_stream_output_count}, "
+        f"accumulated_text_len={len(accumulated_text)}, "
+        f"enable_thinking={enable_thinking}, "
+        f"parser={'yes' if reasoning_parser else 'no'}"
     )
+    if _stream_output_count == 0:
+        logger.warning(
+            "Chat completion stream: ZERO engine outputs received. "
+            "The engine's stream_chat() generator was empty or raised. "
+            "Check engine logs for errors."
+        )
 
     # Send final chunk with usage if requested
     if include_usage:
