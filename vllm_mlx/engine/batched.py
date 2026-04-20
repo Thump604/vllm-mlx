@@ -2573,18 +2573,91 @@ class BatchedEngine(BaseEngine):
             def _run_cache_miss():
                 """Full prefill + generation, then snapshot system KV for next time."""
                 results = []
-                for resp in mlx_stream_generate(
-                    self._text_model,
-                    self._text_tokenizer,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    logits_processors=guided_processors,
-                    mtp=_has_mtp,
-                    num_draft_tokens=1,
-                    prefill_step_size=prefill_step_size,
-                ):
-                    results.append(resp)
+
+                # Phase 2: if a thinking processor can retire (CONTENT, no
+                # inner constraint), split generation into two phases so MTP
+                # can re-enable for content tokens.
+                _can_retire = (
+                    guided_processors
+                    and hasattr(self._text_model, "mtp_forward")
+                    and any(
+                        getattr(p, "is_retired", False) is not None
+                        and hasattr(p, "is_retired")
+                        for p in (
+                            guided_processors
+                            if isinstance(guided_processors, list)
+                            else [guided_processors]
+                        )
+                    )
+                )
+
+                if _can_retire:
+                    # Create shared cache so we can continue with MTP later.
+                    shared_cache = make_prompt_cache(self._text_model)
+                    for resp in mlx_stream_generate(
+                        self._text_model,
+                        self._text_tokenizer,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=guided_processors,
+                        mtp=False,
+                        num_draft_tokens=1,
+                        prefill_step_size=prefill_step_size,
+                        prompt_cache=shared_cache,
+                    ):
+                        results.append(resp)
+                        # Check if processor retired
+                        _retired = any(
+                            getattr(p, "is_retired", False)
+                            for p in (
+                                guided_processors
+                                if isinstance(guided_processors, list)
+                                else [guided_processors]
+                            )
+                        )
+                        if _retired:
+                            break
+
+                    # Phase 2: continue with MTP, no processor
+                    if _retired and len(results) < max_tokens:
+                        remaining = max_tokens - len(results)
+                        # Feed the last token as prompt seed; the shared_cache
+                        # holds the full KV state from phase 1.
+                        last_tok = results[-1].token if hasattr(results[-1], "token") else None
+                        if last_tok is not None:
+                            seed = mx.array([last_tok])
+                        else:
+                            seed = self._text_tokenizer.encode(
+                                results[-1].text if hasattr(results[-1], "text") else ""
+                            )
+                            seed = mx.array(seed)
+                        for resp in mlx_stream_generate(
+                            self._text_model,
+                            self._text_tokenizer,
+                            prompt=seed,
+                            max_tokens=remaining,
+                            sampler=sampler,
+                            logits_processors=None,
+                            mtp=True,
+                            num_draft_tokens=1,
+                            prefill_step_size=prefill_step_size,
+                            prompt_cache=shared_cache,
+                        ):
+                            results.append(resp)
+                else:
+                    for resp in mlx_stream_generate(
+                        self._text_model,
+                        self._text_tokenizer,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                        logits_processors=guided_processors,
+                        mtp=_has_mtp,
+                        num_draft_tokens=1,
+                        prefill_step_size=prefill_step_size,
+                    ):
+                        results.append(resp)
 
                 # Snapshot system KV for next request (if we found a system prefix)
                 if prefix_hash is not None and system_prefix is not None:
