@@ -43,6 +43,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
+        # Streaming state (avoids O(n^2) full-text search on every token)
+        self._seen_start = False
+        self._seen_end = False
+        # Buffer for partial tag matches at chunk boundaries
+        self._boundary_buffer = ""
 
     def extract_reasoning(
         self,
@@ -86,6 +91,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # Case 4: No tags at all - pure content
         return None, model_output
 
+    def reset_state(self):
+        """Reset internal state for a new streaming request."""
+        self._seen_start = False
+        self._seen_end = False
+        self._boundary_buffer = ""
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -93,50 +104,73 @@ class BaseThinkingReasoningParser(ReasoningParser):
         delta_text: str,
     ) -> DeltaMessage | None:
         """
-        Extract reasoning from streaming delta using text-based detection.
+        Extract reasoning from streaming delta using state-machine tracking.
 
-        Handles implicit reasoning mode where <think> was in the prompt
-        and only </think> appears in the output.
+        Uses internal state (_seen_start, _seen_end) to avoid O(n) searches
+        on the full accumulated text every token. Only searches the small
+        delta_text plus a boundary buffer for tag transitions.
 
         Args:
-            previous_text: Text accumulated before this delta.
-            current_text: Text including this delta.
+            previous_text: Text accumulated before this delta (used for
+                           first-call bootstrap only).
+            current_text: Text including this delta (unused in fast path).
             delta_text: Just the new text.
 
         Returns:
             DeltaMessage with reasoning/content, or None to skip.
         """
+        # Bootstrap: on first call, seed state from previous_text (covers
+        # cases where the parser is attached mid-stream or tags were in
+        # earlier chunks processed by a different code path).
+        if not self._seen_start and not self._seen_end and previous_text:
+            if self.start_token in previous_text:
+                self._seen_start = True
+            if self.end_token in previous_text:
+                self._seen_end = True
+
         # Skip if delta is just the special tokens themselves
         stripped_delta = delta_text.strip()
         if stripped_delta == self.start_token:
+            self._seen_start = True
             return None
         if stripped_delta == self.end_token:
+            self._seen_end = True
             return None
 
-        # Check token positions in text (stateless text-based detection)
-        start_in_prev = self.start_token in previous_text
-        start_in_current = self.start_token in current_text
-        end_in_prev = self.end_token in previous_text
-        end_in_delta = self.end_token in delta_text
+        # Check for tags in delta (O(len(delta)) which is small)
+        # Also check boundary: tag might span previous chunk + this delta
+        boundary_check = self._boundary_buffer + delta_text
+        start_in_delta = self.start_token in boundary_check
+        end_in_delta = self.end_token in boundary_check
 
-        # Case 1: Explicit <think> found in text - standard behavior
-        if start_in_current:
+        # Update boundary buffer (keep last N chars where N = max tag length - 1)
+        max_tag_len = max(len(self.start_token), len(self.end_token))
+        self._boundary_buffer = delta_text[-(max_tag_len - 1):] if len(delta_text) >= max_tag_len - 1 else (self._boundary_buffer + delta_text)[-(max_tag_len - 1):]
+
+        # Detect transitions from delta
+        if start_in_delta:
+            self._seen_start = True
+        if end_in_delta:
+            self._seen_end = True
+
+        # Case 1: Explicit <think> found - standard behavior
+        if self._seen_start:
             return self._handle_explicit_think(
-                previous_text, delta_text, start_in_prev, end_in_prev, end_in_delta
+                previous_text, delta_text,
+                start_in_prev=(self._seen_start and not start_in_delta),
+                end_in_prev=(self._seen_end and not end_in_delta),
+                end_in_delta=end_in_delta,
             )
 
         # Case 2: No <think> but </think> found - implicit reasoning mode
-        # This handles when <think> was injected in the prompt
-        if self.end_token in current_text:
-            return self._handle_implicit_think(delta_text, end_in_prev, end_in_delta)
+        if self._seen_end:
+            return self._handle_implicit_think(
+                delta_text,
+                end_in_prev=(self._seen_end and not end_in_delta),
+                end_in_delta=end_in_delta,
+            )
 
-        # Case 3: No think tags seen yet
-        # We can't know if <think> was in the prompt, so we must make a choice:
-        # - Treat as content (safe, but loses reasoning if think was in prompt)
-        # - Treat as reasoning (risky, wrong if no thinking at all)
-        # We choose to treat as reasoning IF we haven't seen </think> yet,
-        # because if think was in prompt, we want to capture the reasoning.
-        # This will be corrected once </think> is seen.
+        # Case 3: No think tags seen yet - treat as reasoning
         return DeltaMessage(reasoning=delta_text)
 
     def _handle_explicit_think(
