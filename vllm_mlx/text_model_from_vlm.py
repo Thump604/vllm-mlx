@@ -121,12 +121,15 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # Use config.json quantization metadata if available; otherwise infer
         # from the presence of .scales keys in the weight names.
         quantization = text_config.get("quantization", config.get("quantization", None))
+        # Log MTP weight names for debugging quantization path matching
+        mtp_scale_names = sorted(
+            name for name, _ in mtp_weights if name.endswith(".scales")
+        )
         logger.info(
-            "build_text_model: quantization config=%s, "
-            "mtp_scales_present=%s, vlm_scales_present=%s",
-            quantization,
-            any(name.endswith(".scales") for name, _ in mtp_weights),
-            any(name.endswith(".scales") for name, _ in vlm_weights),
+            "build_text_model: quantization config present=%s, "
+            "mtp_scales=%s",
+            quantization is not None,
+            mtp_scale_names[:5],
         )
         if quantization is None:
             # Infer: if any weight has .scales, the model is quantized.
