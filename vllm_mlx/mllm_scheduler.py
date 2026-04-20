@@ -585,8 +585,12 @@ class MLLMScheduler:
                 detok.reset()
                 self._detokenizer_pool[request_id] = detok
             detok = self._detokenizer_pool[request_id]
-            detok.add_token(response.token)
-            new_text = detok.last_segment
+
+            # Don't feed stop tokens into the detokenizer — they are not content
+            is_stop_finish = response.finish_reason == "stop"
+            if not is_stop_finish:
+                detok.add_token(response.token)
+            new_text = "" if is_stop_finish else detok.last_segment
 
             # Create output
             output = RequestOutput(
@@ -615,7 +619,11 @@ class MLLMScheduler:
                     detok.finalize()
                     output.output_text = detok.text
                 else:
-                    output.output_text = tokenizer.decode(request.output_tokens)
+                    # Strip the stop token from output before decoding
+                    toks = request.output_tokens
+                    if is_stop_finish and toks:
+                        toks = toks[:-1]
+                    output.output_text = tokenizer.decode(toks)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
                 self._detokenizer_pool.pop(request_id, None)
