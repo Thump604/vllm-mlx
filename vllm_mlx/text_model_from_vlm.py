@@ -166,15 +166,15 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
                 if _broken_paths:
                     logger.warning(
                         "MTP quantization mismatch in %d modules: %s. "
-                        "Disabling MTP for this model (MLLM scheduler "
-                        "will handle generation).",
+                        "Returning None so MLLM scheduler handles all "
+                        "generation for this model.",
                         len(_broken_paths),
                         _broken_paths[:5],
                     )
-                    # Can't easily re-quantize after dict weights are loaded.
-                    # Disable MTP: the model still works via MLLM scheduler,
-                    # just without TextModel+MTP routing.
-                    text_model.mtp = None
+                    # Can't use TextModel+MTP when quantized weights don't
+                    # match the skeleton. Return None so engine falls back
+                    # to MLLM scheduler (which handles thinking natively).
+                    return None
         else:
             logger.warning("No MTP weights found in %s", model_path.name)
 
