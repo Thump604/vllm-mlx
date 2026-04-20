@@ -176,6 +176,10 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # Enable/disable thinking mode (also accepted in chat_template_kwargs)
     enable_thinking: bool | None = None
+    # Cap reasoning tokens as a sub-limit of max_tokens.
+    # When set, the model is forced to transition from thinking to content
+    # after this many reasoning tokens. None = no budget enforcement.
+    thinking_token_budget: int | None = Field(default=None, ge=0)
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
@@ -217,6 +221,7 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):

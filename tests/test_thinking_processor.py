@@ -244,3 +244,84 @@ class TestInnerDelegation:
         tokens = mx.array([10, 11, 50, 20, 21, 60])
         result = proc(tokens, logits)
         assert mx.array_equal(result, logits)
+
+
+# =============================================================================
+# API model and adapter tests
+# =============================================================================
+
+from vllm_mlx.api.models import ChatCompletionRequest, Usage
+from vllm_mlx.api.anthropic_models import AnthropicRequest, AnthropicUsage
+from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+
+
+class TestApiModels:
+    def test_chat_request_accepts_thinking_token_budget(self):
+        req = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking_token_budget=8192,
+        )
+        assert req.thinking_token_budget == 8192
+
+    def test_chat_request_budget_none_by_default(self):
+        req = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert req.thinking_token_budget is None
+
+    def test_chat_request_budget_zero(self):
+        req = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            thinking_token_budget=0,
+        )
+        assert req.thinking_token_budget == 0
+
+    def test_usage_has_reasoning_tokens(self):
+        u = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+        assert u.reasoning_tokens is None
+        u2 = Usage(
+            prompt_tokens=10,
+            completion_tokens=20,
+            total_tokens=30,
+            reasoning_tokens=5,
+        )
+        assert u2.reasoning_tokens == 5
+
+    def test_anthropic_request_accepts_thinking_token_budget(self):
+        req = AnthropicRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1024,
+            thinking_token_budget=4096,
+        )
+        assert req.thinking_token_budget == 4096
+
+    def test_anthropic_usage_has_reasoning_tokens(self):
+        u = AnthropicUsage(input_tokens=10, output_tokens=20)
+        assert u.reasoning_tokens is None
+        u2 = AnthropicUsage(input_tokens=10, output_tokens=20, reasoning_tokens=8)
+        assert u2.reasoning_tokens == 8
+
+
+class TestAnthropicAdapter:
+    def test_budget_forwarded_through_adapter(self):
+        req = AnthropicRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=1024,
+            thinking_token_budget=4096,
+        )
+        openai_req = anthropic_to_openai(req)
+        assert openai_req.thinking_token_budget == 4096
+
+    def test_budget_none_when_not_set(self):
+        req = AnthropicRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=1024,
+        )
+        openai_req = anthropic_to_openai(req)
+        assert openai_req.thinking_token_budget is None
