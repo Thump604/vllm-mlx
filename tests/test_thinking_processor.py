@@ -1,5 +1,6 @@
 """Tests for ThinkingAwareLogitsProcessor and supporting utilities."""
 
+import os
 from typing import Callable
 
 import mlx.core as mx
@@ -389,3 +390,68 @@ class TestDecisionTree:
         Server gates on parser availability."""
         # Documented for integration test coverage.
         pass
+
+
+INTEGRATION = os.environ.get("VLLM_MLX_TEST_THINKING_INTEGRATION", "")
+
+
+@pytest.mark.skipif(
+    not INTEGRATION,
+    reason="Set VLLM_MLX_TEST_THINKING_INTEGRATION=1 to run",
+)
+class TestThinkingIntegration:
+    """Integration tests requiring a running Qwen model.
+
+    Run with: VLLM_MLX_TEST_THINKING_INTEGRATION=1 pytest ...
+    Requires a Qwen 3.x model server on localhost:8080 with
+    --reasoning-parser qwen3.
+    """
+
+    def test_budget_caps_reasoning_tokens(self):
+        """With budget=100, reasoning_tokens should be <= 100."""
+        import httpx
+
+        resp = httpx.post(
+            "http://localhost:8080/v1/chat/completions",
+            json={
+                "model": "qwen3.5-27b",
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "max_tokens": 4096,
+                "thinking_token_budget": 100,
+                "stream": False,
+            },
+            timeout=120,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        usage = data.get("usage", {})
+        assert usage.get("reasoning_tokens") is not None
+        assert usage["reasoning_tokens"] <= 100
+        # Content should be non-empty
+        content = data["choices"][0]["message"]["content"]
+        assert content and len(content.strip()) > 0
+
+    def test_budget_with_json_produces_valid_json(self):
+        """Thinking + JSON + budget should produce valid JSON content."""
+        import httpx
+        import json
+
+        resp = httpx.post(
+            "http://localhost:8080/v1/chat/completions",
+            json={
+                "model": "qwen3.5-27b",
+                "messages": [
+                    {"role": "user", "content": 'Return {"answer": 42}'}
+                ],
+                "max_tokens": 4096,
+                "thinking_token_budget": 200,
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            },
+            timeout=120,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)  # must be valid JSON
+        assert isinstance(parsed, dict)
