@@ -145,6 +145,44 @@ class TestPhaseTransitions:
         # 3 thinking tokens (50, 51, 52), start sequence not counted
         assert proc.thinking_tokens == 3
 
+    def test_prompt_has_think_tag_starts_in_thinking(self):
+        """When chat template already injected <think>, start in THINKING."""
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=100,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+        assert proc.state == Phase.THINKING
+        # First generated token counts as a thinking token
+        _feed_sequence(proc, [50])
+        assert proc.thinking_tokens == 1
+
+    def test_prompt_has_think_tag_budget_zero(self):
+        """prompt_has_think_tag + budget=0 -> start in TRANSITIONING."""
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=0,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+        assert proc.state == Phase.TRANSITIONING
+
+    def test_prompt_has_think_tag_counts_and_transitions(self):
+        """With prompt_has_think_tag, budget enforcement works from first token."""
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=3,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+        _feed_sequence(proc, [50, 51, 52])
+        assert proc.thinking_tokens == 3
+        assert proc.state == Phase.TRANSITIONING
+
 
 class TestBudgetEnforcement:
     def test_budget_forces_transition(self):

@@ -3018,6 +3018,7 @@ async def _create_chat_completion_inner(
             thinking_token_budget=_budget,
             inner=json_logits_processor,
             vocab_size=_tokenizer.vocab_size,
+            prompt_has_think_tag=_thinking_on,
         )
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [_tap]
@@ -3854,6 +3855,7 @@ async def _create_anthropic_message_inner(request: Request, tracker):
             thinking_token_budget=_budget,
             inner=json_logits_processor,
             vocab_size=_tokenizer.vocab_size,
+            prompt_has_think_tag=_thinking_on,
         )
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [_tap]

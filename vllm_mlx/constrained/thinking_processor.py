@@ -81,6 +81,7 @@ class ThinkingAwareLogitsProcessor:
         thinking_token_budget: int,
         inner: Callable[[mx.array, mx.array], mx.array] | None = None,
         vocab_size: int = 152064,
+        prompt_has_think_tag: bool = False,
     ) -> None:
         self._start_matcher = BoundedSuffixMatcher(start_token_ids)
         self._end_matcher = BoundedSuffixMatcher(end_token_ids)
@@ -88,9 +89,18 @@ class ThinkingAwareLogitsProcessor:
         self._thinking_token_budget = thinking_token_budget
         self._inner = inner
         self._vocab_size = vocab_size
-        self._state = Phase.IDLE
         self._thinking_tokens = 0
         self._transition_index = 0
+        # When the chat template already injected <think> into the prompt,
+        # the first generated token is already inside the thinking span.
+        # Start in THINKING (or TRANSITIONING if budget=0) instead of IDLE.
+        if prompt_has_think_tag:
+            if thinking_token_budget == 0:
+                self._state = Phase.TRANSITIONING
+            else:
+                self._state = Phase.THINKING
+        else:
+            self._state = Phase.IDLE
 
     @property
     def state(self) -> Phase:
