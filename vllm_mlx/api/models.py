@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field, computed_field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -222,6 +222,13 @@ class Usage(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     reasoning_tokens: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        d = handler(self)
+        if d.get("reasoning_tokens") is None:
+            d.pop("reasoning_tokens", None)
+        return d
 
 
 class ChatCompletionResponse(BaseModel):
