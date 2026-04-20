@@ -2277,12 +2277,27 @@ class BatchedEngine(BaseEngine):
         max_tokens = max_tokens or 4096
 
         # Check MTP support — used by all generation paths below.
-        # MTP is disabled when logits processors (constrained decoding) are
-        # active: draft tokens from MTP bypass the JSON schema enforcer's FSM,
-        # corrupting its state and causing deadlocks. See vllm-mlx#375.
-        _has_mtp = (
-            hasattr(self._text_model, "mtp_forward")
-            and not guided_processors
+        # MTP is disabled when constrained-decoding logits processors (e.g.
+        # lm-format-enforcer JSON FSM) are active: draft tokens from MTP
+        # bypass the FSM, corrupting its state. See vllm-mlx#375.
+        #
+        # Exception: ThinkingAwareLogitsProcessor without an inner constraint
+        # is safe with MTP — it only counts tokens via a rolling suffix
+        # matcher and passes logits through during THINKING/TRANSITIONING.
+        # mtp_generate_step already applies logits_processors per verified
+        # token, so the counter stays accurate.
+        def _only_thinking_processors(procs) -> bool:
+            """True when every processor is a retired-capable thinking
+            processor with no inner constraint (no JSON FSM)."""
+            from vllm_mlx.constrained.thinking_processor import (
+                ThinkingAwareLogitsProcessor as _TAP,
+            )
+
+            items = procs if isinstance(procs, list) else [procs]
+            return all(isinstance(p, _TAP) and p._inner is None for p in items)
+
+        _has_mtp = hasattr(self._text_model, "mtp_forward") and (
+            not guided_processors or _only_thinking_processors(guided_processors)
         )
 
         # --- System KV cache: find system prefix boundary ---
@@ -2574,15 +2589,18 @@ class BatchedEngine(BaseEngine):
                 """Full prefill + generation, then snapshot system KV for next time."""
                 results = []
 
-                # Phase 2: if a thinking processor can retire (CONTENT, no
-                # inner constraint), split generation into two phases so MTP
-                # can re-enable for content tokens.
+                # Phase 2 split: only needed when MTP is off (inner JSON
+                # constraint) but the thinking processor can retire so MTP
+                # can re-enable for content.  When _has_mtp is already True
+                # (thinking-only processor, no inner constraint), the normal
+                # generation path runs with MTP from the start and a split
+                # would add complexity for no benefit.
                 _can_retire = (
                     guided_processors
+                    and not _has_mtp
                     and hasattr(self._text_model, "mtp_forward")
                     and any(
-                        getattr(p, "is_retired", False) is not None
-                        and hasattr(p, "is_retired")
+                        hasattr(p, "is_retired")
                         for p in (
                             guided_processors
                             if isinstance(guided_processors, list)
@@ -2624,7 +2642,9 @@ class BatchedEngine(BaseEngine):
                         remaining = max_tokens - len(results)
                         # Feed the last token as prompt seed; the shared_cache
                         # holds the full KV state from phase 1.
-                        last_tok = results[-1].token if hasattr(results[-1], "token") else None
+                        last_tok = (
+                            results[-1].token if hasattr(results[-1], "token") else None
+                        )
                         if last_tok is not None:
                             seed = mx.array([last_tok])
                         else:
