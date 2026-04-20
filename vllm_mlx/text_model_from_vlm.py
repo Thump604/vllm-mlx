@@ -65,6 +65,79 @@ def _resolve_quantization_recipe(
     return recipe
 
 
+def _remap_moe_mtp_weights(
+    mtp_weights: list[tuple[str, Any]],
+    text_model: Any,
+    logger,
+) -> list[tuple[str, Any]]:
+    """Remap MTP weight keys to match the model tree for MoE models.
+
+    Handles three known format differences (validated against Qwen 3.6):
+    1. Nested quant: X.weight.weight → X.weight, X.weight.scales → X.scales
+    2. Expert rename: experts.{proj} → switch_mlp.{proj}
+    3. Fused gate_up: experts.gate_up_proj → split into
+       switch_mlp.gate_proj + switch_mlp.up_proj (dim=1 for 3D, dim=0 for 2D)
+
+    If disk keys already match model tree (e.g. 122B), returns unchanged.
+    """
+    # Get the expected model parameter paths for comparison
+    model_param_names = {
+        f"mtp.{n}" for n, _ in mlx.utils.tree_flatten(text_model.mtp.parameters())
+    }
+    disk_names = {n for n, _ in mtp_weights}
+
+    # Quick check: if base weight keys already match, no remap needed
+    disk_base = {n for n in disk_names if n.endswith(".weight") and not n.endswith(".weight.weight")}
+    if disk_base.issubset(model_param_names | {n for n in disk_names if ".scales" in n or ".biases" in n}):
+        # Check more carefully: are all model params covered?
+        disk_weight_keys = {n for n in disk_names if not n.endswith(".scales") and not n.endswith(".biases")}
+        if disk_weight_keys.issubset(model_param_names):
+            logger.info("_remap_moe_mtp_weights: keys match model tree, no remap needed")
+            return mtp_weights
+
+    # Remap needed
+    logger.info("_remap_moe_mtp_weights: disk format differs from model tree, applying remap")
+    remapped = []
+    remap_count = 0
+
+    for name, val in mtp_weights:
+        new_name = name
+
+        # Step 1: de-nest quantization (X.weight.weight → X.weight, etc.)
+        if ".weight.weight" in new_name:
+            new_name = new_name.replace(".weight.weight", ".weight")
+        elif ".weight.scales" in new_name:
+            new_name = new_name.replace(".weight.scales", ".scales")
+        elif ".weight.biases" in new_name:
+            new_name = new_name.replace(".weight.biases", ".biases")
+
+        # Step 2: experts.down_proj → switch_mlp.down_proj
+        if ".mlp.experts.down_proj" in new_name:
+            new_name = new_name.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj")
+
+        # Step 3: experts.gate_up_proj → split into gate_proj + up_proj
+        if ".mlp.experts.gate_up_proj" in new_name:
+            suffix = new_name.split(".mlp.experts.gate_up_proj")[-1]  # .weight/.scales/.biases
+            prefix = new_name.split(".mlp.experts.gate_up_proj")[0]
+            # Split the tensor: gate_up_proj is [num_experts, gate_size + up_size, ...]
+            # or [gate_size + up_size, ...] for 2D. Split in half on the appropriate dim.
+            split_dim = 1 if val.ndim == 3 else 0
+            half = val.shape[split_dim] // 2
+            gate_val = mx.take(val, mx.arange(half), axis=split_dim)
+            up_val = mx.take(val, mx.arange(half, val.shape[split_dim]), axis=split_dim)
+            remapped.append((f"{prefix}.mlp.switch_mlp.gate_proj{suffix}", gate_val))
+            remapped.append((f"{prefix}.mlp.switch_mlp.up_proj{suffix}", up_val))
+            remap_count += 1
+            continue  # Already added both halves
+
+        if new_name != name:
+            remap_count += 1
+        remapped.append((new_name, val))
+
+    logger.info("_remap_moe_mtp_weights: remapped %d keys", remap_count)
+    return remapped
+
+
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
@@ -129,37 +202,16 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
         mtp_weights = _load_mtp_weights(model_path)
 
-        # MoE MTP architecture fixup: MTPDecoderLayer creates SparseMoeBlock
-        # when num_experts > 0, but some MoE models store MTP weights in flat
-        # dense format (only gate_proj/up_proj/down_proj, no shared_expert/gate).
-        # Detect from weight names and replace SparseMoeBlock with dense MLP
-        # ONLY when weights are actually flat.
-        if num_experts > 0 and hasattr(text_model, "mtp") and text_model.mtp is not None:
-            mtp_weight_names = {name for name, _ in mtp_weights}
-            _has_moe_mtp_weights = any(
-                "mtp." in n and (".shared_expert." in n or ".gate." in n or ".experts." in n)
-                for n in mtp_weight_names
-            )
-            if not _has_moe_mtp_weights:
-                # Flat MTP weights: replace SparseMoeBlock with dense MLP
-                from mlx_lm.models.qwen3_5 import MLP
-                intermediate = text_config.get(
-                    "shared_expert_intermediate_size",
-                    text_config.get("intermediate_size", args.hidden_size * 4),
-                )
-                for layer in text_model.mtp.layers:
-                    if hasattr(layer, "mlp") and not isinstance(layer.mlp, MLP):
-                        layer.mlp = MLP(args.hidden_size, intermediate)
-                logger.info(
-                    "build_text_model: MoE model with flat MTP weights -- "
-                    "replaced %d SparseMoeBlock(s) with dense MLP",
-                    len(text_model.mtp.layers),
-                )
-            else:
-                logger.info(
-                    "build_text_model: MoE model with MoE MTP weights -- "
-                    "keeping SparseMoeBlock in MTP layers"
-                )
+        # MoE MTP weight remap: some quantizers (e.g. Qwen 3.6 8-bit) store
+        # MTP weights with different naming than the model tree expects.
+        # Detected mismatches (from disk key enumeration):
+        #   1. Nested quant: X.weight.weight/scales/biases → X.weight/scales/biases
+        #   2. Expert rename: experts.down_proj → switch_mlp.down_proj
+        #   3. Fused experts: experts.gate_up_proj → split into
+        #      switch_mlp.gate_proj + switch_mlp.up_proj
+        # Apply remap ONLY when the disk format differs from model tree.
+        if num_experts > 0 and mtp_weights:
+            mtp_weights = _remap_moe_mtp_weights(mtp_weights, text_model, logger)
 
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
