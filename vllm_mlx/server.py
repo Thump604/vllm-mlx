@@ -54,7 +54,7 @@ from dataclasses import dataclass
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.routing import Match
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -501,6 +501,20 @@ app = FastAPI(
 )
 
 security = HTTPBearer(auto_error=False)
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """Convert engine-level exceptions to appropriate HTTP responses."""
+    from .engine.batched import TextGenerationBusy
+
+    if isinstance(exc, TextGenerationBusy):
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": str(exc), "type": "server_busy"}},
+        )
+    # Re-raise all other exceptions for default handling
+    raise exc
 
 
 class RateLimiter:

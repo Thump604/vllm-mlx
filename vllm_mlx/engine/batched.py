@@ -19,12 +19,40 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+from contextlib import asynccontextmanager
+
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from ..message_utils import _normalize_messages
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+
+class TextGenerationBusy(RuntimeError):
+    """Raised when the text generation lock cannot be acquired within timeout."""
+    pass
+
+
+@asynccontextmanager
+async def _acquire_lock_with_timeout(lock: asyncio.Lock, timeout: float):
+    """Acquire an asyncio.Lock with a timeout on the acquisition phase only.
+
+    Once acquired, the lock is held until the context exits (no timeout on
+    the work phase). Raises TextGenerationBusy if the lock cannot be
+    acquired within `timeout` seconds.
+    """
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise TextGenerationBusy(
+            f"Text generation lock busy (waited {timeout:.0f}s). "
+            "Another request is still generating. Try again shortly."
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 _MEDIA_TYPES = frozenset(
     {
@@ -271,6 +299,9 @@ class BatchedEngine(BaseEngine):
         self._text_tokenizer = None
         self._text_scheduler = None
         self._text_generation_lock = asyncio.Lock()
+        self._text_generation_lock_timeout = float(
+            os.environ.get("VLLM_MLX_TEXT_LOCK_TIMEOUT", "60")
+        )
         self._text_scheduler_route_enabled = _env_flag(
             "VLLM_MLX_ENABLE_TEXT_BATCH_SCHEDULER_CANARY",
             _env_flag("VLLM_MLX_ENABLE_TEXT_BATCH_SCHEDULER", False),
@@ -1335,7 +1366,9 @@ class BatchedEngine(BaseEngine):
                 prefix_hash,
             )
 
-        async with self._text_generation_lock:
+        async with _acquire_lock_with_timeout(
+            self._text_generation_lock, self._text_generation_lock_timeout
+        ):
             # The begin log MUST be inside the lock scope. Logging it before
             # the `async with` would let two concurrent requests log "begin"
             # before either acquired the lock, defeating the concurrency test
@@ -2398,7 +2431,9 @@ class BatchedEngine(BaseEngine):
         # Next request acquires the freed lock -> two threads hit Metal
         # concurrently -> SIGABRT (tryCoalescingPreviousComputeCommandEncoder).
         # See: vllm-mlx PR #220, mlx issue #3216.
-        async with self._text_generation_lock:
+        async with _acquire_lock_with_timeout(
+            self._text_generation_lock, self._text_generation_lock_timeout
+        ):
 
             def _run_with_cache():
                 if use_specprefill:
