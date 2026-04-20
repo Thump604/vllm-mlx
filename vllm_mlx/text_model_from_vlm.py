@@ -146,6 +146,46 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         if mtp_weights:
             text_model.load_weights(mtp_weights, strict=False)
             logger.info("Loaded %d MTP weights from safetensors", len(mtp_weights))
+
+            # Fix quantization mismatch: some model quants (e.g. Qwen 3.6
+            # 8-bit) quantize MTP Linear layers on disk but nn.quantize()
+            # may not have found them (path/scales naming difference). After
+            # load_weights, a dict-valued "weight" means the layer got
+            # quantized weights stuffed into a non-quantized nn.Linear.
+            # Re-quantize those modules so the QuantizedLinear wrapper can
+            # handle the weight/scales/biases triple correctly.
+            if (
+                quantization is not None
+                and hasattr(text_model, "mtp")
+                and text_model.mtp is not None
+            ):
+                mtp_weight_names = set(name for name, _ in mtp_weights)
+                _requantized = 0
+                for path, module in text_model.mtp.named_modules():
+                    full_path = f"mtp.{path}" if path else "mtp"
+                    if (
+                        isinstance(module, nn.Linear)
+                        and not isinstance(module, nn.QuantizedLinear)
+                        and f"{full_path}.scales" in mtp_weight_names
+                    ):
+                        recipe = _resolve_quantization_recipe(
+                            full_path, quantization, mtp_weight_names
+                        )
+                        if recipe:
+                            nn.quantize(
+                                text_model,
+                                class_predicate=lambda p, m, _fp=full_path, _r=recipe: (
+                                    _r if p == _fp else False
+                                ),
+                            )
+                            _requantized += 1
+                if _requantized:
+                    # Re-load MTP weights into the now-quantized modules
+                    text_model.load_weights(mtp_weights, strict=False)
+                    logger.info(
+                        "Post-load quantization: fixed %d MTP modules",
+                        _requantized,
+                    )
         else:
             logger.warning("No MTP weights found in %s", model_path.name)
 
