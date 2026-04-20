@@ -3033,6 +3033,10 @@ async def _create_chat_completion_inner(
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
     # else: no processor needed.
 
+    # Pass _thinking_proc through kwargs so stream_chat_completion can report
+    # reasoning_tokens in the usage chunk.
+    chat_kwargs["_thinking_proc"] = _thinking_proc
+
     if request.stream:
 
         async def _tracked_stream():
@@ -3162,6 +3166,7 @@ async def _create_chat_completion_inner(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             total_tokens=output.prompt_tokens + output.completion_tokens,
+            reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
         ),
     )
 
@@ -3933,6 +3938,7 @@ async def _create_anthropic_message_inner(request: Request, tracker):
         usage=AnthropicUsage(
             input_tokens=output.prompt_tokens,
             output_tokens=output.completion_tokens,
+            reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
         ),
     )
     return Response(
@@ -4023,6 +4029,7 @@ async def _stream_anthropic_messages(
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
     model_ctx: RequestModelContext,
+    _thinking_proc=None,
 ) -> AsyncIterator[str]:
     """
     Stream Anthropic Messages API SSE events.
@@ -4275,10 +4282,13 @@ async def _stream_anthropic_messages(
     stop_reason = "tool_use" if tool_calls else "end_turn"
 
     # Emit message_delta with stop_reason and usage
+    _usage_dict = {"output_tokens": completion_tokens}
+    if _thinking_proc is not None:
+        _usage_dict["reasoning_tokens"] = _thinking_proc.thinking_tokens
     message_delta = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": completion_tokens},
+        "usage": _usage_dict,
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
@@ -4343,6 +4353,7 @@ async def stream_chat_completion(
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
+    _thinking_proc = kwargs.pop("_thinking_proc", None)
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     start_time = time.perf_counter()
     kwargs["raw_output"] = True
@@ -4696,6 +4707,7 @@ async def stream_chat_completion(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
+                reasoning_tokens=_thinking_proc.thinking_tokens if _thinking_proc is not None else None,
             ),
         )
         yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
