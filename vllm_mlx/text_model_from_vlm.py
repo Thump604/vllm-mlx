@@ -95,10 +95,10 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
 
-        # Architecture gate: only Qwen 3.5 family configs map cleanly into
-        # mlx_lm.models.qwen3_5.TextModelArgs. Bail out before the import for
-        # everything else so we don't rely on the except-Exception backstop
-        # below to swallow a ZeroDivisionError on every restart.
+        # Architecture gate: only Qwen 3.5 dense family configs have proven
+        # TextModel+MTP support. MoE models (qwen3_5_moe, Qwen 3.6) use a
+        # non-standard quantization format for MTP weights that isn't handled
+        # yet. They work correctly via the MLLM scheduler path instead.
         text_model_type = (text_config.get("model_type") or "").lower()
         top_model_type = (config.get("model_type") or "").lower()
         if not (
@@ -109,6 +109,21 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
                 "build_text_model: skipping model_type=%r "
                 "(only Qwen 3.5 family is supported)",
                 text_model_type or top_model_type or "<unknown>",
+            )
+            return None
+
+        # MoE gate: skip TextModel+MTP for MoE models until the MTP weight
+        # quantization format mismatch is resolved. MoE models store MTP
+        # weights with nested scales (e.g. mtp.fc.weight.scales) and
+        # inconsistent shared_expert naming that nn.quantize cannot handle.
+        # The MLLM scheduler path handles these models correctly.
+        num_experts = text_config.get("num_experts", 0) or 0
+        if num_experts > 0:
+            logger.info(
+                "build_text_model: skipping MoE model (num_experts=%d). "
+                "MTP weight quantization format not yet supported. "
+                "MLLM scheduler will handle generation.",
+                num_experts,
             )
             return None
 
