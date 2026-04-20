@@ -27,9 +27,22 @@ def _resolve_quantization_recipe(
     quantization: dict[str, Any],
     all_weight_names: set[str],
 ) -> dict[str, Any] | bool:
-    """Return per-module quantization params for an extracted text layer."""
-    if f"{path}.scales" not in all_weight_names:
-        return False
+    """Return per-module quantization params for an extracted text layer.
+
+    Handles MoE naming mismatch: model tree uses `mlp.shared_expert.up_proj`
+    but some quantized models store weights as `mlp.up_proj` (flat naming).
+    Check both the exact path and the flattened alternative.
+    """
+    # Direct match
+    if f"{path}.scales" in all_weight_names:
+        pass  # Found
+    else:
+        # MoE alternate path: mtp.layers.N.mlp.shared_expert.X → mtp.layers.N.mlp.X
+        alt_path = path.replace(".mlp.shared_expert.", ".mlp.")
+        if alt_path != path and f"{alt_path}.scales" in all_weight_names:
+            pass  # Found via alternate
+        else:
+            return False
 
     recipe = {
         "group_size": quantization.get("group_size", 64),
@@ -126,8 +139,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             name for name, _ in mtp_weights if name.endswith(".scales")
         )
         logger.info(
-            "build_text_model: quantization config present=%s, "
-            "mtp_scales=%s",
+            "build_text_model: quantization config present=%s, " "mtp_scales=%s",
             quantization is not None,
             mtp_scale_names[:5],
         )
@@ -166,8 +178,52 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             "Transferred %d weight arrays from vlm language_model", len(vlm_weights)
         )
 
-        # Load MTP weights from safetensors
+        # Load MTP weights from safetensors.
+        # Handle MoE naming mismatch: some quantized models store MTP MoE
+        # weights with flat naming (mtp.layers.N.mlp.gate_proj) while the
+        # TextModel tree uses MoE naming (mtp.layers.N.mlp.shared_expert.gate_proj).
+        # Remap weight names to match the model tree.
         if mtp_weights:
+            # Check if model has MoE MTP but weights use flat naming
+            _has_moe_mtp = (
+                hasattr(text_model, "mtp")
+                and text_model.mtp is not None
+                and any(
+                    hasattr(layer, "mlp") and hasattr(layer.mlp, "shared_expert")
+                    for layer in getattr(text_model.mtp, "layers", [])
+                )
+            )
+            _weights_use_flat = any(
+                "mtp.layers." in name
+                and ".mlp." in name
+                and ".shared_expert." not in name
+                and ".gate." not in name
+                and name.split(".")[-1] in ("weight", "scales", "biases")
+                and any(sub in name for sub in ("gate_proj", "up_proj", "down_proj"))
+                for name, _ in mtp_weights
+            )
+            if _has_moe_mtp and _weights_use_flat:
+                # Remap flat → MoE: mtp.layers.N.mlp.X → mtp.layers.N.mlp.shared_expert.X
+                _remapped = []
+                for name, val in mtp_weights:
+                    if (
+                        "mtp.layers." in name
+                        and ".mlp." in name
+                        and ".shared_expert." not in name
+                    ):
+                        new_name = name.replace(".mlp.", ".mlp.shared_expert.", 1)
+                        _remapped.append((new_name, val))
+                    else:
+                        _remapped.append((name, val))
+                logger.info(
+                    "Remapped %d MTP weights from flat to MoE naming",
+                    sum(1 for a, b in zip(mtp_weights, _remapped) if a[0] != b[0]),
+                )
+                mtp_weights = _remapped
+                # Update all_weight_names with remapped names
+                all_weight_names = set(name for name, _ in vlm_weights)
+                all_weight_names.update(name for name, _ in mtp_weights)
+
             text_model.load_weights(mtp_weights, strict=False)
             logger.info("Loaded %d MTP weights from safetensors", len(mtp_weights))
 
