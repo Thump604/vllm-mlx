@@ -117,9 +117,23 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
 
-        # Quantize the TextModel skeleton to match source weights, while
-        # honoring any per-layer overrides from config.json.
+        # Quantize the TextModel skeleton to match source weights.
+        # Use config.json quantization metadata if available; otherwise infer
+        # from the presence of .scales keys in the weight names.
         quantization = text_config.get("quantization", config.get("quantization", None))
+        if quantization is None:
+            # Infer: if any weight has .scales, the model is quantized.
+            # Use safe defaults matching the common 8-bit affine recipe.
+            if any(name.endswith(".scales") for name, _ in vlm_weights) or any(
+                name.endswith(".scales") for name, _ in mtp_weights
+            ):
+                quantization = {"group_size": 64, "bits": 8, "mode": "affine"}
+                logger.info(
+                    "Inferred quantization from weight names "
+                    "(config.json missing 'quantization' key): %s",
+                    quantization,
+                )
+
         if quantization is not None:
 
             def _class_predicate(path, module):
