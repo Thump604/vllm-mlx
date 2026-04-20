@@ -169,6 +169,7 @@ _default_top_k: int | None = None  # Set via --default-top-k
 _default_min_p: float | None = None  # Set via --default-min-p
 _default_presence_penalty: float | None = None  # Set via --default-presence-penalty
 _default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
+_default_thinking_token_budget: int | None = None  # Set via --default-thinking-token-budget
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -226,6 +227,13 @@ def _resolve_repetition_penalty(request_value: float | None) -> float:
     if _default_repetition_penalty is not None:
         return _default_repetition_penalty
     return 1.0
+
+
+def _resolve_thinking_token_budget(request_value: int | None) -> int | None:
+    """Resolve thinking token budget: request > CLI default > None."""
+    if request_value is not None:
+        return request_value
+    return _default_thinking_token_budget
 
 
 def _resolve_request_field(

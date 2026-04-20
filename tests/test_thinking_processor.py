@@ -325,3 +325,40 @@ class TestAnthropicAdapter:
         )
         openai_req = anthropic_to_openai(req)
         assert openai_req.thinking_token_budget is None
+
+
+class TestResolver:
+    def test_request_value_takes_precedence(self):
+        import vllm_mlx.server as srv
+
+        original = srv._default_thinking_token_budget
+        try:
+            srv._default_thinking_token_budget = 4096
+            assert srv._resolve_thinking_token_budget(8192) == 8192
+        finally:
+            srv._default_thinking_token_budget = original
+
+    def test_server_default_used_when_no_request_value(self):
+        import vllm_mlx.server as srv
+
+        original = srv._default_thinking_token_budget
+        try:
+            srv._default_thinking_token_budget = 4096
+            assert srv._resolve_thinking_token_budget(None) == 4096
+        finally:
+            srv._default_thinking_token_budget = original
+
+    def test_none_when_no_default_and_no_request(self):
+        import vllm_mlx.server as srv
+
+        original = srv._default_thinking_token_budget
+        try:
+            srv._default_thinking_token_budget = None
+            assert srv._resolve_thinking_token_budget(None) is None
+        finally:
+            srv._default_thinking_token_budget = original
+
+    def test_zero_is_valid_budget(self):
+        import vllm_mlx.server as srv
+
+        assert srv._resolve_thinking_token_budget(0) == 0

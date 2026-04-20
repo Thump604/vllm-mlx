@@ -78,6 +78,8 @@ def serve_command(args):
         server._default_presence_penalty = args.default_presence_penalty
     if args.default_repetition_penalty is not None:
         server._default_repetition_penalty = args.default_repetition_penalty
+    if args.default_thinking_token_budget is not None:
+        server._default_thinking_token_budget = args.default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -1011,6 +1013,12 @@ Examples:
         type=float,
         default=None,
         help="Override default repetition_penalty for all requests (1.0 = disabled)",
+    )
+    serve_parser.add_argument(
+        "--default-thinking-token-budget",
+        type=int,
+        default=None,
+        help="Default thinking token budget for reasoning models (caps reasoning tokens as sub-limit of max_tokens)",
     )
     # Embedding model option
     serve_parser.add_argument(
