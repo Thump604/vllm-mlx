@@ -70,7 +70,7 @@ class AnthropicRequest(BaseModel):
     # output / constrained decoding on this endpoint).
     response_format: dict | None = None
     # Thinking token budget (same semantics as OpenAI path)
-    thinking_token_budget: int | None = None
+    thinking_token_budget: int | None = Field(default=None, ge=0)
 
 
 # =============================================================================

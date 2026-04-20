@@ -2986,11 +2986,14 @@ async def _create_chat_completion_inner(
     )
     _budget_effective = _budget is not None
 
-    # Check if the active reasoning parser supports tag-based thinking.
+    # Build a request-local reasoning parser from the model context's serving
+    # profile.  This aligns with the per-request parser used downstream for
+    # reasoning extraction and avoids coupling to the server-wide global.
+    _req_parser = _build_reasoning_parser(engine, model_ctx.serving_profile)
     _parser_has_tags = (
-        _reasoning_parser is not None
-        and hasattr(_reasoning_parser, "start_token")
-        and hasattr(_reasoning_parser, "end_token")
+        _req_parser is not None
+        and hasattr(_req_parser, "start_token")
+        and hasattr(_req_parser, "end_token")
     )
 
     _thinking_on = chat_kwargs.get("enable_thinking") is not False
@@ -3007,10 +3010,10 @@ async def _create_chat_completion_inner(
         _tokenizer = _get_engine_tokenizer(engine)
         _tap = ThinkingAwareLogitsProcessor(
             start_token_ids=_tokenizer.encode(
-                _reasoning_parser.start_token, add_special_tokens=False
+                _req_parser.start_token, add_special_tokens=False
             ),
             end_token_ids=_tokenizer.encode(
-                _reasoning_parser.end_token, add_special_tokens=False
+                _req_parser.end_token, add_special_tokens=False
             ),
             thinking_token_budget=_budget,
             inner=json_logits_processor,
@@ -3168,11 +3171,29 @@ async def _create_chat_completion_inner(
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             total_tokens=output.prompt_tokens + output.completion_tokens,
-            reasoning_tokens=(
-                _thinking_proc.thinking_tokens if _thinking_proc is not None else None
+            reasoning_tokens=_get_reasoning_token_count(
+                _thinking_proc, reasoning_text, engine
             ),
         ),
     )
+
+
+def _get_reasoning_token_count(
+    thinking_proc,
+    reasoning_text: str | None,
+    engine,
+) -> int | None:
+    """Extract reasoning token count: authoritative from processor, best-effort from text."""
+    if thinking_proc is not None:
+        return thinking_proc.thinking_tokens
+    if reasoning_text:
+        tokenizer = _get_engine_tokenizer(engine)
+        if tokenizer is not None:
+            try:
+                return len(tokenizer.encode(reasoning_text, add_special_tokens=False))
+            except Exception:
+                pass
+    return None
 
 
 # =============================================================================
@@ -3805,10 +3826,11 @@ async def _create_anthropic_message_inner(request: Request, tracker):
     )
     _budget_effective = _budget is not None
 
+    _req_parser = _build_reasoning_parser(engine, model_ctx.serving_profile)
     _parser_has_tags = (
-        _reasoning_parser is not None
-        and hasattr(_reasoning_parser, "start_token")
-        and hasattr(_reasoning_parser, "end_token")
+        _req_parser is not None
+        and hasattr(_req_parser, "start_token")
+        and hasattr(_req_parser, "end_token")
     )
 
     _thinking_on = chat_kwargs.get("enable_thinking") is not False
@@ -3824,10 +3846,10 @@ async def _create_anthropic_message_inner(request: Request, tracker):
         _tokenizer = _get_engine_tokenizer(engine)
         _tap = ThinkingAwareLogitsProcessor(
             start_token_ids=_tokenizer.encode(
-                _reasoning_parser.start_token, add_special_tokens=False
+                _req_parser.start_token, add_special_tokens=False
             ),
             end_token_ids=_tokenizer.encode(
-                _reasoning_parser.end_token, add_special_tokens=False
+                _req_parser.end_token, add_special_tokens=False
             ),
             thinking_token_budget=_budget,
             inner=json_logits_processor,
@@ -3942,8 +3964,8 @@ async def _create_anthropic_message_inner(request: Request, tracker):
         usage=AnthropicUsage(
             input_tokens=output.prompt_tokens,
             output_tokens=output.completion_tokens,
-            reasoning_tokens=(
-                _thinking_proc.thinking_tokens if _thinking_proc is not None else None
+            reasoning_tokens=_get_reasoning_token_count(
+                _thinking_proc, reasoning_text, engine
             ),
         ),
     )
@@ -4713,10 +4735,8 @@ async def stream_chat_completion(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
-                reasoning_tokens=(
-                    _thinking_proc.thinking_tokens
-                    if _thinking_proc is not None
-                    else None
+                reasoning_tokens=_get_reasoning_token_count(
+                    _thinking_proc, None, engine
                 ),
             ),
         )

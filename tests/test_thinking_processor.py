@@ -175,6 +175,18 @@ class TestBudgetEnforcement:
         assert logits[21].item() == 0.0
         assert proc.state == Phase.CONTENT
 
+    def test_transition_forces_end_sequence_2d_logits(self):
+        """Verify forced transition works with (1, vocab) shaped logits."""
+        proc = _make_processor(budget=2)
+        _feed_sequence(proc, [10, 11, 50, 51])
+        assert proc.state == Phase.TRANSITIONING
+        tokens_so_far = [10, 11, 50, 51, 0]
+        logits_2d = mx.zeros((1, _VOCAB_SIZE))
+        result = proc(mx.array(tokens_so_far), logits_2d)
+        assert result.shape == (1, _VOCAB_SIZE)
+        assert result[0, 20].item() == 0.0
+        assert result[0, 0].item() == float("-inf")
+
     def test_forced_transition_tokens_not_counted(self):
         proc = _make_processor(budget=2)
         _feed_sequence(proc, [10, 11, 50, 51])  # 2 thinking tokens

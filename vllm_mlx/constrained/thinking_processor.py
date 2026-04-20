@@ -140,8 +140,12 @@ class ThinkingAwareLogitsProcessor:
         """Force the next token in the reasoning end sequence."""
         target_id = self._end_token_ids[self._transition_index]
         # Mask all logits to -inf, then set the target token to 0.
+        # Handle both 1-D (vocab,) and 2-D (1, vocab) logits shapes.
         masked = mx.full(logits.shape, float("-inf"))
-        masked[target_id] = 0.0
+        if masked.ndim == 1:
+            masked[target_id] = 0.0
+        else:
+            masked[..., target_id] = 0.0
         self._transition_index += 1
         if self._transition_index >= len(self._end_token_ids):
             self._state = Phase.CONTENT
