@@ -124,30 +124,42 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         args = TextModelArgs.from_dict(text_config)
         text_model = TextModel(args)
 
-        # MoE MTP fixup: when num_experts > 0, MTPDecoderLayer creates
-        # SparseMoeBlock, but MTP weights on disk are for dense MLP (only
-        # gate_proj/up_proj/down_proj). Replace MTP's SparseMoeBlock with
-        # plain MLP to match the on-disk weight format.
-        if num_experts > 0 and hasattr(text_model, "mtp") and text_model.mtp is not None:
-            from mlx_lm.models.qwen3_5 import MLP
-            intermediate = text_config.get(
-                "shared_expert_intermediate_size",
-                text_config.get("intermediate_size", args.hidden_size * 4),
-            )
-            for layer in text_model.mtp.layers:
-                if hasattr(layer, "mlp") and not isinstance(layer.mlp, MLP):
-                    layer.mlp = MLP(args.hidden_size, intermediate)
-                    logger.debug("Replaced MTP SparseMoeBlock with dense MLP")
-            logger.info(
-                "build_text_model: replaced %d MTP SparseMoeBlock(s) with "
-                "dense MLP (MTP weights are dense on this MoE model)",
-                len(text_model.mtp.layers),
-            )
-
         # Collect all weights first: backbone from vlm + MTP from safetensors
         vlm_lm = vlm_model.language_model
         vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
         mtp_weights = _load_mtp_weights(model_path)
+
+        # MoE MTP architecture fixup: MTPDecoderLayer creates SparseMoeBlock
+        # when num_experts > 0, but some MoE models store MTP weights in flat
+        # dense format (only gate_proj/up_proj/down_proj, no shared_expert/gate).
+        # Detect from weight names and replace SparseMoeBlock with dense MLP
+        # ONLY when weights are actually flat.
+        if num_experts > 0 and hasattr(text_model, "mtp") and text_model.mtp is not None:
+            mtp_weight_names = {name for name, _ in mtp_weights}
+            _has_moe_mtp_weights = any(
+                "mtp." in n and (".shared_expert." in n or ".gate." in n or ".experts." in n)
+                for n in mtp_weight_names
+            )
+            if not _has_moe_mtp_weights:
+                # Flat MTP weights: replace SparseMoeBlock with dense MLP
+                from mlx_lm.models.qwen3_5 import MLP
+                intermediate = text_config.get(
+                    "shared_expert_intermediate_size",
+                    text_config.get("intermediate_size", args.hidden_size * 4),
+                )
+                for layer in text_model.mtp.layers:
+                    if hasattr(layer, "mlp") and not isinstance(layer.mlp, MLP):
+                        layer.mlp = MLP(args.hidden_size, intermediate)
+                logger.info(
+                    "build_text_model: MoE model with flat MTP weights -- "
+                    "replaced %d SparseMoeBlock(s) with dense MLP",
+                    len(text_model.mtp.layers),
+                )
+            else:
+                logger.info(
+                    "build_text_model: MoE model with MoE MTP weights -- "
+                    "keeping SparseMoeBlock in MTP layers"
+                )
 
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
