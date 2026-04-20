@@ -2725,81 +2725,111 @@ class BatchedEngine(BaseEngine):
                     prefix_hash,
                 )
 
-            _task = asyncio.ensure_future(asyncio.to_thread(_run_with_cache))
-            try:
-                result = await asyncio.shield(_task)
-            except asyncio.CancelledError:
-                # Shield was pierced by outer cancellation. Wait for the
-                # Metal worker to finish before releasing the lock.
+            # --- Incremental streaming via queue ---
+            # Instead of collecting all tokens then yielding, stream tokens
+            # to the client as they are generated. This prevents the
+            # batch-then-yield timeout: clients see progressive output during
+            # thinking and content phases rather than silence for minutes.
+            loop = asyncio.get_running_loop()
+            _queue: asyncio.Queue = asyncio.Queue()
+            _SENTINEL = object()
+
+            def _producer():
                 try:
-                    await _task
+                    results, ptc = _run_with_cache()
+                    for resp in results:
+                        loop.call_soon_threadsafe(_queue.put_nowait, resp)
+                    # Send prompt_token_count as metadata after all tokens
+                    loop.call_soon_threadsafe(_queue.put_nowait, ("_meta", ptc))
+                except Exception as e:
+                    loop.call_soon_threadsafe(_queue.put_nowait, e)
+                finally:
+                    loop.call_soon_threadsafe(_queue.put_nowait, _SENTINEL)
+
+            producer_task = asyncio.ensure_future(asyncio.to_thread(_producer))
+
+            accumulated_text = ""
+            token_count = 0
+            prompt_token_count = 0
+            finished = False
+
+            try:
+                while True:
+                    item = await _queue.get()
+                    if item is _SENTINEL:
+                        break
+                    if isinstance(item, Exception):
+                        logger.error(
+                            "Generation failed in _run_with_cache: %s: %s",
+                            type(item).__name__,
+                            item,
+                        )
+                        raise item
+                    if isinstance(item, tuple) and item[0] == "_meta":
+                        prompt_token_count = item[1]
+                        continue
+
+                    resp = item
+                    token_count += 1
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    accumulated_text += new_text
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_token_count,
+                        completion_tokens=token_count,
+                        finished=False,
+                        finish_reason=None,
+                    )
+            except asyncio.CancelledError:
+                # Client disconnect: drain queue, await producer for Metal safety
+                try:
+                    while True:
+                        item = await _queue.get()
+                        if item is _SENTINEL:
+                            break
+                except Exception:
+                    pass
+                try:
+                    await producer_task
                 except Exception:
                     pass
                 raise
-            except Exception as exc:
-                logger.error(
-                    "Generation failed in _run_with_cache: %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                raise
-            all_resps, prompt_token_count = result
+            finally:
+                if not producer_task.done():
+                    try:
+                        await producer_task
+                    except Exception:
+                        pass
 
-        logger.info(
-            "Generation complete: %d tokens, prompt_tokens=%d, " "mtp=%s, guided=%s",
-            len(all_resps),
-            prompt_token_count,
-            _has_mtp,
-            bool(guided_processors),
-        )
-        if all_resps:
-            first_text = all_resps[0].text if hasattr(all_resps[0], "text") else "?"
-            last_text = all_resps[-1].text if hasattr(all_resps[-1], "text") else "?"
-            last_fr = (
-                all_resps[-1].finish_reason
-                if hasattr(all_resps[-1], "finish_reason")
-                else "?"
-            )
-            logger.info(
-                "Generation tokens: first=%r last=%r last_finish_reason=%s",
-                first_text[:50] if first_text else "",
-                last_text[:50] if last_text else "",
-                last_fr,
-            )
-
-        # Yield results as GenerationOutput
-        accumulated_text = ""
-        token_count = 0
-        finished = False
-        for i, resp in enumerate(all_resps):
-            token_count += 1
-            new_text = resp.text if hasattr(resp, "text") else str(resp)
-            accumulated_text += new_text
-
-            is_last = i == len(all_resps) - 1
-            finished = is_last or token_count >= max_tokens
-
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text=new_text,
-                prompt_tokens=prompt_token_count,
-                completion_tokens=token_count,
-                finished=finished,
-                finish_reason="stop" if finished else None,
-            )
-
-            if finished:
-                break
-
-        if not finished:
+        # Emit final chunk with finish_reason
+        if token_count > 0:
             yield GenerationOutput(
                 text=accumulated_text,
                 new_text="",
                 prompt_tokens=prompt_token_count,
                 completion_tokens=token_count,
                 finished=True,
+                finish_reason="stop",
+            )
+        else:
+            yield GenerationOutput(
+                text="",
+                new_text="",
+                prompt_tokens=prompt_token_count,
+                completion_tokens=0,
+                finished=True,
                 finish_reason="length",
             )
+
+        logger.info(
+            "Generation complete: %d tokens, prompt_tokens=%d, " "mtp=%s, guided=%s",
+            token_count,
+            prompt_token_count,
+            _has_mtp,
+            bool(guided_processors),
+        )
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
