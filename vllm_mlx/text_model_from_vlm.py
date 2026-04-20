@@ -112,20 +112,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             )
             return None
 
-        # MoE gate: skip TextModel+MTP for MoE models until the MTP weight
-        # quantization format mismatch is resolved. MoE models store MTP
-        # weights with nested scales (e.g. mtp.fc.weight.scales) and
-        # inconsistent shared_expert naming that nn.quantize cannot handle.
-        # The MLLM scheduler path handles these models correctly.
         num_experts = text_config.get("num_experts", 0) or 0
-        if num_experts > 0:
-            logger.info(
-                "build_text_model: skipping MoE model (num_experts=%d). "
-                "MTP weight quantization format not yet supported. "
-                "MLLM scheduler will handle generation.",
-                num_experts,
-            )
-            return None
 
         # Always import from qwen3_5 — TextModel and TextModelArgs handle both
         # dense and MoE natively (MTPDecoderLayer auto-selects SparseMoeBlock
@@ -136,6 +123,26 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # rope_scaling, head_dim derivation)
         args = TextModelArgs.from_dict(text_config)
         text_model = TextModel(args)
+
+        # MoE MTP fixup: when num_experts > 0, MTPDecoderLayer creates
+        # SparseMoeBlock, but MTP weights on disk are for dense MLP (only
+        # gate_proj/up_proj/down_proj). Replace MTP's SparseMoeBlock with
+        # plain MLP to match the on-disk weight format.
+        if num_experts > 0 and hasattr(text_model, "mtp") and text_model.mtp is not None:
+            from mlx_lm.models.qwen3_5 import MLP
+            intermediate = text_config.get(
+                "shared_expert_intermediate_size",
+                text_config.get("intermediate_size", args.hidden_size * 4),
+            )
+            for layer in text_model.mtp.layers:
+                if hasattr(layer, "mlp") and not isinstance(layer.mlp, MLP):
+                    layer.mlp = MLP(args.hidden_size, intermediate)
+                    logger.debug("Replaced MTP SparseMoeBlock with dense MLP")
+            logger.info(
+                "build_text_model: replaced %d MTP SparseMoeBlock(s) with "
+                "dense MLP (MTP weights are dense on this MoE model)",
+                len(text_model.mtp.layers),
+            )
 
         # Collect all weights first: backbone from vlm + MTP from safetensors
         vlm_lm = vlm_model.language_model
