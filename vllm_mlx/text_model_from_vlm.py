@@ -121,6 +121,13 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # Use config.json quantization metadata if available; otherwise infer
         # from the presence of .scales keys in the weight names.
         quantization = text_config.get("quantization", config.get("quantization", None))
+        logger.info(
+            "build_text_model: quantization config=%s, "
+            "mtp_scales_present=%s, vlm_scales_present=%s",
+            quantization,
+            any(name.endswith(".scales") for name, _ in mtp_weights),
+            any(name.endswith(".scales") for name, _ in vlm_weights),
+        )
         if quantization is None:
             # Infer: if any weight has .scales, the model is quantized.
             # Use safe defaults matching the common 8-bit affine recipe.
