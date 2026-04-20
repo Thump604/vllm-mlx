@@ -2978,19 +2978,60 @@ async def _create_chat_completion_inner(
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
-    # Wire constrained decoding logits processor if available.
-    if json_logits_processor is not None:
+    # --- Thinking-aware processor decision tree ---
+    _budget = _resolve_thinking_token_budget(
+        getattr(request, "thinking_token_budget", None)
+    )
+    _budget_effective = _budget is not None
+
+    # Check if the active reasoning parser supports tag-based thinking.
+    _parser_has_tags = (
+        _reasoning_parser is not None
+        and hasattr(_reasoning_parser, "start_token")
+        and hasattr(_reasoning_parser, "end_token")
+    )
+
+    _thinking_on = chat_kwargs.get("enable_thinking") is not False
+    _ctk = chat_kwargs.get("chat_template_kwargs")
+    if _ctk and _ctk.get("enable_thinking") is False:
+        _thinking_on = False
+
+    _thinking_proc = None
+
+    if _thinking_on and _budget_effective and _parser_has_tags:
+        # Build unified thinking-aware processor.
+        from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
+
+        _tokenizer = _get_engine_tokenizer(engine)
+        _tap = ThinkingAwareLogitsProcessor(
+            start_token_ids=_tokenizer.encode(
+                _reasoning_parser.start_token, add_special_tokens=False
+            ),
+            end_token_ids=_tokenizer.encode(
+                _reasoning_parser.end_token, add_special_tokens=False
+            ),
+            thinking_token_budget=_budget,
+            inner=json_logits_processor,
+            vocab_size=_tokenizer.vocab_size,
+        )
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [_tap]
+        _thinking_proc = _tap
+    elif _thinking_on and not _budget_effective and json_logits_processor is not None:
+        # Fallback: thinking + JSON but no budget -> force thinking off
+        # (Session 105 compatibility behavior).
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
-        # Constrained decoding is incompatible with thinking: the model
-        # cannot emit <think> tags when forced to produce JSON tokens.
-        # Force thinking off unconditionally, even if the client explicitly
-        # requested it. Same policy as the Anthropic /v1/messages path.
         request.enable_thinking = False
         chat_kwargs["enable_thinking"] = False
         ctk = chat_kwargs.get("chat_template_kwargs")
         if ctk is not None:
             ctk["enable_thinking"] = False
+    elif json_logits_processor is not None:
+        # No thinking or thinking without budget -> JSON processor directly.
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+    # else: no processor needed.
 
     if request.stream:
 
@@ -3749,13 +3790,53 @@ async def _create_anthropic_message_inner(request: Request, tracker):
                     )
                     json_logits_processor = None
 
-    if json_logits_processor is not None:
+    # --- Thinking-aware processor decision tree (Anthropic path) ---
+    _budget = _resolve_thinking_token_budget(
+        getattr(request, "thinking_token_budget", None)
+    )
+    _budget_effective = _budget is not None
+
+    _parser_has_tags = (
+        _reasoning_parser is not None
+        and hasattr(_reasoning_parser, "start_token")
+        and hasattr(_reasoning_parser, "end_token")
+    )
+
+    _thinking_on = chat_kwargs.get("enable_thinking") is not False
+    _ctk = chat_kwargs.get("chat_template_kwargs")
+    if _ctk and _ctk.get("enable_thinking") is False:
+        _thinking_on = False
+
+    _thinking_proc = None
+
+    if _thinking_on and _budget_effective and _parser_has_tags:
+        from vllm_mlx.constrained import ThinkingAwareLogitsProcessor
+
+        _tokenizer = _get_engine_tokenizer(engine)
+        _tap = ThinkingAwareLogitsProcessor(
+            start_token_ids=_tokenizer.encode(
+                _reasoning_parser.start_token, add_special_tokens=False
+            ),
+            end_token_ids=_tokenizer.encode(
+                _reasoning_parser.end_token, add_special_tokens=False
+            ),
+            thinking_token_budget=_budget,
+            inner=json_logits_processor,
+            vocab_size=_tokenizer.vocab_size,
+        )
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [_tap]
+        _thinking_proc = _tap
+    elif _thinking_on and not _budget_effective and json_logits_processor is not None:
         existing = chat_kwargs.get("logits_processors") or []
         chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
         chat_kwargs["enable_thinking"] = False
         ctk = chat_kwargs.get("chat_template_kwargs")
         if ctk is not None:
             ctk["enable_thinking"] = False
+    elif json_logits_processor is not None:
+        existing = chat_kwargs.get("logits_processors") or []
+        chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
 
     start_time = time.perf_counter()
     timeout = _default_timeout

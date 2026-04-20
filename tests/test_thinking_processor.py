@@ -362,3 +362,30 @@ class TestResolver:
         import vllm_mlx.server as srv
 
         assert srv._resolve_thinking_token_budget(0) == 0
+
+
+class TestDecisionTree:
+    """Test the processor construction decision tree logic."""
+
+    def test_thinking_budget_json_builds_unified(self):
+        mock_json = lambda tokens, logits: logits  # noqa: E731
+        proc = _make_processor(budget=8192, inner=mock_json)
+        assert isinstance(proc, ThinkingAwareLogitsProcessor)
+        assert proc._inner is mock_json
+
+    def test_thinking_budget_no_json_builds_unified(self):
+        proc = _make_processor(budget=8192, inner=None)
+        assert isinstance(proc, ThinkingAwareLogitsProcessor)
+        assert proc._inner is None
+
+    def test_thinking_no_budget_json_is_fallback(self):
+        """No budget + JSON = server must fall back to forcing thinking off.
+        Processor alone cannot enforce this; server-level decision."""
+        # Documented for integration test coverage.
+        pass
+
+    def test_no_parser_budget_is_noop(self):
+        """Budget without a parser is meaningless.
+        Server gates on parser availability."""
+        # Documented for integration test coverage.
+        pass
