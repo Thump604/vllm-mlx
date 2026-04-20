@@ -110,6 +110,15 @@ class ThinkingAwareLogitsProcessor:
     def thinking_tokens(self) -> int:
         return self._thinking_tokens
 
+    @property
+    def is_retired(self) -> bool:
+        """True when the processor is in CONTENT with no inner constraint.
+
+        The engine can use this signal to drop the processor and re-enable
+        MTP for the remaining content generation (Phase 2 optimization).
+        """
+        return self._state == Phase.CONTENT and self._inner is None
+
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         # Extract the last token ID from the sequence.
         last_token = tokens[-1].item()
