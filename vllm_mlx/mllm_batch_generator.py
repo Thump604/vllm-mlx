@@ -880,6 +880,43 @@ class MLLMBatchGenerator:
             return output.logits
         return output
 
+    @staticmethod
+    def _trim_rotating_caches(cache_list):
+        """Trim RotatingKVCache buffers restored from prefix cache.
+
+        Prefix cache stores the full KV state (offset may exceed max_size for
+        sliding-window layers). RotatingKVCache._update_in_place computes
+        ``new_size = min(step, max_size - prev)`` which goes negative when
+        ``prev > max_size``, crashing with "Negative dimensions not allowed".
+
+        Trimming the buffer to max_size and clamping offset/idx prevents this.
+        """
+        from mlx_lm.models.cache import RotatingKVCache
+
+        for layer_cache in cache_list:
+            if not isinstance(layer_cache, RotatingKVCache):
+                continue
+            if layer_cache.keys is None:
+                layer_cache.offset = 0
+                continue
+            buf_len = layer_cache.keys.shape[2]
+            if buf_len > layer_cache.max_size:
+                trim_size = buf_len - layer_cache.max_size
+                layer_cache.keys = layer_cache._trim(trim_size, layer_cache.keys)
+                layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
+                layer_cache._idx = layer_cache.max_size
+            layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
+            # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
+            # Prefix cache trimming can create offset > keys.shape[2] when
+            # a supersequence/LCP trim crosses the max_size boundary.
+            buf_len = layer_cache.keys.shape[2]
+            if min(layer_cache.offset, layer_cache.max_size) > buf_len:
+                logger.warning(
+                    f"RotatingKVCache offset ({layer_cache.offset}) > "
+                    f"buffer ({buf_len}), capping to buffer size"
+                )
+                layer_cache.offset = buf_len
+
     def _run_vision_encoding(
         self, request: MLLMBatchRequest, cache: Optional[List[Any]] = None
     ) -> mx.array:

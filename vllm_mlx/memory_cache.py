@@ -338,9 +338,38 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
                     tc.values = mx.concatenate([pad_v, kept_v], axis=2)
                     tc._idx = tc.max_size
                 else:
-                    tc.keys = kept_k
-                    tc.values = kept_v
-                    tc._idx = entries_to_keep
+                    if entries_to_keep < new_offset:
+                        # Buffer has fewer entries than offset requires.
+                        # This happens when old_offset > max_size (rotating)
+                        # and the trim brought new_offset below max_size.
+                        # Pad with zeros on the left to maintain the invariant
+                        # size() == keys.shape[2], preventing merge crashes.
+                        pad_n = new_offset - entries_to_keep
+                        pad_k = mx.zeros(
+                            (
+                                kept_k.shape[0],
+                                kept_k.shape[1],
+                                pad_n,
+                                kept_k.shape[3],
+                            ),
+                            dtype=kept_k.dtype,
+                        )
+                        pad_v = mx.zeros(
+                            (
+                                kept_v.shape[0],
+                                kept_v.shape[1],
+                                pad_n,
+                                kept_v.shape[3],
+                            ),
+                            dtype=kept_v.dtype,
+                        )
+                        tc.keys = mx.concatenate([pad_k, kept_k], axis=2)
+                        tc.values = mx.concatenate([pad_v, kept_v], axis=2)
+                        tc._idx = new_offset
+                    else:
+                        tc.keys = kept_k
+                        tc.values = kept_v
+                        tc._idx = entries_to_keep
                 eval_targets.extend([tc.keys, tc.values])
             else:
                 # No entries removed (trim_by == 0 already handled above,
