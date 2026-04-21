@@ -43,10 +43,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
-        # Streaming state (avoids O(n^2) full-text search on every token)
+        # Streaming state.
         self._seen_start = False
         self._seen_end = False
-        # Buffer for partial tag matches at chunk boundaries
+        # Buffer for partial tag matches at chunk boundaries.
         self._boundary_buffer = ""
 
     def extract_reasoning(
@@ -123,127 +123,97 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # cases where the parser is attached mid-stream or tags were in
         # earlier chunks processed by a different code path).
         if not self._seen_start and not self._seen_end and previous_text:
-            if self.start_token in previous_text:
-                self._seen_start = True
             if self.end_token in previous_text:
                 self._seen_end = True
+            elif self.start_token in previous_text:
+                self._seen_start = True
 
-        # Skip if delta is just the special tokens themselves
-        stripped_delta = delta_text.strip()
-        if stripped_delta == self.start_token:
-            self._seen_start = True
-            return None
-        if stripped_delta == self.end_token:
-            self._seen_end = True
-            return None
+        self._boundary_buffer += delta_text
+        reasoning_parts: list[str] = []
+        content_parts: list[str] = []
 
-        # Check for tags in delta (O(len(delta)) which is small)
-        # Also check boundary: tag might span previous chunk + this delta
-        boundary_check = self._boundary_buffer + delta_text
-        start_in_delta = self.start_token in boundary_check
-        end_in_delta = self.end_token in boundary_check
+        while self._boundary_buffer:
+            if self._seen_end:
+                content_parts.append(self._boundary_buffer)
+                self._boundary_buffer = ""
+                break
 
-        # Update boundary buffer (keep last N chars where N = max tag length - 1)
-        max_tag_len = max(len(self.start_token), len(self.end_token))
-        self._boundary_buffer = delta_text[-(max_tag_len - 1):] if len(delta_text) >= max_tag_len - 1 else (self._boundary_buffer + delta_text)[-(max_tag_len - 1):]
+            if self._seen_start:
+                end_idx = self._boundary_buffer.find(self.end_token)
+                if end_idx != -1:
+                    if end_idx:
+                        reasoning_parts.append(self._boundary_buffer[:end_idx])
+                    self._boundary_buffer = self._boundary_buffer[
+                        end_idx + len(self.end_token) :
+                    ]
+                    self._seen_end = True
+                    continue
 
-        # Detect transitions from delta
-        if start_in_delta:
-            self._seen_start = True
-        if end_in_delta:
-            self._seen_end = True
+                hold = self._partial_tag_suffix_len(
+                    self._boundary_buffer, (self.end_token,)
+                )
+                emit = self._boundary_buffer[:-hold] if hold else self._boundary_buffer
+                if emit:
+                    reasoning_parts.append(emit)
+                self._boundary_buffer = self._boundary_buffer[-hold:] if hold else ""
+                break
 
-        # Case 1: Explicit <think> found - standard behavior
-        if self._seen_start:
-            return self._handle_explicit_think(
-                previous_text, delta_text,
-                start_in_prev=(self._seen_start and not start_in_delta),
-                end_in_prev=(self._seen_end and not end_in_delta),
-                end_in_delta=end_in_delta,
+            start_idx = self._boundary_buffer.find(self.start_token)
+            end_idx = self._boundary_buffer.find(self.end_token)
+            candidates = [idx for idx in (start_idx, end_idx) if idx != -1]
+
+            if candidates:
+                next_idx = min(candidates)
+                if start_idx != -1 and start_idx == next_idx:
+                    prefix = self._boundary_buffer[:start_idx]
+                    if prefix:
+                        reasoning_parts.append(prefix)
+                    self._boundary_buffer = self._boundary_buffer[
+                        start_idx + len(self.start_token) :
+                    ]
+                    self._seen_start = True
+                    continue
+
+                prefix = self._boundary_buffer[:end_idx]
+                if prefix:
+                    reasoning_parts.append(prefix)
+                self._boundary_buffer = self._boundary_buffer[
+                    end_idx + len(self.end_token) :
+                ]
+                self._seen_end = True
+                continue
+
+            hold = self._partial_tag_suffix_len(
+                self._boundary_buffer, (self.start_token, self.end_token)
             )
+            emit = self._boundary_buffer[:-hold] if hold else self._boundary_buffer
+            if emit:
+                reasoning_parts.append(emit)
+            self._boundary_buffer = self._boundary_buffer[-hold:] if hold else ""
+            break
 
-        # Case 2: No <think> but </think> found - implicit reasoning mode
+        reasoning = "".join(reasoning_parts) or None
+        content = "".join(content_parts) or None
+        if reasoning is None and content is None:
+            return None
+        return DeltaMessage(reasoning=reasoning, content=content)
+
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Flush any buffered text that did not complete a tag."""
+        if not self._boundary_buffer:
+            return None
+
+        pending = self._boundary_buffer
+        self._boundary_buffer = ""
         if self._seen_end:
-            return self._handle_implicit_think(
-                delta_text,
-                end_in_prev=(self._seen_end and not end_in_delta),
-                end_in_delta=end_in_delta,
-            )
+            return DeltaMessage(content=pending)
+        return DeltaMessage(reasoning=pending)
 
-        # Case 3: No think tags seen yet - treat as reasoning
-        return DeltaMessage(reasoning=delta_text)
-
-    def _handle_explicit_think(
-        self,
-        previous_text: str,
-        delta_text: str,
-        start_in_prev: bool,
-        end_in_prev: bool,
-        end_in_delta: bool,
-    ) -> DeltaMessage | None:
-        """Handle case where <think> tag is explicitly in the output."""
-        start_in_delta = self.start_token in delta_text
-
-        if start_in_prev:
-            # We're after the start token
-            if end_in_delta:
-                # Transition: end token in this delta
-                idx = delta_text.find(self.end_token)
-                reasoning_part = delta_text[:idx]
-                content_part = delta_text[idx + len(self.end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning_part if reasoning_part else None,
-                    content=content_part if content_part else None,
-                )
-            elif end_in_prev:
-                # Already past reasoning phase - pure content
-                return DeltaMessage(content=delta_text)
-            else:
-                # Still in reasoning phase
-                return DeltaMessage(reasoning=delta_text)
-
-        elif start_in_delta:
-            # Start token is in this delta
-            start_idx = delta_text.find(self.start_token)
-
-            if end_in_delta:
-                # Both tokens in this delta
-                end_idx = delta_text.find(self.end_token)
-                reasoning_part = delta_text[start_idx + len(self.start_token) : end_idx]
-                content_part = delta_text[end_idx + len(self.end_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning_part if reasoning_part else None,
-                    content=content_part if content_part else None,
-                )
-            else:
-                # Only start token - beginning of reasoning
-                reasoning_part = delta_text[start_idx + len(self.start_token) :]
-                return DeltaMessage(
-                    reasoning=reasoning_part if reasoning_part else None
-                )
-
-        # Fallback - treat as content
-        return DeltaMessage(content=delta_text)
-
-    def _handle_implicit_think(
-        self,
-        delta_text: str,
-        end_in_prev: bool,
-        end_in_delta: bool,
-    ) -> DeltaMessage | None:
-        """Handle case where <think> was in prompt (only </think> in output)."""
-        if end_in_delta:
-            # Transition: end token in this delta
-            idx = delta_text.find(self.end_token)
-            reasoning_part = delta_text[:idx]
-            content_part = delta_text[idx + len(self.end_token) :]
-            return DeltaMessage(
-                reasoning=reasoning_part if reasoning_part else None,
-                content=content_part if content_part else None,
-            )
-        elif end_in_prev:
-            # Already past reasoning phase - pure content
-            return DeltaMessage(content=delta_text)
-        else:
-            # Still in implicit reasoning phase
-            return DeltaMessage(reasoning=delta_text)
+    @staticmethod
+    def _partial_tag_suffix_len(text: str, tags: tuple[str, ...]) -> int:
+        """Return the longest suffix of text that could continue as a tag."""
+        for length in range(len(text), 0, -1):
+            suffix = text[-length:]
+            if any(tag.startswith(suffix) for tag in tags):
+                return length
+        return 0

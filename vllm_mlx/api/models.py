@@ -206,6 +206,11 @@ class AssistantMessage(BaseModel):
     )
     tool_calls: list[ToolCall] | None = None
 
+    @property
+    def reasoning(self) -> str | None:
+        """Backward-compatible alias for reasoning_content."""
+        return self.reasoning_content
+
 
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
@@ -459,8 +464,16 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning_content: str | None = None
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     tool_calls: list[dict] | None = None
+
+    @property
+    def reasoning(self) -> str | None:
+        """Backward-compatible alias for reasoning_content."""
+        return self.reasoning_content
 
 
 class ChatCompletionChunkChoice(BaseModel):
