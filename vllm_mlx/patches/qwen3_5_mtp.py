@@ -19,11 +19,119 @@ The actual MTP scheduling logic lives in:
   - vllm_mlx/scheduler.py  (_install_mtp, _mtp_step, _mtp_next)
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _load_weights_into_linear(dst, src, mx) -> None:
+    """Copy a source linear module into an MTP BF16 destination."""
+    if hasattr(src, "scales") and hasattr(src, "biases"):
+        dense = mx.dequantize(
+            src.weight,
+            src.scales,
+            src.biases,
+            group_size=src.group_size,
+            bits=src.bits,
+        )
+        dst.load_weights([("weight", dense)])
+        return
+
+    import mlx.utils
+
+    src_params = mlx.utils.tree_flatten(src.parameters())
+    dst.load_weights(src_params)
+
+
+def _prepare_mtp_weights(
+    raw_mtp: dict[str, Any],
+    *,
+    bits: int,
+    group_size: int,
+    mx,
+) -> dict[str, Any]:
+    """Normalize and dequantize raw MTP tensors into BF16 module weights."""
+    normalized: dict[str, Any] = {}
+    for key, value in raw_mtp.items():
+        norm = key
+        if ".weight.weight" in norm:
+            norm = norm.replace(".weight.weight", ".weight")
+        elif ".weight.scales" in norm:
+            norm = norm.replace(".weight.scales", ".scales")
+        elif ".weight.biases" in norm:
+            norm = norm.replace(".weight.biases", ".biases")
+        normalized[norm] = value
+
+    mtp_weights: dict[str, Any] = {}
+    processed = set()
+    for key in sorted(normalized.keys()):
+        if key in processed:
+            continue
+        if key.endswith(".scales") or key.endswith(".biases"):
+            continue
+
+        scales_key = key.replace(".weight", ".scales")
+        biases_key = key.replace(".weight", ".biases")
+        if scales_key in normalized and biases_key in normalized:
+            mtp_weights[key] = mx.dequantize(
+                normalized[key],
+                normalized[scales_key],
+                normalized[biases_key],
+                group_size=group_size,
+                bits=bits,
+            )
+            processed.update([key, scales_key, biases_key])
+        else:
+            mtp_weights[key] = normalized[key]
+            processed.add(key)
+
+    return mtp_weights
+
+
+def _load_indexed_mtp_weights(model_path: Path, *, bits: int, group_size: int, mx):
+    """Load MTP tensors from the main sharded checkpoint index, if present."""
+    index_file = model_path / "model.safetensors.index.json"
+    if not index_file.exists():
+        return {}
+
+    weight_map = json.loads(index_file.read_text()).get("weight_map", {})
+    mtp_keys: dict[str, tuple[str, str]] = {}
+    for orig, shard in weight_map.items():
+        if ".mtp." not in orig:
+            continue
+        clean = orig
+        if clean.startswith("language_model."):
+            clean = clean.replace("language_model.", "", 1)
+        clean = clean.removeprefix("mtp.")
+        mtp_keys[orig] = (clean, shard)
+
+    if not mtp_keys:
+        return {}
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for orig, (clean, shard) in mtp_keys.items():
+        grouped.setdefault(shard, []).append((orig, clean))
+
+    raw_mtp: dict[str, Any] = {}
+    for shard_file, pairs in grouped.items():
+        shard_path = model_path / shard_file
+        if not shard_path.exists():
+            logger.warning("[MTP inject] Indexed shard missing: %s", shard_file)
+            continue
+        shard_data = mx.load(str(shard_path))
+        for orig, clean in pairs:
+            if orig in shard_data:
+                raw_mtp[clean] = shard_data[orig]
+
+    return _prepare_mtp_weights(
+        raw_mtp,
+        bits=bits,
+        group_size=group_size,
+        mx=mx,
+    )
 
 
 def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
@@ -55,8 +163,7 @@ def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
         src = getattr(last_fa_layer.mlp, "gate", None)
         dst = getattr(mtp_layer.mlp, "gate", None)
         if src is not None and dst is not None:
-            src_params = mlx.utils.tree_flatten(src.parameters())
-            dst.load_weights(src_params)
+            _load_weights_into_linear(dst, src, mx)
             mx.eval(dst.parameters())
             logger.info("[MTP fixup] Copied mlp.gate from main model last layer")
 
@@ -65,8 +172,7 @@ def _fixup_moe_mtp(mtp, inner_model, loaded_keys: set, mx) -> None:
         src = getattr(last_fa_layer.mlp, "shared_expert_gate", None)
         dst = getattr(mtp_layer.mlp, "shared_expert_gate", None)
         if src is not None and dst is not None:
-            src_params = mlx.utils.tree_flatten(src.parameters())
-            dst.load_weights(src_params)
+            _load_weights_into_linear(dst, src, mx)
             mx.eval(dst.parameters())
             logger.info(
                 "[MTP fixup] Copied shared_expert_gate from main model last layer"
@@ -127,15 +233,6 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
         return False
 
     model_path = Path(model_path)
-    # Look for MTP weights in mtp/ subdirectory first (avoids mlx_vlm glob),
-    # then fall back to model-mtp.safetensors in model dir.
-    mtp_file = model_path / "mtp" / "weights.safetensors"
-    if not mtp_file.exists():
-        mtp_file = model_path / "model-mtp.safetensors"
-    if not mtp_file.exists():
-        logger.warning(f"[MTP inject] MTP weights not found in {model_path}")
-        return False
-
     # Get model args — navigate VLM wrapper if needed
     # Model hierarchy: Model → language_model (TextModel) → model (Qwen3_5TextModel)
     text_model = model
@@ -196,50 +293,47 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     bits = quant_config.get("bits", 4) if quant_config else 4
     group_size = quant_config.get("group_size", 64) if quant_config else 64
 
-    logger.info(
-        f"[MTP inject] Loading weights from {mtp_file.name} (BF16, no quantization)"
+    logger.info("[MTP inject] Loading indexed MTP weights from model shards")
+    mtp_weights = _load_indexed_mtp_weights(
+        model_path,
+        bits=bits,
+        group_size=group_size,
+        mx=mx,
     )
-    raw = mx.load(str(mtp_file))
-    raw_mtp = {
-        k.removeprefix("mtp."): v for k, v in raw.items() if k.startswith("mtp.")
-    }
-    del raw
 
-    # Dequantize any quantized weight triplets (weight + scales + biases)
-    mtp_weights: dict[str, mx.array] = {}
-    processed = set()
-    for key in sorted(raw_mtp.keys()):
-        if key in processed:
-            continue
-        if key.endswith(".scales") or key.endswith(".biases"):
-            continue
+    if not mtp_weights:
+        mtp_file = model_path / "mtp" / "weights.safetensors"
+        if not mtp_file.exists():
+            mtp_file = model_path / "model-mtp.safetensors"
+        if not mtp_file.exists():
+            logger.warning(f"[MTP inject] MTP weights not found in {model_path}")
+            return False
 
-        scales_key = key.replace(".weight", ".scales")
-        biases_key = key.replace(".weight", ".biases")
-
-        if scales_key in raw_mtp and biases_key in raw_mtp:
-            # Quantized triplet → dequantize to BF16
-            dq = mx.dequantize(
-                raw_mtp[key],
-                raw_mtp[scales_key],
-                raw_mtp[biases_key],
-                group_size=group_size,
-                bits=bits,
-            )
-            mtp_weights[key] = dq
-            processed.update([key, scales_key, biases_key])
-        else:
-            # Already FP (norms, fc, shared_expert_gate)
-            mtp_weights[key] = raw_mtp[key]
-            processed.add(key)
-    del raw_mtp
+        logger.info(
+            f"[MTP inject] Loading fallback weights from {mtp_file.name} "
+            "(BF16 / dequantized)"
+        )
+        raw = mx.load(str(mtp_file))
+        raw_mtp = {}
+        for key, value in raw.items():
+            clean = key
+            if clean.startswith("language_model."):
+                clean = clean.replace("language_model.", "", 1)
+            clean = clean.removeprefix("mtp.")
+            raw_mtp[clean] = value
+        del raw
+        mtp_weights = _prepare_mtp_weights(
+            raw_mtp,
+            bits=bits,
+            group_size=group_size,
+            mx=mx,
+        )
 
     mtp.load_weights(list(mtp_weights.items()), strict=False)
     mx.eval(mtp.parameters())
 
-    dq_count = sum(1 for k in mtp_weights if not k.endswith((".scales", ".biases")))
-    has_quantized = any(k.endswith(".scales") for k in processed)
-    mode = "dequantized from quantized" if has_quantized else "native BF16"
+    dq_count = len(mtp_weights)
+    mode = "dequantized / normalized"
     logger.info(f"[MTP inject] Loaded {dq_count} MTP weight tensors ({mode})")
 
     # --- Step 4: Fix missing MoE MTP weights ---
