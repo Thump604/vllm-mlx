@@ -880,6 +880,19 @@ class MLLMBatchGenerator:
             return output.logits
         return output
 
+        request.vision_encoded = True
+
+        # Unwrap LanguageModelOutput (Gemma 4 / Qwen 3.5 VLM language
+        # models return a wrapper object whose ``logits`` attribute is
+        # the actual mx.array). The cooperative session passes the raw
+        # call result through without unwrapping, so we have to do it
+        # here before _process_prompts subscripts ``logits[:, -1, :]``
+        # for first-token sampling.
+        logits = result.logits
+        if hasattr(logits, "logits"):
+            logits = logits.logits
+        return logits, result.cache
+
     @staticmethod
     def _trim_rotating_caches(cache_list):
         """Trim RotatingKVCache buffers restored from prefix cache.
