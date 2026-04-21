@@ -15,6 +15,7 @@ Features:
 
 import atexit
 import base64
+import json
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -133,6 +135,302 @@ class MLLMOutput:
     finish_reason: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+
+
+def _coerce_enable_thinking(value: object | None) -> bool:
+    """Resolve thinking mode from explicit kwargs or environment."""
+    if value is None:
+        env = os.environ.get("VLLM_MLX_ENABLE_THINKING")
+        if env is None:
+            return True
+        return str(env).lower() not in {"0", "false", "no"}
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "no"}
+    return bool(value)
+
+
+def _normalize_content_part(item: object) -> object:
+    """Convert Pydantic content parts into plain Python objects."""
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    if hasattr(item, "dict"):
+        return {k: v for k, v in item.dict().items() if v is not None}
+    return item
+
+
+def _normalize_message_content(content: object) -> object:
+    """Normalize OpenAI-style message content for chat templating."""
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        return [_normalize_content_part(item) for item in content]
+    return content
+
+
+_GEMMA_TOOL_RESULT_COMPLETION_CUE = (
+    "Tool result received. If the user's request is now satisfied, respond to "
+    "the user directly instead of calling another tool. Only call another tool "
+    "if more changes are still required."
+)
+
+
+def _append_completion_cue_to_tool_content(content: object, cue: str | None) -> object:
+    """Append a text completion cue to native tool content without clobbering it."""
+    if not cue:
+        return content
+
+    if isinstance(content, str):
+        if cue in content:
+            return content
+        return f"{content}\n\n{cue}" if content else cue
+
+    if isinstance(content, list):
+        for item in content:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and item.get("text") == cue
+            ):
+                return content
+        return [*content, {"type": "text", "text": cue}]
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            if text == cue:
+                return content
+            updated = dict(content)
+            updated["text"] = f"{text}\n\n{cue}" if text else cue
+            return updated
+
+    return content
+
+
+def _extract_text_and_collect_images(
+    content: object, all_image_urls: list[str]
+) -> tuple[str, int]:
+    """Extract text and count images from normalized OpenAI content."""
+    text = ""
+    image_count = 0
+
+    if isinstance(content, str):
+        return content, 0
+
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                text += item
+                continue
+
+            if not isinstance(item, dict):
+                text += str(item)
+                continue
+
+            item_type = item.get("type", "")
+            if item_type == "text":
+                text += item.get("text", "")
+            elif item_type == "image_url":
+                img_url = item.get("image_url", {})
+                if isinstance(img_url, str):
+                    all_image_urls.append(img_url)
+                elif isinstance(img_url, dict):
+                    all_image_urls.append(img_url.get("url", ""))
+                image_count += 1
+            elif item_type == "image":
+                all_image_urls.append(item.get("image", item.get("url", "")))
+                image_count += 1
+
+        return text, image_count
+
+    return str(content), 0
+
+
+def _normalize_native_tool_calls(tool_calls: object) -> list[dict]:
+    """Normalize assistant tool calls for chat templates that support them."""
+    normalized: list[dict] = []
+    if not isinstance(tool_calls, list):
+        return normalized
+
+    for tool_call in tool_calls:
+        entry = _normalize_content_part(tool_call)
+        if not isinstance(entry, dict):
+            continue
+        tc = json.loads(json.dumps(entry, default=str))
+        func = tc.get("function")
+        if isinstance(func, dict):
+            args = func.get("arguments")
+            if isinstance(args, str):
+                try:
+                    func["arguments"] = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        normalized.append(tc)
+    return normalized
+
+
+def _build_mllm_chat_messages(
+    messages: list[dict[str, object]],
+    *,
+    all_image_urls: list[str],
+    video_frame_counts: dict[int, int],
+    preserve_native_tool_format: bool,
+    tool_result_completion_cue: str | None = None,
+) -> list[dict[str, object]]:
+    """Build chat-template messages while preserving tool replay when requested."""
+    chat_messages: list[dict[str, object]] = []
+
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        if not isinstance(role, str):
+            role = str(role)
+
+        normalized_content = _normalize_message_content(msg.get("content", ""))
+        msg_text, msg_image_count = _extract_text_and_collect_images(
+            normalized_content, all_image_urls
+        )
+        msg_image_count += video_frame_counts.get(msg_idx, 0)
+
+        tool_calls = msg.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            if preserve_native_tool_format:
+                assistant_message: dict[str, object] = {
+                    "role": role,
+                    "content": normalized_content,
+                }
+                normalized_tool_calls = _normalize_native_tool_calls(tool_calls)
+                if normalized_tool_calls:
+                    assistant_message["tool_calls"] = normalized_tool_calls
+                reasoning = msg.get("reasoning")
+                if reasoning is not None:
+                    assistant_message["reasoning"] = reasoning
+                reasoning_content = msg.get("reasoning_content")
+                if reasoning_content is not None:
+                    assistant_message["reasoning_content"] = reasoning_content
+                chat_messages.append(assistant_message)
+            else:
+                tool_call_lines = []
+                for tool_call in tool_calls if isinstance(tool_calls, list) else []:
+                    entry = _normalize_content_part(tool_call)
+                    if not isinstance(entry, dict):
+                        continue
+                    func = entry.get("function", {})
+                    if not isinstance(func, dict):
+                        continue
+                    name = func.get("name", "unknown")
+                    args = func.get("arguments", "{}")
+                    tool_call_lines.append(f"[Calling tool: {name}({args})]")
+                text = msg_text
+                if tool_call_lines:
+                    text = (text + "\n" if text else "") + "\n".join(tool_call_lines)
+                chat_messages.append({"role": role, "content": text})
+            continue
+
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id", "") or ""
+            if preserve_native_tool_format:
+                tool_content = _append_completion_cue_to_tool_content(
+                    normalized_content, tool_result_completion_cue
+                )
+                chat_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }
+                )
+            else:
+                chat_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[Tool Result ({tool_call_id})]: {msg_text}",
+                    }
+                )
+            continue
+
+        if msg_text or msg_image_count > 0:
+            if role == "user" and msg_image_count > 0:
+                content_list = []
+                for _ in range(msg_image_count):
+                    content_list.append({"type": "image"})
+                content_list.append(
+                    {"type": "text", "text": msg_text, "content": msg_text}
+                )
+                chat_messages.append({"role": role, "content": content_list})
+            else:
+                chat_messages.append({"role": role, "content": msg_text})
+
+    return chat_messages
+
+
+_GEMMA_TOOL_REPLAY_TURN_NEEDLE = (
+    "{%- set continue_same_model_turn = "
+    "(role == 'model' and prev_nt.role == 'assistant') -%}"
+)
+_GEMMA_TOOL_REPLAY_TURN_PATCH = (
+    "{%- set prev_msg_role = "
+    "(loop_messages[loop.index0 - 1]['role'] if loop.index0 > 0 else None) -%}\n"
+    "    {%- set continue_same_model_turn = "
+    "(role == 'model' and prev_nt.role == 'assistant' and prev_msg_role != 'tool') -%}"
+)
+_GEMMA_TOOL_REPLAY_GENERATION_NEEDLES = (
+    "{%- if ns.prev_message_type != 'tool_response' and "
+    "ns.prev_message_type != 'tool_call' -%}",
+    "{%- if ns.prev_message_type != 'tool_response' -%}",
+)
+_GEMMA_TOOL_REPLAY_GENERATION_PATCH = "{%- if ns.prev_message_type != 'tool_call' -%}"
+
+
+def _patch_gemma_tool_replay_chat_template(template: str) -> str:
+    """Ensure OpenAI tool replay starts a fresh model turn after tool results."""
+    updated = template
+    turn_already_patched = "prev_msg_role != 'tool'" in updated
+    generation_already_patched = _GEMMA_TOOL_REPLAY_GENERATION_PATCH in updated
+    turn_patched = turn_already_patched
+    generation_patched = generation_already_patched
+
+    if not turn_already_patched and _GEMMA_TOOL_REPLAY_TURN_NEEDLE in updated:
+        updated = updated.replace(
+            _GEMMA_TOOL_REPLAY_TURN_NEEDLE, _GEMMA_TOOL_REPLAY_TURN_PATCH, 1
+        )
+        turn_patched = True
+
+    for needle in _GEMMA_TOOL_REPLAY_GENERATION_NEEDLES:
+        if needle in updated:
+            updated = updated.replace(needle, _GEMMA_TOOL_REPLAY_GENERATION_PATCH, 1)
+            generation_patched = True
+            break
+
+    if not turn_patched or not generation_patched:
+        logger.warning(
+            "Gemma tool replay template patch incomplete "
+            "(turn_patched=%s, generation_patched=%s)",
+            turn_patched,
+            generation_patched,
+        )
+
+    return updated
+
+
+def _resolve_native_tool_result_completion_cue(
+    model_name: object,
+    model_config: object,
+    *,
+    preserve_native_tool_format: bool,
+) -> str | None:
+    """Return the local completion cue for Gemma native tool replay."""
+    if not preserve_native_tool_format:
+        return None
+
+    model_name_text = str(model_name or "").lower()
+    if "gemma" in model_name_text:
+        return _GEMMA_TOOL_RESULT_COMPLETION_CUE
+
+    if isinstance(model_config, dict):
+        model_type = str(model_config.get("model_type", "")).lower()
+        if "gemma" in model_type:
+            return _GEMMA_TOOL_RESULT_COMPLETION_CUE
+
+    return None
 
 
 def is_base64_image(s: str) -> bool:
@@ -734,6 +1032,7 @@ class MLXMultimodalLM:
             self._video_native = hasattr(
                 self.model.config, "video_token_id"
             ) or hasattr(self.model.config, "video_token_index")
+            self._patch_tool_replay_chat_templates()
             logger.info(f"MLLM loaded successfully: {self.model_name}")
             if self._video_native:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
@@ -751,9 +1050,40 @@ class MLXMultimodalLM:
         """Extract the underlying language model for mlx_lm TextModel construction."""
         return self.model.language_model
 
+    def _patch_tool_replay_chat_templates(self) -> None:
+        """Patch Gemma chat templates so tool-result followups start a fresh turn."""
+        if "gemma" not in str(self.model_name).lower():
+            return
+
+        patched = False
+        targets = [self.processor]
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is not None:
+            targets.append(tokenizer)
+
+        for target in targets:
+            template = getattr(target, "chat_template", None)
+            if not isinstance(template, str):
+                continue
+            updated = _patch_gemma_tool_replay_chat_template(template)
+            if updated != template:
+                target.chat_template = updated
+                patched = True
+
+        if patched:
+            logger.info(
+                "Patched Gemma chat template for OpenAI tool replay turn boundaries"
+            )
+
     def get_tokenizer(self):
-        """Get the text tokenizer (not the multimodal processor)."""
-        return self.processor.tokenizer
+        """Get the text tokenizer (not the multimodal processor).
+
+        Some processors ARE the tokenizer directly, while others wrap it as
+        `.tokenizer`.
+        """
+        if hasattr(self.processor, "tokenizer"):
+            return self.processor.tokenizer
+        return self.processor
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process image inputs and return local file paths."""
@@ -1315,12 +1645,10 @@ class MLXMultimodalLM:
             self.load()
 
         from mlx_vlm import generate
-        from mlx_vlm.prompt_utils import get_chat_template
+        from mlx_vlm.generate import apply_chat_template
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
-        chat_messages = []  # List of properly formatted messages for chat template
+        all_image_urls = []
+        chat_messages = []
 
         logger.info(f"MLLM.chat() called with {len(messages)} messages")
 
@@ -1329,10 +1657,25 @@ class MLXMultimodalLM:
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
-        enable_thinking = kwargs.pop("enable_thinking", True)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", None) or {})
+        preserve_native_tool_format = bool(
+            kwargs.pop("preserve_native_tool_format", False)
+        )
+        enable_thinking = _coerce_enable_thinking(
+            kwargs.pop("enable_thinking", chat_template_kwargs.get("enable_thinking"))
+        )
+        kwargs.pop("response_format", None)
+        existing_logits_processors = kwargs.pop("logits_processors", None)
+        if existing_logits_processors is not None:
+            kwargs["logits_processors"] = existing_logits_processors
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
+        tool_result_completion_cue = _resolve_native_tool_result_completion_cue(
+            self.model_name,
+            getattr(self.model, "config", None),
+            preserve_native_tool_format=preserve_native_tool_format,
+        )
 
         # Use native video pipeline for supported models
         if self._video_native and _msg_video_inputs:
@@ -1360,77 +1703,13 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        # Second pass: build chat messages with image counts that include video frames
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""  # Text content for this message
-            msg_image_count = 0  # Number of images in THIS message
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                # OpenAI multimodal format - extract text and count images for THIS message
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    # Convert Pydantic models to dicts, excluding None fields
-                    # to avoid null keys like image_url: null on text parts
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            # Add video frame count to image count for this message
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-
-            # Build properly structured message for Qwen3-VL-MoE
-            # Format: {"role": "...", "content": [{"type": "image"}, ..., {"type": "text", "text": "..."}]}
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    # User message WITH images - build content array with image tokens FIRST
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    # Assistant messages - just text content (not array)
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    # User/system message WITHOUT images - still use content array format
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+            preserve_native_tool_format=preserve_native_tool_format,
+            tool_result_completion_cue=tool_result_completion_cue,
+        )
 
         # Process images
         all_images = []
@@ -1450,16 +1729,17 @@ class MLXMultimodalLM:
             )
 
         # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
+        template_extra_kwargs = dict(chat_template_kwargs)
         if tools:
             template_extra_kwargs["tools"] = tools
+        template_extra_kwargs.setdefault("enable_thinking", enable_thinking)
 
         try:
-            formatted_prompt = get_chat_template(
+            formatted_prompt = apply_chat_template(
                 self.processor,
+                self.model.config,
                 chat_messages,
                 add_generation_prompt=True,
-                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:
@@ -1589,6 +1869,7 @@ class MLXMultimodalLM:
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
+            enable_thinking=enable_thinking,
             **kwargs,
         )
 
@@ -1704,7 +1985,7 @@ class MLXMultimodalLM:
 
         try:
             from mlx_vlm import stream_generate
-            from mlx_vlm.prompt_utils import get_chat_template
+            from mlx_vlm.generate import apply_chat_template
         except ImportError:
             # Fallback to non-streaming if stream_generate not available
             output = self.chat(
@@ -1716,20 +1997,29 @@ class MLXMultimodalLM:
             yield output
             return
 
-        # Extract text and images from messages
-        # Build chat_messages for multi-turn support WITH proper image tokens per message
-        all_image_urls = []  # Raw URLs/paths to process later
-        chat_messages = []  # List of properly formatted messages for chat template
+        all_image_urls = []
+        chat_messages = []
 
         # Pop params early so they don't leak into mlx_vlm.generate()
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
         use_cache = kwargs.pop("use_cache", True)
-        enable_thinking = kwargs.pop("enable_thinking", True)
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", None) or {})
+        preserve_native_tool_format = bool(
+            kwargs.pop("preserve_native_tool_format", False)
+        )
+        enable_thinking = _coerce_enable_thinking(
+            kwargs.pop("enable_thinking", chat_template_kwargs.get("enable_thinking"))
+        )
 
         # Collect video inputs from messages
         _msg_video_inputs = self._collect_video_inputs(messages)
+        tool_result_completion_cue = _resolve_native_tool_result_completion_cue(
+            self.model_name,
+            getattr(self.model, "config", None),
+            preserve_native_tool_format=preserve_native_tool_format,
+        )
 
         # Use native video pipeline for supported models.
         # NOTE: Native video yields a single chunk (not incremental streaming)
@@ -1764,67 +2054,13 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        for msg_idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            msg_text = ""
-            msg_image_count = 0
-
-            if isinstance(content, str):
-                msg_text = content
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, str):
-                        msg_text += item
-                        continue
-
-                    if hasattr(item, "model_dump"):
-                        item = item.model_dump(exclude_none=True)
-                    elif hasattr(item, "dict"):
-                        item = {k: v for k, v in item.dict().items() if v is not None}
-
-                    if isinstance(item, dict):
-                        item_type = item.get("type", "")
-
-                        if item_type == "text":
-                            msg_text += item.get("text", "")
-
-                        elif item_type == "image_url":
-                            img_url = item.get("image_url", {})
-                            if isinstance(img_url, str):
-                                all_image_urls.append(img_url)
-                            else:
-                                all_image_urls.append(img_url.get("url", ""))
-                            msg_image_count += 1
-
-                        elif item_type == "image":
-                            all_image_urls.append(
-                                item.get("image", item.get("url", ""))
-                            )
-                            msg_image_count += 1
-
-            msg_image_count += _msg_video_frame_counts.get(msg_idx, 0)
-
-            if msg_text or msg_image_count > 0:
-                if role == "user" and msg_image_count > 0:
-                    content_list = []
-                    for _ in range(msg_image_count):
-                        content_list.append({"type": "image"})
-                    content_list.append(
-                        {"type": "text", "text": msg_text, "content": msg_text}
-                    )
-                    chat_messages.append({"role": role, "content": content_list})
-                elif role == "assistant":
-                    chat_messages.append({"role": role, "content": msg_text})
-                else:
-                    chat_messages.append(
-                        {
-                            "role": role,
-                            "content": [
-                                {"type": "text", "text": msg_text, "content": msg_text}
-                            ],
-                        }
-                    )
+        chat_messages = _build_mllm_chat_messages(
+            messages,
+            all_image_urls=all_image_urls,
+            video_frame_counts=_msg_video_frame_counts,
+            preserve_native_tool_format=preserve_native_tool_format,
+            tool_result_completion_cue=tool_result_completion_cue,
+        )
 
         all_images = []
         if all_image_urls:
@@ -1832,16 +2068,17 @@ class MLXMultimodalLM:
         all_images.extend(all_video_frames)
 
         # Build template kwargs for tool definitions (tools already popped above)
-        template_extra_kwargs = {}
+        template_extra_kwargs = dict(chat_template_kwargs)
         if tools:
             template_extra_kwargs["tools"] = tools
+        template_extra_kwargs.setdefault("enable_thinking", enable_thinking)
 
         try:
-            formatted_prompt = get_chat_template(
+            formatted_prompt = apply_chat_template(
                 self.processor,
+                self.model.config,
                 chat_messages,
                 add_generation_prompt=True,
-                enable_thinking=enable_thinking,
                 **template_extra_kwargs,
             )
         except Exception as e:
@@ -1895,6 +2132,7 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             prompt_cache=prompt_cache,
+            enable_thinking=enable_thinking,
             **kwargs,
         ):
             token_count += 1
