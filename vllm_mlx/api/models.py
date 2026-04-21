@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, computed_field, model_serializer
+from pydantic import BaseModel, Field, computed_field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -200,16 +200,16 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning_content: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    reasoning: str | None = (
+        None  # Reasoning/thinking content (when --reasoning-parser is used)
     )
     tool_calls: list[ToolCall] | None = None
 
+    @computed_field
     @property
-    def reasoning(self) -> str | None:
-        """Backward-compatible alias for reasoning_content."""
-        return self.reasoning_content
+    def reasoning_content(self) -> str | None:
+        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
+        return self.reasoning
 
 
 class ChatCompletionChoice(BaseModel):
@@ -456,24 +456,23 @@ class EmbeddingResponse(BaseModel):
 class ChatCompletionChunkDelta(BaseModel):
     """Delta content in a streaming chunk.
 
-    Note: reasoning_content is excluded when None so that clients using
-    @ai-sdk/openai-compatible (OpenCode, Kilo) don't choke on unknown
-    fields.  Only ``reasoning_content`` is emitted (not a separate
-    ``reasoning`` field) for OpenAI SDK compatibility.
+    ``reasoning`` remains the canonical streamed key for upstream
+    compatibility; ``reasoning_content`` is serialized as an alias for
+    downstream clients that expect it.
     """
 
     role: str | None = None
     content: str | None = None
-    reasoning_content: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    reasoning: str | None = (
+        None  # Reasoning/thinking content (when --reasoning-parser is used)
     )
     tool_calls: list[dict] | None = None
 
+    @computed_field
     @property
-    def reasoning(self) -> str | None:
-        """Backward-compatible alias for reasoning_content."""
-        return self.reasoning_content
+    def reasoning_content(self) -> str | None:
+        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
+        return self.reasoning
 
 
 class ChatCompletionChunkChoice(BaseModel):
