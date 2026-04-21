@@ -398,6 +398,15 @@ class MLLMBatchGenerator:
         # executor threads.
         self._aborted_request_ids: set = set()
 
+        # Deferred removal queue — UIDs scheduled for removal from another
+        # thread (typically the event loop on client disconnect).  The
+        # actual removal, which mutates `active_batch` and touches MLX
+        # arrays, must happen on the scheduler thread to avoid a race with
+        # an in-flight forward pass.  Metal asserts ("encodeSignalEvent
+        # with uncommitted encoder") if two threads submit GPU work on the
+        # same stream concurrently.  See `schedule_removal` /
+        # `process_pending_removals`.
+        self._pending_removal_uids: set = set()
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
             max_pixel_entries=vision_cache_size,
@@ -590,6 +599,36 @@ class MLLMBatchGenerator:
         self._aborted_request_ids.add(request_id)
         logger.info(f"[abort_prefill] Marked {request_id} for prefill abort")
 
+    def schedule_removal(self, uids: List[int]) -> None:
+        """Thread-safe deferred removal of UIDs from the batch.
+
+        Safe to call from any thread (typically the event loop during
+        client-disconnect cleanup).  The actual `remove()`, which creates
+        ``mx.array`` instances and filters the KV cache, runs on the
+        scheduler thread via :meth:`process_pending_removals` at the next
+        batch boundary.  This avoids the Metal ``encodeSignalEvent:
+        uncommitted encoder`` crash that occurs when two threads submit
+        GPU work on the same stream concurrently.
+        """
+        for uid in uids:
+            self._pending_removal_uids.add(uid)
+
+    def process_pending_removals(self) -> None:
+        """Remove any UIDs enqueued via :meth:`schedule_removal`.
+
+        MUST be called from the scheduler thread only, at a safe point
+        (e.g. the start of :meth:`MLLMScheduler.step` before any forward
+        pass has been issued).  Safe to call even when the queue is
+        empty (no-op).
+        """
+        if not self._pending_removal_uids:
+            return
+        # Atomically snapshot and clear the queue.  `set` ops are
+        # GIL-protected, and concurrent `schedule_removal` calls that
+        # arrive after the snapshot will simply be processed next step.
+        uids = list(self._pending_removal_uids)
+        self._pending_removal_uids.clear()
+        self.remove(uids)
     def __del__(self):
         try:
             self.close()
