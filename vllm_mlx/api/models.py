@@ -11,8 +11,9 @@ These models define the request and response schemas for:
 
 import time
 import uuid
+from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field, computed_field, model_serializer
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -173,19 +174,25 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Enable/disable thinking mode (also accepted in chat_template_kwargs)
+    enable_thinking: bool | None = None
+    # Cap reasoning tokens as a sub-limit of max_tokens.
+    # When set, the model is forced to transition from thinking to content
+    # after this many reasoning tokens. None = no budget enforcement.
+    thinking_token_budget: int | None = Field(default=None, ge=0)
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
-    # Sampling penalties
-    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
-    # Enable/disable thinking mode (None = server default, typically True)
-    enable_thinking: bool | None = None
+    # OpenAI client compatibility: server-specific extensions
+    extra_body: dict[str, Any] | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -193,16 +200,16 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        """Backward-compatible alias for reasoning_content."""
+        return self.reasoning_content
 
 
 class ChatCompletionChoice(BaseModel):
@@ -219,6 +226,14 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        d = handler(self)
+        if d.get("reasoning_tokens") is None:
+            d.pop("reasoning_tokens", None)
+        return d
 
 
 class ChatCompletionResponse(BaseModel):
@@ -250,11 +265,16 @@ class CompletionRequest(BaseModel):
     repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
+    stream_options: StreamOptions | None = None
     stop: list[str] | None = None
-    # Sampling penalties
-    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
+    # OpenAI client compatibility: server-specific extensions
+    extra_body: dict[str, Any] | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -434,20 +454,26 @@ class EmbeddingResponse(BaseModel):
 
 
 class ChatCompletionChunkDelta(BaseModel):
-    """Delta content in a streaming chunk."""
+    """Delta content in a streaming chunk.
+
+    Note: reasoning_content is excluded when None so that clients using
+    @ai-sdk/openai-compatible (OpenCode, Kilo) don't choke on unknown
+    fields.  Only ``reasoning_content`` is emitted (not a separate
+    ``reasoning`` field) for OpenAI SDK compatibility.
+    """
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[dict] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        """Backward-compatible alias for reasoning_content."""
+        return self.reasoning_content
 
 
 class ChatCompletionChunkChoice(BaseModel):

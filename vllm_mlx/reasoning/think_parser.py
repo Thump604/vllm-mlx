@@ -9,12 +9,6 @@ Supports three scenarios:
 1. Both tags in output: <think>reasoning</think>content
 2. Only closing tag (think injected in prompt): reasoning</think>content
 3. No tags: pure content
-
-Performance: The streaming parser uses a simple state machine to track the
-current phase (pre-think / thinking / content). Tag completion is detected
-against the accumulated text for correctness when `<think>` / `</think>` are
-split across delta boundaries, but phase tracking still avoids the old
-whole-output rescanning behavior.
 """
 
 from abc import abstractmethod
@@ -33,12 +27,8 @@ class BaseThinkingReasoningParser(ReasoningParser):
     and only </think> appears in the model output. This is common with AI agents
     like OpenCode that force models to reason by injecting thinking tags.
 
-    The streaming parser uses a state machine with three phases:
-
-        pre_think -> thinking -> content
-
-    Transitions are tracked by parser state. Accumulated text is consulted only
-    to detect when a start/end tag has completed across delta boundaries.
+    The parser tracks state during streaming to correctly separate reasoning
+    from content as tokens arrive incrementally.
     """
 
     @property
@@ -53,12 +43,11 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
-        # Streaming state — reset per request via reset_state()
-        self._phase: str = "pre_think"  # "pre_think" | "thinking" | "content"
-
-    def reset_state(self):
-        """Reset state machine for a new streaming request."""
-        self._phase = "pre_think"
+        # Streaming state.
+        self._seen_start = False
+        self._seen_end = False
+        # Buffer for partial tag matches at chunk boundaries.
+        self._boundary_buffer = ""
 
     def extract_reasoning(
         self,
@@ -82,11 +71,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         # Case 1: Both tags present (normal case)
         if self.start_token in text and self.end_token in text:
+            # Get everything after start token
             _, _, after_start = text.partition(self.start_token)
+            # Split on end token
             reasoning, _, content = after_start.partition(self.end_token)
             return reasoning.strip() or None, content.strip() or None
 
         # Case 2: Only closing tag (think was injected in prompt)
+        # Everything before </think> is reasoning
         if self.end_token in text:
             reasoning, _, content = text.partition(self.end_token)
             return reasoning.strip() or None, content.strip() or None
@@ -96,8 +88,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
             _, _, reasoning = text.partition(self.start_token)
             return reasoning.strip() or None, None
 
-        # Case 4: No tags at all — pure content
+        # Case 4: No tags at all - pure content
         return None, model_output
+
+    def reset_state(self):
+        """Reset internal state for a new streaming request."""
+        self._seen_start = False
+        self._seen_end = False
+        self._boundary_buffer = ""
 
     def extract_reasoning_streaming(
         self,
@@ -106,99 +104,116 @@ class BaseThinkingReasoningParser(ReasoningParser):
         delta_text: str,
     ) -> DeltaMessage | None:
         """
-        Extract reasoning from a streaming delta using state-machine tracking.
+        Extract reasoning from streaming delta using state-machine tracking.
 
-        Instead of rescanning the full accumulated text on every token, this
-        method tracks the current phase (pre_think / thinking / content) and
-        only consults accumulated text to detect completed start/end tags that
-        were split across delta boundaries.
-
-        Handles three scenarios:
-        1. Explicit <think>...</think> in model output
-        2. Implicit mode (<think> in prompt, only </think> in output)
-        3. No tags at all (pure content after first token with no reasoning)
+        Uses internal state (_seen_start, _seen_end) to avoid O(n) searches
+        on the full accumulated text every token. Only searches the small
+        delta_text plus a boundary buffer for tag transitions.
 
         Args:
-            previous_text: Text accumulated before this delta.
-            current_text: Text including this delta.
-            delta_text: Just the new text in this chunk.
+            previous_text: Text accumulated before this delta (used for
+                           first-call bootstrap only).
+            current_text: Text including this delta (unused in fast path).
+            delta_text: Just the new text.
 
         Returns:
-            DeltaMessage with reasoning and/or content, or None to skip.
+            DeltaMessage with reasoning/content, or None to skip.
         """
-        if not delta_text:
+        # Bootstrap: on first call, seed state from previous_text (covers
+        # cases where the parser is attached mid-stream or tags were in
+        # earlier chunks processed by a different code path).
+        if not self._seen_start and not self._seen_end and previous_text:
+            if self.end_token in previous_text:
+                self._seen_end = True
+            elif self.start_token in previous_text:
+                self._seen_start = True
+
+        self._boundary_buffer += delta_text
+        reasoning_parts: list[str] = []
+        content_parts: list[str] = []
+
+        while self._boundary_buffer:
+            if self._seen_end:
+                content_parts.append(self._boundary_buffer)
+                self._boundary_buffer = ""
+                break
+
+            if self._seen_start:
+                end_idx = self._boundary_buffer.find(self.end_token)
+                if end_idx != -1:
+                    if end_idx:
+                        reasoning_parts.append(self._boundary_buffer[:end_idx])
+                    self._boundary_buffer = self._boundary_buffer[
+                        end_idx + len(self.end_token) :
+                    ]
+                    self._seen_end = True
+                    continue
+
+                hold = self._partial_tag_suffix_len(
+                    self._boundary_buffer, (self.end_token,)
+                )
+                emit = self._boundary_buffer[:-hold] if hold else self._boundary_buffer
+                if emit:
+                    reasoning_parts.append(emit)
+                self._boundary_buffer = self._boundary_buffer[-hold:] if hold else ""
+                break
+
+            start_idx = self._boundary_buffer.find(self.start_token)
+            end_idx = self._boundary_buffer.find(self.end_token)
+            candidates = [idx for idx in (start_idx, end_idx) if idx != -1]
+
+            if candidates:
+                next_idx = min(candidates)
+                if start_idx != -1 and start_idx == next_idx:
+                    prefix = self._boundary_buffer[:start_idx]
+                    if prefix:
+                        reasoning_parts.append(prefix)
+                    self._boundary_buffer = self._boundary_buffer[
+                        start_idx + len(self.start_token) :
+                    ]
+                    self._seen_start = True
+                    continue
+
+                prefix = self._boundary_buffer[:end_idx]
+                if prefix:
+                    reasoning_parts.append(prefix)
+                self._boundary_buffer = self._boundary_buffer[
+                    end_idx + len(self.end_token) :
+                ]
+                self._seen_end = True
+                continue
+
+            hold = self._partial_tag_suffix_len(
+                self._boundary_buffer, (self.start_token, self.end_token)
+            )
+            emit = self._boundary_buffer[:-hold] if hold else self._boundary_buffer
+            if emit:
+                reasoning_parts.append(emit)
+            self._boundary_buffer = self._boundary_buffer[-hold:] if hold else ""
+            break
+
+        reasoning = "".join(reasoning_parts) or None
+        content = "".join(content_parts) or None
+        if reasoning is None and content is None:
+            return None
+        return DeltaMessage(reasoning=reasoning, content=content)
+
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Flush any buffered text that did not complete a tag."""
+        if not self._boundary_buffer:
             return None
 
-        start_tok = self.start_token
-        end_tok = self.end_token
+        pending = self._boundary_buffer
+        self._boundary_buffer = ""
+        if self._seen_end:
+            return DeltaMessage(content=pending)
+        return DeltaMessage(reasoning=pending)
 
-        # ── Phase: pre_think ──────────────────────────────────────
-        # Haven't seen a completed tag yet. Could be:
-        # - About to see <think> (explicit reasoning)
-        # - Already inside implicit reasoning (think was in prompt)
-        # - No reasoning at all (pure content model)
-        if self._phase == "pre_think":
-            if start_tok in current_text:
-                self._phase = "thinking"
-                idx = delta_text.find(start_tok)
-                after = delta_text[idx + len(start_tok) :] if idx >= 0 else delta_text
-
-                if end_tok in after:
-                    self._phase = "content"
-                    eidx = after.find(end_tok)
-                    reasoning = after[:eidx]
-                    content = after[eidx + len(end_tok) :]
-                    if not reasoning and not content:
-                        return None
-                    return DeltaMessage(
-                        reasoning=reasoning or None,
-                        content=content or None,
-                    )
-                return DeltaMessage(reasoning=after) if after else None
-
-            # Implicit mode: </think> completed without an explicit <think>.
-            if end_tok in current_text:
-                self._phase = "content"
-                idx = delta_text.find(end_tok)
-                if idx >= 0:
-                    reasoning = delta_text[:idx]
-                    content = delta_text[idx + len(end_tok) :]
-                else:
-                    reasoning = None
-                    content = delta_text
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning or None,
-                    content=content or None,
-                )
-
-            # No tags — default to reasoning (implicit mode assumption).
-            # If the model doesn't use thinking at all, the server's
-            # non-parser path handles it. This path only activates when
-            # a reasoning parser is explicitly configured.
-            return DeltaMessage(reasoning=delta_text)
-
-        # ── Phase: thinking ───────────────────────────────────────
-        # Inside a reasoning block, waiting for end tag.
-        if self._phase == "thinking":
-            if end_tok in current_text and end_tok not in previous_text:
-                self._phase = "content"
-                idx = delta_text.find(end_tok)
-                if idx >= 0:
-                    reasoning = delta_text[:idx]
-                    content = delta_text[idx + len(end_tok) :]
-                else:
-                    reasoning = delta_text
-                    content = None
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning or None,
-                    content=content or None,
-                )
-            return DeltaMessage(reasoning=delta_text)
-
-        # ── Phase: content ────────────────────────────────────────
-        # Past the reasoning block — everything is content.
-        return DeltaMessage(content=delta_text)
+    @staticmethod
+    def _partial_tag_suffix_len(text: str, tags: tuple[str, ...]) -> int:
+        """Return the longest suffix of text that could continue as a tag."""
+        for length in range(len(text), 0, -1):
+            suffix = text[-length:]
+            if any(tag.startswith(suffix) for tag in tags):
+                return length
+        return 0
