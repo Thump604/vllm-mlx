@@ -420,11 +420,29 @@ class MLLMScheduler:
             except ValueError:
                 pass
 
-        # Remove from batch generator
+        # Remove from batch generator.
+        #
+        # IMPORTANT: `abort_request` may be called from the asyncio event
+        # loop (e.g. in `stream_outputs`' `finally` block on client
+        # disconnect) while `scheduler.step()` — and therefore the
+        # batch generator's forward pass — is running on a separate
+        # executor thread (see engine_core.py: loop.run_in_executor).
+        #
+        # Calling `batch_generator.remove([uid])` eagerly here would
+        # trigger `active_batch.filter(...)`, which creates an
+        # `mx.array` and submits Metal work.  If the scheduler thread
+        # has an open Metal encoder mid-forward-pass, two threads
+        # submit to the same stream concurrently and Metal asserts
+        # with ``encodeSignalEvent:value: with uncommitted encoder``,
+        # aborting the process.
+        #
+        # Instead we defer the removal to the scheduler thread: it
+        # will drain the queue at the next safe boundary (start of
+        # step(), before any forward pass).
         if request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
-                self.batch_generator.remove([uid])
+                self.batch_generator.schedule_removal([uid])
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
 
@@ -671,6 +689,14 @@ class MLLMScheduler:
             MLLMSchedulerOutput with results of this step
         """
         output = MLLMSchedulerOutput()
+
+        # Drain any deferred removals queued from other threads (e.g.
+        # the asyncio event loop during client-disconnect aborts).
+        # This MUST run before any forward pass to avoid the Metal
+        # ``encodeSignalEvent: uncommitted encoder`` race.  See
+        # `abort_request` and `MLLMBatchGenerator.schedule_removal`.
+        if self.batch_generator is not None:
+            self.batch_generator.process_pending_removals()
 
         # Schedule waiting requests
         scheduled = self._schedule_waiting()
