@@ -92,6 +92,7 @@ from .api.models import (
     Message,  # noqa: F401
     ModelInfo,  # noqa: F401
     ModelsResponse,
+    ResponseFormat,
     ToolCall,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
@@ -158,14 +159,31 @@ def _resolve_thinking_token_budget(request_value: int | None) -> int | None:
 
 def _get_engine_tokenizer(engine: BaseEngine) -> object | None:
     """Return the tokenizer used for constrained decoding."""
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is None:
-        tokenizer = getattr(engine, "_tokenizer", None)
-    if tokenizer is None:
-        processor = getattr(engine, "_processor", None)
-        if processor is not None:
-            tokenizer = getattr(processor, "tokenizer", processor)
-    return tokenizer
+    candidates = (
+        getattr(engine, "tokenizer", None),
+        getattr(engine, "_tokenizer", None),
+        getattr(engine, "_processor", None),
+    )
+
+    for candidate in candidates:
+        current = candidate
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if hasattr(current, "encode"):
+                return current
+            if hasattr(current, "tokenizer"):
+                nxt = getattr(current, "tokenizer", None)
+                if nxt is not None and nxt is not current:
+                    current = nxt
+                    continue
+            if hasattr(current, "_tokenizer"):
+                nxt = getattr(current, "_tokenizer", None)
+                if nxt is not None and nxt is not current:
+                    current = nxt
+                    continue
+            current = None
+    return None
 
 
 def _encode_no_special_tokens(tokenizer: object, text: str) -> list[int]:
@@ -176,21 +194,84 @@ def _encode_no_special_tokens(tokenizer: object, text: str) -> list[int]:
         return tokenizer.encode(text)
 
 
+def _build_json_logits_processor(
+    response_format: object | None, tokenizer: object | None
+):
+    """Build a constrained-decoding processor for JSON response formats."""
+    if response_format is None or tokenizer is None:
+        return None
+
+    schema = None
+    if isinstance(response_format, ResponseFormat):
+        format_type = response_format.type
+        if response_format.json_schema is not None:
+            schema = response_format.json_schema.schema_
+    elif isinstance(response_format, dict):
+        format_type = response_format.get("type", "text")
+        json_schema_spec = response_format.get("json_schema") or {}
+        if isinstance(json_schema_spec, dict):
+            schema = json_schema_spec.get("schema")
+        else:
+            schema = getattr(json_schema_spec, "schema_", None) or getattr(
+                json_schema_spec, "schema", None
+            )
+    else:
+        return None
+
+    if format_type == "text":
+        return None
+    if format_type not in ("json_object", "json_schema"):
+        return None
+    if format_type == "json_object" or (format_type == "json_schema" and not schema):
+        schema = None
+
+    try:
+        from .constrained import JSONSchemaLogitsProcessor, is_available
+    except ImportError:
+        return None
+
+    if not is_available():
+        return None
+
+    try:
+        return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
+    except Exception:
+        return None
+
+
 def _maybe_attach_thinking_budget_processor(
     engine: BaseEngine,
     request: ChatCompletionRequest | AnthropicRequest,
     chat_kwargs: dict,
 ):
-    """Install a thinking-budget logits processor when the request enables it."""
+    """Install request-local logits processors for thinking and JSON output."""
     budget = _resolve_thinking_token_budget(
         getattr(request, "thinking_token_budget", None)
     )
-    if budget is None:
-        return None
-
     thinking_on = chat_kwargs.get("enable_thinking") is not False
-    if not thinking_on:
-        return None
+    response_format = getattr(request, "response_format", None)
+    tools_active = bool(
+        getattr(request, "tools", None) and getattr(request, "tool_choice", None) != "none"
+    )
+
+    tokenizer = _get_engine_tokenizer(engine)
+    json_logits_processor = None
+    if response_format and not tools_active and tokenizer is not None:
+        try:
+            json_logits_processor = _build_json_logits_processor(
+                response_format, tokenizer
+            )
+        except Exception as exc:
+            logger.warning("Failed to build JSON logits processor: %s", exc)
+            json_logits_processor = None
+
+    if budget is None or not thinking_on:
+        if json_logits_processor is not None:
+            existing = chat_kwargs.get("logits_processors") or []
+            chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+            if thinking_on:
+                chat_kwargs["enable_thinking"] = False
+        return json_logits_processor
 
     parser = _reasoning_parser
     if (
@@ -198,11 +279,13 @@ def _maybe_attach_thinking_budget_processor(
         or not hasattr(parser, "start_token")
         or not hasattr(parser, "end_token")
     ):
-        return None
+        if json_logits_processor is not None:
+            existing = chat_kwargs.get("logits_processors") or []
+            chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        return json_logits_processor
 
-    tokenizer = _get_engine_tokenizer(engine)
     if tokenizer is None:
-        return None
+        return json_logits_processor
 
     try:
         from .constrained import ThinkingAwareLogitsProcessor
@@ -211,11 +294,15 @@ def _maybe_attach_thinking_budget_processor(
             start_token_ids=_encode_no_special_tokens(tokenizer, parser.start_token),
             end_token_ids=_encode_no_special_tokens(tokenizer, parser.end_token),
             thinking_token_budget=budget,
+            inner=json_logits_processor,
             prompt_has_think_tag=thinking_on,
         )
     except Exception as exc:
         logger.warning("Failed to install thinking budget processor: %s", exc)
-        return None
+        if json_logits_processor is not None:
+            existing = chat_kwargs.get("logits_processors") or []
+            chat_kwargs["logits_processors"] = list(existing) + [json_logits_processor]
+        return json_logits_processor
 
     existing = chat_kwargs.get("logits_processors") or []
     chat_kwargs["logits_processors"] = list(existing) + [proc]

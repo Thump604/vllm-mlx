@@ -210,6 +210,126 @@ class TestThinkingBudgetProcessorWiring:
             else:
                 sys.modules.pop("vllm_mlx.constrained", None)
 
+    def test_engine_tokenizer_unwraps_processor_wrapper(self):
+        import vllm_mlx.server as server
+
+        class DummyTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [1, 2]
+
+        class DummyProcessor:
+            tokenizer = DummyTokenizer()
+
+        class DummyEngine:
+            tokenizer = DummyProcessor()
+
+        tokenizer = server._get_engine_tokenizer(DummyEngine())
+        assert tokenizer is DummyProcessor.tokenizer
+
+    def test_json_response_format_without_budget_disables_thinking_and_attaches_json_processor(
+        self,
+    ):
+        import vllm_mlx.server as server
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        class DummyTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [1, 2]
+
+        class DummyEngine:
+            tokenizer = DummyTokenizer()
+
+        original_builder = server._build_json_logits_processor
+        try:
+            fake_json_proc = object()
+
+            def _fake_builder(response_format, tokenizer):
+                return fake_json_proc
+
+            server._build_json_logits_processor = _fake_builder
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Hello")],
+                enable_thinking=True,
+                response_format={"type": "json_object"},
+            )
+            chat_kwargs = {"enable_thinking": True}
+
+            proc = server._maybe_attach_thinking_budget_processor(
+                DummyEngine(), request, chat_kwargs
+            )
+
+            assert proc is fake_json_proc
+            assert chat_kwargs["enable_thinking"] is False
+            assert chat_kwargs["logits_processors"] == [fake_json_proc]
+        finally:
+            server._build_json_logits_processor = original_builder
+
+    def test_budgeted_json_response_format_wraps_json_processor_inside_thinking_processor(
+        self,
+    ):
+        import vllm_mlx.server as server
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        class DummyTokenizer:
+            vocab_size = 100
+
+            def encode(self, text, add_special_tokens=False):
+                mapping = {"<think>": [10, 11], "</think>": [20, 21]}
+                return mapping[text]
+
+        class DummyParser:
+            start_token = "<think>"
+            end_token = "</think>"
+
+        class DummyEngine:
+            tokenizer = DummyTokenizer()
+
+        fake_constrained = types.ModuleType("vllm_mlx.constrained")
+
+        class FakeThinkingAwareLogitsProcessor:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        original = server._reasoning_parser
+        original_module = sys.modules.get("vllm_mlx.constrained")
+        original_builder = server._build_json_logits_processor
+        try:
+            fake_json_proc = object()
+
+            def _fake_builder(response_format, tokenizer):
+                return fake_json_proc
+
+            fake_constrained.ThinkingAwareLogitsProcessor = (
+                FakeThinkingAwareLogitsProcessor
+            )
+            sys.modules["vllm_mlx.constrained"] = fake_constrained
+            server._reasoning_parser = DummyParser()
+            server._build_json_logits_processor = _fake_builder
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Hello")],
+                enable_thinking=True,
+                thinking_token_budget=128,
+                response_format={"type": "json_object"},
+            )
+            chat_kwargs = {"enable_thinking": True}
+
+            proc = server._maybe_attach_thinking_budget_processor(
+                DummyEngine(), request, chat_kwargs
+            )
+
+            assert proc is not None
+            assert proc.kwargs["inner"] is fake_json_proc
+            assert chat_kwargs["logits_processors"][-1] is proc
+        finally:
+            server._reasoning_parser = original
+            server._build_json_logits_processor = original_builder
+            if original_module is not None:
+                sys.modules["vllm_mlx.constrained"] = original_module
+            else:
+                sys.modules.pop("vllm_mlx.constrained", None)
+
 
 class TestCompletionRequest:
     """Test CompletionRequest model."""

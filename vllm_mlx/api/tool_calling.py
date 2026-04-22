@@ -21,6 +21,23 @@ from jsonschema import validate, ValidationError
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 
+def _looks_like_tool_call(obj: Any) -> bool:
+    """
+    Decide whether a parsed JSON object is really a tool call.
+
+    ``response_format`` outputs can legitimately contain a ``"name"`` field,
+    so raw JSON should only be treated as a tool call when it follows the
+    OpenAI shape of ``{"name": ..., "arguments": ...}``.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if "name" not in obj or "arguments" not in obj:
+        return False
+    if not isinstance(obj["name"], str) or not obj["name"]:
+        return False
+    return isinstance(obj["arguments"], (dict, str))
+
+
 def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     """
     Parse raw JSON tool calls from model output.
@@ -45,11 +62,13 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
     if text.startswith("["):
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list) and all(
-                isinstance(item, dict) and "name" in item for item in parsed
+            if (
+                isinstance(parsed, list)
+                and parsed
+                and all(_looks_like_tool_call(item) for item in parsed)
             ):
                 return [
-                    {"name": item["name"], "arguments": item.get("arguments", {})}
+                    {"name": item["name"], "arguments": item["arguments"]}
                     for item in parsed
                 ]
         except json.JSONDecodeError:
@@ -71,9 +90,9 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
                 json_str = text[start : i + 1]
                 try:
                     obj = json.loads(json_str)
-                    if isinstance(obj, dict) and "name" in obj:
+                    if _looks_like_tool_call(obj):
                         tool_calls.append(
-                            {"name": obj["name"], "arguments": obj.get("arguments", {})}
+                            {"name": obj["name"], "arguments": obj["arguments"]}
                         )
                 except json.JSONDecodeError:
                     pass
@@ -281,7 +300,8 @@ def parse_tool_calls(
 
     # Fallback: Raw JSON tool calls (lowest priority)
     # Only try if no other formats matched
-    if not tool_calls:
+    tools_requested = bool(request and request.get("tools"))
+    if not tool_calls and tools_requested:
         raw_json_calls = _parse_raw_json_tool_calls(cleaned_text)
         if raw_json_calls:
             for call_data in raw_json_calls:
@@ -586,3 +606,60 @@ def build_json_system_prompt(
         return prompt
 
     return None
+
+
+def build_json_logits_processor(
+    response_format: ResponseFormat | dict[str, Any] | None,
+    tokenizer: Any,
+):
+    """
+    Build a logits processor that constrains generation to valid JSON matching
+    ``response_format``.
+
+    Returns ``None`` when no constrained decoding should be applied or when the
+    optional runtime dependency is unavailable, so callers can fall back to the
+    prompt-instruction path.
+    """
+    if response_format is None:
+        return None
+
+    if isinstance(response_format, ResponseFormat):
+        format_type = response_format.type
+        schema: dict | None = None
+        if response_format.json_schema is not None:
+            schema = response_format.json_schema.schema_
+    elif isinstance(response_format, dict):
+        format_type = response_format.get("type", "text")
+        json_schema_spec = response_format.get("json_schema") or {}
+        if isinstance(json_schema_spec, dict):
+            schema = json_schema_spec.get("schema")
+        else:
+            schema = getattr(json_schema_spec, "schema_", None) or getattr(
+                json_schema_spec, "schema", None
+            )
+    else:
+        return None
+
+    if format_type == "text":
+        return None
+    if format_type not in ("json_object", "json_schema"):
+        return None
+
+    try:
+        from ..constrained import (
+            JSONSchemaLogitsProcessor,
+            is_available,
+        )
+    except ImportError:
+        return None
+
+    if not is_available():
+        return None
+
+    if format_type == "json_object" or (format_type == "json_schema" and not schema):
+        schema = None
+
+    try:
+        return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
+    except Exception:
+        return None
