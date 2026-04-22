@@ -183,6 +183,19 @@ class TestPhaseTransitions:
         assert proc.thinking_tokens == 3
         assert proc.state == Phase.TRANSITIONING
 
+    def test_empty_tokens_pass_through_while_waiting_for_first_completion_token(self):
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=3,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+        logits = _uniform_logits()
+        result = proc(mx.array([], dtype=mx.int32), logits)
+        assert mx.array_equal(result, logits)
+        assert proc.state == Phase.THINKING
+
 
 class TestBudgetEnforcement:
     def test_budget_forces_transition(self):
@@ -238,6 +251,20 @@ class TestBudgetEnforcement:
         _feed_sequence(proc, [10, 11])  # <think> detected
         assert proc.state == Phase.TRANSITIONING
         assert proc.thinking_tokens == 0
+
+    def test_empty_tokens_force_transition_when_budget_zero_and_prompt_has_think_tag(
+        self,
+    ):
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=0,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+        logits = proc(mx.array([], dtype=mx.int32), _uniform_logits())
+        assert logits[20].item() == 0.0
+        assert proc.state == Phase.TRANSITIONING
 
     def test_natural_end_before_budget(self):
         proc = _make_processor(budget=100)

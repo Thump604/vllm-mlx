@@ -120,6 +120,15 @@ class ThinkingAwareLogitsProcessor:
         return self._state == Phase.CONTENT and self._inner is None
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+        # The MLLM scheduler applies processors before the first completion
+        # token is emitted, so ``tokens`` can be empty on step 0.
+        if tokens.size == 0:
+            if self._state == Phase.TRANSITIONING:
+                return self._force_transition(logits)
+            if self._state == Phase.CONTENT:
+                return self._call_inner(tokens, logits)
+            return logits
+
         # Extract the last token ID from the sequence.
         last_token = tokens[-1].item()
 
