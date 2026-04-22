@@ -16,6 +16,7 @@ Test Cases:
 import base64
 import os
 import tempfile
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -326,6 +327,19 @@ class TestMLLMRequest:
         assert req.status == RequestStatus.WAITING
         assert req.output_text == ""
 
+    def test_create_request_with_custom_logits_processors(self):
+        """Custom request-level processors must survive scheduler handoff."""
+        from vllm_mlx.mllm_scheduler import MLLMRequest
+
+        proc = MagicMock()
+        req = MLLMRequest(
+            request_id="req-2",
+            prompt="Describe this image",
+            logits_processors=[proc],
+        )
+
+        assert req.logits_processors == [proc]
+
 
 class TestMLLMSchedulerOutput:
     """Tests for MLLMSchedulerOutput."""
@@ -341,6 +355,61 @@ class TestMLLMSchedulerOutput:
         assert output.finished_request_ids == set()
         assert output.outputs == []
         assert output.has_work is False
+
+
+class TestMLLMSchedulerCustomProcessors:
+    def test_add_request_preserves_custom_logits_processors(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.requests = {}
+        scheduler.waiting = deque()
+        scheduler.processor = MagicMock()
+
+        proc = MagicMock()
+        request_id = MLLMScheduler.add_request(
+            scheduler,
+            prompt="Hello",
+            logits_processors=[proc],
+        )
+
+        request = scheduler.requests[request_id]
+        assert request.logits_processors == [proc]
+
+    def test_schedule_waiting_forwards_custom_logits_processors(self):
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.waiting = deque()
+        scheduler.running = {}
+        scheduler.requests = {}
+        scheduler.request_id_to_uid = {}
+        scheduler.uid_to_request_id = {}
+        scheduler.config = MagicMock(max_num_seqs=4)
+        scheduler.processor = MagicMock()
+        scheduler._ensure_batch_generator = MagicMock()
+
+        captured = {}
+
+        class FakeBatchGenerator:
+            def insert(self, batch_requests):
+                captured["batch_requests"] = batch_requests
+                return [101]
+
+        scheduler.batch_generator = FakeBatchGenerator()
+
+        proc = MagicMock()
+        request_id = MLLMScheduler.add_request(
+            scheduler,
+            prompt="Hello",
+            logits_processors=[proc],
+        )
+
+        scheduled = MLLMScheduler._schedule_waiting(scheduler)
+
+        assert len(scheduled) == 1
+        assert scheduled[0].request_id == request_id
+        assert captured["batch_requests"][0].logits_processors == [proc]
 
 
 class TestMultimodalProcessorBatch:

@@ -60,6 +60,7 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    logits_processors: Optional[List[Callable]] = None
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -629,6 +630,7 @@ class MLLMBatchGenerator:
         uids = list(self._pending_removal_uids)
         self._pending_removal_uids.clear()
         self.remove(uids)
+
     def __del__(self):
         try:
             self.close()
@@ -1316,8 +1318,10 @@ class MLLMBatchGenerator:
         batch_logits_processors = []
         has_any_lp = False
         for req in requests:
+            custom_lp = list(req.logits_processors) if req.logits_processors else []
             need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
             need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            per_request_lp = list(custom_lp)
             if need_rep or need_pres:
                 lp_kwargs = {}
                 if need_rep:
@@ -1325,12 +1329,16 @@ class MLLMBatchGenerator:
                 if need_pres:
                     lp_kwargs["presence_penalty"] = req.presence_penalty
                 lp = make_logits_processors(**lp_kwargs)
-                batch_logits_processors.append(lp)
+                if lp:
+                    per_request_lp.extend(lp)
+            if per_request_lp:
+                batch_logits_processors.append(per_request_lp)
                 has_any_lp = True
                 logger.info(
                     f"[sampling] request={req.request_id[:12]} "
                     f"rep_penalty={req.repetition_penalty} "
-                    f"pres_penalty={req.presence_penalty}"
+                    f"pres_penalty={req.presence_penalty} "
+                    f"extra_logits={len(custom_lp)}"
                 )
             else:
                 batch_logits_processors.append(None)

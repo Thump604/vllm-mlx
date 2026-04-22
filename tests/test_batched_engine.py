@@ -92,3 +92,70 @@ class TestBatchedEngineGenerate:
         assert result.prompt_tokens == 7
         assert result.completion_tokens == 1
         assert result.finish_reason == "stop"
+
+
+class TestBatchedEngineMLLMCustomLogitsProcessors:
+    def _make_engine(self):
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine("test-mllm")
+
+        engine._loaded = True
+        engine._is_mllm = True
+        engine._mllm_scheduler = MagicMock()
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_custom_logits_processors(self):
+        engine = self._make_engine()
+        logits_processors = [MagicMock()]
+
+        mock_output = MagicMock()
+        mock_output.output_text = "Hello"
+        mock_output.output_token_ids = [42]
+        mock_output.prompt_tokens = 10
+        mock_output.completion_tokens = 1
+        mock_output.finish_reason = "stop"
+        engine._mllm_scheduler.generate = AsyncMock(return_value=mock_output)
+
+        result = await engine.generate(
+            prompt="test",
+            max_tokens=5,
+            logits_processors=logits_processors,
+        )
+
+        assert result.text == "Hello"
+        kwargs = engine._mllm_scheduler.generate.await_args.kwargs
+        assert kwargs["logits_processors"] == logits_processors
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_custom_logits_processors(self):
+        engine = self._make_engine()
+        logits_processors = [MagicMock()]
+
+        async def fake_outputs(_request_id):
+            yield MagicMock(
+                output_text="Hello",
+                new_text="Hello",
+                prompt_tokens=10,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        engine._mllm_scheduler.add_request_async = AsyncMock(return_value="req-1")
+        engine._mllm_scheduler.stream_outputs = fake_outputs
+
+        outputs = [
+            output
+            async for output in engine.stream_generate(
+                prompt="test",
+                max_tokens=5,
+                logits_processors=logits_processors,
+            )
+        ]
+
+        assert len(outputs) == 1
+        kwargs = engine._mllm_scheduler.add_request_async.await_args.kwargs
+        assert kwargs["logits_processors"] == logits_processors

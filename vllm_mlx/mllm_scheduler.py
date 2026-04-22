@@ -27,7 +27,7 @@ import uuid
 import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -110,6 +110,8 @@ class MLLMRequest:
 
     # Timing
     first_token_time: Optional[float] = None
+    # Custom logits processors (e.g. thinking budget / constrained decoding)
+    logits_processors: Optional[List[Callable]] = None
 
 
 @dataclass
@@ -363,6 +365,7 @@ class MLLMScheduler:
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
         )
+        logits_processors = kwargs.pop("logits_processors", None)
 
         request = MLLMRequest(
             request_id=request_id,
@@ -370,6 +373,9 @@ class MLLMScheduler:
             images=images,
             videos=videos,
             sampling_params=sampling_params,
+            logits_processors=(
+                list(logits_processors) if logits_processors is not None else None
+            ),
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -509,6 +515,11 @@ class MLLMScheduler:
                 min_p=request.sampling_params.min_p,
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
+                logits_processors=(
+                    list(request.logits_processors)
+                    if request.logits_processors is not None
+                    else None
+                ),
             )
             batch_requests.append(batch_req)
 

@@ -538,6 +538,7 @@ class BatchedEngine(BaseEngine):
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
             # so text-only requests must also be routed here.
+            logits_processors = kwargs.pop("logits_processors", None)
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -549,6 +550,7 @@ class BatchedEngine(BaseEngine):
                 min_p=kwargs.pop("min_p", 0.0),
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
+                logits_processors=logits_processors,
             )
 
             return GenerationOutput(
@@ -620,6 +622,7 @@ class BatchedEngine(BaseEngine):
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
+            logits_processors = kwargs.pop("logits_processors", None)
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
@@ -631,6 +634,7 @@ class BatchedEngine(BaseEngine):
                 min_p=kwargs.pop("min_p", 0.0),
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
+                logits_processors=logits_processors,
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):

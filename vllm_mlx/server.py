@@ -147,6 +147,81 @@ def _resolve_top_p(request_value: float | None) -> float:
     return _FALLBACK_TOP_P
 
 
+def _resolve_thinking_token_budget(request_value: int | None) -> int | None:
+    """Resolve the effective request-local thinking budget.
+
+    The v0.2.8 shadow base does not expose a server-wide default budget flag,
+    so the request field is the only effective source in this runtime.
+    """
+    return request_value
+
+
+def _get_engine_tokenizer(engine: BaseEngine) -> object | None:
+    """Return the tokenizer used for constrained decoding."""
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = getattr(engine, "_tokenizer", None)
+    if tokenizer is None:
+        processor = getattr(engine, "_processor", None)
+        if processor is not None:
+            tokenizer = getattr(processor, "tokenizer", processor)
+    return tokenizer
+
+
+def _encode_no_special_tokens(tokenizer: object, text: str) -> list[int]:
+    """Encode a marker string without adding BOS/EOS wrappers."""
+    try:
+        return tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
+def _maybe_attach_thinking_budget_processor(
+    engine: BaseEngine,
+    request: ChatCompletionRequest | AnthropicRequest,
+    chat_kwargs: dict,
+):
+    """Install a thinking-budget logits processor when the request enables it."""
+    budget = _resolve_thinking_token_budget(
+        getattr(request, "thinking_token_budget", None)
+    )
+    if budget is None:
+        return None
+
+    thinking_on = chat_kwargs.get("enable_thinking") is not False
+    if not thinking_on:
+        return None
+
+    parser = _reasoning_parser
+    if (
+        parser is None
+        or not hasattr(parser, "start_token")
+        or not hasattr(parser, "end_token")
+    ):
+        return None
+
+    tokenizer = _get_engine_tokenizer(engine)
+    if tokenizer is None:
+        return None
+
+    try:
+        from .constrained import ThinkingAwareLogitsProcessor
+
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_encode_no_special_tokens(tokenizer, parser.start_token),
+            end_token_ids=_encode_no_special_tokens(tokenizer, parser.end_token),
+            thinking_token_budget=budget,
+            prompt_has_think_tag=thinking_on,
+        )
+    except Exception as exc:
+        logger.warning("Failed to install thinking budget processor: %s", exc)
+        return None
+
+    existing = chat_kwargs.get("logits_processors") or []
+    chat_kwargs["logits_processors"] = list(existing) + [proc]
+    return proc
+
+
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
@@ -1554,6 +1629,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.tools and request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
+    # Request-local thinking budget enforcement for both LLM and MLLM paths.
+    # The MLLM scheduler supports custom logits processors in this runtime, so
+    # the same processor can govern the live 35B lane used by the jobs app.
+    _maybe_attach_thinking_budget_processor(engine, request, chat_kwargs)
+
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
@@ -1814,9 +1894,13 @@ async def create_anthropic_message(
         "presence_penalty": openai_request.presence_penalty or 0.0,
         "repetition_penalty": openai_request.repetition_penalty or 1.0,
     }
+    if openai_request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = openai_request.enable_thinking
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    _maybe_attach_thinking_budget_processor(engine, openai_request, chat_kwargs)
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -2061,9 +2145,13 @@ async def _stream_anthropic_messages(
         "presence_penalty": openai_request.presence_penalty or 0.0,
         "repetition_penalty": openai_request.repetition_penalty or 1.0,
     }
+    if openai_request.enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = openai_request.enable_thinking
 
     if openai_request.tools and openai_request.tool_choice != "none":
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    _maybe_attach_thinking_budget_processor(engine, openai_request, chat_kwargs)
 
     # Emit message_start
     message_start = {
