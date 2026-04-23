@@ -19,8 +19,6 @@ Architecture:
 """
 
 import asyncio
-import concurrent.futures
-import importlib
 import logging
 import time
 import uuid
@@ -41,17 +39,6 @@ from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
 logger = logging.getLogger(__name__)
-
-
-def _bind_worker_generation_streams() -> None:
-    """Rebind mlx generation streams inside the scheduler worker thread."""
-    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        if hasattr(module, "generation_stream"):
-            module.generation_stream = mx.new_stream(mx.default_device())
 
 
 @dataclass
@@ -232,7 +219,6 @@ class MLLMScheduler:
         # Async processing control
         self._running = False
         self._processing_task: Optional[asyncio.Task] = None
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
         # Memory management: periodic mx.clear_cache() to free Metal buffer pool
         self._step_count = 0
@@ -324,7 +310,6 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
             )
-
             # Install MTP if enabled and language model supports it
             if self.config.enable_mtp:
                 lm = self.batch_generator.language_model
@@ -443,23 +428,9 @@ class MLLMScheduler:
 
         # Remove from batch generator.
         #
-        # IMPORTANT: `abort_request` may be called from the asyncio event
-        # loop (e.g. in `stream_outputs`' `finally` block on client
-        # disconnect) while `scheduler.step()` — and therefore the
-        # batch generator's forward pass — is running on a separate
-        # executor thread (see engine_core.py: loop.run_in_executor).
-        #
-        # Calling `batch_generator.remove([uid])` eagerly here would
-        # trigger `active_batch.filter(...)`, which creates an
-        # `mx.array` and submits Metal work.  If the scheduler thread
-        # has an open Metal encoder mid-forward-pass, two threads
-        # submit to the same stream concurrently and Metal asserts
-        # with ``encodeSignalEvent:value: with uncommitted encoder``,
-        # aborting the process.
-        #
-        # Instead we defer the removal to the scheduler thread: it
-        # will drain the queue at the next safe boundary (start of
-        # step(), before any forward pass).
+        # Defer active-batch mutation to the scheduler loop. Removing a UID
+        # immediately can invalidate in-flight batch-generator state while
+        # prompt processing or decode is still using the current batch.
         if request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
@@ -778,11 +749,6 @@ class MLLMScheduler:
         if self._running:
             return
 
-        if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="mllm-step"
-            )
-
         self._running = True
         self._processing_task = asyncio.create_task(self._process_loop())
         logger.info(
@@ -800,41 +766,25 @@ class MLLMScheduler:
                 pass
 
         if self.batch_generator is not None:
-            if self._executor is not None:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    self._executor, self._close_batch_generator_in_worker
-                )
-            else:
-                self.batch_generator.close()
+            self.batch_generator.close()
             self.batch_generator = None
-
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            self._executor = None
 
         logger.info("MLLM Scheduler stopped")
 
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Run all batch-generator work on the dedicated scheduler worker.
-        MLLM generation uses a thread-affine MLX stream and a shared model
-        wrapper with cached rope state; splitting prefill and decode across
-        different threads leads to stream lookup failures and stale state.
+        Run scheduler work on the event-loop thread.
+
+        The loaded Qwen 3.6 MLLM path carries Metal stream state created during
+        startup/model load.  Running step() on a separate worker thread leaves
+        that state owned by a different thread and causes stream lookup
+        failures during batched prefill/eval.
         """
-        if self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="mllm-step"
-            )
-
-        executor = self._executor
-        loop = asyncio.get_running_loop()
-
         while self._running:
             try:
                 if self.has_requests():
-                    await loop.run_in_executor(executor, self._run_worker_step)
+                    self.step()
                     await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
@@ -845,17 +795,6 @@ class MLLMScheduler:
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
-
-    def _run_worker_step(self) -> MLLMSchedulerOutput:
-        """Run one scheduler step inside the dedicated worker thread."""
-        _bind_worker_generation_streams()
-        return self.step()
-
-    def _close_batch_generator_in_worker(self) -> None:
-        """Close the batch generator inside the dedicated worker thread."""
-        _bind_worker_generation_streams()
-        if self.batch_generator is not None:
-            self.batch_generator.close()
 
     async def add_request_async(
         self,

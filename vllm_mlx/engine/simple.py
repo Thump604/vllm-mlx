@@ -46,13 +46,15 @@ def _has_media_content(messages: list) -> bool:
 
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
+    default_stream = mx.new_stream(mx.default_device())
+    mx.set_default_stream(default_stream)
     for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
         try:
             module = importlib.import_module(module_name)
         except ImportError:
             continue
         if hasattr(module, "generation_stream"):
-            module.generation_stream = mx.new_stream(mx.default_device())
+            module.generation_stream = default_stream
 
 
 def _only_mtp_safe_thinking_processors(processors: list[Any] | None) -> bool:

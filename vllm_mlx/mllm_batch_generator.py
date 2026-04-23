@@ -17,6 +17,7 @@ Architecture:
 """
 
 import logging
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -450,17 +451,25 @@ class MLLMBatchGenerator:
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
+        self._stream_local = threading.local()
 
-    @staticmethod
-    def _stream_context():
-        """Use the default MLX stream for batched MLLM generation.
+    def _stream_context(self):
+        """Bind batched generation to a worker-owned MLX stream.
 
-        A custom stream proved too fragile across the scheduler's async
-        lifecycle and shutdown paths on this hardware/runtime stack. The
-        dedicated worker thread still serializes GPU work; the default stream
-        preserves correctness without thread-affine stream lookup failures.
+        The scheduler intentionally runs all batch-generator work on one
+        dedicated worker thread.  Reusing a lazily-created stream on that
+        thread keeps MLX/Metal stream ownership aligned with the actual eval
+        site and avoids looking up a stream created on another thread.
         """
-        return nullcontext()
+        if not mx.metal.is_available():
+            return nullcontext()
+
+        stream = getattr(self._stream_local, "stream", None)
+        if stream is None:
+            stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(stream)
+            self._stream_local.stream = stream
+        return mx.stream(stream)
 
     def _reset_text_position_cache(self) -> None:
         """Clear cached Qwen rope state before a new text-only request."""

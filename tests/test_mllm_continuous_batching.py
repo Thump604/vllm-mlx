@@ -17,6 +17,7 @@ import base64
 import asyncio
 import os
 import tempfile
+import threading
 from collections import deque
 from unittest.mock import MagicMock
 
@@ -429,39 +430,83 @@ class TestMLLMBatchGeneratorRuntimeFixes:
         assert generator.language_model._position_ids is None
         assert generator.language_model._rope_deltas is None
 
+    def test_stream_context_reuses_worker_local_stream(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._stream_local = threading.local()
+
+        fake_stream = object()
+        created = []
+        entered = []
+
+        class FakeContext:
+            def __enter__(self):
+                entered.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                entered.append("exit")
+
+        monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+        monkeypatch.setattr(mx, "default_device", lambda: "gpu")
+        monkeypatch.setattr(
+            mx,
+            "new_stream",
+            lambda device: created.append(device) or fake_stream,
+        )
+        monkeypatch.setattr(mx, "set_default_stream", lambda stream: None)
+        monkeypatch.setattr(
+            mx,
+            "stream",
+            lambda stream: (
+                entered.append(("stream", stream)) or FakeContext()
+            ),
+        )
+
+        with MLLMBatchGenerator._stream_context(generator):
+            pass
+        with MLLMBatchGenerator._stream_context(generator):
+            pass
+
+        assert created == ["gpu"]
+        assert entered == [
+            ("stream", fake_stream),
+            "enter",
+            "exit",
+            ("stream", fake_stream),
+            "enter",
+            "exit",
+        ]
+
 
 class TestMLLMSchedulerThreadingFixes:
     @pytest.mark.asyncio
-    async def test_process_loop_runs_all_steps_on_executor(self, monkeypatch):
+    async def test_process_loop_runs_steps_inline(self, monkeypatch):
         from vllm_mlx.mllm_scheduler import MLLMScheduler
 
         scheduler = MLLMScheduler.__new__(MLLMScheduler)
         scheduler._running = True
-        scheduler._executor = object()
         scheduler.batch_generator = None
 
         calls = []
-
-        class FakeLoop:
-            async def run_in_executor(self, executor, fn, *args):
-                calls.append(executor)
-                fn(*args)
 
         async def fake_sleep(_seconds):
             return None
 
         scheduler.has_requests = lambda: scheduler._running
-        scheduler._run_worker_step = lambda: setattr(scheduler, "_running", False)
+        scheduler.step = lambda: (
+            calls.append("step"),
+            setattr(scheduler, "_running", False),
+        )[-1]
 
-        monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         await MLLMScheduler._process_loop(scheduler)
 
-        assert calls == [scheduler._executor]
+        assert calls == ["step"]
 
     @pytest.mark.asyncio
-    async def test_stop_closes_batch_generator_via_executor(self, monkeypatch):
+    async def test_stop_closes_batch_generator_inline(self):
         from vllm_mlx.mllm_scheduler import MLLMScheduler
 
         scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -470,44 +515,10 @@ class TestMLLMSchedulerThreadingFixes:
         batch_generator = MagicMock()
         scheduler.batch_generator = batch_generator
 
-        class FakeExecutor:
-            def __init__(self):
-                self.shutdown_calls = []
-
-            def shutdown(self, wait=True, cancel_futures=False):
-                self.shutdown_calls.append((wait, cancel_futures))
-
-        executor = FakeExecutor()
-        scheduler._executor = executor
-
-        class FakeLoop:
-            async def run_in_executor(self, _executor, fn, *args):
-                return fn(*args)
-
-        monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
-
         await MLLMScheduler.stop(scheduler)
 
         batch_generator.close.assert_called_once_with()
         assert scheduler.batch_generator is None
-        assert scheduler._executor is None
-        assert executor.shutdown_calls == [(True, True)]
-
-    def test_run_worker_step_rebinds_generation_streams(self, monkeypatch):
-        from vllm_mlx.mllm_scheduler import MLLMScheduler
-
-        scheduler = MLLMScheduler.__new__(MLLMScheduler)
-        calls = []
-
-        monkeypatch.setattr(
-            "vllm_mlx.mllm_scheduler._bind_worker_generation_streams",
-            lambda: calls.append("bind"),
-        )
-        scheduler.step = lambda: calls.append("step")
-
-        MLLMScheduler._run_worker_step(scheduler)
-
-        assert calls == ["bind", "step"]
 
 
 class TestMultimodalProcessorBatch:
