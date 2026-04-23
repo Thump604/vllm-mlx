@@ -267,6 +267,10 @@ class BaseThinkingReasoningParser(ReasoningParser):
         reasoning_parts: list[str] = []
 
         while buffer:
+            if buffer.startswith(self.end_token):
+                buffer = buffer[len(self.end_token) :].lstrip()
+                continue
+
             if buffer.startswith(self.start_token):
                 after_start = buffer[len(self.start_token) :]
                 end_idx = after_start.find(self.end_token)
@@ -279,6 +283,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 continue
 
             if self.start_token.startswith(buffer):
+                return reasoning_parts, None, buffer
+
+            if self.end_token.startswith(buffer):
                 return reasoning_parts, None, buffer
 
             self._content_started = True
