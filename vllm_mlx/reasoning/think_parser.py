@@ -46,6 +46,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         # Streaming state.
         self._seen_start = False
         self._seen_end = False
+        self._content_started = False
         # Buffer for partial tag matches at chunk boundaries.
         self._boundary_buffer = ""
 
@@ -69,19 +70,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         """
         text = model_output
 
-        # Case 1: Both tags present (normal case)
-        if self.start_token in text and self.end_token in text:
-            # Get everything after start token
-            _, _, after_start = text.partition(self.start_token)
-            # Split on end token
-            reasoning, _, content = after_start.partition(self.end_token)
-            return reasoning.strip() or None, content.strip() or None
-
-        # Case 2: Only closing tag (think was injected in prompt)
-        # Everything before </think> is reasoning
+        # Cases 1 and 2: consume one or more leading reasoning spans.  Some
+        # thinking models emit an extra empty ``<think></think>`` block after
+        # the forced transition; that block still belongs to reasoning, not
+        # final content.
         if self.end_token in text:
-            reasoning, _, content = text.partition(self.end_token)
-            return reasoning.strip() or None, content.strip() or None
+            return self._extract_complete_reasoning(text)
 
         # Case 3: Only start tag (incomplete reasoning, no end yet)
         if self.start_token in text:
@@ -95,6 +89,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
         """Reset internal state for a new streaming request."""
         self._seen_start = False
         self._seen_end = False
+        self._content_started = False
         self._boundary_buffer = ""
 
     def extract_reasoning_streaming(
@@ -134,8 +129,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
 
         while self._boundary_buffer:
             if self._seen_end:
-                content_parts.append(self._boundary_buffer)
-                self._boundary_buffer = ""
+                reasoning, content, hold = self._consume_leading_stream_content(
+                    self._boundary_buffer
+                )
+                if reasoning:
+                    reasoning_parts.extend(reasoning)
+                if content:
+                    content_parts.append(content)
+                self._boundary_buffer = hold
                 break
 
             if self._seen_start:
@@ -206,8 +207,84 @@ class BaseThinkingReasoningParser(ReasoningParser):
         pending = self._boundary_buffer
         self._boundary_buffer = ""
         if self._seen_end:
-            return DeltaMessage(content=pending)
+            reasoning, content, hold = self._consume_leading_stream_content(pending)
+            if hold:
+                reasoning.append(hold)
+            return DeltaMessage(
+                reasoning="".join(reasoning) or None,
+                content=content or None,
+            )
         return DeltaMessage(reasoning=pending)
+
+    def _extract_complete_reasoning(self, text: str) -> tuple[str | None, str | None]:
+        """Split complete output into leading reasoning spans and final content."""
+        reasoning_parts: list[str] = []
+        remainder = text
+
+        while remainder:
+            stripped = remainder.lstrip()
+
+            if stripped.startswith(self.start_token):
+                after_start = stripped[len(self.start_token) :]
+                reasoning, found, after_end = after_start.partition(self.end_token)
+                if not found:
+                    reasoning_parts.append(reasoning)
+                    remainder = ""
+                    break
+                if reasoning.strip():
+                    reasoning_parts.append(reasoning.strip())
+                remainder = after_end
+                continue
+
+            start_idx = stripped.find(self.start_token)
+            end_idx = stripped.find(self.end_token)
+            if end_idx != -1 and (start_idx == -1 or end_idx < start_idx):
+                reasoning = stripped[:end_idx]
+                if reasoning.strip():
+                    reasoning_parts.append(reasoning.strip())
+                remainder = stripped[end_idx + len(self.end_token) :]
+                continue
+
+            remainder = stripped
+            break
+
+        reasoning = "\n".join(reasoning_parts).strip() or None
+        content = remainder.strip() or None
+        return reasoning, content
+
+    def _consume_leading_stream_content(
+        self, text: str
+    ) -> tuple[list[str], str | None, str]:
+        """Consume leading post-transition think blocks before streaming content.
+
+        Returns ``(reasoning_parts, content, hold)``.  ``hold`` is retained when
+        the chunk ends in a partial leading tag.
+        """
+        if self._content_started:
+            return [], text, ""
+
+        buffer = text.lstrip()
+        reasoning_parts: list[str] = []
+
+        while buffer:
+            if buffer.startswith(self.start_token):
+                after_start = buffer[len(self.start_token) :]
+                end_idx = after_start.find(self.end_token)
+                if end_idx == -1:
+                    return reasoning_parts, None, buffer
+                reasoning = after_start[:end_idx]
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                buffer = after_start[end_idx + len(self.end_token) :].lstrip()
+                continue
+
+            if self.start_token.startswith(buffer):
+                return reasoning_parts, None, buffer
+
+            self._content_started = True
+            return reasoning_parts, buffer, ""
+
+        return reasoning_parts, None, ""
 
     @staticmethod
     def _partial_tag_suffix_len(text: str, tags: tuple[str, ...]) -> int:
