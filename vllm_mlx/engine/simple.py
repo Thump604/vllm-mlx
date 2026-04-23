@@ -7,16 +7,15 @@ performance when serving a single user at a time.
 """
 
 import asyncio
-import importlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 import mlx.core as mx
 
-from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, is_mllm_model
 from .base import BaseEngine, GenerationOutput
+from ..mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +45,7 @@ def _has_media_content(messages: list) -> bool:
 
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
-    default_stream = mx.new_stream(mx.default_device())
-    mx.set_default_stream(default_stream)
-    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        if hasattr(module, "generation_stream"):
-            module.generation_stream = default_stream
+    bind_generation_streams()
 
 
 def _cache_snapshot_nbytes(entry: Any) -> int:

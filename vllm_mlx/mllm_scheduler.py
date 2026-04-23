@@ -19,6 +19,7 @@ Architecture:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -35,6 +36,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -774,27 +776,56 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Run scheduler work on the event-loop thread.
-
-        The loaded Qwen 3.6 MLLM path carries Metal stream state created during
-        startup/model load.  Running step() on a separate worker thread leaves
-        that state owned by a different thread and causes stream lookup
-        failures during batched prefill/eval.
+        All MLLM steps run on one worker thread. MLX generation streams are
+        thread-local, so prefill and decode must not bounce between the event
+        loop thread and a worker thread.
         """
-        while self._running:
-            try:
-                if self.has_requests():
-                    self.step()
-                    await asyncio.sleep(0)
-                else:
-                    # No work, wait a bit
-                    await asyncio.sleep(0.01)
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mllm-step"
+        )
+        loop = asyncio.get_running_loop()
+        worker_streams_bound = False
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
+        def _ensure_worker_streams_bound() -> None:
+            nonlocal worker_streams_bound
+            if not worker_streams_bound:
+                bind_generation_streams()
+                worker_streams_bound = True
+
+        def _step_on_worker() -> None:
+            _ensure_worker_streams_bound()
+            self.step()
+
+        def _close_batch_generator_on_worker() -> None:
+            _ensure_worker_streams_bound()
+            if self.batch_generator is not None:
+                self.batch_generator.close()
+                self.batch_generator = None
+
+        try:
+            while self._running:
+                try:
+                    if self.has_requests():
+                        await loop.run_in_executor(_executor, _step_on_worker)
+                        await asyncio.sleep(0)
+                    else:
+                        # No work, wait a bit
+                        await asyncio.sleep(0.01)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                    await asyncio.sleep(0.1)
+        finally:
+            close_future = loop.run_in_executor(
+                _executor, _close_batch_generator_on_worker
+            )
+            try:
+                await asyncio.shield(close_future)
+            except BaseException:
+                pass
+            _executor.shutdown(wait=True)
 
     async def add_request_async(
         self,
@@ -1053,7 +1084,10 @@ class MLLMScheduler:
         if self.vision_cache:
             self.vision_cache.clear()
             cleared["vision_cache"] = True
-        if self.batch_generator is not None and self.batch_generator.prefix_cache is not None:
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.prefix_cache is not None
+        ):
             self.batch_generator.prefix_cache.clear()
             cleared["prefix_cache"] = True
         return cleared
