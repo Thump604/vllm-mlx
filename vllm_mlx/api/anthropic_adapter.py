@@ -92,6 +92,8 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         stop=request.stop_sequences,
         tools=tools,
         tool_choice=tool_choice,
+        response_format=request.response_format,
+        thinking_token_budget=request.thinking_token_budget,
     )
 
 

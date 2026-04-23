@@ -65,6 +65,10 @@ class AnthropicRequest(BaseModel):
     tool_choice: dict | None = None
     metadata: dict | None = None
     top_k: int | None = None
+    # OpenAI-compatible extensions accepted by this server for parity with
+    # /v1/chat/completions. They are not part of the official Anthropic spec.
+    response_format: dict | None = None
+    thinking_token_budget: int | None = Field(default=None, ge=0)
 
 
 # =============================================================================
@@ -79,6 +83,7 @@ class AnthropicUsage(BaseModel):
     output_tokens: int = 0
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 class AnthropicResponseContentBlock(BaseModel):
