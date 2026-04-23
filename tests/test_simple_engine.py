@@ -414,6 +414,10 @@ class TestSimpleEngineConcurrency:
             patch("vllm_mlx.mlx_streams.mx.default_device", return_value="gpu"),
             patch(
                 "vllm_mlx.mlx_streams.mx.new_stream",
+                return_value=object(),
+            ),
+            patch(
+                "vllm_mlx.mlx_streams.mx.new_thread_local_stream",
                 return_value=sentinel_stream,
             ),
             patch("vllm_mlx.mlx_streams.mx.set_default_stream"),

@@ -544,8 +544,12 @@ class MLLMBatchGenerator:
 
         stream = getattr(self._stream_local, "stream", None)
         if stream is None:
-            stream = mx.new_stream(mx.default_device())
-            mx.set_default_stream(stream)
+            stream_factory = getattr(mx, "new_thread_local_stream", None)
+            if stream_factory is not None:
+                stream = stream_factory(mx.default_device())
+            else:
+                stream = mx.new_stream(mx.default_device())
+                mx.set_default_stream(stream)
             self._stream_local.stream = stream
         return mx.stream(stream)
 

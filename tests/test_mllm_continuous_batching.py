@@ -451,9 +451,10 @@ class TestMLLMBatchGeneratorRuntimeFixes:
         monkeypatch.setattr(mx, "default_device", lambda: "gpu")
         monkeypatch.setattr(
             mx,
-            "new_stream",
+            "new_thread_local_stream",
             lambda device: created.append(device) or fake_stream,
         )
+        monkeypatch.setattr(mx, "new_stream", lambda device: object())
         monkeypatch.setattr(mx, "set_default_stream", lambda stream: None)
         monkeypatch.setattr(
             mx,

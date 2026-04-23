@@ -18,11 +18,17 @@ def bind_generation_streams(
     """
     default_stream = mx.new_stream(mx.default_device())
     mx.set_default_stream(default_stream)
+    generation_stream_factory = getattr(mx, "new_thread_local_stream", None)
+    generation_stream = (
+        generation_stream_factory(mx.default_device())
+        if generation_stream_factory is not None
+        else default_stream
+    )
     for module_name in module_names:
         try:
             module = importlib.import_module(module_name)
         except ImportError:
             continue
         if hasattr(module, "generation_stream"):
-            module.generation_stream = default_stream
-    return default_stream
+            module.generation_stream = generation_stream
+    return generation_stream
