@@ -372,13 +372,44 @@ def score_tokens(
     return importance
 
 
-def select_chunks(importance, keep_pct=0.3, chunk_size=32):
-    """Select top-k% token chunks by average importance.
+def _select_evenly_spaced_chunks(n_chunks: int, count: int) -> list[int]:
+    """Select ``count`` chunk indices spread across ``n_chunks``.
+
+    This preserves a thin global backbone so long-tail structured facts do not
+    disappear entirely when importance scores concentrate on a few prompt
+    regions.
+    """
+    if count <= 0 or n_chunks <= 0:
+        return []
+    if count >= n_chunks:
+        return list(range(n_chunks))
+
+    selected: list[int] = []
+    for i in range(count):
+        idx = round(i * (n_chunks - 1) / max(1, count - 1))
+        if idx not in selected:
+            selected.append(idx)
+
+    if len(selected) == count:
+        return selected
+
+    for idx in range(n_chunks):
+        if idx not in selected:
+            selected.append(idx)
+            if len(selected) == count:
+                break
+    return selected
+
+
+def select_chunks(importance, keep_pct=0.3, chunk_size=32, backbone_pct=0.0):
+    """Select sparse prompt chunks by mixing global coverage with top scores.
 
     Args:
         importance: (M,) per-token importance scores
         keep_pct: fraction of chunks to keep (default 0.3)
         chunk_size: tokens per chunk (default 32)
+        backbone_pct: fraction of chunks to reserve for evenly spaced global
+            coverage within the same total budget (default 0.0)
 
     Returns:
         sorted mx.array of kept token indices
@@ -389,17 +420,22 @@ def select_chunks(importance, keep_pct=0.3, chunk_size=32):
 
     n_chunks = math.ceil(M / chunk_size)
     keep_n = max(1, math.ceil(n_chunks * keep_pct))
-
+    backbone_n = min(keep_n, max(0, math.floor(n_chunks * backbone_pct)))
     chunk_scores = []
     for i in range(n_chunks):
         start = i * chunk_size
         end = min(start + chunk_size, M)
         chunk_scores.append(mx.mean(importance[start:end]).item())
 
-    top_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[
-        :keep_n
-    ]
-    top_chunks.sort()
+    selected_chunks = set(_select_evenly_spaced_chunks(n_chunks, backbone_n))
+
+    ranked_chunks = sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)
+    for idx in ranked_chunks:
+        if len(selected_chunks) >= keep_n:
+            break
+        selected_chunks.add(idx)
+
+    top_chunks = sorted(selected_chunks)
 
     indices = []
     for ci in top_chunks:

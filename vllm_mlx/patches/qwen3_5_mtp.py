@@ -394,6 +394,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             next_token_ids,
             cache=None,
             mtp_cache=None,
+            return_hidden: bool = False,
         ):
             """Run MTP head: predict token n+2 from hidden states + token n+1."""
             input_embeds = self.model.embed_tokens(next_token_ids)
@@ -409,8 +410,12 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             x = self.mtp.norm(x)
 
             if self.args.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(x)
-            return self.lm_head(x)
+                out = self.model.embed_tokens.as_linear(x)
+            else:
+                out = self.lm_head(x)
+            if return_hidden:
+                return out, x
+            return out
 
         def make_mtp_cache(self):
             """Create KV cache for MTP layers."""

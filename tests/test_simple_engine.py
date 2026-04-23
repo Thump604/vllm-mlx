@@ -342,6 +342,7 @@ class TestSimpleEngineConcurrency:
             mtp_num_draft_tokens=4,
             specprefill_enabled=True,
             specprefill_threshold=1,
+            specprefill_backbone_pct=0.1,
         )
         engine._loaded = True
         engine._text_model = text_model
@@ -364,16 +365,14 @@ class TestSimpleEngineConcurrency:
                 "vllm_mlx.specprefill.score_tokens",
                 return_value=mx.array([1.0, 0.9, 0.8], dtype=mx.float32),
             ),
-            patch(
-                "vllm_mlx.specprefill.select_chunks",
-                return_value=mx.array([0, 1, 2], dtype=mx.int32),
-            ),
+            patch("vllm_mlx.specprefill.select_chunks") as mock_select_chunks,
             patch(
                 "vllm_mlx.specprefill.sparse_prefill",
                 return_value=mx.zeros((1, 3, 32), dtype=mx.float32),
             ),
             patch("vllm_mlx.specprefill.cleanup_rope"),
         ):
+            mock_select_chunks.return_value = mx.array([0, 1, 2], dtype=mx.int32)
             outputs = [
                 chunk
                 async for chunk in engine._stream_generate_text(
@@ -393,9 +392,12 @@ class TestSimpleEngineConcurrency:
         }
         assert captured["prompt"] == [17]
         assert captured["kwargs"]["mtp"] is True
+        assert "draft_model" not in captured["kwargs"]
         assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
+        mock_select_chunks.assert_called_once()
+        assert mock_select_chunks.call_args.kwargs["backbone_pct"] == pytest.approx(0.1)
 
     @pytest.mark.anyio
     async def test_run_blocking_serialized_rebinds_worker_generation_streams(self):
@@ -823,8 +825,9 @@ class TestSimpleEngineConcurrency:
         engine._text_model.make_mtp_cache.return_value = []
         engine._text_tokenizer = tokenizer
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
-            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
         ):
             outputs = [
                 chunk
@@ -846,7 +849,129 @@ class TestSimpleEngineConcurrency:
         assert "logits_processors" not in calls[1]
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(self):
+    async def test_stream_generate_text_keeps_mtp_for_speculation_safe_processor(self):
+        """Budget-only thinking processors should not force native MTP off."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        class SafeThinkingProcessor:
+            speculation_safe = True
+            is_retired = False
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = SafeThinkingProcessor()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            calls.append({"prompt": prompt, **kwargs})
+            yield SimpleNamespace(token=11, text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [11]
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_model.make_mtp_cache.return_value = []
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.6,
+                    top_p=0.95,
+                    top_k=20,
+                    logits_processors=[processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert len(calls) == 1
+        assert calls[0]["mtp"] is True
+        assert calls[0]["num_draft_tokens"] == 4
+        assert calls[0]["logits_processors"][0] is processor
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_disables_mtp_for_retireable_thinking_processor_without_explicit_safety(
+        self,
+    ):
+        """Retireable thinking processors are fail-closed unless they opt into speculation."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        class ThinkingAwareLogitsProcessor:
+            is_retired = False
+            _inner = None
+
+            def __call__(self, tokens, logits):
+                return logits
+
+        processor = ThinkingAwareLogitsProcessor()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            calls.append({"prompt": prompt, **kwargs})
+            yield SimpleNamespace(token=11, text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [11]
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_model.make_mtp_cache.return_value = []
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.6,
+                    top_p=0.95,
+                    top_k=20,
+                    logits_processors=[processor],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert len(calls) == 1
+        assert "mtp" not in calls[0]
+        assert "num_draft_tokens" not in calls[0]
+        assert calls[0]["logits_processors"][0] is processor
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(
+        self,
+    ):
         """SpecPrefill continuation should resume with MTP once thinking retires."""
         from types import SimpleNamespace
 
@@ -892,20 +1017,22 @@ class TestSimpleEngineConcurrency:
             processor.is_retired = True
             return mx.array(11, dtype=mx.uint32), logits
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate), patch(
-            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
-        ), patch(
-            "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
-        ), patch(
-            "vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])
-        ), patch(
-            "vllm_mlx.specprefill.sparse_prefill",
-            return_value=mx.zeros((1, 1, 32)),
-        ), patch(
-            "vllm_mlx.specprefill.cleanup_rope"
-        ), patch(
-            "vllm_mlx.engine.simple._sample_with_processors",
-            side_effect=fake_sample,
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
+            ),
+            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 32)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch(
+                "vllm_mlx.engine.simple._sample_with_processors",
+                side_effect=fake_sample,
+            ),
         ):
             outputs = [
                 chunk
@@ -922,6 +1049,7 @@ class TestSimpleEngineConcurrency:
         assert outputs[-1].text == "Hello world"
         assert len(calls) == 1
         assert calls[0]["mtp"] is True
+        assert "draft_model" not in calls[0]
         assert calls[0]["num_draft_tokens"] == 4
         assert "logits_processors" not in calls[0]
 

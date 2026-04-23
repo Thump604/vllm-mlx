@@ -122,3 +122,44 @@ def test_score_tokens_falls_back_to_current_cache_factory(monkeypatch):
 
     assert cache == ["patched-cache"]
     patched_factory.assert_called_once_with(model)
+
+
+def test_select_chunks_reserves_evenly_spaced_backbone_within_budget():
+    from vllm_mlx.specprefill import select_chunks
+
+    importance = mx.array(
+        [10.0] * 32 + [0.1] * 32 + [0.1] * 32 + [9.0] * 32 + [0.1] * 32 + [8.0] * 32,
+        dtype=mx.float32,
+    )
+
+    selected = select_chunks(
+        importance,
+        keep_pct=0.5,  # 3 of 6 chunks
+        chunk_size=32,
+        backbone_pct=1 / 6,  # reserve 1 chunk for global coverage
+    ).tolist()
+
+    selected_chunks = sorted({idx // 32 for idx in selected})
+    assert len(selected_chunks) == 3
+    assert 0 in selected_chunks
+    assert 3 in selected_chunks
+    assert 5 in selected_chunks
+
+
+def test_select_chunks_defaults_to_top_scores_when_backbone_disabled():
+    from vllm_mlx.specprefill import select_chunks
+
+    importance = mx.array(
+        [10.0] * 32 + [0.1] * 32 + [0.1] * 32 + [9.0] * 32 + [0.1] * 32 + [8.0] * 32,
+        dtype=mx.float32,
+    )
+
+    selected = select_chunks(
+        importance,
+        keep_pct=0.5,
+        chunk_size=32,
+        backbone_pct=0.0,
+    ).tolist()
+
+    selected_chunks = sorted({idx // 32 for idx in selected})
+    assert selected_chunks == [0, 3, 5]

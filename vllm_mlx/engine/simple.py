@@ -129,6 +129,21 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
+def _processors_allow_speculative_drafting(processors: list[Any] | None) -> bool:
+    """True when every active processor is safe to evaluate during native MTP."""
+    if not processors:
+        return False
+
+    for processor in processors:
+        flag = getattr(processor, "speculation_safe", None)
+        if flag is not None:
+            if flag is not True:
+                return False
+            continue
+        return False
+    return True
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -149,6 +164,7 @@ class SimpleEngine(BaseEngine):
         specprefill_enabled: bool = False,
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
+        specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
     ):
         """
@@ -165,6 +181,8 @@ class SimpleEngine(BaseEngine):
             specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+            specprefill_backbone_pct: Fraction of chunks to reserve for evenly
+                spaced global coverage within the sparse prefill budget
             specprefill_draft_model: Path to small draft model for importance scoring
         """
         self._model_name = model_name
@@ -179,6 +197,7 @@ class SimpleEngine(BaseEngine):
         self._specprefill_enabled = specprefill_enabled
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
+        self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
 
         self._model = None
@@ -188,7 +207,7 @@ class SimpleEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
 
-        # SpecPrefill draft model (loaded at start if enabled)
+        # Draft model used only for SpecPrefill scoring/prefill
         self._draft_model = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
@@ -285,7 +304,6 @@ class SimpleEngine(BaseEngine):
                 self._text_model = None
                 self._text_tokenizer = None
 
-        # Load SpecPrefill draft model (small model for importance scoring)
         if self._specprefill_enabled and self._specprefill_draft_model_path:
             try:
                 from mlx_lm import load as mlx_lm_load
@@ -305,12 +323,10 @@ class SimpleEngine(BaseEngine):
         if self._mtp:
             mtp_info = f", MTP={self._mtp}(configured={self._mtp_num_draft_tokens}, effective=1)"
         routing = ", routing=per-request" if self._text_model is not None else ""
-        specprefill_info = (
-            ", SpecPrefill=active" if self._draft_model is not None else ""
-        )
+        draft_info = ", SpecPrefill=active" if self._draft_model is not None else ""
         logger.info(
             f"SimpleEngine loaded: {self._model_name} "
-            f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
+            f"(MLLM={self._is_mllm}{mtp_info}{routing}{draft_info})"
         )
 
     async def stop(self) -> None:
@@ -426,6 +442,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -468,6 +485,7 @@ class SimpleEngine(BaseEngine):
                         top_p,
                         stop=stop,
                         specprefill_keep_pct=specprefill_keep_pct_override,
+                        specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
                     ):
                         yield output
@@ -790,6 +808,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         specprefill_keep_pct: float | None = None,
+        specprefill_backbone_pct: float | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -839,7 +858,16 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
 
                 # Phase 3: Sparse prefill on target model
@@ -855,12 +883,13 @@ class SimpleEngine(BaseEngine):
 
                 logger.info(
                     "SpecPrefill: scored %d tokens in %.1fs, "
-                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
+                    "sparse prefill %d/%d (keep=%.0f%%, backbone=%.0f%%) in %.1fs",
                     n_tokens,
                     t_score,
                     n_selected,
                     n_tokens,
                     n_selected / n_tokens * 100,
+                    effective_backbone * 100,
                     t_prefill,
                 )
 
@@ -990,6 +1019,7 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+        specprefill_backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
         presence_penalty = kwargs.pop("presence_penalty", 0.0)
@@ -1199,19 +1229,44 @@ class SimpleEngine(BaseEngine):
         def _emit_error(exc: BaseException) -> None:
             loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
 
+        def _apply_speculative_decode_kwargs(
+            kwargs: dict[str, Any],
+            *,
+            use_native_mtp: bool,
+            log_context: str | None = None,
+        ) -> None:
+            """Attach native MTP kwargs to mlx_lm kwargs."""
+            if not use_native_mtp:
+                kwargs.pop("mtp", None)
+                kwargs.pop("num_draft_tokens", None)
+                return
+
+            kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+            if log_context:
+                logger.info(
+                    "%s: using native MTP speculative decode (draft_tokens=%d)",
+                    log_context,
+                    self._mtp_num_draft_tokens,
+                )
+            kwargs["mtp"] = True
+
         # Run all Metal ops in a single serialized thread.
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
-            use_mtp = (
+            speculative_safe_processors = _processors_allow_speculative_drafting(
+                all_processors
+            )
+            use_native_mtp = (
                 self._mtp
-                and not custom_logits_active
+                and (not custom_logits_active or speculative_safe_processors)
                 and hasattr(model, "mtp")
                 and model.mtp is not None
             )
-            if self._mtp and custom_logits_active:
+            use_mtp = use_native_mtp
+            if self._mtp and custom_logits_active and not speculative_safe_processors:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )
@@ -1272,8 +1327,7 @@ class SimpleEngine(BaseEngine):
             # --- Normal path (MTP via mlx_lm stream_generate) ---
             prompt_cache = None
             if backbone_cache is not None:
-                # Add MTP cache on top of backbone
-                if use_mtp and hasattr(model, "make_mtp_cache"):
+                if use_native_mtp and hasattr(model, "make_mtp_cache"):
                     mtp_cache = model.make_mtp_cache()
                     prompt_cache = backbone_cache + mtp_cache
                 else:
@@ -1287,8 +1341,11 @@ class SimpleEngine(BaseEngine):
             if all_processors:
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
-                gen_kwargs["mtp"] = True
-                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                _apply_speculative_decode_kwargs(
+                    gen_kwargs,
+                    use_native_mtp=use_native_mtp,
+                    log_context="Text route",
+                )
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
             if can_retire_processors and not use_mtp:
@@ -1326,9 +1383,7 @@ class SimpleEngine(BaseEngine):
                         seed = mx.array([last_tok], dtype=mx.uint32)
                     else:
                         seed = mx.array(
-                            self._text_tokenizer.encode(
-                                getattr(last_resp, "text", "")
-                            ),
+                            self._text_tokenizer.encode(getattr(last_resp, "text", "")),
                             dtype=mx.uint32,
                         )
                     resume_kwargs = dict(
@@ -1337,12 +1392,19 @@ class SimpleEngine(BaseEngine):
                         prefill_step_size=self._prefill_step_size,
                         prompt_cache=shared_cache,
                     )
-                    if hasattr(model, "make_mtp_cache") and model.mtp is not None:
-                        resume_kwargs["prompt_cache"] = (
-                            shared_cache + model.make_mtp_cache()
+                    if model.mtp is not None:
+                        _apply_speculative_decode_kwargs(
+                            resume_kwargs,
+                            use_native_mtp=True,
+                            log_context="Text route resume",
                         )
-                        resume_kwargs["mtp"] = True
-                        resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                        if hasattr(model, "make_mtp_cache"):
+                            # Start with a fresh MTP cache after trim+seed. The
+                            # earlier stream may have advanced speculative state
+                            # beyond the retained backbone cache window.
+                            resume_kwargs["prompt_cache"] = (
+                                shared_cache + model.make_mtp_cache()
+                            )
                     for resp in mlx_stream_generate(
                         model,
                         self._text_tokenizer,
@@ -1388,7 +1450,16 @@ class SimpleEngine(BaseEngine):
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                selected = select_chunks(importance, keep_pct=effective_keep)
+                effective_backbone = (
+                    specprefill_backbone_pct
+                    if specprefill_backbone_pct is not None
+                    else self._specprefill_backbone_pct
+                )
+                selected = select_chunks(
+                    importance,
+                    keep_pct=effective_keep,
+                    backbone_pct=effective_backbone,
+                )
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
 
@@ -1406,16 +1477,18 @@ class SimpleEngine(BaseEngine):
 
                 logger.info(
                     "SpecPrefill: scored %d tokens in %.1fs, "
-                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
-                    "(offset=%d, effective_keep=%.2f)",
+                    "sparse prefill %d/%d (keep=%.0f%%, backbone=%.0f%%) in %.1fs "
+                    "(offset=%d, effective_keep=%.2f, effective_backbone=%.2f)",
                     n_total,
                     t_score,
                     n_selected,
                     n_total,
                     n_selected / n_total * 100,
+                    effective_backbone * 100,
                     t_prefill,
                     specprefill_offset,
                     effective_keep,
+                    effective_backbone,
                 )
 
                 # Phase 4: Sample the first token from the prefilled logits, then
@@ -1475,10 +1548,17 @@ class SimpleEngine(BaseEngine):
                         prefill_step_size=self._prefill_step_size,
                         prompt_cache=bc,
                     )
-                    if hasattr(model, "make_mtp_cache") and model.mtp is not None:
-                        resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                        resume_kwargs["mtp"] = True
-                        resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                    if model.mtp is not None:
+                        _apply_speculative_decode_kwargs(
+                            resume_kwargs,
+                            use_native_mtp=True,
+                            log_context="SpecPrefill text route resume",
+                        )
+                        if hasattr(model, "make_mtp_cache"):
+                            # Resume speculative decode from the trimmed
+                            # backbone cache with a fresh MTP cache so no stale
+                            # speculative state survives the seed handoff.
+                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                     for resp in mlx_stream_generate(
                         model,
                         self._text_tokenizer,
@@ -1490,16 +1570,23 @@ class SimpleEngine(BaseEngine):
 
                 last_resp = None
                 retired = False
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=continuation_prompt,
+                specprefill_gen_kwargs = dict(
                     max_tokens=max_tokens - token_count,
                     sampler=sampler,
                     prefill_step_size=self._prefill_step_size,
                     logits_processors=seeded_processors,
                     prompt_cache=prompt_cache,
-                    mtp=use_mtp,
+                )
+                _apply_speculative_decode_kwargs(
+                    specprefill_gen_kwargs,
+                    use_native_mtp=use_mtp,
+                    log_context="SpecPrefill text route",
+                )
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=continuation_prompt,
+                    **specprefill_gen_kwargs,
                 ):
                     _emit_response(resp)
                     token_count += 1
@@ -1521,9 +1608,7 @@ class SimpleEngine(BaseEngine):
                         seed = mx.array([last_tok], dtype=mx.uint32)
                     else:
                         seed = mx.array(
-                            self._text_tokenizer.encode(
-                                getattr(last_resp, "text", "")
-                            ),
+                            self._text_tokenizer.encode(getattr(last_resp, "text", "")),
                             dtype=mx.uint32,
                         )
                     resume_kwargs = dict(
@@ -1532,10 +1617,17 @@ class SimpleEngine(BaseEngine):
                         prefill_step_size=self._prefill_step_size,
                         prompt_cache=bc,
                     )
-                    if hasattr(model, "make_mtp_cache") and model.mtp is not None:
-                        resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                        resume_kwargs["mtp"] = True
-                        resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                    if model.mtp is not None:
+                        _apply_speculative_decode_kwargs(
+                            resume_kwargs,
+                            use_native_mtp=True,
+                            log_context="SpecPrefill text route resume",
+                        )
+                        if hasattr(model, "make_mtp_cache"):
+                            # Resume speculative decode from the trimmed
+                            # backbone cache with a fresh MTP cache so no stale
+                            # speculative state survives the seed handoff.
+                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
                     for resp in mlx_stream_generate(
                         model,
                         self._text_tokenizer,
@@ -1638,6 +1730,7 @@ class SimpleEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
+                "backbone_pct": self._specprefill_backbone_pct,
             }
 
         # System KV cache stats

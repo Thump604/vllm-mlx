@@ -191,6 +191,8 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: evenly spaced global backbone budget (0.0-1.0, None = server default)
+    specprefill_backbone_pct: float | None = None
     # OpenAI client compatibility: server-specific extensions
     extra_body: dict[str, Any] | None = None
 
@@ -273,6 +275,8 @@ class CompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # SpecPrefill: evenly spaced global backbone budget (0.0-1.0, None = server default)
+    specprefill_backbone_pct: float | None = None
     # OpenAI client compatibility: server-specific extensions
     extra_body: dict[str, Any] | None = None
 

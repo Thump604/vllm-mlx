@@ -220,7 +220,8 @@ def serve_command(args):
             print(
                 f"SpecPrefill: enabled (draft={args.specprefill_draft_model}, "
                 f"threshold={args.specprefill_threshold}, "
-                f"keep={args.specprefill_keep_pct*100:.0f}%)"
+                f"keep={args.specprefill_keep_pct*100:.0f}%, "
+                f"backbone={args.specprefill_backbone_pct*100:.0f}%)"
             )
 
     # Load model with unified server
@@ -239,6 +240,7 @@ def serve_command(args):
         specprefill_enabled=args.specprefill,
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
+        specprefill_backbone_pct=args.specprefill_backbone_pct,
         specprefill_draft_model=args.specprefill_draft_model,
     )
 
@@ -843,6 +845,14 @@ Examples:
         default=0.3,
         help="Fraction of tokens to keep during sparse prefill (default: 0.3). "
         "Lower = faster prefill but more quality loss.",
+    )
+    serve_parser.add_argument(
+        "--specprefill-backbone-pct",
+        type=float,
+        default=0.0,
+        help="Fraction of chunk budget to reserve for evenly spaced global coverage "
+        "during sparse prefill (default: 0.0). Keeps long-tail prompt facts alive "
+        "without increasing the total sparse prefill budget.",
     )
     serve_parser.add_argument(
         "--specprefill-draft-model",

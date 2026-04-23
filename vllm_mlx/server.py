@@ -128,9 +128,7 @@ _default_top_p: float | None = None  # Set via --default-top-p
 _default_top_k: int | None = None  # Set via --default-top-k
 _default_min_p: float | None = None  # Set via --default-min-p
 _default_presence_penalty: float | None = None  # Set via --default-presence-penalty
-_default_repetition_penalty: float | None = (
-    None  # Set via --default-repetition-penalty
-)
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -297,7 +295,8 @@ def _maybe_attach_thinking_budget_processor(
     thinking_on = chat_kwargs.get("enable_thinking") is not False
     response_format = getattr(request, "response_format", None)
     tools_active = bool(
-        getattr(request, "tools", None) and getattr(request, "tool_choice", None) != "none"
+        getattr(request, "tools", None)
+        and getattr(request, "tool_choice", None) != "none"
     )
 
     tokenizer = _get_engine_tokenizer(engine)
@@ -768,6 +767,7 @@ def load_model(
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
+    specprefill_backbone_pct: float = 0.0,
     specprefill_draft_model: str = None,
 ):
     """
@@ -786,6 +786,8 @@ def load_model(
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+        specprefill_backbone_pct: Fraction of chunks to reserve for evenly spaced
+            global coverage within the sparse prefill budget
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
     """
     global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
@@ -822,6 +824,7 @@ def load_model(
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
         )
         # Start SimpleEngine synchronously (no background loop)
@@ -1582,9 +1585,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             "top_p": _resolve_top_p(request.top_p),
             "top_k": _resolve_top_k(request.top_k),
             "min_p": _resolve_min_p(request.min_p),
-            "presence_penalty": _resolve_presence_penalty(
-                request.presence_penalty
-            ),
+            "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
             "stop": request.stop,
         }
         if comp_rep_penalty is not None:
@@ -1767,9 +1768,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "top_k": _resolve_top_k(request.top_k),
         "min_p": _resolve_min_p(request.min_p),
         "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
-        "repetition_penalty": _resolve_repetition_penalty(
-            request.repetition_penalty
-        ),
+        "repetition_penalty": _resolve_repetition_penalty(request.repetition_penalty),
     }
     if rep_penalty is not None:
         chat_kwargs["repetition_penalty"] = rep_penalty
@@ -1788,6 +1787,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["specprefill"] = request.specprefill
     if request.specprefill_keep_pct is not None:
         chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    if request.specprefill_backbone_pct is not None:
+        chat_kwargs["specprefill_backbone_pct"] = request.specprefill_backbone_pct
 
     # Enable/disable thinking mode per request
     if request.enable_thinking is not None:
@@ -2059,9 +2060,7 @@ async def create_anthropic_message(
         "top_p": _resolve_top_p(openai_request.top_p),
         "top_k": _resolve_top_k(openai_request.top_k),
         "min_p": _resolve_min_p(openai_request.min_p),
-        "presence_penalty": _resolve_presence_penalty(
-            openai_request.presence_penalty
-        ),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(
             openai_request.repetition_penalty
         ),
@@ -2314,9 +2313,7 @@ async def _stream_anthropic_messages(
         "top_p": _resolve_top_p(openai_request.top_p),
         "top_k": _resolve_top_k(openai_request.top_k),
         "min_p": _resolve_min_p(openai_request.min_p),
-        "presence_penalty": _resolve_presence_penalty(
-            openai_request.presence_penalty
-        ),
+        "presence_penalty": _resolve_presence_penalty(openai_request.presence_penalty),
         "repetition_penalty": _resolve_repetition_penalty(
             openai_request.repetition_penalty
         ),
