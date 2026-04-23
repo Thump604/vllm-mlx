@@ -156,7 +156,9 @@ class TestChatCompletionRequest:
 
 
 class TestThinkingBudgetProcessorWiring:
-    def test_attach_thinking_budget_processor_installs_custom_logits_processor(self):
+    def test_attach_thinking_budget_processor_installs_custom_logits_processor(
+        self, monkeypatch
+    ):
         import vllm_mlx.server as server
         from vllm_mlx.server import ChatCompletionRequest, Message
 
@@ -183,6 +185,7 @@ class TestThinkingBudgetProcessorWiring:
         original = server._reasoning_parser
         original_module = sys.modules.get("vllm_mlx.constrained")
         try:
+            monkeypatch.delenv("VLLM_MLX_ALLOW_THINKING_MTP", raising=False)
             fake_constrained.ThinkingAwareLogitsProcessor = (
                 FakeThinkingAwareLogitsProcessor
             )
@@ -201,8 +204,65 @@ class TestThinkingBudgetProcessorWiring:
             )
 
             assert proc is not None
+            assert proc.kwargs["speculation_safe"] is False
             assert "logits_processors" in chat_kwargs
             assert chat_kwargs["logits_processors"][-1] is proc
+        finally:
+            server._reasoning_parser = original
+            if original_module is not None:
+                sys.modules["vllm_mlx.constrained"] = original_module
+            else:
+                sys.modules.pop("vllm_mlx.constrained", None)
+
+    def test_thinking_budget_mtp_opt_in_marks_processor_speculation_safe(
+        self, monkeypatch
+    ):
+        import vllm_mlx.server as server
+        from vllm_mlx.server import ChatCompletionRequest, Message
+
+        class DummyTokenizer:
+            vocab_size = 100
+
+            def encode(self, text, add_special_tokens=False):
+                mapping = {"<think>": [10, 11], "</think>": [20, 21]}
+                return mapping[text]
+
+        class DummyParser:
+            start_token = "<think>"
+            end_token = "</think>"
+
+        class DummyEngine:
+            tokenizer = DummyTokenizer()
+
+        fake_constrained = types.ModuleType("vllm_mlx.constrained")
+
+        class FakeThinkingAwareLogitsProcessor:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        original = server._reasoning_parser
+        original_module = sys.modules.get("vllm_mlx.constrained")
+        try:
+            monkeypatch.setenv("VLLM_MLX_ALLOW_THINKING_MTP", "1")
+            fake_constrained.ThinkingAwareLogitsProcessor = (
+                FakeThinkingAwareLogitsProcessor
+            )
+            sys.modules["vllm_mlx.constrained"] = fake_constrained
+            server._reasoning_parser = DummyParser()
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[Message(role="user", content="Hello")],
+                enable_thinking=True,
+                thinking_token_budget=128,
+            )
+            chat_kwargs = {"enable_thinking": True}
+
+            proc = server._maybe_attach_thinking_budget_processor(
+                DummyEngine(), request, chat_kwargs
+            )
+
+            assert proc is not None
+            assert proc.kwargs["speculation_safe"] is True
         finally:
             server._reasoning_parser = original
             if original_module is not None:

@@ -83,7 +83,9 @@ class ThinkingAwareLogitsProcessor:
         "_thinking_tokens",
         "_transition_index",
         "_processed_len",
+        "_processed_token_ids",
         "_snapshots",
+        "speculation_safe",
     )
 
     def __init__(
@@ -94,6 +96,7 @@ class ThinkingAwareLogitsProcessor:
         inner: Callable[[mx.array, mx.array], mx.array] | None = None,
         vocab_size: int = 152064,
         prompt_has_think_tag: bool = False,
+        speculation_safe: bool = False,
     ) -> None:
         self._start_matcher = BoundedSuffixMatcher(start_token_ids)
         self._end_matcher = BoundedSuffixMatcher(end_token_ids)
@@ -117,7 +120,11 @@ class ThinkingAwareLogitsProcessor:
         else:
             self._state = Phase.IDLE
         self._processed_len = 0
+        self._processed_token_ids: list[int] = []
         self._snapshots = [self._snapshot_state()]
+        # Only budget-only thinking is eligible. JSON/schema inner processors
+        # remain fail-closed because they are stateful and not MTP-audited here.
+        self.speculation_safe = bool(speculation_safe and inner is None)
 
     @property
     def state(self) -> Phase:
@@ -205,16 +212,26 @@ class ThinkingAwareLogitsProcessor:
         self._start_matcher.restore(start_state)
         self._end_matcher.restore(end_state)
         self._processed_len = processed_len
+        self._processed_token_ids = self._processed_token_ids[:processed_len]
         self._snapshots = self._snapshots[: processed_len + 1]
 
     def _sync_to_tokens(self, tokens: mx.array) -> None:
         target_len = int(tokens.size)
-        if target_len < self._processed_len:
-            self._restore_snapshot(target_len)
+        token_ids = [int(tokens[idx].item()) for idx in range(target_len)]
+        common_len = 0
+        max_common = min(target_len, self._processed_len)
+        while (
+            common_len < max_common
+            and self._processed_token_ids[common_len] == token_ids[common_len]
+        ):
+            common_len += 1
+        if common_len < self._processed_len:
+            self._restore_snapshot(common_len)
         if target_len == self._processed_len:
             return
-        for idx in range(self._processed_len, target_len):
-            self._advance_with_token(int(tokens[idx].item()))
+        for token_id in token_ids[self._processed_len :]:
+            self._advance_with_token(token_id)
+            self._processed_token_ids.append(token_id)
             self._processed_len += 1
             self._snapshots.append(self._snapshot_state())
 

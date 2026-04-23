@@ -341,6 +341,7 @@ def _maybe_attach_thinking_budget_processor(
             thinking_token_budget=budget,
             inner=json_logits_processor,
             prompt_has_think_tag=thinking_on,
+            speculation_safe=os.getenv("VLLM_MLX_ALLOW_THINKING_MTP") == "1",
         )
     except Exception as exc:
         logger.warning("Failed to install thinking budget processor: %s", exc)

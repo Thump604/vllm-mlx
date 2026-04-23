@@ -235,6 +235,53 @@ class TestPhaseTransitions:
         assert proc.state == Phase.THINKING
         assert proc.thinking_tokens == 2
 
+    def test_same_length_replacement_rolls_back_to_common_prefix(self):
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=8,
+            vocab_size=_VOCAB_SIZE,
+            prompt_has_think_tag=True,
+        )
+
+        proc(mx.array([101, 102], dtype=mx.uint32), _uniform_logits())
+        assert proc.thinking_tokens == 2
+
+        proc(mx.array([101, 103], dtype=mx.uint32), _uniform_logits())
+        assert proc.state == Phase.THINKING
+        assert proc.thinking_tokens == 2
+
+        proc(mx.array([101, 103, 104], dtype=mx.uint32), _uniform_logits())
+        assert proc.thinking_tokens == 3
+
+    def test_speculation_safe_is_explicit_and_budget_only(self):
+        proc = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=8,
+            vocab_size=_VOCAB_SIZE,
+            speculation_safe=True,
+        )
+        assert proc.speculation_safe is True
+
+        constrained = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=8,
+            inner=lambda tokens, logits: logits,
+            vocab_size=_VOCAB_SIZE,
+            speculation_safe=True,
+        )
+        assert constrained.speculation_safe is False
+
+        default = ThinkingAwareLogitsProcessor(
+            start_token_ids=_START_IDS,
+            end_token_ids=_END_IDS,
+            thinking_token_budget=8,
+            vocab_size=_VOCAB_SIZE,
+        )
+        assert default.speculation_safe is False
+
 
 class TestBudgetEnforcement:
     def test_budget_forces_transition(self):
