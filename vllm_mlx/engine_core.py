@@ -547,6 +547,10 @@ class EngineCore:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
 
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.scheduler.clear_runtime_caches()
+
     def _release_model(self) -> None:
         """Release model ownership."""
         if self._owns_model and not self._closed:
@@ -691,3 +695,7 @@ class AsyncEngineCore:
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk."""
         return self.engine.load_cache_from_disk(cache_dir)
+
+    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+        """Clear scheduler-managed runtime caches."""
+        return self.engine.clear_runtime_caches()

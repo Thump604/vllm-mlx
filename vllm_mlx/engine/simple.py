@@ -244,6 +244,13 @@ class SimpleEngine(BaseEngine):
         self._model.load()
         self._loaded = True
 
+        if self._mtp and self._mtp_num_draft_tokens != 1:
+            logger.warning(
+                "Native mlx_lm MTP currently ignores num_draft_tokens=%d; "
+                "effective speculative draft depth remains 1",
+                self._mtp_num_draft_tokens,
+            )
+
         # Build parallel mlx_lm TextModel for text-only routing.
         # Even when MTP is disabled, text-only requests should not be trapped
         # on the slower mlx_vlm multimodal path.
@@ -294,11 +301,9 @@ class SimpleEngine(BaseEngine):
                 logger.error("SpecPrefill: draft model load failed: %s", e)
                 self._draft_model = None
 
-        mtp_info = (
-            f", MTP={self._mtp}({self._mtp_num_draft_tokens} draft)"
-            if self._mtp
-            else ""
-        )
+        mtp_info = ""
+        if self._mtp:
+            mtp_info = f", MTP={self._mtp}(configured={self._mtp_num_draft_tokens}, effective=1)"
         routing = ", routing=per-request" if self._text_model is not None else ""
         specprefill_info = (
             ", SpecPrefill=active" if self._draft_model is not None else ""
@@ -1663,4 +1668,11 @@ class SimpleEngine(BaseEngine):
         """Get cache statistics (for MLLM models)."""
         if self._is_mllm and self._model is not None:
             return self._model.get_cache_stats()
+        return None
+
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
+        """Clear engine-managed runtime caches."""
+        if self._is_mllm and self._model is not None:
+            self._model.clear_cache()
+            return {"model_cache": True}
         return None
