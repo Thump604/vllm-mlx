@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import MagicMock
 
 try:
     import mlx.core as mx
@@ -82,3 +83,42 @@ def test_sparse_prefill_expands_tail_when_prompt_exceeds_window():
 
     flattened = [token for chunk in calls for row in chunk for token in row]
     assert flattened == [0, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
+def test_score_tokens_uses_original_cache_factory_when_available(monkeypatch):
+    from vllm_mlx import specprefill
+
+    model = object()
+    original_factory = MagicMock(return_value=["original-cache"])
+    patched_factory = MagicMock(
+        side_effect=AssertionError("quantized cache factory should be bypassed")
+    )
+
+    monkeypatch.setattr(specprefill, "make_prompt_cache", patched_factory)
+    monkeypatch.setattr(
+        specprefill.cache_module,
+        "_original_make_prompt_cache",
+        original_factory,
+        raising=False,
+    )
+
+    cache = specprefill._make_draft_prompt_cache(model)
+
+    assert cache == ["original-cache"]
+    original_factory.assert_called_once_with(model)
+
+
+def test_score_tokens_falls_back_to_current_cache_factory(monkeypatch):
+    from vllm_mlx import specprefill
+
+    model = object()
+    monkeypatch.delattr(
+        specprefill.cache_module, "_original_make_prompt_cache", raising=False
+    )
+    patched_factory = MagicMock(return_value=["patched-cache"])
+    monkeypatch.setattr(specprefill, "make_prompt_cache", patched_factory)
+
+    cache = specprefill._make_draft_prompt_cache(model)
+
+    assert cache == ["patched-cache"]
+    patched_factory.assert_called_once_with(model)

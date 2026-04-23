@@ -125,9 +125,19 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_top_k: int | None = None  # Set via --default-top-k
+_default_min_p: float | None = None  # Set via --default-min-p
+_default_presence_penalty: float | None = None  # Set via --default-presence-penalty
+_default_repetition_penalty: float | None = (
+    None  # Set via --default-repetition-penalty
+)
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
+_FALLBACK_TOP_K = 0
+_FALLBACK_MIN_P = 0.0
+_FALLBACK_PRESENCE_PENALTY = 0.0
+_FALLBACK_REPETITION_PENALTY = 1.0
 
 
 def _resolve_temperature(request_value: float | None) -> float:
@@ -146,6 +156,42 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_top_k(request_value: int | None) -> int:
+    """Resolve top_k: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_top_k is not None:
+        return _default_top_k
+    return _FALLBACK_TOP_K
+
+
+def _resolve_min_p(request_value: float | None) -> float:
+    """Resolve min_p: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_min_p is not None:
+        return _default_min_p
+    return _FALLBACK_MIN_P
+
+
+def _resolve_presence_penalty(request_value: float | None) -> float:
+    """Resolve presence_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_presence_penalty is not None:
+        return _default_presence_penalty
+    return _FALLBACK_PRESENCE_PENALTY
+
+
+def _resolve_repetition_penalty(request_value: float | None) -> float:
+    """Resolve repetition_penalty: request > CLI default > fallback."""
+    if request_value is not None:
+        return request_value
+    if _default_repetition_penalty is not None:
+        return _default_repetition_penalty
+    return _FALLBACK_REPETITION_PENALTY
 
 
 def _resolve_thinking_token_budget(request_value: int | None) -> int | None:
@@ -717,6 +763,7 @@ def load_model(
     gpu_memory_utilization: float = 0.90,
     served_model_name: str | None = None,
     mtp: bool = False,
+    mtp_num_draft_tokens: int = 1,
     prefill_step_size: int = 2048,
     specprefill_enabled: bool = False,
     specprefill_threshold: int = 8192,
@@ -734,6 +781,7 @@ def load_model(
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
+        mtp_num_draft_tokens: Draft tokens per speculative MTP step
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
         specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
@@ -769,6 +817,7 @@ def load_model(
             model_name=model_name,
             force_mllm=force_mllm,
             mtp=mtp,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
             prefill_step_size=prefill_step_size,
             specprefill_enabled=specprefill_enabled,
             specprefill_threshold=specprefill_threshold,
@@ -1507,9 +1556,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             "max_tokens": request.max_tokens or _default_max_tokens,
             "temperature": _resolve_temperature(request.temperature),
             "top_p": _resolve_top_p(request.top_p),
-            "top_k": request.top_k or 0,
-            "min_p": request.min_p or 0.0,
-            "presence_penalty": request.presence_penalty or 0.0,
+            "top_k": _resolve_top_k(request.top_k),
+            "min_p": _resolve_min_p(request.min_p),
+            "presence_penalty": _resolve_presence_penalty(
+                request.presence_penalty
+            ),
             "stop": request.stop,
         }
         if comp_rep_penalty is not None:
@@ -1678,17 +1729,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages = _inject_json_instruction(messages, json_instruction)
 
     # Resolve repetition penalty
-    rep_penalty = request.repetition_penalty
+    rep_penalty = (
+        request.repetition_penalty
+        if request.repetition_penalty is not None
+        else _default_repetition_penalty
+    )
 
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
-        "repetition_penalty": request.repetition_penalty or 1.0,
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            request.repetition_penalty
+        ),
     }
     if rep_penalty is not None:
         chat_kwargs["repetition_penalty"] = rep_penalty
@@ -1974,12 +2031,16 @@ async def create_anthropic_message(
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(
+            openai_request.presence_penalty
+        ),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
     }
     if openai_request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = openai_request.enable_thinking
@@ -2225,12 +2286,16 @@ async def _stream_anthropic_messages(
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
-        "top_k": openai_request.top_k or 0,
-        "min_p": openai_request.min_p or 0.0,
-        "presence_penalty": openai_request.presence_penalty or 0.0,
-        "repetition_penalty": openai_request.repetition_penalty or 1.0,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "top_k": _resolve_top_k(openai_request.top_k),
+        "min_p": _resolve_min_p(openai_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(
+            openai_request.presence_penalty
+        ),
+        "repetition_penalty": _resolve_repetition_penalty(
+            openai_request.repetition_penalty
+        ),
     }
     if openai_request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = openai_request.enable_thinking
@@ -2464,9 +2529,9 @@ async def stream_completion(
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
-        "top_k": request.top_k or 0,
-        "min_p": request.min_p or 0.0,
-        "presence_penalty": request.presence_penalty or 0.0,
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
         "stop": request.stop,
     }
     if repetition_penalty is not None:
@@ -2997,18 +3062,54 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Default top_k for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Default min_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help="Default presence_penalty for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Default repetition_penalty for generation when not specified in request"
+        ),
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
     global _default_temperature, _default_top_p
+    global _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        _default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        _default_presence_penalty = args.default_presence_penalty
+    if args.default_repetition_penalty is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -3054,6 +3155,8 @@ Examples:
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        mtp=getattr(args, "enable_mtp", False),
+        mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
     )
 
     # Start server

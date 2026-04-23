@@ -41,6 +41,7 @@ Reference: arxiv.org/abs/2502.02789 (SpecPrefill: Speculative Prefilling)
 import math
 
 import mlx.core as mx
+import mlx_lm.models.cache as cache_module
 
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
@@ -207,6 +208,22 @@ def _avg_pool1d(x, kernel_size):
     return (prefix[..., kernel_size:] - prefix[..., :-kernel_size]) / kernel_size
 
 
+def _make_draft_prompt_cache(model):
+    """Build an unquantized cache for SpecPrefill's draft-model scorer.
+
+    Runtime KV quantization globally patches ``make_prompt_cache`` and stores the
+    original constructor on ``mlx_lm.models.cache._original_make_prompt_cache``.
+    The scoring path explicitly inspects ``cache.keys`` / ``cache.values`` and
+    therefore cannot use quantized cache wrappers like ``QuantizedSDPACache``.
+    """
+    original_make_prompt_cache = getattr(
+        cache_module, "_original_make_prompt_cache", None
+    )
+    if callable(original_make_prompt_cache):
+        return original_make_prompt_cache(model)
+    return make_prompt_cache(model)
+
+
 def _compute_importance(
     query_buffer, attn_caches, n_prompt, n_attn_heads, n_kv_heads, pool_kernel=13
 ):
@@ -319,7 +336,7 @@ def score_tokens(
             query_extractor = _llama_extract_queries
 
     # Phase 1: Prefill
-    cache = make_prompt_cache(model)
+    cache = _make_draft_prompt_cache(model)
     logits = _prefill_draft(model, tokens, cache, step_size=prefill_step_size)
 
     # Phase 2: Lookahead decode with query capture

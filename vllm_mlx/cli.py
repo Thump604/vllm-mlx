@@ -144,6 +144,13 @@ def serve_command(args):
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
+        if args.specprefill:
+            print(
+                "WARNING: SpecPrefill is SimpleEngine-only in this build; "
+                "ignoring --specprefill for continuous batching"
+            )
+            args.specprefill = False
+
         # Handle prefix cache flags
         enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
@@ -151,6 +158,7 @@ def serve_command(args):
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
             completion_batch_size=args.completion_batch_size,
+            prefill_step_size=args.prefill_step_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
             # Memory-aware cache options
@@ -179,6 +187,7 @@ def serve_command(args):
             print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         if args.enable_mtp:
             print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
+        print(f"Prefill step size: {args.prefill_step_size}")
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -201,7 +210,10 @@ def serve_command(args):
     else:
         print("Mode: Simple (maximum throughput)")
         if args.enable_mtp:
-            print("MTP: enabled (native speculative decoding)")
+            print(
+                f"MTP: enabled (native speculative decoding, "
+                f"draft_tokens={args.mtp_num_draft_tokens})"
+            )
         if args.enable_mtp and getattr(args, "mllm", False):
             print("MTP + MLLM: per-request routing (text-only → MTP, media → MLLM)")
         if args.specprefill and args.specprefill_draft_model:
@@ -222,6 +234,7 @@ def serve_command(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         served_model_name=args.served_model_name,
         mtp=args.enable_mtp,
+        mtp_num_draft_tokens=args.mtp_num_draft_tokens,
         prefill_step_size=args.prefill_step_size,
         specprefill_enabled=args.specprefill,
         specprefill_threshold=args.specprefill_threshold,
@@ -934,6 +947,36 @@ Examples:
         type=float,
         default=None,
         help="Override default top_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Override default top_k for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-min-p",
+        type=float,
+        default=None,
+        help="Override default min_p for all requests (default: use model default)",
+    )
+    serve_parser.add_argument(
+        "--default-presence-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default presence_penalty for all requests "
+            "(default: use model default)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Override default repetition_penalty for all requests "
+            "(default: use model default)"
+        ),
     )
     # Embedding model option
     serve_parser.add_argument(

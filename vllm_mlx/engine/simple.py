@@ -57,26 +57,62 @@ def _bind_worker_generation_streams() -> None:
             module.generation_stream = default_stream
 
 
-def _only_mtp_safe_thinking_processors(processors: list[Any] | None) -> bool:
-    """Return True when processors are budget-only thinking controllers.
+def _cache_snapshot_nbytes(entry: Any) -> int:
+    """Recursively total cache snapshot bytes for raw or quantized entries."""
+    if entry is None:
+        return 0
+    if hasattr(entry, "nbytes"):
+        return entry.nbytes
+    if isinstance(entry, (list, tuple)):
+        return sum(_cache_snapshot_nbytes(item) for item in entry)
+    return 0
 
-    Native mlx_lm MTP applies logits processors on verified tokens in
-    ``mtp_generate_step()``, so a ThinkingAwareLogitsProcessor without an
-    inner JSON/schema constraint is safe to keep active with MTP. Any other
-    custom processor still fails closed to non-MTP decoding here.
-    """
+
+def _seed_logits_processors(
+    seed_tokens: mx.array | None,
+    processors: list[Any] | None,
+) -> list[Any] | None:
+    """Wrap logits processors so continuation decode sees the full prompt."""
     if not processors:
-        return False
-    try:
-        from ..constrained import ThinkingAwareLogitsProcessor
-    except Exception:
-        return False
+        return None
+    if seed_tokens is None or seed_tokens.size == 0:
+        return list(processors)
 
-    return all(
-        isinstance(proc, ThinkingAwareLogitsProcessor)
-        and getattr(proc, "_inner", None) is None
-        for proc in processors
-    )
+    def _wrap(processor):
+        def _seeded(tokens, logits):
+            merged = seed_tokens
+            if tokens is not None:
+                if not isinstance(tokens, mx.array):
+                    tokens_arr = mx.array(tokens, dtype=mx.uint32)
+                else:
+                    tokens_arr = tokens
+                if tokens_arr.size > 0:
+                    merged = mx.concatenate([seed_tokens, tokens_arr])
+            return processor(merged, logits)
+
+        return _seeded
+
+    return [_wrap(processor) for processor in processors]
+
+
+def _sample_with_processors(
+    tokens: mx.array | None,
+    logits: mx.array,
+    sampler: Any,
+    logits_processors: list[Any] | None,
+) -> tuple[mx.array, mx.array]:
+    """Sample a token while honoring any active logits processors."""
+    if logits_processors:
+        is_1d = logits.ndim == 1
+        if is_1d:
+            logits = logits[None]
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+        if is_1d:
+            logits = logits.squeeze(0)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tok = sampler(logprobs)
+    return tok, logprobs
 
 
 class SimpleEngine(BaseEngine):
@@ -983,7 +1019,6 @@ class SimpleEngine(BaseEngine):
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
-        mtp_safe_processors = _only_mtp_safe_thinking_processors(all_processors)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -1151,11 +1186,11 @@ class SimpleEngine(BaseEngine):
             model = self._text_model
             use_mtp = (
                 self._mtp
-                and (not custom_logits_active or mtp_safe_processors)
+                and not custom_logits_active
                 and hasattr(model, "mtp")
                 and model.mtp is not None
             )
-            if self._mtp and custom_logits_active and not mtp_safe_processors:
+            if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )
@@ -1202,7 +1237,7 @@ class SimpleEngine(BaseEngine):
             # --- SpecPrefill path (with fallback to normal on failure) ---
             if use_specprefill:
                 try:
-                    _run_specprefill(model, backbone_cache)
+                    _run_specprefill(model, backbone_cache, use_mtp)
                     return
                 except Exception as e:
                     logger.error(
@@ -1244,8 +1279,8 @@ class SimpleEngine(BaseEngine):
             ):
                 _emit_response(resp)
 
-        def _run_specprefill(model, bc):
-            """Score tokens, sparse prefill, generate without MTP."""
+        def _run_specprefill(model, bc, use_mtp):
+            """Score tokens, sparse prefill, then continue on the standard decode path."""
             from types import SimpleNamespace
 
             from ..specprefill import (
@@ -1303,38 +1338,62 @@ class SimpleEngine(BaseEngine):
                     effective_keep,
                 )
 
-                # Phase 4: Generate (simple autoregressive, no MTP)
+                # Phase 4: Sample the first token from the prefilled logits, then
+                # continue through mlx_lm's normal decode path so MTP and request-
+                # local logits processors remain active after sparse prefill.
                 eos_id = self._text_tokenizer.eos_token_id
-                y = sampler(logits[:, -1, :])
+                seed_tokens = (
+                    mx.array(full_tokens_list, dtype=mx.uint32)
+                    if full_tokens_list is not None
+                    else None
+                )
+                seeded_processors = _seed_logits_processors(seed_tokens, all_processors)
+                y, _ = _sample_with_processors(
+                    None,
+                    logits[:, -1, :].squeeze(0),
+                    sampler,
+                    seeded_processors,
+                )
                 mx.eval(y)
 
                 generated_ids = []
                 prev_decoded = ""
 
-                for _ in range(max_tokens):
-                    tok_id = y.item()
-                    generated_ids.append(tok_id)
+                tok_id = y.item()
+                generated_ids.append(tok_id)
 
-                    # Incremental text decode
-                    decoded = self._text_tokenizer.decode(generated_ids)
-                    new_text = decoded[len(prev_decoded) :]
-                    prev_decoded = decoded
+                decoded = self._text_tokenizer.decode(generated_ids)
+                new_text = decoded[len(prev_decoded) :]
+                prev_decoded = decoded
 
-                    is_eos = tok_id == eos_id
-                    _emit_response(
-                        SimpleNamespace(
-                            text=new_text,
-                            finish_reason="stop" if is_eos else None,
-                        )
+                is_eos = tok_id == eos_id
+                _emit_response(
+                    SimpleNamespace(
+                        text=new_text,
+                        finish_reason="stop" if is_eos else None,
                     )
+                )
 
-                    if is_eos:
-                        break
+                if is_eos or max_tokens <= 1:
+                    return
 
-                    # Next token
-                    logits = model(y.reshape(1, -1), cache=bc)
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
+                prompt_cache = bc
+                if use_mtp and hasattr(model, "make_mtp_cache"):
+                    prompt_cache = bc + model.make_mtp_cache()
+
+                continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=continuation_prompt,
+                    max_tokens=max_tokens - 1,
+                    sampler=sampler,
+                    prefill_step_size=self._prefill_step_size,
+                    logits_processors=seeded_processors,
+                    prompt_cache=prompt_cache,
+                    mtp=use_mtp,
+                ):
+                    _emit_response(resp)
 
             finally:
                 cleanup_rope(model)
@@ -1436,10 +1495,7 @@ class SimpleEngine(BaseEngine):
         if self._system_kv_snapshot is not None:
             cache_bytes = 0
             for entry in self._system_kv_snapshot:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    cache_bytes += entry[0].nbytes + entry[1].nbytes
-                elif isinstance(entry, list):
-                    cache_bytes += sum(a.nbytes for a in entry if a is not None)
+                cache_bytes += _cache_snapshot_nbytes(entry)
             stats["system_kv_cache"] = {
                 "tokens": self._system_kv_token_count,
                 "hash": self._system_kv_hash,
