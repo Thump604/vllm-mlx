@@ -922,9 +922,7 @@ class TestAPIKeyVerification:
 
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
-                )
+                asyncio.run(server.verify_api_key(credentials))
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
@@ -950,9 +948,7 @@ class TestAPIKeyVerification:
             )
 
             # Should not raise any exception
-            result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
-            )
+            result = asyncio.run(server.verify_api_key(credentials))
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:

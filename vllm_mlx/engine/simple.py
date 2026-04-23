@@ -9,6 +9,7 @@ performance when serving a single user at a time.
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -1059,6 +1060,7 @@ class SimpleEngine(BaseEngine):
         repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
         stop = kwargs.pop("stop", None)
         external_logits_processors = kwargs.pop("logits_processors", None)
+        abort_event = threading.Event()
 
         # Per-request enable_thinking override; fall back to env var / default True.
         enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1254,6 +1256,8 @@ class SimpleEngine(BaseEngine):
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
         def _emit_response(resp: Any) -> None:
+            if abort_event.is_set():
+                return
             loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
 
         def _emit_done() -> None:
@@ -1329,6 +1333,9 @@ class SimpleEngine(BaseEngine):
                 ),
                 bool(resume_kwargs.get("mtp")),
             ):
+                if abort_event.is_set():
+                    logger.info("%s: abort requested; stopping resume decode", label)
+                    break
                 _emit_response(resp)
 
         # Run all Metal ops in a single serialized thread.
@@ -1444,6 +1451,12 @@ class SimpleEngine(BaseEngine):
                     prompt=prompt_to_send,
                     **gen_kwargs,
                 ):
+                    if abort_event.is_set():
+                        logger.info(
+                            "Text route: abort requested; stopping decode after %d tokens",
+                            token_count,
+                        )
+                        break
                     _emit_response(resp)
                     token_count += 1
                     last_resp = resp
@@ -1477,6 +1490,9 @@ class SimpleEngine(BaseEngine):
                     ),
                     use_mtp,
                 ):
+                    if abort_event.is_set():
+                        logger.info("Text route: abort requested; stopping decode")
+                        break
                     _emit_response(resp)
 
         def _run_specprefill(model, bc, use_mtp):
@@ -1585,6 +1601,12 @@ class SimpleEngine(BaseEngine):
                     )
                 )
 
+                if abort_event.is_set():
+                    logger.info(
+                        "SpecPrefill text route: abort requested after seed token"
+                    )
+                    return
+
                 if is_eos or max_tokens <= 1:
                     return
 
@@ -1633,6 +1655,11 @@ class SimpleEngine(BaseEngine):
                     ),
                     bool(specprefill_gen_kwargs.get("mtp")),
                 ):
+                    if abort_event.is_set():
+                        logger.info(
+                            "SpecPrefill text route: abort requested; stopping decode"
+                        )
+                        break
                     _emit_response(resp)
                     token_count += 1
                     last_resp = resp
@@ -1669,6 +1696,7 @@ class SimpleEngine(BaseEngine):
                 try:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
+                    abort_event.set()
                     try:
                         await task
                     except BaseException:
@@ -1722,6 +1750,8 @@ class SimpleEngine(BaseEngine):
                 if finished:
                     break
         finally:
+            if not producer_task.done():
+                abort_event.set()
             await producer_task
 
         if not finished:
