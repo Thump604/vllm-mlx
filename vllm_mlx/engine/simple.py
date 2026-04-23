@@ -144,6 +144,44 @@ def _processors_allow_speculative_drafting(processors: list[Any] | None) -> bool
     return True
 
 
+def _stream_with_speculation_stats(label: str, responses, enabled: bool):
+    """Yield mlx-lm responses while logging accepted draft-token rate."""
+    if not enabled:
+        yield from responses
+        return
+
+    total = 0
+    draft = 0
+    last_resp = None
+    try:
+        for resp in responses:
+            total += 1
+            if getattr(resp, "from_draft", False):
+                draft += 1
+            last_resp = resp
+            yield resp
+    finally:
+        if total:
+            generation_tps = getattr(last_resp, "generation_tps", None)
+            if generation_tps is None:
+                logger.info(
+                    "%s: MTP stats tokens=%d accepted_draft=%d accepted_draft_rate=%.1f%%",
+                    label,
+                    total,
+                    draft,
+                    100.0 * draft / total,
+                )
+            else:
+                logger.info(
+                    "%s: MTP stats tokens=%d accepted_draft=%d accepted_draft_rate=%.1f%% generation_tps=%.2f",
+                    label,
+                    total,
+                    draft,
+                    100.0 * draft / total,
+                    generation_tps,
+                )
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -1405,19 +1443,27 @@ class SimpleEngine(BaseEngine):
                             resume_kwargs["prompt_cache"] = (
                                 shared_cache + model.make_mtp_cache()
                             )
-                    for resp in mlx_stream_generate(
-                        model,
-                        self._text_tokenizer,
-                        prompt=seed,
-                        **resume_kwargs,
+                    for resp in _stream_with_speculation_stats(
+                        "Text route resume",
+                        mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=seed,
+                            **resume_kwargs,
+                        ),
+                        bool(resume_kwargs.get("mtp")),
                     ):
                         _emit_response(resp)
             else:
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=prompt_to_send,
-                    **gen_kwargs,
+                for resp in _stream_with_speculation_stats(
+                    "Text route",
+                    mlx_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=prompt_to_send,
+                        **gen_kwargs,
+                    ),
+                    use_mtp,
                 ):
                     _emit_response(resp)
 
@@ -1559,11 +1605,15 @@ class SimpleEngine(BaseEngine):
                             # backbone cache with a fresh MTP cache so no stale
                             # speculative state survives the seed handoff.
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                    for resp in mlx_stream_generate(
-                        model,
-                        self._text_tokenizer,
-                        prompt=continuation_prompt,
-                        **resume_kwargs,
+                    for resp in _stream_with_speculation_stats(
+                        "SpecPrefill text route resume",
+                        mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=continuation_prompt,
+                            **resume_kwargs,
+                        ),
+                        bool(resume_kwargs.get("mtp")),
                     ):
                         _emit_response(resp)
                     return
@@ -1582,11 +1632,15 @@ class SimpleEngine(BaseEngine):
                     use_native_mtp=use_mtp,
                     log_context="SpecPrefill text route",
                 )
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=continuation_prompt,
-                    **specprefill_gen_kwargs,
+                for resp in _stream_with_speculation_stats(
+                    "SpecPrefill text route",
+                    mlx_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=continuation_prompt,
+                        **specprefill_gen_kwargs,
+                    ),
+                    bool(specprefill_gen_kwargs.get("mtp")),
                 ):
                     _emit_response(resp)
                     token_count += 1
@@ -1628,11 +1682,15 @@ class SimpleEngine(BaseEngine):
                             # backbone cache with a fresh MTP cache so no stale
                             # speculative state survives the seed handoff.
                             resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                    for resp in mlx_stream_generate(
-                        model,
-                        self._text_tokenizer,
-                        prompt=seed,
-                        **resume_kwargs,
+                    for resp in _stream_with_speculation_stats(
+                        "SpecPrefill text route resume",
+                        mlx_stream_generate(
+                            model,
+                            self._text_tokenizer,
+                            prompt=seed,
+                            **resume_kwargs,
+                        ),
+                        bool(resume_kwargs.get("mtp")),
                     ):
                         _emit_response(resp)
 
