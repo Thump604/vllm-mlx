@@ -2,6 +2,7 @@
 """Tests for SimpleEngine concurrency handling."""
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -591,6 +592,90 @@ class TestSimpleEngineConcurrency:
         assert outputs[-1].text == "Hello"
         assert captured_kwargs["mtp"] is True
         assert captured_kwargs["logits_processors"][0] is thinking_proc
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_passes_num_draft_tokens(self):
+        """Text routing should forward configured MTP draft depth."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_kwargs["mtp"] is True
+        assert captured_kwargs["num_draft_tokens"] == 4
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_emits_before_generation_completes(self):
+        """Text routing should yield the first token before the worker finishes."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        second_token_gate = threading.Event()
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            yield SimpleNamespace(text="Hello", finish_reason=None)
+            second_token_gate.wait(timeout=1.0)
+            yield SimpleNamespace(text=" world", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            agen = engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=16,
+                temperature=0.7,
+                top_p=0.9,
+            )
+            first = await asyncio.wait_for(anext(agen), timeout=0.2)
+            assert first.new_text == "Hello"
+            second_token_gate.set()
+            remaining = [chunk async for chunk in agen]
+
+        assert remaining[-1].new_text == " world"
+        assert remaining[-1].finished is True
 
     @pytest.mark.anyio
     async def test_stream_generate_text_honors_stop_sequences(self):

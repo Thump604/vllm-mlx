@@ -94,6 +94,7 @@ class SimpleEngine(BaseEngine):
         enable_cache: bool = True,
         force_mllm: bool = False,
         mtp: bool = False,
+        mtp_num_draft_tokens: int = 1,
         prefill_step_size: int = 2048,
         specprefill_enabled: bool = False,
         specprefill_threshold: int = 8192,
@@ -109,6 +110,7 @@ class SimpleEngine(BaseEngine):
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
             mtp: Enable native MTP speculative decoding (model must have MTP head)
+            mtp_num_draft_tokens: Draft tokens per speculative MTP step
             prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
             specprefill_enabled: Enable SpecPrefill (attention-based sparse prefill)
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
@@ -120,6 +122,7 @@ class SimpleEngine(BaseEngine):
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._mtp = mtp
+        self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
 
         # SpecPrefill config
@@ -185,6 +188,7 @@ class SimpleEngine(BaseEngine):
                 self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
+                mtp_num_draft_tokens=self._mtp_num_draft_tokens,
             )
 
         self._model.load()
@@ -240,7 +244,11 @@ class SimpleEngine(BaseEngine):
                 logger.error("SpecPrefill: draft model load failed: %s", e)
                 self._draft_model = None
 
-        mtp_info = f", MTP={self._mtp}" if self._mtp else ""
+        mtp_info = (
+            f", MTP={self._mtp}({self._mtp_num_draft_tokens} draft)"
+            if self._mtp
+            else ""
+        )
         routing = ", routing=per-request" if self._text_model is not None else ""
         specprefill_info = (
             ", SpecPrefill=active" if self._draft_model is not None else ""
@@ -1124,6 +1132,18 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
+        loop = asyncio.get_running_loop()
+        response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+        def _emit_response(resp: Any) -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+
+        def _emit_done() -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
+
+        def _emit_error(exc: BaseException) -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
+
         # Run all Metal ops in a single serialized thread.
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
@@ -1182,7 +1202,8 @@ class SimpleEngine(BaseEngine):
             # --- SpecPrefill path (with fallback to normal on failure) ---
             if use_specprefill:
                 try:
-                    return _run_specprefill(model, backbone_cache)
+                    _run_specprefill(model, backbone_cache)
+                    return
                 except Exception as e:
                     logger.error(
                         "SpecPrefill failed, falling back to normal MTP path: %s",
@@ -1202,7 +1223,6 @@ class SimpleEngine(BaseEngine):
                 else:
                     prompt_cache = backbone_cache
 
-            results = []
             gen_kwargs = dict(
                 max_tokens=max_tokens,
                 sampler=sampler,
@@ -1212,6 +1232,7 @@ class SimpleEngine(BaseEngine):
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
                 gen_kwargs["mtp"] = True
+                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
 
@@ -1221,8 +1242,7 @@ class SimpleEngine(BaseEngine):
                 prompt=prompt_to_send,
                 **gen_kwargs,
             ):
-                results.append(resp)
-            return results
+                _emit_response(resp)
 
         def _run_specprefill(model, bc):
             """Score tokens, sparse prefill, generate without MTP."""
@@ -1288,7 +1308,6 @@ class SimpleEngine(BaseEngine):
                 y = sampler(logits[:, -1, :])
                 mx.eval(y)
 
-                results = []
                 generated_ids = []
                 prev_decoded = ""
 
@@ -1302,7 +1321,7 @@ class SimpleEngine(BaseEngine):
                     prev_decoded = decoded
 
                     is_eos = tok_id == eos_id
-                    results.append(
+                    _emit_response(
                         SimpleNamespace(
                             text=new_text,
                             finish_reason="stop" if is_eos else None,
@@ -1317,44 +1336,73 @@ class SimpleEngine(BaseEngine):
                     y = sampler(logits[:, -1, :])
                     mx.eval(y)
 
-                return results
-
             finally:
                 cleanup_rope(model)
 
-        all_resps = await self._run_blocking_serialized(_run_all)
+        async def _produce_responses() -> None:
+            def run_bound() -> None:
+                _bind_worker_generation_streams()
+                _run_all()
+
+            async with self._generation_lock:
+                task = asyncio.create_task(asyncio.to_thread(run_bound))
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise
+                except BaseException as exc:
+                    _emit_error(exc)
+                else:
+                    _emit_done()
+
+        producer_task = asyncio.create_task(_produce_responses())
 
         # Yield results as GenerationOutput
         accumulated_text = ""
         token_count = 0
         finished = False
-        for i, resp in enumerate(all_resps):
-            token_count += 1
-            new_text = resp.text if hasattr(resp, "text") else str(resp)
-            accumulated_text += new_text
+        try:
+            while True:
+                kind, payload = await response_queue.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise payload
+                resp = payload
 
-            is_last = i == len(all_resps) - 1
-            stop_hit = False
-            if stop:
-                stop_hit = any(stop_seq in accumulated_text for stop_seq in stop)
-            finished = stop_hit or is_last or token_count >= max_tokens
-            finish_reason = getattr(resp, "finish_reason", None)
-            if stop_hit:
-                finish_reason = "stop"
-            elif finish_reason is None and finished:
-                finish_reason = "stop"
+                token_count += 1
+                new_text = resp.text if hasattr(resp, "text") else str(resp)
+                accumulated_text += new_text
 
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text=new_text,
-                prompt_tokens=full_token_count or 0,
-                completion_tokens=token_count,
-                finished=finished,
-                finish_reason=finish_reason,
-            )
+                stop_hit = False
+                if stop:
+                    stop_hit = any(stop_seq in accumulated_text for stop_seq in stop)
+                finished = stop_hit or token_count >= max_tokens
+                finish_reason = getattr(resp, "finish_reason", None)
+                if stop_hit:
+                    finish_reason = "stop"
+                elif finish_reason is None and finished:
+                    finish_reason = "stop"
+                elif finish_reason is not None:
+                    finished = True
 
-            if finished:
-                break
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=full_token_count or 0,
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
+
+                if finished:
+                    break
+        finally:
+            await producer_task
 
         if not finished:
             yield GenerationOutput(
