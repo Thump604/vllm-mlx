@@ -542,6 +542,56 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["logits_processors"][0] is user_processor
 
     @pytest.mark.anyio
+    async def test_stream_generate_text_keeps_mtp_for_budget_only_thinking_processor(
+        self,
+    ):
+        """Budget-only ThinkingAwareLogitsProcessor should not disable MTP."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=True)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = MagicMock()
+        engine._text_tokenizer = tokenizer
+
+        thinking_proc = MagicMock()
+
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "vllm_mlx.engine.simple._only_mtp_safe_thinking_processors",
+                return_value=True,
+            ),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.7,
+                    top_p=0.9,
+                    logits_processors=[thinking_proc],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_kwargs["mtp"] is True
+        assert captured_kwargs["logits_processors"][0] is thinking_proc
+
+    @pytest.mark.anyio
     async def test_stream_generate_text_honors_stop_sequences(self):
         """Text routing should stop on explicit stop sequences like the LLM path."""
         from types import SimpleNamespace

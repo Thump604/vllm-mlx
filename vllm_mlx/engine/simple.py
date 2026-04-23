@@ -55,6 +55,28 @@ def _bind_worker_generation_streams() -> None:
             module.generation_stream = mx.new_stream(mx.default_device())
 
 
+def _only_mtp_safe_thinking_processors(processors: list[Any] | None) -> bool:
+    """Return True when processors are budget-only thinking controllers.
+
+    Native mlx_lm MTP applies logits processors on verified tokens in
+    ``mtp_generate_step()``, so a ThinkingAwareLogitsProcessor without an
+    inner JSON/schema constraint is safe to keep active with MTP. Any other
+    custom processor still fails closed to non-MTP decoding here.
+    """
+    if not processors:
+        return False
+    try:
+        from ..constrained import ThinkingAwareLogitsProcessor
+    except Exception:
+        return False
+
+    return all(
+        isinstance(proc, ThinkingAwareLogitsProcessor)
+        and getattr(proc, "_inner", None) is None
+        for proc in processors
+    )
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -951,6 +973,7 @@ class SimpleEngine(BaseEngine):
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
+        mtp_safe_processors = _only_mtp_safe_thinking_processors(all_processors)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -1106,11 +1129,11 @@ class SimpleEngine(BaseEngine):
             model = self._text_model
             use_mtp = (
                 self._mtp
-                and not custom_logits_active
+                and (not custom_logits_active or mtp_safe_processors)
                 and hasattr(model, "mtp")
                 and model.mtp is not None
             )
-            if self._mtp and custom_logits_active:
+            if self._mtp and custom_logits_active and not mtp_safe_processors:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )

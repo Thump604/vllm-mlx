@@ -18,6 +18,7 @@ Architecture:
 
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -311,9 +312,6 @@ class MLLMBatchGenerator:
         ...         print(f"Request {resp.request_id}: token={resp.token}")
     """
 
-    # Generation stream for async eval
-    _stream = None
-
     def __init__(
         self,
         model: nn.Module,
@@ -446,16 +444,30 @@ class MLLMBatchGenerator:
         # Stripping the suffix from cache keys enables clean PREFIX match.
         self._think_suffix_len = self._compute_think_suffix_len()
 
-        # Generation stream
-        if MLLMBatchGenerator._stream is None:
-            MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
-
         # Memory management
         self._old_wired_limit = None
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
+
+    @staticmethod
+    def _stream_context():
+        """Use the default MLX stream for batched MLLM generation.
+
+        A custom stream proved too fragile across the scheduler's async
+        lifecycle and shutdown paths on this hardware/runtime stack. The
+        dedicated worker thread still serializes GPU work; the default stream
+        preserves correctness without thread-affine stream lookup failures.
+        """
+        return nullcontext()
+
+    def _reset_text_position_cache(self) -> None:
+        """Clear cached Qwen rope state before a new text-only request."""
+        if hasattr(self.language_model, "_position_ids"):
+            self.language_model._position_ids = None
+        if hasattr(self.language_model, "_rope_deltas"):
+            self.language_model._rope_deltas = None
 
     def _normalize_chat_template_for_prefix_cache(self) -> None:
         """Patch chat template so historical assistant turns are prefix-stable.
@@ -586,7 +598,7 @@ class MLLMBatchGenerator:
     def close(self) -> None:
         """Release resources and reset wired limit."""
         if self._old_wired_limit is not None:
-            mx.synchronize(MLLMBatchGenerator._stream)
+            mx.synchronize()
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1054,6 +1066,9 @@ class MLLMBatchGenerator:
         aborted_requests = []
         for req in requests:
             try:
+                if req.is_text_only:
+                    self._reset_text_position_cache()
+
                 # Check abort before starting prefill
                 if req.request_id in self._aborted_request_ids:
                     self._aborted_request_ids.discard(req.request_id)
@@ -1100,7 +1115,7 @@ class MLLMBatchGenerator:
                     total_tokens = len(input_ids_list)
                     remaining_count = len(remaining_ids)
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with self._stream_context():
                         step = self.prefill_step_size
                         if remaining_count <= step:
                             # Short remaining — process in one shot
@@ -1180,7 +1195,7 @@ class MLLMBatchGenerator:
                         total_tokens,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with self._stream_context():
                         logits = self.language_model(last_token, cache=request_cache)
                         if hasattr(logits, "logits"):
                             logits = logits.logits
@@ -1206,7 +1221,7 @@ class MLLMBatchGenerator:
                     # Cache miss — full forward pass
                     request_cache = make_prompt_cache(self.language_model)
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with self._stream_context():
                         # Text-only: chunked prefill with real progress tracking
                         # Multimodal: atomic VLM forward (vision encoder needs full input)
                         if req.is_text_only:
@@ -1640,7 +1655,7 @@ class MLLMBatchGenerator:
         Returns:
             List of MLLMBatchResponse, one per active request
         """
-        with mx.stream(MLLMBatchGenerator._stream):
+        with self._stream_context():
             return self._next()
 
     def stats(self) -> MLLMBatchStats:

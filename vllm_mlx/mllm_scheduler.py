@@ -20,6 +20,7 @@ Architecture:
 
 import asyncio
 import concurrent.futures
+import importlib
 import logging
 import time
 import uuid
@@ -40,6 +41,17 @@ from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
 logger = logging.getLogger(__name__)
+
+
+def _bind_worker_generation_streams() -> None:
+    """Rebind mlx generation streams inside the scheduler worker thread."""
+    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "generation_stream"):
+            module.generation_stream = mx.new_stream(mx.default_device())
 
 
 @dataclass
@@ -220,6 +232,7 @@ class MLLMScheduler:
         # Async processing control
         self._running = False
         self._processing_task: Optional[asyncio.Task] = None
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
         # Memory management: periodic mx.clear_cache() to free Metal buffer pool
         self._step_count = 0
@@ -765,6 +778,11 @@ class MLLMScheduler:
         if self._running:
             return
 
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mllm-step"
+            )
+
         self._running = True
         self._processing_task = asyncio.create_task(self._process_loop())
         logger.info(
@@ -782,39 +800,42 @@ class MLLMScheduler:
                 pass
 
         if self.batch_generator is not None:
-            self.batch_generator.close()
+            if self._executor is not None:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    self._executor, self._close_batch_generator_in_worker
+                )
+            else:
+                self.batch_generator.close()
             self.batch_generator = None
+
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
 
         logger.info("MLLM Scheduler stopped")
 
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Uses a thread pool executor for steps that involve prefill
-        (waiting requests or partial prefill in progress) so that the
-        event loop stays responsive for health checks and other HTTP
-        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        Run all batch-generator work on the dedicated scheduler worker.
+        MLLM generation uses a thread-affine MLX stream and a shared model
+        wrapper with cached rope state; splitting prefill and decode across
+        different threads leads to stream lookup failures and stale state.
         """
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-step"
-        )
+        if self._executor is None:
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mllm-step"
+            )
+
+        executor = self._executor
         loop = asyncio.get_running_loop()
 
         while self._running:
             try:
                 if self.has_requests():
-                    has_waiting = self.get_num_waiting() > 0
-                    has_partial = (
-                        self.batch_generator is not None
-                        and getattr(self.batch_generator, "_partial", None) is not None
-                    )
-                    needs_executor = has_waiting or has_partial
-
-                    if needs_executor:
-                        await loop.run_in_executor(_executor, self.step)
-                    else:
-                        self.step()
-                        await asyncio.sleep(0)
+                    await loop.run_in_executor(executor, self._run_worker_step)
+                    await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
@@ -824,6 +845,17 @@ class MLLMScheduler:
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
+
+    def _run_worker_step(self) -> MLLMSchedulerOutput:
+        """Run one scheduler step inside the dedicated worker thread."""
+        _bind_worker_generation_streams()
+        return self.step()
+
+    def _close_batch_generator_in_worker(self) -> None:
+        """Close the batch generator inside the dedicated worker thread."""
+        _bind_worker_generation_streams()
+        if self.batch_generator is not None:
+            self.batch_generator.close()
 
     async def add_request_async(
         self,
