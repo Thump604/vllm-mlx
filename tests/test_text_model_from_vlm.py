@@ -5,9 +5,10 @@ import json
 import logging
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 
-from vllm_mlx.text_model_from_vlm import build_text_model
+from vllm_mlx.text_model_from_vlm import _load_mtp_weights, build_text_model
 
 # VLM+MTP model (created by merging mlx-community VLM + our MTP weights)
 VLM_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-VLM-MTP-8bit"
@@ -30,6 +31,28 @@ def test_build_text_model_none_vlm():
     """Returns None when vlm_model is None."""
     result = build_text_model(None, TEXT_MTP_MODEL)
     assert result is None
+
+
+def test_load_mtp_weights_fallback_sidecar(tmp_path):
+    """Fallback sidecar should load when the index has no mtp entries."""
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {}})
+    )
+    mtp_dir = tmp_path / "mtp"
+    mtp_dir.mkdir()
+    mtp_file = mtp_dir / "weights.safetensors"
+    mx.save_safetensors(
+        str(mtp_file),
+        {
+            "mtp.fc.weight": mx.zeros((2, 2)),
+            "language_model.mtp.norm.weight": mx.ones((2,)),
+            "lm_head.weight": mx.ones((1,)),
+        },
+    )
+
+    weights = dict(_load_mtp_weights(tmp_path))
+
+    assert set(weights) == {"mtp.fc.weight", "mtp.norm.weight"}
 
 
 @pytest.mark.skipif(

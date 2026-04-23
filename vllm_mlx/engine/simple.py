@@ -7,9 +7,12 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import importlib
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, is_mllm_model
@@ -39,6 +42,17 @@ def _has_media_content(messages: list) -> bool:
                 if isinstance(part, dict) and part.get("type") in _MEDIA_TYPES:
                     return True
     return False
+
+
+def _bind_worker_generation_streams() -> None:
+    """Rebind mlx generation streams inside the current worker thread."""
+    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "generation_stream"):
+            module.generation_stream = mx.new_stream(mx.default_device())
 
 
 class SimpleEngine(BaseEngine):
@@ -152,18 +166,16 @@ class SimpleEngine(BaseEngine):
         self._model.load()
         self._loaded = True
 
-        # Build parallel mlx_lm TextModel for text-only MTP routing
-        if self._is_mllm and self._mtp:
+        # Build parallel mlx_lm TextModel for text-only routing.
+        # Even when MTP is disabled, text-only requests should not be trapped
+        # on the slower mlx_vlm multimodal path.
+        if self._is_mllm:
             try:
                 from ..text_model_from_vlm import build_text_model
 
                 self._text_model = build_text_model(self._model.model, self._model_name)
 
-                if (
-                    self._text_model is not None
-                    and hasattr(self._text_model, "mtp")
-                    and self._text_model.mtp is not None
-                ):
+                if self._text_model is not None:
                     self._text_tokenizer = self._model.get_tokenizer()
 
                     # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
@@ -173,18 +185,18 @@ class SimpleEngine(BaseEngine):
                             self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                         )
 
+                    has_mtp = (
+                        hasattr(self._text_model, "mtp")
+                        and self._text_model.mtp is not None
+                    )
                     logger.info(
-                        "MLLM+MTP routing: text-only → mlx_lm TextModel (MTP=True), "
-                        "media → mlx_vlm"
+                        "MLLM text routing: text-only → mlx_lm TextModel (MTP=%s), "
+                        "media → mlx_vlm",
+                        has_mtp,
                     )
-                else:
-                    logger.warning(
-                        "TextModel built but no MTP — text-only requests won't use MTP"
-                    )
-                    self._text_model = None
 
             except Exception as e:
-                logger.error("MLLM+MTP routing setup failed: %s", e)
+                logger.error("MLLM text routing setup failed: %s", e)
                 self._text_model = None
                 self._text_tokenizer = None
 
@@ -233,8 +245,13 @@ class SimpleEngine(BaseEngine):
         finishes, or a follow-up request can enter MLX/Metal concurrently and
         corrupt the command-buffer state.
         """
+
+        def run_bound() -> Any:
+            _bind_worker_generation_streams()
+            return func(*args, **kwargs)
+
         async with self._generation_lock:
-            task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            task = asyncio.create_task(asyncio.to_thread(run_bound))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -453,11 +470,7 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # mlx-lm non-streaming chat with tools can stall indefinitely on some
-        # local models, while the streaming path completes normally. Reuse the
-        # streaming implementation and aggregate its final state so both chat
-        # APIs share the same tool-capable execution path.
-        if tools and not self._is_mllm:
+        async def aggregate_stream_chat() -> GenerationOutput:
             final_output = GenerationOutput(text="")
             async for output in self.stream_chat(
                 messages=messages,
@@ -478,6 +491,24 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
             )
+
+        # mlx-lm non-streaming chat with tools can stall indefinitely on some
+        # local models, while the streaming path completes normally. Reuse the
+        # streaming implementation and aggregate its final state so both chat
+        # APIs share the same tool-capable execution path.
+        if tools and not self._is_mllm:
+            return await aggregate_stream_chat()
+
+        # Text-only requests on MLLM models should use the TextModel route even
+        # for non-streaming chat. Aggregating the streaming path keeps one
+        # execution seam for text-only requests and avoids thread-local mlx_vlm
+        # stream assumptions inside to_thread().
+        if (
+            self._is_mllm
+            and self._text_model is not None
+            and not _has_media_content(messages)
+        ):
+            return await aggregate_stream_chat()
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -561,13 +592,16 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Per-request routing: text-only through mlx_lm with MTP
+        # Per-request routing: text-only through mlx_lm TextModel
         if (
             self._is_mllm
             and self._text_model is not None
             and not _has_media_content(messages)
         ):
-            logger.info("Text-only request → LLM path (MTP=True)")
+            has_mtp = (
+                hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
+            )
+            logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
@@ -848,9 +882,9 @@ class SimpleEngine(BaseEngine):
         tools: list | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
-        """Text-only generation via mlx_lm TextModel with MTP.
+        """Text-only generation via mlx_lm TextModel.
 
-        Used when MLLM+MTP routing is active and the request has no media.
+        Used when text-only MLLM routing is active and the request has no media.
         Runs the full generation in a single thread to maintain Metal safety.
 
         System prompt KV caching: on the first request, prefills system tokens
@@ -863,11 +897,17 @@ class SimpleEngine(BaseEngine):
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
         from mlx_lm.models.cache import make_prompt_cache
-        from mlx_lm.sample_utils import make_sampler
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
+        top_k = kwargs.pop("top_k", 0)
+        min_p = kwargs.pop("min_p", 0.0)
+        presence_penalty = kwargs.pop("presence_penalty", 0.0)
+        repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
+        stop = kwargs.pop("stop", None)
+        external_logits_processors = kwargs.pop("logits_processors", None)
 
         # Per-request enable_thinking override; fall back to env var / default True.
         enable_thinking = kwargs.pop("enable_thinking", None)
@@ -897,7 +937,20 @@ class SimpleEngine(BaseEngine):
             )
 
         # Build sampler
-        sampler = make_sampler(temp=temperature, top_p=top_p)
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        penalty_processors = make_logits_processors(
+            repetition_penalty=(
+                repetition_penalty if repetition_penalty != 1.0 else None
+            ),
+            presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
+        )
+        all_processors = (external_logits_processors or []) + (penalty_processors or [])
+        custom_logits_active = bool(all_processors)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -1051,6 +1104,16 @@ class SimpleEngine(BaseEngine):
             nonlocal backbone_cache, prompt_to_send
 
             model = self._text_model
+            use_mtp = (
+                self._mtp
+                and not custom_logits_active
+                and hasattr(model, "mtp")
+                and model.mtp is not None
+            )
+            if self._mtp and custom_logits_active:
+                logger.info(
+                    "Text route: disabling MTP for request-local logits processors"
+                )
 
             # Cache MISS with valid prefix: prefill system tokens and snapshot
             if (
@@ -1108,7 +1171,7 @@ class SimpleEngine(BaseEngine):
             prompt_cache = None
             if backbone_cache is not None:
                 # Add MTP cache on top of backbone
-                if hasattr(model, "make_mtp_cache"):
+                if use_mtp and hasattr(model, "make_mtp_cache"):
                     mtp_cache = model.make_mtp_cache()
                     prompt_cache = backbone_cache + mtp_cache
                 else:
@@ -1118,9 +1181,12 @@ class SimpleEngine(BaseEngine):
             gen_kwargs = dict(
                 max_tokens=max_tokens,
                 sampler=sampler,
-                mtp=True,
                 prefill_step_size=self._prefill_step_size,
             )
+            if all_processors:
+                gen_kwargs["logits_processors"] = all_processors
+            if use_mtp:
+                gen_kwargs["mtp"] = True
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
 
@@ -1243,7 +1309,15 @@ class SimpleEngine(BaseEngine):
             accumulated_text += new_text
 
             is_last = i == len(all_resps) - 1
-            finished = is_last or token_count >= max_tokens
+            stop_hit = False
+            if stop:
+                stop_hit = any(stop_seq in accumulated_text for stop_seq in stop)
+            finished = stop_hit or is_last or token_count >= max_tokens
+            finish_reason = getattr(resp, "finish_reason", None)
+            if stop_hit:
+                finish_reason = "stop"
+            elif finish_reason is None and finished:
+                finish_reason = "stop"
 
             yield GenerationOutput(
                 text=accumulated_text,
@@ -1251,8 +1325,7 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=full_token_count or 0,
                 completion_tokens=token_count,
                 finished=finished,
-                finish_reason=getattr(resp, "finish_reason", None)
-                or ("stop" if finished else None),
+                finish_reason=finish_reason,
             )
 
             if finished:

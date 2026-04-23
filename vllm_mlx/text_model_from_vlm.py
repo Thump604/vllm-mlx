@@ -367,6 +367,29 @@ def _load_mtp_weights(model_path: Path) -> list[tuple[str, mx.array]]:
             mtp_keys[key] = (clean, shard)
 
     if not mtp_keys:
+        for mtp_file in (
+            model_path / "mtp" / "weights.safetensors",
+            model_path / "model-mtp.safetensors",
+        ):
+            if not mtp_file.exists():
+                continue
+            raw = mx.load(str(mtp_file))
+            weights = []
+            for key, value in raw.items():
+                clean = (
+                    key.replace("language_model.", "", 1)
+                    if key.startswith("language_model.")
+                    else key
+                )
+                if clean.startswith("mtp."):
+                    weights.append((clean, value))
+            if weights:
+                logger.info(
+                    "_load_mtp_weights: loaded %d fallback tensors from %s",
+                    len(weights),
+                    mtp_file.relative_to(model_path),
+                )
+                return weights
         return []
 
     # Group by shard to minimize I/O
