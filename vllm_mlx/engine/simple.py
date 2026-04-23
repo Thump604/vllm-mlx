@@ -8,6 +8,7 @@ performance when serving a single user at a time.
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -108,6 +109,8 @@ def _sample_with_processors(
 
 def _processors_can_retire(processors: list[Any] | None) -> bool:
     """True when any processor advertises a retire-to-content transition."""
+    if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
+        return False
     return bool(processors) and any(
         isinstance(getattr(p, "is_retired", None), bool) for p in processors
     )
@@ -115,6 +118,8 @@ def _processors_can_retire(processors: list[Any] | None) -> bool:
 
 def _processors_retired(processors: list[Any] | None) -> bool:
     """True when any retire-capable processor has entered its retired state."""
+    if os.getenv("VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME") != "1":
+        return False
     return bool(processors) and any(
         getattr(p, "is_retired", False) is True for p in processors
     )
@@ -1037,7 +1042,6 @@ class SimpleEngine(BaseEngine):
         system prompt restore the snapshot and only prefill the suffix tokens.
         """
         import hashlib
-        import os
 
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
