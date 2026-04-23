@@ -1288,6 +1288,54 @@ class SimpleEngine(BaseEngine):
                 )
             kwargs["mtp"] = True
 
+        def _seed_from_last_response(prompt_cache, last_resp):
+            last_tok = getattr(last_resp, "token", None)
+            if last_tok is not None:
+                cache_module.trim_prompt_cache(prompt_cache, 1)
+                return mx.array([last_tok], dtype=mx.uint32)
+            return mx.array(
+                self._text_tokenizer.encode(getattr(last_resp, "text", "")),
+                dtype=mx.uint32,
+            )
+
+        def _resume_after_processor_retirement(
+            label: str,
+            model,
+            prompt_cache,
+            prompt,
+            remaining_tokens: int,
+        ) -> None:
+            resume_kwargs = dict(
+                max_tokens=remaining_tokens,
+                sampler=sampler,
+                prefill_step_size=self._prefill_step_size,
+                prompt_cache=prompt_cache,
+            )
+            if model.mtp is not None:
+                _apply_speculative_decode_kwargs(
+                    resume_kwargs,
+                    use_native_mtp=True,
+                    log_context=label,
+                )
+                if hasattr(model, "make_mtp_cache"):
+                    # Resume speculative decode from the retained backbone cache
+                    # with a fresh MTP cache so stale speculative state cannot
+                    # survive the processor-to-content handoff.
+                    resume_kwargs["prompt_cache"] = (
+                        prompt_cache + model.make_mtp_cache()
+                    )
+            for resp in _stream_with_speculation_stats(
+                label,
+                mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=prompt,
+                    **resume_kwargs,
+                ),
+                bool(resume_kwargs.get("mtp")),
+            ):
+                _emit_response(resp)
+
         # Run all Metal ops in a single serialized thread.
         def _run_all():
             nonlocal backbone_cache, prompt_to_send
@@ -1415,45 +1463,14 @@ class SimpleEngine(BaseEngine):
                         break
 
                 if retired and token_count < max_tokens and last_resp is not None:
-                    last_tok = getattr(last_resp, "token", None)
-                    if last_tok is not None:
-                        cache_module.trim_prompt_cache(shared_cache, 1)
-                        seed = mx.array([last_tok], dtype=mx.uint32)
-                    else:
-                        seed = mx.array(
-                            self._text_tokenizer.encode(getattr(last_resp, "text", "")),
-                            dtype=mx.uint32,
-                        )
-                    resume_kwargs = dict(
-                        max_tokens=max_tokens - token_count,
-                        sampler=sampler,
-                        prefill_step_size=self._prefill_step_size,
-                        prompt_cache=shared_cache,
-                    )
-                    if model.mtp is not None:
-                        _apply_speculative_decode_kwargs(
-                            resume_kwargs,
-                            use_native_mtp=True,
-                            log_context="Text route resume",
-                        )
-                        if hasattr(model, "make_mtp_cache"):
-                            # Start with a fresh MTP cache after trim+seed. The
-                            # earlier stream may have advanced speculative state
-                            # beyond the retained backbone cache window.
-                            resume_kwargs["prompt_cache"] = (
-                                shared_cache + model.make_mtp_cache()
-                            )
-                    for resp in _stream_with_speculation_stats(
+                    seed = _seed_from_last_response(shared_cache, last_resp)
+                    _resume_after_processor_retirement(
                         "Text route resume",
-                        mlx_stream_generate(
-                            model,
-                            self._text_tokenizer,
-                            prompt=seed,
-                            **resume_kwargs,
-                        ),
-                        bool(resume_kwargs.get("mtp")),
-                    ):
-                        _emit_response(resp)
+                        model,
+                        shared_cache,
+                        seed,
+                        max_tokens - token_count,
+                    )
             else:
                 for resp in _stream_with_speculation_stats(
                     "Text route",
@@ -1588,34 +1605,13 @@ class SimpleEngine(BaseEngine):
                         "resuming content phase with MTP=%s",
                         hasattr(model, "make_mtp_cache") and model.mtp is not None,
                     )
-                    resume_kwargs = dict(
-                        max_tokens=max_tokens - token_count,
-                        sampler=sampler,
-                        prefill_step_size=self._prefill_step_size,
-                        prompt_cache=bc,
-                    )
-                    if model.mtp is not None:
-                        _apply_speculative_decode_kwargs(
-                            resume_kwargs,
-                            use_native_mtp=True,
-                            log_context="SpecPrefill text route resume",
-                        )
-                        if hasattr(model, "make_mtp_cache"):
-                            # Resume speculative decode from the trimmed
-                            # backbone cache with a fresh MTP cache so no stale
-                            # speculative state survives the seed handoff.
-                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                    for resp in _stream_with_speculation_stats(
+                    _resume_after_processor_retirement(
                         "SpecPrefill text route resume",
-                        mlx_stream_generate(
-                            model,
-                            self._text_tokenizer,
-                            prompt=continuation_prompt,
-                            **resume_kwargs,
-                        ),
-                        bool(resume_kwargs.get("mtp")),
-                    ):
-                        _emit_response(resp)
+                        model,
+                        bc,
+                        continuation_prompt,
+                        max_tokens - token_count,
+                    )
                     return
 
                 last_resp = None
@@ -1656,43 +1652,14 @@ class SimpleEngine(BaseEngine):
                         break
 
                 if retired and token_count < max_tokens and last_resp is not None:
-                    last_tok = getattr(last_resp, "token", None)
-                    if last_tok is not None:
-                        cache_module.trim_prompt_cache(bc, 1)
-                        seed = mx.array([last_tok], dtype=mx.uint32)
-                    else:
-                        seed = mx.array(
-                            self._text_tokenizer.encode(getattr(last_resp, "text", "")),
-                            dtype=mx.uint32,
-                        )
-                    resume_kwargs = dict(
-                        max_tokens=max_tokens - token_count,
-                        sampler=sampler,
-                        prefill_step_size=self._prefill_step_size,
-                        prompt_cache=bc,
-                    )
-                    if model.mtp is not None:
-                        _apply_speculative_decode_kwargs(
-                            resume_kwargs,
-                            use_native_mtp=True,
-                            log_context="SpecPrefill text route resume",
-                        )
-                        if hasattr(model, "make_mtp_cache"):
-                            # Resume speculative decode from the trimmed
-                            # backbone cache with a fresh MTP cache so no stale
-                            # speculative state survives the seed handoff.
-                            resume_kwargs["prompt_cache"] = bc + model.make_mtp_cache()
-                    for resp in _stream_with_speculation_stats(
+                    seed = _seed_from_last_response(bc, last_resp)
+                    _resume_after_processor_retirement(
                         "SpecPrefill text route resume",
-                        mlx_stream_generate(
-                            model,
-                            self._text_tokenizer,
-                            prompt=seed,
-                            **resume_kwargs,
-                        ),
-                        bool(resume_kwargs.get("mtp")),
-                    ):
-                        _emit_response(resp)
+                        model,
+                        bc,
+                        seed,
+                        max_tokens - token_count,
+                    )
 
             finally:
                 cleanup_rope(model)
