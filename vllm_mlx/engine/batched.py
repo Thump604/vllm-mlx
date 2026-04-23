@@ -237,10 +237,12 @@ class BatchedEngine(BaseEngine):
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
+        prefill_step_size = getattr(self._scheduler_config, "prefill_step_size", 1024)
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
+            prefill_step_size=prefill_step_size,
             enable_vision_cache=True,
             vision_cache_size=100,
             cache_memory_mb=cache_memory_mb,
@@ -925,7 +927,8 @@ class BatchedEngine(BaseEngine):
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
-        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+        if self._mllm_scheduler:
+            self._mllm_scheduler._ensure_batch_generator()
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is not None:
                 return pc.load_from_disk(cache_dir)
