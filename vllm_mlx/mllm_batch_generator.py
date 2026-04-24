@@ -1100,6 +1100,7 @@ class MLLMBatchGenerator:
             MLLMBatch ready for generation
         """
         from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         tic = time.perf_counter()
 
@@ -1132,6 +1133,61 @@ class MLLMBatchGenerator:
         if not requests:
             # All requests failed
             return None
+
+        logits_processors_by_request: dict[str, Optional[List[Callable]]] = {}
+        samplers_by_request: dict[str, Optional[Callable]] = {}
+        for req in requests:
+            custom_lp = list(req.logits_processors) if req.logits_processors else []
+            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
+            need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            per_request_lp = list(custom_lp)
+            if need_rep or need_pres:
+                lp_kwargs = {}
+                if need_rep:
+                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
+                if need_pres:
+                    lp_kwargs["presence_penalty"] = req.presence_penalty
+                lp = make_logits_processors(**lp_kwargs)
+                if lp:
+                    per_request_lp.extend(lp)
+            if per_request_lp:
+                logits_processors_by_request[req.request_id] = per_request_lp
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"rep_penalty={req.repetition_penalty} "
+                    f"pres_penalty={req.presence_penalty} "
+                    f"extra_logits={len(custom_lp)}"
+                )
+            else:
+                logits_processors_by_request[req.request_id] = None
+
+            samplers_by_request[req.request_id] = make_sampler(
+                temp=req.temperature,
+                top_p=req.top_p,
+                top_k=req.top_k,
+                min_p=req.min_p,
+            )
+            logger.info(
+                f"[sampling] request={req.request_id[:12]} "
+                f"temp={req.temperature} top_p={req.top_p} "
+                f"top_k={req.top_k} min_p={req.min_p}"
+            )
+
+        def _sample_first_token(req: MLLMBatchRequest, logits: mx.array):
+            sample_logits = logits
+            processors = logits_processors_by_request.get(req.request_id)
+            if processors:
+                prefix = mx.array(req.output_tokens, dtype=mx.uint32)
+                for processor in processors:
+                    sample_logits = processor(prefix, sample_logits)
+
+            logprobs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
+            sampler = samplers_by_request.get(req.request_id) or self.sampler
+            sampled = sampler(logprobs)
+            mx.eval(sampled, logprobs)
+            return sampled, logprobs
 
         total_prompt_tokens = sum(
             req.input_ids.size if req.input_ids is not None else 1 for req in requests
@@ -1262,11 +1318,7 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
-                        mx.eval(sampled, logprobs)
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1298,11 +1350,7 @@ class MLLMBatchGenerator:
                             logits = logits.logits
 
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
-                        mx.eval(sampled, logprobs)
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1330,12 +1378,7 @@ class MLLMBatchGenerator:
 
                         # Extract last token logits and sample
                         last_logits = logits[:, -1, :]
-                        logprobs = last_logits - mx.logsumexp(
-                            last_logits, axis=-1, keepdims=True
-                        )
-                        sampled = self.sampler(logprobs)
-
-                        mx.eval(sampled, logprobs)
+                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -1424,56 +1467,12 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors (repetition_penalty, presence_penalty)
-        from mlx_lm.sample_utils import make_logits_processors, make_sampler
-
-        batch_logits_processors = []
-        has_any_lp = False
-        for req in requests:
-            custom_lp = list(req.logits_processors) if req.logits_processors else []
-            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
-            need_pres = req.presence_penalty and req.presence_penalty != 0.0
-            per_request_lp = list(custom_lp)
-            if need_rep or need_pres:
-                lp_kwargs = {}
-                if need_rep:
-                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
-                if need_pres:
-                    lp_kwargs["presence_penalty"] = req.presence_penalty
-                lp = make_logits_processors(**lp_kwargs)
-                if lp:
-                    per_request_lp.extend(lp)
-            if per_request_lp:
-                batch_logits_processors.append(per_request_lp)
-                has_any_lp = True
-                logger.info(
-                    f"[sampling] request={req.request_id[:12]} "
-                    f"rep_penalty={req.repetition_penalty} "
-                    f"pres_penalty={req.presence_penalty} "
-                    f"extra_logits={len(custom_lp)}"
-                )
-            else:
-                batch_logits_processors.append(None)
-
-        # Build per-request samplers for top_k/min_p
-        batch_samplers = []
-        has_any_sampler = False
-        for req in requests:
-            if req.top_k != 0 or req.min_p != 0.0:
-                s = make_sampler(
-                    temp=req.temperature,
-                    top_p=req.top_p,
-                    top_k=req.top_k,
-                    min_p=req.min_p,
-                )
-                batch_samplers.append(s)
-                has_any_sampler = True
-                logger.info(
-                    f"[sampling] request={req.request_id[:12]} "
-                    f"top_k={req.top_k} min_p={req.min_p}"
-                )
-            else:
-                batch_samplers.append(None)
+        batch_logits_processors = [
+            logits_processors_by_request.get(req.request_id) for req in requests
+        ]
+        has_any_lp = any(batch_logits_processors)
+        batch_samplers = [samplers_by_request.get(req.request_id) for req in requests]
+        has_any_sampler = any(batch_samplers)
 
         self._stats.prompt_time += time.perf_counter() - tic
 
@@ -1661,11 +1660,13 @@ class MLLMBatchGenerator:
             return error_responses
 
         y, logprobs = batch.y, batch.logprobs
-        output_tokens = (
-            [req.output_tokens for req in batch.requests]
-            if batch.logits_processors
-            else None
-        )
+        output_tokens = None
+        if batch.logits_processors:
+            y_list = y.tolist()
+            output_tokens = [
+                list(req.output_tokens) + [token]
+                for req, token in zip(batch.requests, y_list)
+            ]
         batch.y, batch.logprobs = self._step(
             y[:, None],
             batch.cache,
