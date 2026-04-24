@@ -729,6 +729,60 @@ class TestQwen3SpecificCases:
         assert "".join(content_parts) == "ACK_THINK_READY"
 
 
+class TestReasoningStrippedFromToolCallContent:
+    """
+    Verify that extract_reasoning strips reasoning markers from text that
+    already had tool call markup removed, matching the server tool-call path.
+    """
+
+    def test_gemma4_channel_tokens_stripped_after_tool_parse(self):
+        """Gemma 4 channel tokens should be stripped from post-tool-parse text."""
+        parser = get_parser("gemma4")()
+        post_tool_text = "<|channel>thought\nLet me find the weather.\n<channel|>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Let me find the weather."
+        assert content is None or content == ""
+
+    def test_gemma4_alternative_format_stripped_after_tool_parse(self):
+        """Alternative <|channel>response format should also be stripped."""
+        parser = get_parser("gemma4")()
+        post_tool_text = "<|channel>thought\nChecking parameters.\n<|channel>response\n"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Checking parameters."
+        assert content is None or content.strip() == ""
+
+    def test_gemma4_empty_input_after_tool_parse(self):
+        """Empty string after tool parsing should not crash."""
+        parser = get_parser("gemma4")()
+        reasoning, content = parser.extract_reasoning("")
+        assert reasoning is None
+        assert content == ""
+
+    def test_qwen3_think_tags_stripped_after_tool_parse(self):
+        """Qwen3 <think> tags should be stripped from post-tool-parse text."""
+        parser = get_parser("qwen3")()
+        post_tool_text = "<think>Let me call the function.</think>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Let me call the function."
+        assert content is None or content == ""
+
+    def test_deepseek_think_tags_stripped_after_tool_parse(self):
+        """DeepSeek-R1 <think> tags should be stripped from post-tool-parse text."""
+        parser = get_parser("deepseek_r1")()
+        post_tool_text = "<think>I need to call this API.</think>"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "I need to call this API."
+        assert content is None or content == ""
+
+    def test_gemma4_residual_text_preserved(self):
+        """Non-reasoning text after channel markers should be preserved as content."""
+        parser = get_parser("gemma4")()
+        post_tool_text = "<|channel>thought\nThinking...\n<channel|>Some residual text"
+        reasoning, content = parser.extract_reasoning(post_tool_text)
+        assert reasoning == "Thinking..."
+        assert content == "Some residual text"
+
+
 class TestGptOssParser:
     """Tests for the GPT-OSS reasoning parser (channel-based format)."""
 
