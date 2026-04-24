@@ -17,7 +17,9 @@ Architecture:
 """
 
 import logging
+import math
 import os
+import random
 import threading
 import time
 from contextlib import nullcontext
@@ -1894,6 +1896,59 @@ def install_mtp_mllm(
             return mx.concatenate(sampled, axis=0)
         return batch_gen.sampler(logprobs)
 
+    def _sampling_distribution_logprobs(
+        logprobs: mx.array,
+        requests: List[Any],
+    ) -> mx.array:
+        """Return normalized log-probs for each request's sampler policy."""
+        from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
+
+        rows = []
+        for e, req in enumerate(requests):
+            row = logprobs[e : e + 1]
+            temp = getattr(req, "temperature", 0.0)
+            top_p = getattr(req, "top_p", 1.0)
+            top_k = getattr(req, "top_k", 0)
+            min_p = getattr(req, "min_p", 0.0)
+
+            if top_p > 0 and top_p < 1.0:
+                row = apply_top_p(row, top_p)
+            if min_p != 0.0:
+                row = apply_min_p(row, min_p)
+            if top_k > 0:
+                row = apply_top_k(row, top_k)
+
+            if temp in (0, 0.0):
+                token = mx.argmax(row, axis=-1)
+                one_hot = mx.full(row.shape, -float("inf"))
+                one_hot = mx.put_along_axis(one_hot, token[:, None], 0.0, axis=-1)
+                rows.append(one_hot)
+            else:
+                scaled = row * (1.0 / temp)
+                rows.append(scaled - mx.logsumexp(scaled, axis=-1, keepdims=True))
+        return mx.concatenate(rows, axis=0)
+
+    def _sample_residual_distribution(
+        target_logprobs: mx.array,
+        draft_logprobs: mx.array,
+    ) -> int:
+        """Sample from max(target - draft, 0), falling back to target if empty."""
+        target_probs = mx.exp(target_logprobs)
+        draft_probs = mx.exp(draft_logprobs)
+        residual = mx.maximum(target_probs - draft_probs, 0.0)
+        mass = mx.sum(residual, keepdims=True)
+        residual_logprobs = mx.where(
+            residual > 0,
+            mx.log(residual) - mx.log(mass),
+            -float("inf"),
+        )
+        use_target = float(mass.item()) <= 1e-8
+        sampled = mx.random.categorical(
+            target_logprobs if use_target else residual_logprobs
+        )
+        mx.eval(sampled)
+        return int(sampled.item())
+
     def _mtp_step(
         input_tokens: mx.array,
         cache: List[Any],
@@ -1981,6 +2036,7 @@ def install_mtp_mllm(
         # MTP draft + always-advance verify
         try:
             draft_tokens_steps = []
+            draft_distribution_steps = []
             draft_prefix_steps: List[List[List[int]]] = []
             mtp_hidden = hidden_states[:, -1:, :]
             mtp_next_ids = primary_tokens[:, None]
@@ -2021,8 +2077,15 @@ def install_mtp_mllm(
                     draft_logits, axis=-1, keepdims=True
                 )
                 if sampled_mtp_enabled and has_non_greedy_sampling:
+                    draft_distribution_steps.append(
+                        _sampling_distribution_logprobs(
+                            draft_logprobs,
+                            active_requests,
+                        )
+                    )
                     draft_tokens = _sample_from_request(draft_logprobs, samplers)
                 else:
+                    draft_distribution_steps.append(None)
                     draft_tokens = _draft_sampler(draft_logprobs)
                 draft_tokens_steps.append(draft_tokens)
                 if draft_idx + 1 >= num_draft_tokens or mtp_hidden is None:
@@ -2057,6 +2120,7 @@ def install_mtp_mllm(
                 verify_hidden = None
 
             processed_verify_steps = []
+            verify_distribution_steps = []
             verify_preds = []
             for step_idx in range(draft_count):
                 step_logits = verify_logits[:, step_idx, :]
@@ -2071,10 +2135,15 @@ def install_mtp_mllm(
                     step_logprobs = step_logits - mx.logsumexp(
                         step_logits, axis=-1, keepdims=True
                     )
-                    verify_preds.append(
-                        _sample_from_request(step_logprobs, samplers)[:, None]
+                    verify_distribution_steps.append(
+                        _sampling_distribution_logprobs(
+                            step_logprobs,
+                            active_requests,
+                        )
                     )
+                    verify_preds.append(mx.argmax(step_logits, axis=-1)[:, None])
                 else:
+                    verify_distribution_steps.append(None)
                     verify_preds.append(mx.argmax(step_logits, axis=-1)[:, None])
 
             processed_verify_logits = mx.concatenate(processed_verify_steps, axis=1)
@@ -2082,10 +2151,72 @@ def install_mtp_mllm(
                 processed_verify_logits, axis=-1, keepdims=True
             )
             verify_pred = mx.concatenate(verify_preds, axis=1)
-            mx.eval(verify_pred, draft_token_matrix)
+            sampled_speculation = sampled_mtp_enabled and has_non_greedy_sampling
+            if sampled_speculation:
+                draft_distribution_lp = mx.concatenate(
+                    [step[:, None, :] for step in draft_distribution_steps], axis=1
+                )
+                verify_distribution_lp = mx.concatenate(
+                    [step[:, None, :] for step in verify_distribution_steps], axis=1
+                )
+                mx.eval(
+                    draft_token_matrix,
+                    draft_distribution_lp,
+                    verify_distribution_lp,
+                    verify_lp,
+                )
+            else:
+                draft_distribution_lp = None
+                verify_distribution_lp = None
+                mx.eval(verify_pred, draft_token_matrix)
             pred_list = verify_pred.tolist()
             draft_list = draft_token_matrix.tolist()
-            all_accepted = pred_list == draft_list
+            stochastic_suffix_by_uid: Dict[int, List[dict]] = {}
+            stochastic_all_accepted = False
+
+            if sampled_speculation:
+                stochastic_all_accepted = True
+                for e, uid in enumerate(current_uids):
+                    actual_infos: List[dict] = []
+                    for step in range(draft_count):
+                        draft_token = int(draft_list[e][step])
+                        target_lp = verify_distribution_lp[e, step]
+                        draft_lp = draft_distribution_lp[e, step]
+                        log_accept = float(
+                            (target_lp[draft_token] - draft_lp[draft_token]).item()
+                        )
+                        accept = (
+                            log_accept >= 0.0
+                            or math.log(random.random() or 1e-35) < log_accept
+                        )
+                        if accept:
+                            actual_infos.append(
+                                {
+                                    "token": draft_token,
+                                    "logprobs": verify_lp[e, step],
+                                }
+                            )
+                            continue
+
+                        stochastic_all_accepted = False
+                        residual_token = _sample_residual_distribution(
+                            target_lp,
+                            draft_lp,
+                        )
+                        actual_infos.append(
+                            {
+                                "token": residual_token,
+                                "logprobs": verify_lp[e, step],
+                            }
+                        )
+                        break
+                    stochastic_suffix_by_uid[uid] = actual_infos
+
+            all_accepted = (
+                stochastic_all_accepted
+                if sampled_speculation
+                else pred_list == draft_list
+            )
 
             if all_accepted and verify_hidden is not None:
                 # ACCEPT
@@ -2107,29 +2238,17 @@ def install_mtp_mllm(
 
             else:
                 # REJECT
-                sampled_reject = sampled_mtp_enabled and has_non_greedy_sampling
+                sampled_reject = sampled_speculation
                 deferred_tokens_by_uid: Dict[int, List[dict]] = {}
                 if sampled_reject:
-                    # Exact sampled verifier: independently sample target tokens
-                    # from verify logits. Accepted drafts equal those target
-                    # samples; on first mismatch, emit the target sample and
-                    # rerun the actual emitted suffix to keep cache state exact.
+                    # Proper stochastic speculative decoding for non-greedy
+                    # sampling: accept drafts with min(1, p/q); on rejection
+                    # emit a token from the residual max(p-q, 0). Rerun the
+                    # actual emitted suffix to keep cache state exact.
                     rerun_sequences = []
                     for e, uid in enumerate(current_uids):
-                        actual_suffix: List[int] = []
-                        actual_infos: List[dict] = []
-                        for step in range(draft_count):
-                            target_token = int(pred_list[e][step])
-                            draft_token = int(draft_list[e][step])
-                            actual_suffix.append(target_token)
-                            actual_infos.append(
-                                {
-                                    "token": target_token,
-                                    "logprobs": verify_lp[e, step],
-                                }
-                            )
-                            if target_token != draft_token:
-                                break
+                        actual_infos = stochastic_suffix_by_uid.get(uid, [])
+                        actual_suffix = [int(info["token"]) for info in actual_infos]
                         deferred_tokens_by_uid[uid] = actual_infos
                         rerun_sequences.append(
                             [int(primary_tokens[e].item())] + actual_suffix

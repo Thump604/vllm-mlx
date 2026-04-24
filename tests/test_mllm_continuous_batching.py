@@ -730,7 +730,7 @@ class TestMLLMBatchGeneratorRuntimeFixes:
                     request_id="req-7",
                     temperature=0.6,
                     top_p=0.95,
-                    top_k=20,
+                    top_k=0,
                     min_p=0.0,
                     output_tokens=[],
                 )
@@ -779,7 +779,6 @@ class TestMLLMBatchGeneratorRuntimeFixes:
             side_effect=[
                 mx.array([1], dtype=mx.uint32),  # primary from target logits
                 mx.array([2], dtype=mx.uint32),  # draft from proposal logits
-                mx.array([4], dtype=mx.uint32),  # target sample rejects draft
             ]
         )
         cache = TrimmableCache()
@@ -797,7 +796,7 @@ class TestMLLMBatchGeneratorRuntimeFixes:
 
         assert tokens.tolist() == [1]
         assert [r.token for r in responses] == [1, 4]
-        assert request_sampler.call_count == 3
+        assert request_sampler.call_count == 2
         assert language_model.mtp_inputs == [[[1]]]
         assert language_model.forward_inputs == [[[123]], [[1, 2]], [[1, 4]]]
         assert cache.trim_calls == [2]
