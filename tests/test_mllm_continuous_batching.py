@@ -961,6 +961,107 @@ class TestMLLMBatchGeneratorRuntimeFixes:
             [99, 1, 2],
         ]
 
+    def test_install_mtp_mllm_reject_trims_full_hybrid_verify_width(self):
+        from unittest.mock import MagicMock
+
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trim_calls.append(count)
+
+        class RecurrentCache:
+            def __init__(self):
+                self.state = [mx.array([1]), mx.array([2])]
+
+            def is_trimmable(self):
+                return False
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = MagicMock()
+                self._next = MagicMock(return_value=[])
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.uids = [7]
+                self.active_batch.requests = [
+                    MagicMock(
+                        request_id="req-7",
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        min_p=0.0,
+                        output_tokens=[],
+                    )
+                ]
+                self.active_batch.num_tokens = [0]
+                self.active_batch.max_tokens = [16]
+                self.stop_tokens = set()
+                self.sampler = lambda logprobs: mx.array([1], dtype=mx.uint32)
+
+        class FakeLanguageModel:
+            def __init__(self):
+                self.forward_inputs = []
+                self.mtp_calls = 0
+
+            def make_mtp_cache(self):
+                return [object()]
+
+            def mtp_forward(
+                self,
+                hidden_states,
+                next_token_ids,
+                mtp_cache=None,
+                return_hidden=False,
+            ):
+                self.mtp_calls += 1
+                logits = mx.full((1, 1, 6), -1000.0)
+                logits[:, :, 2 if self.mtp_calls == 1 else 3] = 0.0
+                if return_hidden:
+                    return logits, mx.zeros((1, 1, 4))
+                return logits
+
+            def __call__(self, tokens, cache=None, return_hidden=False):
+                self.forward_inputs.append(tokens.tolist())
+                if len(self.forward_inputs) == 1:
+                    logits = mx.full((1, 1, 6), -1000.0)
+                    logits[:, 0, 1] = 0.0
+                    return logits, mx.zeros((1, 1, 4))
+                if tokens.tolist() == [[1, 2, 3]]:
+                    logits = mx.full((1, 3, 6), -1000.0)
+                    logits[:, 0, 4] = 0.0
+                    logits[:, 1, 5] = 0.0
+                    logits[:, 2, 5] = 0.0
+                    return logits, mx.zeros((1, 3, 4))
+                logits = mx.full((1, 1, 6), -1000.0)
+                logits[:, 0, 1] = 0.0
+                return logits, mx.zeros((1, 1, 4))
+
+        batch_gen = FakeBatchGen()
+        language_model = FakeLanguageModel()
+        kv_cache = TrimmableCache()
+        recurrent_cache = RecurrentCache()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=2)
+
+        tokens, _ = batch_gen._step(
+            mx.array([[123]], dtype=mx.uint32),
+            cache=[kv_cache, recurrent_cache],
+            logits_processors=None,
+            output_tokens=[[]],
+            samplers=[None],
+        )
+
+        assert tokens.tolist() == [1]
+        assert kv_cache.trim_calls == [3]
+        assert language_model.forward_inputs == [[[123]], [[1, 2, 3]], [[1]]]
+
     def test_next_keeps_retired_processors_by_default(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatch,

@@ -2091,14 +2091,17 @@ def install_mtp_mllm(
             else:
                 # REJECT
                 if _rnn_snapshots:
-                    # Hybrid model: undo entire verify, re-advance with primary
+                    # Hybrid model: undo the entire verify pass and re-advance
+                    # with primary. The verify input is [primary, draft...], so
+                    # attention caches must drop primary plus every draft token.
+                    verify_width = draft_count + 1
                     for c in cache:
                         if (
                             hasattr(c, "is_trimmable")
                             and c.is_trimmable()
                             and hasattr(c, "trim")
                         ):
-                            c.trim(2)
+                            c.trim(verify_width)
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     rerun_out = language_model(
