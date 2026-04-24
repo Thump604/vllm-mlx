@@ -1881,6 +1881,19 @@ def install_mtp_mllm(
     # MTP stats
     _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
 
+    def _sample_from_request(
+        logprobs: mx.array,
+        samplers: Optional[List[Optional[Callable]]],
+    ) -> mx.array:
+        """Sample one token per request using request-local samplers."""
+        if samplers and any(samplers):
+            sampled = []
+            for e in range(logprobs.shape[0]):
+                sampler = samplers[e] if samplers[e] else batch_gen.sampler
+                sampled.append(sampler(logprobs[e : e + 1]))
+            return mx.concatenate(sampled, axis=0)
+        return batch_gen.sampler(logprobs)
+
     def _mtp_step(
         input_tokens: mx.array,
         cache: List[Any],
@@ -1907,19 +1920,18 @@ def install_mtp_mllm(
             or getattr(req, "min_p", 0.0) != 0.0
             for req in active_requests
         )
+        sampled_mtp_enabled = os.getenv("VLLM_MLX_ENABLE_SAMPLED_MLLM_MTP") == "1"
 
         # Prefill guard: skip MTP for multi-token input or when no active batch.
         # Also skip MTP when batch has multiple active requests (MTP overhead
-        # hurts aggregate throughput in concurrent scenarios). The current
-        # MTP-MLLM verifier samples drafts greedily via `_draft_sampler` and
-        # accepts them against argmax verify logits. That is correctness-safe
-        # only for greedy decoding. Non-greedy requests need a sampler-aware
-        # verifier before batched MTP can preserve the exact output contract.
+        # hurts aggregate throughput in concurrent scenarios). Non-greedy MTP
+        # stays opt-in until the writing qualification matrix proves the
+        # sampled verifier is a throughput and quality win on real workloads.
         if (
             input_tokens.shape[1] > 1
             or batch_gen.active_batch is None
             or len(batch_gen.active_batch) > 1
-            or has_non_greedy_sampling
+            or (has_non_greedy_sampling and not sampled_mtp_enabled)
             or (
                 logits_processors is not None
                 and any(logits_processors)
@@ -1962,14 +1974,7 @@ def install_mtp_mllm(
 
         # Sample primary (use per-request sampler if available)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if samplers and any(samplers):
-            sampled_list = []
-            for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else batch_gen.sampler
-                sampled_list.append(s(logprobs[e : e + 1]))
-            primary_tokens = mx.concatenate(sampled_list, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
+        primary_tokens = _sample_from_request(logprobs, samplers)
 
         current_uids = list(batch_gen.active_batch.uids)
 
@@ -2015,7 +2020,10 @@ def install_mtp_mllm(
                 draft_logprobs = draft_logits - mx.logsumexp(
                     draft_logits, axis=-1, keepdims=True
                 )
-                draft_tokens = _draft_sampler(draft_logprobs)
+                if sampled_mtp_enabled and has_non_greedy_sampling:
+                    draft_tokens = _sample_from_request(draft_logprobs, samplers)
+                else:
+                    draft_tokens = _draft_sampler(draft_logprobs)
                 draft_tokens_steps.append(draft_tokens)
                 if draft_idx + 1 >= num_draft_tokens or mtp_hidden is None:
                     break
@@ -2059,9 +2067,20 @@ def install_mtp_mllm(
                         draft_prefix_steps[step_idx],
                     )
                 processed_verify_steps.append(step_logits[:, None, :])
-                verify_preds.append(mx.argmax(step_logits, axis=-1)[:, None])
+                if sampled_mtp_enabled and has_non_greedy_sampling:
+                    step_logprobs = step_logits - mx.logsumexp(
+                        step_logits, axis=-1, keepdims=True
+                    )
+                    verify_preds.append(
+                        _sample_from_request(step_logprobs, samplers)[:, None]
+                    )
+                else:
+                    verify_preds.append(mx.argmax(step_logits, axis=-1)[:, None])
 
             processed_verify_logits = mx.concatenate(processed_verify_steps, axis=1)
+            verify_lp = processed_verify_logits - mx.logsumexp(
+                processed_verify_logits, axis=-1, keepdims=True
+            )
             verify_pred = mx.concatenate(verify_preds, axis=1)
             mx.eval(verify_pred, draft_token_matrix)
             pred_list = verify_pred.tolist()
@@ -2075,9 +2094,6 @@ def install_mtp_mllm(
                     "hidden": verify_hidden[:, -1:, :],
                 }
                 mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
-                verify_lp = processed_verify_logits - mx.logsumexp(
-                    processed_verify_logits, axis=-1, keepdims=True
-                )
                 for e in range(batch_size):
                     uid = current_uids[e]
                     _deferred_drafts[uid] = [
@@ -2091,7 +2107,68 @@ def install_mtp_mllm(
 
             else:
                 # REJECT
-                if _rnn_snapshots:
+                sampled_reject = sampled_mtp_enabled and has_non_greedy_sampling
+                deferred_tokens_by_uid: Dict[int, List[dict]] = {}
+                if sampled_reject:
+                    # Exact sampled verifier: independently sample target tokens
+                    # from verify logits. Accepted drafts equal those target
+                    # samples; on first mismatch, emit the target sample and
+                    # rerun the actual emitted suffix to keep cache state exact.
+                    rerun_sequences = []
+                    for e, uid in enumerate(current_uids):
+                        actual_suffix: List[int] = []
+                        actual_infos: List[dict] = []
+                        for step in range(draft_count):
+                            target_token = int(pred_list[e][step])
+                            draft_token = int(draft_list[e][step])
+                            actual_suffix.append(target_token)
+                            actual_infos.append(
+                                {
+                                    "token": target_token,
+                                    "logprobs": verify_lp[e, step],
+                                }
+                            )
+                            if target_token != draft_token:
+                                break
+                        deferred_tokens_by_uid[uid] = actual_infos
+                        rerun_sequences.append(
+                            [int(primary_tokens[e].item())] + actual_suffix
+                        )
+
+                    verify_width = draft_count + 1
+                    for c in cache:
+                        if (
+                            hasattr(c, "is_trimmable")
+                            and c.is_trimmable()
+                            and hasattr(c, "trim")
+                        ):
+                            c.trim(verify_width)
+                    for _ci, _snap in _rnn_snapshots.items():
+                        cache[_ci].state = _snap
+
+                    rerun_input = mx.array(rerun_sequences, dtype=input_tokens.dtype)
+                    rerun_out = language_model(
+                        rerun_input,
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                    if isinstance(rerun_out, tuple):
+                        rerun_logits, rerun_hidden = rerun_out
+                    else:
+                        rerun_logits = rerun_out
+                        rerun_hidden = None
+                    if rerun_hidden is not None:
+                        _skip_state[0] = {
+                            "logits": rerun_logits[:, -1, :],
+                            "hidden": rerun_hidden[:, -1:, :],
+                        }
+                        mx.async_eval(
+                            _skip_state[0]["logits"],
+                            _skip_state[0]["hidden"],
+                        )
+                    else:
+                        _skip_state[0] = None
+                elif _rnn_snapshots:
                     # Hybrid model: undo the entire verify pass and re-advance
                     # with primary. The verify input is [primary, draft...], so
                     # attention caches must drop primary plus every draft token.
@@ -2127,7 +2204,8 @@ def install_mtp_mllm(
                     else:
                         _skip_state[0] = None
                 else:
-                    # Pure attention model: trim all speculative draft tokens.
+                    # Pure attention model: preserve the already-advanced
+                    # primary token and trim only speculative drafts.
                     for c in cache:
                         if (
                             hasattr(c, "is_trimmable")
@@ -2146,8 +2224,12 @@ def install_mtp_mllm(
                         )
                     else:
                         _skip_state[0] = None
+
                 for uid in current_uids:
-                    _deferred_drafts.pop(uid, None)
+                    if sampled_reject:
+                        _deferred_drafts[uid] = deferred_tokens_by_uid.get(uid, [])
+                    else:
+                        _deferred_drafts.pop(uid, None)
                 _mtp_stats["rejected"] += 1
 
         except Exception as e:

@@ -523,9 +523,7 @@ class TestMLLMBatchGeneratorRuntimeFixes:
             "exit",
         ]
 
-    def test_process_prompts_applies_request_sampling_to_first_token(
-        self, monkeypatch
-    ):
+    def test_process_prompts_applies_request_sampling_to_first_token(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,
             MLLMBatchRequest,
@@ -557,7 +555,9 @@ class TestMLLMBatchGeneratorRuntimeFixes:
             "mlx_lm.models.cache.make_prompt_cache", lambda model: [FakeCache()]
         )
         monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", fake_make_sampler)
-        monkeypatch.setattr("mlx_lm.sample_utils.make_logits_processors", lambda **_: [])
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_: []
+        )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator._stats = MLLMBatchStats()
@@ -596,9 +596,7 @@ class TestMLLMBatchGeneratorRuntimeFixes:
         assert processor.calls == [[]]
         assert request_sampler.call_count == 1
         fallback_sampler.assert_not_called()
-        assert sampler_calls == [
-            {"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}
-        ]
+        assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
 
     def test_install_mtp_mllm_disables_mtp_when_logits_processors_active(self):
         from unittest.mock import MagicMock
@@ -693,6 +691,116 @@ class TestMLLMBatchGeneratorRuntimeFixes:
         original_step.assert_called_once()
         language_model.assert_not_called()
         language_model.mtp_forward.assert_not_called()
+
+    def test_install_mtp_mllm_sampled_non_greedy_reruns_target_on_reject(
+        self, monkeypatch
+    ):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm
+
+        monkeypatch.setenv("VLLM_MLX_ENABLE_SAMPLED_MLLM_MTP", "1")
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trim_calls.append(count)
+
+        class FakeBatchGen:
+            def __init__(self):
+                self._step = MagicMock()
+                self._next = MagicMock(
+                    return_value=[
+                        MLLMBatchResponse(
+                            uid=7,
+                            request_id="req-7",
+                            token=1,
+                            logprobs=mx.array([0.0] * 6),
+                            finish_reason=None,
+                        )
+                    ]
+                )
+                self.active_batch = MagicMock()
+                self.active_batch.__len__.return_value = 1
+                self.active_batch.uids = [7]
+                request = MagicMock(
+                    request_id="req-7",
+                    temperature=0.6,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                    output_tokens=[],
+                )
+                self.active_batch.requests = [request]
+                self.active_batch.num_tokens = [0]
+                self.active_batch.max_tokens = [16]
+                self.stop_tokens = set()
+                self.sampler = MagicMock()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        class FakeLanguageModel:
+            def __init__(self):
+                self.forward_inputs = []
+                self.mtp_inputs = []
+
+            def make_mtp_cache(self):
+                return [object()]
+
+            def mtp_forward(
+                self,
+                hidden_states,
+                next_token_ids,
+                mtp_cache=None,
+                return_hidden=False,
+            ):
+                self.mtp_inputs.append(next_token_ids.tolist())
+                logits = mx.full((1, 1, 6), -1000.0)
+                logits[:, :, 2] = 0.0
+                if return_hidden:
+                    return logits, mx.zeros((1, 1, 4))
+                return logits
+
+            def __call__(self, tokens, cache=None, return_hidden=False):
+                self.forward_inputs.append(tokens.tolist())
+                if len(self.forward_inputs) == 1:
+                    logits = mx.full((1, 1, 6), -1000.0)
+                    logits[:, 0, 1] = 0.0
+                    return logits, mx.zeros((1, 1, 4))
+                logits = mx.full((1, tokens.shape[1], 6), -1000.0)
+                logits[:, :, 4] = 0.0
+                return logits, mx.zeros((1, tokens.shape[1], 4))
+
+        batch_gen = FakeBatchGen()
+        language_model = FakeLanguageModel()
+        request_sampler = MagicMock(
+            side_effect=[
+                mx.array([1], dtype=mx.uint32),  # primary from target logits
+                mx.array([2], dtype=mx.uint32),  # draft from proposal logits
+                mx.array([4], dtype=mx.uint32),  # target sample rejects draft
+            ]
+        )
+        cache = TrimmableCache()
+
+        install_mtp_mllm(batch_gen, language_model, num_draft_tokens=1)
+
+        tokens, _ = batch_gen._step(
+            mx.array([[123]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=[[]],
+            samplers=[request_sampler],
+        )
+        responses = batch_gen._next()
+
+        assert tokens.tolist() == [1]
+        assert [r.token for r in responses] == [1, 4]
+        assert request_sampler.call_count == 3
+        assert language_model.mtp_inputs == [[[1]]]
+        assert language_model.forward_inputs == [[[123]], [[1, 2]], [[1, 4]]]
+        assert cache.trim_calls == [2]
 
     def test_install_mtp_mllm_chains_multiple_draft_tokens(self):
         from unittest.mock import MagicMock
