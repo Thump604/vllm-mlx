@@ -924,7 +924,8 @@ async def status():
         },
         "cache": stats.get("memory_aware_cache")
         or stats.get("paged_cache")
-        or stats.get("prefix_cache"),
+        or stats.get("prefix_cache")
+        or stats.get("system_kv_cache"),
         "requests": stats.get("requests", []),
     }
 
@@ -2128,6 +2129,7 @@ async def create_anthropic_message(
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
 
     _maybe_attach_thinking_budget_processor(engine, openai_request, chat_kwargs)
+    chat_kwargs.setdefault("request_id", msg_id)
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -2706,6 +2708,7 @@ async def stream_chat_completion(
             tool_parser.reset()
 
     # Stream content
+    kwargs.setdefault("request_id", response_id)
     async for output in engine.stream_chat(messages=messages, **kwargs):
         delta_text = output.new_text
         last_output = output

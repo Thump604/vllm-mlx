@@ -82,3 +82,41 @@ def test_clear_cache_clears_engine_managed_runtime_caches(monkeypatch):
             sys.modules["mlx_vlm.utils"] = original_module
         else:
             sys.modules.pop("mlx_vlm.utils", None)
+
+
+def test_status_includes_system_kv_cache(monkeypatch):
+    import vllm_mlx.server as server
+
+    class DummyEngine:
+        is_mllm = False
+
+        def get_stats(self):
+            return {
+                "running": False,
+                "system_kv_cache": {
+                    "tokens": 350,
+                    "hash": "abc123",
+                    "memory_mb": 21.0,
+                },
+            }
+
+    original_engine = server._engine
+    original_model_name = server._model_name
+    original_api_key = server._api_key
+    try:
+        server._engine = DummyEngine()
+        server._model_name = "dummy-model"
+        server._api_key = None
+        client = TestClient(server.app)
+
+        response = client.get("/v1/status")
+        assert response.status_code == 200
+        assert response.json()["cache"] == {
+            "tokens": 350,
+            "hash": "abc123",
+            "memory_mb": 21.0,
+        }
+    finally:
+        server._engine = original_engine
+        server._model_name = original_model_name
+        server._api_key = original_api_key

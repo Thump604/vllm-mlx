@@ -274,12 +274,59 @@ class TestSimpleEngineConcurrency:
             engine._system_kv_hash = "abc123"
 
             stats = engine.get_stats()
+            cache_stats = engine.get_cache_stats()
 
         assert stats["system_kv_cache"] == {
             "tokens": 350,
             "hash": "abc123",
             "memory_mb": 21.0,
         }
+        assert cache_stats == {"system_kv_cache": stats["system_kv_cache"]}
+
+    def test_clear_runtime_caches_clears_system_kv_snapshot(self):
+        """Benchmark cache resets must clear SimpleEngine's system KV snapshot."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._system_kv_snapshot = [("k", "v")]
+            engine._system_kv_token_count = 350
+            engine._system_kv_hash = "abc123"
+
+            cleared = engine.clear_runtime_caches()
+            stats = engine.get_stats()
+
+        assert cleared == {"system_kv_cache": True}
+        assert "system_kv_cache" not in stats
+        assert engine._system_kv_snapshot is None
+        assert engine._system_kv_token_count == 0
+        assert engine._system_kv_hash is None
+
+    async def test_active_request_status_and_abort(self):
+        """SimpleEngine exposes and cancels active streaming requests by id."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            abort_event = threading.Event()
+            engine._active_requests["req-1"] = {
+                "request_id": "req-1",
+                "status": "running",
+                "completion_tokens": 7,
+            }
+            engine._abort_events["req-1"] = abort_event
+
+            stats = engine.get_stats()
+            aborted = await engine.abort_request("req-1")
+            missing = await engine.abort_request("missing")
+
+        assert stats["running"] is True
+        assert stats["num_running"] == 1
+        assert stats["requests"][0]["request_id"] == "req-1"
+        assert aborted is True
+        assert abort_event.is_set()
+        assert engine._active_requests["req-1"]["status"] == "cancelling"
+        assert missing is False
 
     def test_seed_logits_processors_prepends_prompt_tokens(self):
         """Continuation decode processors must see the original prompt prefix."""

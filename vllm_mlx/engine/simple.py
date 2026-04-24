@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -252,6 +253,8 @@ class SimpleEngine(BaseEngine):
         self._system_kv_snapshot = None  # List of (keys, values) per backbone layer
         self._system_kv_hash = None  # Hash of system prefix text
         self._system_kv_token_count = 0  # Tokens in cached prefix
+        self._active_requests: dict[str, dict[str, Any]] = {}
+        self._abort_events: dict[str, threading.Event] = {}
 
     @property
     def model_name(self) -> str:
@@ -1061,6 +1064,7 @@ class SimpleEngine(BaseEngine):
         stop = kwargs.pop("stop", None)
         external_logits_processors = kwargs.pop("logits_processors", None)
         abort_event = threading.Event()
+        request_id = str(kwargs.pop("request_id", "") or f"simple-{id(abort_event):x}")
 
         # Per-request enable_thinking override; fall back to env var / default True.
         enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1251,6 +1255,17 @@ class SimpleEngine(BaseEngine):
                 _SPECPREFILL_MAX_TOKENS,
             )
             use_specprefill = False
+
+        started_at = time.time()
+        self._active_requests[request_id] = {
+            "request_id": request_id,
+            "status": "running",
+            "kind": "stream_chat",
+            "prompt_tokens": full_token_count or 0,
+            "completion_tokens": 0,
+            "elapsed_s": 0.0,
+        }
+        self._abort_events[request_id] = abort_event
 
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -1725,6 +1740,13 @@ class SimpleEngine(BaseEngine):
                 token_count += 1
                 new_text = resp.text if hasattr(resp, "text") else str(resp)
                 accumulated_text += new_text
+                if request_id in self._active_requests:
+                    self._active_requests[request_id].update(
+                        {
+                            "completion_tokens": token_count,
+                            "elapsed_s": round(time.time() - started_at, 1),
+                        }
+                    )
 
                 stop_hit = False
                 if stop:
@@ -1753,6 +1775,8 @@ class SimpleEngine(BaseEngine):
             if not producer_task.done():
                 abort_event.set()
             await producer_task
+            self._active_requests.pop(request_id, None)
+            self._abort_events.pop(request_id, None)
 
         if not finished:
             yield GenerationOutput(
@@ -1771,6 +1795,10 @@ class SimpleEngine(BaseEngine):
             "model_name": self._model_name,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
+            "running": bool(self._active_requests),
+            "num_running": len(self._active_requests),
+            "num_waiting": 0,
+            "requests": list(self._active_requests.values()),
         }
 
         # SpecPrefill stats
@@ -1784,15 +1812,9 @@ class SimpleEngine(BaseEngine):
             }
 
         # System KV cache stats
-        if self._system_kv_snapshot is not None:
-            cache_bytes = 0
-            for entry in self._system_kv_snapshot:
-                cache_bytes += _cache_snapshot_nbytes(entry)
-            stats["system_kv_cache"] = {
-                "tokens": self._system_kv_token_count,
-                "hash": self._system_kv_hash,
-                "memory_mb": round(cache_bytes / 1e6, 1),
-            }
+        system_kv_cache = self._system_kv_cache_stats()
+        if system_kv_cache is not None:
+            stats["system_kv_cache"] = system_kv_cache
 
         # Include Metal memory stats
         try:
@@ -1808,14 +1830,48 @@ class SimpleEngine(BaseEngine):
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        """Get cache statistics (for MLLM models)."""
+        """Get cache statistics for externally visible cache controls."""
+        stats: dict[str, Any] = {}
         if self._is_mllm and self._model is not None:
-            return self._model.get_cache_stats()
-        return None
+            model_stats = self._model.get_cache_stats()
+            if model_stats:
+                stats.update(model_stats)
+        system_kv_cache = self._system_kv_cache_stats()
+        if system_kv_cache is not None:
+            stats["system_kv_cache"] = system_kv_cache
+        return stats or None
+
+    def _system_kv_cache_stats(self) -> dict[str, Any] | None:
+        """Return system KV snapshot stats if the SimpleEngine prefix cache is active."""
+        if self._system_kv_snapshot is None:
+            return None
+        cache_bytes = 0
+        for entry in self._system_kv_snapshot:
+            cache_bytes += _cache_snapshot_nbytes(entry)
+        return {
+            "tokens": self._system_kv_token_count,
+            "hash": self._system_kv_hash,
+            "memory_mb": round(cache_bytes / 1e6, 1),
+        }
 
     def clear_runtime_caches(self) -> dict[str, Any] | None:
         """Clear engine-managed runtime caches."""
+        had_system_kv = self._system_kv_snapshot is not None
+        self._system_kv_snapshot = None
+        self._system_kv_hash = None
+        self._system_kv_token_count = 0
+        cleared = {"system_kv_cache": had_system_kv}
         if self._is_mllm and self._model is not None:
             self._model.clear_cache()
-            return {"model_cache": True}
-        return None
+            cleared["model_cache"] = True
+        return cleared
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort the active SimpleEngine request when its id is known."""
+        abort_event = self._abort_events.get(request_id)
+        if abort_event is None:
+            return False
+        abort_event.set()
+        if request_id in self._active_requests:
+            self._active_requests[request_id]["status"] = "cancelling"
+        return True
