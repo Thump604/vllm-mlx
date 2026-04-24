@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible API server."""
 
+import asyncio
 import json
 import platform
 import sys
@@ -928,6 +929,38 @@ class TestRequestTimeoutField:
             model="test-model", prompt="Once upon a time", timeout=120.0
         )
         assert request_with_timeout.timeout == 120.0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_guard_enforces_stream_timeout(self):
+        """Streaming timeout must cancel generators that keep heartbeating forever."""
+        from vllm_mlx.server import _disconnect_guard
+
+        closed = asyncio.Event()
+
+        class FakeRequest:
+            async def is_disconnected(self):
+                return False
+
+        async def slow_generator():
+            try:
+                while True:
+                    await asyncio.sleep(10)
+                    yield "data: never\n\n"
+            finally:
+                closed.set()
+
+        chunks = []
+        async for chunk in _disconnect_guard(
+            slow_generator(),
+            FakeRequest(),
+            poll_interval=0.01,
+            heartbeat_interval=1.0,
+            timeout=0.05,
+        ):
+            chunks.append(chunk)
+
+        assert chunks == []
+        assert closed.is_set()
 
 
 class TestAPIKeyVerification:
