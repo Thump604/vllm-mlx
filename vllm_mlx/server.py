@@ -381,6 +381,21 @@ _tool_parser_instance = None  # Instantiated parser
 _TOOL_MARKUP_PATTERN = re.compile(r"</?tool_call>|</?tool_call_reasoning>")
 
 
+def _streaming_tool_markup_possible(text: str) -> bool:
+    """Return true once streaming text may contain supported tool markup."""
+    markers = (
+        "<tool_call",
+        "<function=",
+        "[Calling tool:",
+        "[TOOL_CALLS]",
+        "<minimax:tool_call>",
+        '<invoke name="',
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return re.search(r"\[[A-Za-z_]\w*\(", text) is not None
+
+
 def _load_prefix_cache_from_disk() -> None:
     """Load prefix cache from disk during startup."""
     try:
@@ -2410,7 +2425,9 @@ async def _stream_anthropic_messages(
 
             # Filter tool call markup during streaming
             if tool_parser and content_to_emit:
-                if not tool_markup_possible and "<" not in content_to_emit:
+                if not tool_markup_possible and not _streaming_tool_markup_possible(
+                    tool_accumulated_text + content_to_emit
+                ):
                     tool_accumulated_text += content_to_emit
                 else:
                     if not tool_markup_possible:
@@ -2453,7 +2470,9 @@ async def _stream_anthropic_messages(
 
             # Filter tool call markup during streaming
             if tool_parser and content_to_emit:
-                if not tool_markup_possible and "<" not in content_to_emit:
+                if not tool_markup_possible and not _streaming_tool_markup_possible(
+                    tool_accumulated_text + content_to_emit
+                ):
                     tool_accumulated_text += content_to_emit
                 else:
                     if not tool_markup_possible:
@@ -2628,7 +2647,7 @@ async def stream_chat_completion(
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
-    tool_markup_possible = False  # Fast path: skip parsing until '<' seen
+    tool_markup_possible = False
     tool_choice = getattr(request, "tool_choice", None)
     if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
@@ -2688,7 +2707,9 @@ async def stream_chat_completion(
 
             # Tool call parsing on content portion
             if tool_parser and content:
-                if not tool_markup_possible and "<" not in content:
+                if not tool_markup_possible and not _streaming_tool_markup_possible(
+                    tool_accumulated_text + content
+                ):
                     tool_accumulated_text += content
                     # Suppress whitespace-only content when tools are active;
                     # avoids emitting stray newlines before tool call XML.
@@ -2798,10 +2819,10 @@ async def stream_chat_completion(
 
             # Tool call streaming parsing
             if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
+                # Fast path: skip parsing until supported tool markup appears.
+                if not tool_markup_possible and not _streaming_tool_markup_possible(
+                    tool_accumulated_text + delta_text
+                ):
                     tool_accumulated_text += delta_text
                     # No tool markup yet, fall through to normal chunk emission
                 else:

@@ -1006,6 +1006,84 @@ class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
     @pytest.mark.asyncio
+    async def test_qwen_parser_streams_split_bracket_tool_calls(self, monkeypatch):
+        """Qwen bracket calls should not leak when ')' and ']' split chunks."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                chunks = [
+                    GenerationOutput(
+                        text="",
+                        new_text='[Calling tool: add({"a": 1, "b": 2})',
+                        finished=False,
+                    ),
+                    GenerationOutput(
+                        text="",
+                        new_text="]",
+                        finished=True,
+                        finish_reason="stop",
+                        prompt_tokens=4,
+                        completion_tokens=2,
+                    ),
+                ]
+                for chunk in chunks:
+                    yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "qwen3")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="request-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        leaked_content = [
+            payload["choices"][0]["delta"].get("content")
+            for payload in payloads
+            if payload["choices"]
+        ]
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert not any(
+            content and "[Calling tool:" in content for content in leaked_content
+        )
+        assert len(tool_payloads) == 1
+        delta = tool_payloads[0]["choices"][0]["delta"]
+        assert delta["tool_calls"][0]["function"]["name"] == "add"
+        assert delta["tool_calls"][0]["function"]["arguments"] == '{"a": 1, "b": 2}'
+        assert delta["content"] is None
+        assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
     async def test_reasoning_stream_emits_structured_tool_calls(self, monkeypatch):
         """Tool markup after </think> should emit tool_calls chunks."""
         from vllm_mlx.engine.base import GenerationOutput
