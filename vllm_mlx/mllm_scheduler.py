@@ -78,6 +78,8 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
+    max_kv_size: int = 0
 
 
 @dataclass
@@ -308,6 +310,7 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
+                max_kv_size=self.config.max_kv_size,
             )
 
             # Install MTP if enabled and language model supports it

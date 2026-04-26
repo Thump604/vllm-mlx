@@ -394,6 +394,7 @@ class MLLMBatchGenerator:
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
+        max_kv_size: int = 0,
     ):
         """
         Initialize MLLM batch generator.
@@ -411,10 +412,12 @@ class MLLMBatchGenerator:
             enable_vision_cache: Enable vision embedding caching
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
+            max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
         """
         self.model = model
         self.processor = processor
         self.mm_processor = mm_processor
+        self.max_kv_size = max_kv_size
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
@@ -1402,7 +1405,10 @@ class MLLMBatchGenerator:
 
                 else:
                     # Cache miss — full forward pass
-                    request_cache = make_prompt_cache(self.language_model)
+                    request_cache = make_prompt_cache(
+                        self.language_model,
+                        max_kv_size=self.max_kv_size or None,
+                    )
 
                     with mx.stream(MLLMBatchGenerator._stream):
                         # Text-only: chunked prefill with real progress tracking
