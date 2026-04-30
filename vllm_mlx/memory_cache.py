@@ -213,6 +213,8 @@ class CacheStats:
 
     hits: int = 0
     misses: int = 0
+    misses_short_prefix: int = 0
+    misses_short_lcp: int = 0
     evictions: int = 0
     tokens_saved: int = 0
     current_memory_bytes: int = 0
@@ -234,6 +236,8 @@ class CacheStats:
         return {
             "hits": self.hits,
             "misses": self.misses,
+            "misses_short_prefix": self.misses_short_prefix,
+            "misses_short_lcp": self.misses_short_lcp,
             "hit_rate": round(self.hit_rate, 4),
             "evictions": self.evictions,
             "tokens_saved": self.tokens_saved,
@@ -718,6 +722,7 @@ class MemoryAwarePrefixCache:
             return None, tokens
         if len(tokens) < self._config.min_prefix_tokens:
             self._stats.misses += 1
+            self._stats.misses_short_prefix += 1
             self._last_match_type = "miss_short_prefix"
             return None, tokens
 
@@ -879,6 +884,7 @@ class MemoryAwarePrefixCache:
                     self._config.min_prefix_tokens,
                 )
                 self._stats.misses += 1
+                self._stats.misses_short_lcp += 1
                 self._last_match_type = "miss_short_lcp"
                 return None, tokens
             excess = len(best_lcp_entry.tokens) - best_lcp_length

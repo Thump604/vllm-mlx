@@ -75,6 +75,9 @@ class SchedulerConfig:
     cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
+    # Prefix cache floor
+    min_prefix_tokens: int = 128
+
     # KV cache quantization (reduces prefix cache memory)
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -1186,6 +1189,7 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    min_prefix_tokens=self.config.min_prefix_tokens,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,

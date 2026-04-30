@@ -78,6 +78,8 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    # Minimum prefix length eligible for cache reuse
+    min_prefix_tokens: int = 128
 
 
 @dataclass
@@ -295,6 +297,7 @@ class MLLMScheduler:
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
+                    min_prefix_tokens=self.config.min_prefix_tokens,
                 )
 
             self.batch_generator = MLLMBatchGenerator(

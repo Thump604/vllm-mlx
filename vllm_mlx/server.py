@@ -1455,6 +1455,12 @@ def _prepare_responses_request(
         "max_tokens": chat_request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(chat_request.temperature),
         "top_p": _resolve_top_p(chat_request.top_p),
+        "top_k": _resolve_top_k(chat_request.top_k),
+        "min_p": _resolve_min_p(chat_request.min_p),
+        "presence_penalty": _resolve_presence_penalty(chat_request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(
+            chat_request.repetition_penalty
+        ),
     }
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)

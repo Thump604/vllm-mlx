@@ -297,7 +297,29 @@ class TestMemoryAwarePrefixCache:
         result, remaining = cache.fetch(short_tokens)
         assert result is None
         assert remaining == short_tokens
-        assert cache.get_stats()["misses"] == 1
+        stats = cache.get_stats()
+        assert stats["misses"] == 1
+        assert stats["misses_short_prefix"] == 1
+
+    def test_lcp_match_below_floor_is_rejected(self, model, mock_kv_cache):
+        cache = MemoryAwarePrefixCache(
+            model,
+            MemoryCacheConfig(
+                max_memory_mb=10,
+                max_entries=10,
+                min_prefix_tokens=8,
+            ),
+        )
+        long_tokens = list(range(1, 21))
+        kv = mock_kv_cache(1000)
+        cache.store(long_tokens, kv)
+
+        query = list(range(1, 6)) + list(range(100, 120))
+        result, remaining = cache.fetch(query)
+        assert result is None
+        assert remaining == query
+        stats = cache.get_stats()
+        assert stats["misses_short_lcp"] == 1
 
     def test_fetch_prefix_match(self, small_cache, mock_kv_cache):
         # Store shorter sequence
@@ -454,6 +476,38 @@ class TestMemoryAwarePrefixCache:
             cache.store([i], mock_kv_cache(100))
 
         assert len(cache) <= 3
+
+    def test_load_from_disk_skips_short_entries(self, model, tmp_path):
+        import array
+        import json
+
+        cache = MemoryAwarePrefixCache(
+            model,
+            MemoryCacheConfig(
+                max_memory_mb=10,
+                max_entries=10,
+                min_prefix_tokens=64,
+            ),
+        )
+
+        short_tokens = list(range(1, 11))
+        arr = array.array("i", short_tokens)
+        tokens_path = tmp_path / "entry_0_tokens.bin"
+        with open(tokens_path, "wb") as f:
+            arr.tofile(f)
+        safetensors_path = tmp_path / "entry_0.safetensors"
+        safetensors_path.write_bytes(b"")
+
+        index = {
+            "version": 2,
+            "model_fingerprint": cache._model_fingerprint,
+            "entries": [{"index": 0, "num_tokens": len(short_tokens)}],
+        }
+        (tmp_path / "index.json").write_text(json.dumps(index))
+
+        loaded = cache.load_from_disk(str(tmp_path))
+        assert loaded == 0
+        assert len(cache) == 0
 
 
 class TestGetAvailableMemory:

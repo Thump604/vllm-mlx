@@ -210,6 +210,7 @@ def serve_command(args):
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
+            min_prefix_tokens=args.prefix_cache_min_tokens,
             # Memory-aware cache options
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
@@ -253,7 +254,10 @@ def serve_command(args):
                 if args.cache_memory_mb
                 else f"{args.cache_memory_percent*100:.0f}% of RAM"
             )
-            print(f"Memory-aware cache: {cache_info}")
+            print(
+                f"Memory-aware cache: {cache_info}, "
+                f"min_prefix_tokens={args.prefix_cache_min_tokens}"
+            )
             if args.kv_cache_quantization:
                 print(
                     f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
@@ -343,6 +347,7 @@ def bench_command(args):
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
+            min_prefix_tokens=args.prefix_cache_min_tokens,
             # Memory-aware cache options
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
@@ -829,6 +834,12 @@ Examples:
         default=100,
         help="Max entries in prefix cache (default: 100, legacy mode only)",
     )
+    serve_parser.add_argument(
+        "--prefix-cache-min-tokens",
+        type=int,
+        default=128,
+        help="Minimum prefix length eligible for cache reuse (default: 128)",
+    )
     # Memory-aware cache options (recommended for large models)
     serve_parser.add_argument(
         "--cache-memory-mb",
@@ -1241,6 +1252,12 @@ Examples:
         type=int,
         default=100,
         help="Max entries in prefix cache (default: 100, legacy mode only)",
+    )
+    bench_parser.add_argument(
+        "--prefix-cache-min-tokens",
+        type=int,
+        default=128,
+        help="Minimum prefix length eligible for cache reuse (default: 128)",
     )
     # Memory-aware cache options (recommended for large models)
     bench_parser.add_argument(
