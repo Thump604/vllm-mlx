@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -33,6 +34,31 @@ logger = logging.getLogger(__name__)
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
     bind_generation_streams()
+
+
+def _plain_generation_response(resp: Any) -> SimpleNamespace:
+    """Copy a generation response into plain Python fields.
+
+    mlx-lm response objects can retain MLX-owned state. The text route moves
+    responses from a generation worker thread back to the asyncio event loop, so
+    the cross-thread payload must be detached from MLX objects before it leaves
+    the worker.
+    """
+    token = getattr(resp, "token", None)
+    if token is not None:
+        try:
+            if hasattr(token, "item"):
+                token = token.item()
+            token = int(token)
+        except (TypeError, ValueError):
+            pass
+    text = getattr(resp, "text", None)
+    return SimpleNamespace(
+        text=str(resp) if text is None else text,
+        token=token,
+        finish_reason=getattr(resp, "finish_reason", None),
+        prompt_tokens=getattr(resp, "prompt_tokens", 0),
+    )
 
 
 def _seed_logits_processors(
@@ -183,6 +209,7 @@ class SimpleEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_owner_thread: int | None = None
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
@@ -318,6 +345,7 @@ class SimpleEngine(BaseEngine):
                     )
 
                     if self._text_model is not None:
+                        self._text_model_owner_thread = threading.get_ident()
                         self._text_tokenizer = self._model.get_tokenizer()
 
                         # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
@@ -339,11 +367,13 @@ class SimpleEngine(BaseEngine):
                     else:
                         self._text_model = None
                         self._text_tokenizer = None
+                        self._text_model_owner_thread = None
 
                 except Exception as e:
                     logger.error("MLLM text routing setup failed: %s", e)
                     self._text_model = None
                     self._text_tokenizer = None
+                    self._text_model_owner_thread = None
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -416,6 +446,7 @@ class SimpleEngine(BaseEngine):
         self._model = None
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_owner_thread = None
         self._draft_model = None
         self._dflash_backend = None
         self._loaded = False
@@ -1162,7 +1193,10 @@ class SimpleEngine(BaseEngine):
             def _emit_response(resp: Any) -> None:
                 if abort_event.is_set():
                     return
-                loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+                loop.call_soon_threadsafe(
+                    response_queue.put_nowait,
+                    ("resp", _plain_generation_response(resp)),
+                )
 
             def _emit_done() -> None:
                 loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
@@ -1598,6 +1632,7 @@ class SimpleEngine(BaseEngine):
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
         max_tokens = max_tokens or 4096
+        run_on_owner_thread = self._text_model_owner_thread == threading.get_ident()
 
         if self._speculative_method == "dflash":
             dflash_blockers = []
@@ -1641,9 +1676,13 @@ class SimpleEngine(BaseEngine):
                         )
                     )
 
-                all_resps = await self._run_blocking_serialized(
-                    _run_dflash, on_cancel=abort_event.set
-                )
+                if run_on_owner_thread:
+                    async with self._generation_lock:
+                        all_resps = _run_dflash()
+                else:
+                    all_resps = await self._run_blocking_serialized(
+                        _run_dflash, on_cancel=abort_event.set
+                    )
 
                 accumulated_text = ""
                 completion_tokens = 0
@@ -1849,13 +1888,93 @@ class SimpleEngine(BaseEngine):
             )
             use_specprefill = False
 
+        if run_on_owner_thread and not use_specprefill and backbone_cache is None:
+            prompt_tokens = (
+                full_token_count
+                if full_token_count
+                else len(self._text_tokenizer.encode(full_prompt))
+            )
+            gen_kwargs = dict(
+                max_tokens=max_tokens,
+                sampler=sampler,
+                prefill_step_size=self._prefill_step_size,
+            )
+            if all_processors:
+                gen_kwargs["logits_processors"] = all_processors
+            use_mtp = (
+                self._mtp
+                and not custom_logits_active
+                and hasattr(self._text_model, "mtp")
+                and self._text_model.mtp is not None
+            )
+            if use_mtp:
+                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+            elif self._mtp and custom_logits_active:
+                logger.info(
+                    "Text route: disabling MTP for request-local logits processors"
+                )
+
+            accumulated_text = ""
+            token_count = 0
+            finished = False
+            async with self._generation_lock:
+                for resp in mlx_stream_generate(
+                    self._text_model,
+                    self._text_tokenizer,
+                    prompt=full_prompt,
+                    **gen_kwargs,
+                ):
+                    token_count += 1
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    accumulated_text += new_text
+
+                    stop_hit = False
+                    if stop:
+                        stop_hit = any(
+                            stop_seq in accumulated_text for stop_seq in stop
+                        )
+                    finished = stop_hit or token_count >= max_tokens
+                    finish_reason = getattr(resp, "finish_reason", None)
+                    if stop_hit:
+                        finish_reason = "stop"
+                    elif finish_reason is None and finished:
+                        finish_reason = "stop"
+                    elif finish_reason is not None:
+                        finished = True
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=token_count,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+
+                    if finished:
+                        break
+
+            if not finished:
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text="",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=token_count,
+                    finished=True,
+                    finish_reason="length",
+                )
+            return
+
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
         def _emit_response(resp: Any) -> None:
             if abort_event.is_set():
                 return
-            loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+            loop.call_soon_threadsafe(
+                response_queue.put_nowait,
+                ("resp", _plain_generation_response(resp)),
+            )
 
         def _emit_done() -> None:
             loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
