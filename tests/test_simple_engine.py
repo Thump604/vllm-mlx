@@ -1611,6 +1611,154 @@ class TestSimpleEngineConcurrency:
         assert captured_kwargs["num_draft_tokens"] == 4
 
     @pytest.mark.anyio
+    async def test_stream_generate_text_routes_to_dflash_when_configured(self):
+        """DFlash is explicit, default-off, and bypasses native MTP routing."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeDFlashBackend:
+            def __init__(self):
+                self.calls = []
+
+            def stream_generate(self, *, target_model, tokenizer, prompt, **kwargs):
+                self.calls.append(
+                    {
+                        "target_model": target_model,
+                        "tokenizer": tokenizer,
+                        "prompt": prompt,
+                        "kwargs": kwargs,
+                    }
+                )
+                yield SimpleNamespace(
+                    text="Hello",
+                    tokens=[101, 102],
+                    accepted=1,
+                    prompt_tokens=3,
+                    generation_tokens=2,
+                    finish_reason="stop",
+                )
+
+            def snapshot_stats(self):
+                return {
+                    "draft_tokens": 2,
+                    "accepted_tokens": 1,
+                    "rejected_tokens": 1,
+                    "acceptance_rate": 0.5,
+                }
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode.return_value = [1, 2, 3]
+
+        backend = FakeDFlashBackend()
+        text_model = MagicMock()
+        text_model.mtp = MagicMock()
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mtp=True,
+            mtp_num_draft_tokens=4,
+            speculative_method="dflash",
+            dflash_draft_model="z-lab/Qwen3.6-35B-A3B-DFlash",
+        )
+        engine._loaded = True
+        engine._text_model = text_model
+        engine._text_tokenizer = tokenizer
+        engine._dflash_backend = backend
+
+        with patch("mlx_lm.stream_generate") as normal_stream:
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.6,
+                    top_p=0.95,
+                    top_k=20,
+                    min_p=0.0,
+                )
+            ]
+
+        assert [chunk.new_text for chunk in outputs] == ["Hello"]
+        assert outputs[-1].completion_tokens == 2
+        assert outputs[-1].finish_reason == "stop"
+        assert backend.calls[0]["target_model"] is text_model
+        assert backend.calls[0]["tokenizer"] is tokenizer
+        assert backend.calls[0]["prompt"] == "<|im_start|>user\nhello"
+        assert backend.calls[0]["kwargs"]["max_tokens"] == 16
+        assert backend.calls[0]["kwargs"]["temperature"] == 0.6
+        assert backend.calls[0]["kwargs"]["top_p"] == 0.95
+        assert backend.calls[0]["kwargs"]["top_k"] == 20
+        assert backend.calls[0]["kwargs"]["min_p"] == 0.0
+        normal_stream.assert_not_called()
+
+        stats = engine.get_stats()
+        assert stats["dflash"]["enabled"] is True
+        assert stats["dflash"]["draft_model"] == "z-lab/Qwen3.6-35B-A3B-DFlash"
+        assert stats["dflash"]["draft_tokens"] == 2
+        assert stats["dflash"]["accepted_tokens"] == 1
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_disables_dflash_for_stop_sequences(self):
+        """Per-request stop controls fall back to the normal safe path."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_kwargs = {}
+
+        class FakeDFlashBackend:
+            def stream_generate(self, **_kwargs):
+                raise AssertionError("DFlash should be disabled for stop controls")
+
+            def snapshot_stats(self):
+                return {
+                    "draft_tokens": 0,
+                    "accepted_tokens": 0,
+                    "rejected_tokens": 0,
+                    "acceptance_rate": None,
+                }
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            speculative_method="dflash",
+            dflash_draft_model="z-lab/Qwen3.6-35B-A3B-DFlash",
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_tokenizer = tokenizer
+        engine._dflash_backend = FakeDFlashBackend()
+
+        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                    temperature=0.0,
+                    top_p=1.0,
+                    stop=["END"],
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_kwargs["max_tokens"] == 16
+
+    @pytest.mark.anyio
     async def test_stream_generate_text_reenables_mtp_after_retired_processor_when_enabled(
         self,
     ):

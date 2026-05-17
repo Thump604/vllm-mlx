@@ -116,6 +116,10 @@ class RegistryServeDefaults:
     specprefill_threshold: int
     specprefill_keep_pct: float
     specprefill_draft_model: str | None
+    speculative_method: str | None
+    dflash_draft_model: str | None
+    dflash_block_size: int | None
+    dflash_draft_sliding_window_size: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
@@ -155,6 +159,10 @@ class RegisteredModel:
     specprefill_threshold: int | None = None
     specprefill_keep_pct: float | None = None
     specprefill_draft_model: str | None = None
+    speculative_method: str | None = None
+    dflash_draft_model: str | None = None
+    dflash_block_size: int | None = None
+    dflash_draft_sliding_window_size: int | None = None
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
     estimated_memory_bytes: int | None = None
@@ -174,6 +182,10 @@ class ResolvedModelConfig:
     specprefill_threshold: int
     specprefill_keep_pct: float
     specprefill_draft_model: str | None
+    speculative_method: str | None
+    dflash_draft_model: str | None
+    dflash_block_size: int | None
+    dflash_draft_sliding_window_size: int | None
     stream_interval: int
     gpu_memory_utilization: float
     scheduler_config: SchedulerConfig | None
@@ -349,6 +361,12 @@ def load_registry_config(
             specprefill_threshold=item.get("specprefill_threshold"),
             specprefill_keep_pct=item.get("specprefill_keep_pct"),
             specprefill_draft_model=item.get("specprefill_draft_model"),
+            speculative_method=item.get("speculative_method"),
+            dflash_draft_model=item.get("dflash_draft_model"),
+            dflash_block_size=item.get("dflash_block_size"),
+            dflash_draft_sliding_window_size=item.get(
+                "dflash_draft_sliding_window_size"
+            ),
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=item.get("gpu_memory_utilization"),
             estimated_memory_bytes=estimated_bytes,
@@ -798,6 +816,10 @@ class ModelManager:
                 specprefill_threshold=config.specprefill_threshold,
                 specprefill_keep_pct=config.specprefill_keep_pct,
                 specprefill_draft_model=config.specprefill_draft_model,
+                speculative_method=config.speculative_method,
+                dflash_draft_model=config.dflash_draft_model,
+                dflash_block_size=config.dflash_block_size,
+                dflash_draft_sliding_window_size=config.dflash_draft_sliding_window_size,
             )
 
         await engine.start()
@@ -896,6 +918,26 @@ class ModelManager:
             if entry.specprefill_draft_model is not None
             else self._defaults.specprefill_draft_model
         )
+        speculative_method = (
+            entry.speculative_method
+            if entry.speculative_method is not None
+            else self._defaults.speculative_method
+        )
+        dflash_draft_model = (
+            entry.dflash_draft_model
+            if entry.dflash_draft_model is not None
+            else self._defaults.dflash_draft_model
+        )
+        dflash_block_size = (
+            entry.dflash_block_size
+            if entry.dflash_block_size is not None
+            else self._defaults.dflash_block_size
+        )
+        dflash_draft_sliding_window_size = (
+            entry.dflash_draft_sliding_window_size
+            if entry.dflash_draft_sliding_window_size is not None
+            else self._defaults.dflash_draft_sliding_window_size
+        )
         stream_interval = (
             entry.stream_interval
             if entry.stream_interval is not None
@@ -919,6 +961,10 @@ class ModelManager:
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            speculative_method=speculative_method,
+            dflash_draft_model=dflash_draft_model,
+            dflash_block_size=dflash_block_size,
+            dflash_draft_sliding_window_size=dflash_draft_sliding_window_size,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
             scheduler_config=scheduler_config,

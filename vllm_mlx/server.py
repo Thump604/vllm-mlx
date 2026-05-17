@@ -1089,6 +1089,10 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_threshold=spec.specprefill_threshold,
         specprefill_keep_pct=spec.specprefill_keep_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
+        speculative_method=spec.speculative_method,
+        dflash_draft_model=spec.dflash_draft_model,
+        dflash_block_size=spec.dflash_block_size,
+        dflash_draft_sliding_window_size=spec.dflash_draft_sliding_window_size,
         max_kv_size=max_kv_size,
     )
 
@@ -2843,6 +2847,10 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    speculative_method: str | None = None,
+    dflash_draft_model: str | None = None,
+    dflash_block_size: int | None = None,
+    dflash_draft_sliding_window_size: int | None = None,
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
@@ -2865,6 +2873,10 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        speculative_method: Explicit speculative backend ("dflash" or None)
+        dflash_draft_model: Qwen 35B DFlash draft model id or local path
+        dflash_block_size: Optional DFlash block-size override
+        dflash_draft_sliding_window_size: Reserved for SWA DFlash drafts
         auto_unload_idle_seconds: Idle time before auto-unloading the main model.
             When non-zero, the main model is managed through lifecycle
             residency instead of being loaded immediately in this function.
@@ -2948,6 +2960,10 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            speculative_method=speculative_method,
+            dflash_draft_model=dflash_draft_model,
+            dflash_block_size=dflash_block_size,
+            dflash_draft_sliding_window_size=dflash_draft_sliding_window_size,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -2999,6 +3015,10 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            speculative_method=speculative_method,
+            dflash_draft_model=dflash_draft_model,
+            dflash_block_size=dflash_block_size,
+            dflash_draft_sliding_window_size=dflash_draft_sliding_window_size,
             max_kv_size=_max_kv,
         )
         # Start SimpleEngine synchronously (no background loop)
@@ -6251,6 +6271,10 @@ def main():
         max_request_tokens=args.max_request_tokens,
         force_mllm=args.mllm,
         trust_remote_code=args.trust_remote_code,
+        speculative_method=args.speculative_method,
+        dflash_draft_model=args.dflash_draft_model,
+        dflash_block_size=args.dflash_block_size,
+        dflash_draft_sliding_window_size=args.dflash_draft_sliding_window_size,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6315,6 +6339,30 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users",
+    )
+    parser.add_argument(
+        "--speculative-method",
+        choices=["dflash"],
+        default=None,
+        help="Explicit speculative backend to enable (default: disabled).",
+    )
+    parser.add_argument(
+        "--dflash-draft-model",
+        type=str,
+        default=None,
+        help="DFlash draft model id or local path for the selected target.",
+    )
+    parser.add_argument(
+        "--dflash-block-size",
+        type=int,
+        default=None,
+        help="Optional DFlash block size. Qwen 35B requires 16.",
+    )
+    parser.add_argument(
+        "--dflash-draft-sliding-window-size",
+        type=int,
+        default=None,
+        help="Reserved for future SWA DFlash drafts; unsupported by Qwen 35B.",
     )
     parser.add_argument(
         "--mcp-config",

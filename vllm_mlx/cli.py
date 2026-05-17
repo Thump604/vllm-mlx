@@ -298,6 +298,12 @@ def serve_command(args):
                 f"threshold={args.specprefill_threshold}, "
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
+        if getattr(args, "speculative_method", None) == "dflash":
+            print(
+                "DFlash: enabled "
+                f"(draft={getattr(args, 'dflash_draft_model', None)}, "
+                f"block_size={getattr(args, 'dflash_block_size', None)})"
+            )
 
     if args.models_config:
         defaults = RegistryServeDefaults(
@@ -309,6 +315,12 @@ def serve_command(args):
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            speculative_method=getattr(args, "speculative_method", None),
+            dflash_draft_model=getattr(args, "dflash_draft_model", None),
+            dflash_block_size=getattr(args, "dflash_block_size", None),
+            dflash_draft_sliding_window_size=getattr(
+                args, "dflash_draft_sliding_window_size", None
+            ),
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             gpu_memory_utilization=args.gpu_memory_utilization,
             scheduler_config=scheduler_config,
@@ -335,6 +347,12 @@ def serve_command(args):
             specprefill_threshold=args.specprefill_threshold,
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            speculative_method=getattr(args, "speculative_method", None),
+            dflash_draft_model=getattr(args, "dflash_draft_model", None),
+            dflash_block_size=getattr(args, "dflash_block_size", None),
+            dflash_draft_sliding_window_size=getattr(
+                args, "dflash_draft_sliding_window_size", None
+            ),
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1203,6 +1221,30 @@ Examples:
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    serve_parser.add_argument(
+        "--speculative-method",
+        choices=["dflash"],
+        default=None,
+        help="Explicit speculative backend to enable (default: disabled).",
+    )
+    serve_parser.add_argument(
+        "--dflash-draft-model",
+        type=str,
+        default=None,
+        help="DFlash draft model id or local path for the selected target.",
+    )
+    serve_parser.add_argument(
+        "--dflash-block-size",
+        type=int,
+        default=None,
+        help="Optional DFlash block size. Qwen 35B requires 16.",
+    )
+    serve_parser.add_argument(
+        "--dflash-draft-sliding-window-size",
+        type=int,
+        default=None,
+        help="Reserved for future SWA DFlash drafts; unsupported by Qwen 35B.",
     )
     # MCP options
     serve_parser.add_argument(

@@ -75,6 +75,10 @@ def _defaults() -> RegistryServeDefaults:
         specprefill_threshold=8192,
         specprefill_keep_pct=0.3,
         specprefill_draft_model=None,
+        speculative_method=None,
+        dflash_draft_model=None,
+        dflash_block_size=None,
+        dflash_draft_sliding_window_size=None,
         stream_interval=1,
         gpu_memory_utilization=0.9,
         scheduler_config=None,
@@ -257,5 +261,46 @@ def test_non_local_registry_entry_requires_explicit_memory_estimate():
 
         with pytest.raises(ValueError, match="estimated_memory_gb"):
             await manager.acquire("remote")
+
+    asyncio.run(_run())
+
+
+def test_registry_resolves_dflash_config_from_entry(tmp_path):
+    async def _run():
+        source = tmp_path / "qwen35"
+        source.mkdir()
+        registry = {
+            "qwen35-dflash": RegisteredModel(
+                name="qwen35-dflash",
+                source=str(source),
+                force_mllm=True,
+                speculative_method="dflash",
+                dflash_draft_model="z-lab/Qwen3.6-35B-A3B-DFlash",
+                dflash_block_size=16,
+                estimated_memory_bytes=4 * 1024**3,
+            )
+        }
+        created: list[FakeEngine] = []
+
+        def engine_factory(config: ResolvedModelConfig) -> FakeEngine:
+            engine = FakeEngine(config)
+            created.append(engine)
+            return engine
+
+        manager = ModelManager(
+            _manager_config(budget_gb=8),
+            registry,
+            _defaults(),
+            engine_factory=engine_factory,
+        )
+
+        lease = await manager.acquire("qwen35-dflash")
+        await lease.release()
+
+        config = created[0]._config
+        assert config.speculative_method == "dflash"
+        assert config.dflash_draft_model == "z-lab/Qwen3.6-35B-A3B-DFlash"
+        assert config.dflash_block_size == 16
+        assert config.dflash_draft_sliding_window_size is None
 
     asyncio.run(_run())

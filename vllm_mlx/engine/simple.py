@@ -125,6 +125,10 @@ class SimpleEngine(BaseEngine):
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
+        speculative_method: str | None = None,
+        dflash_draft_model: str | None = None,
+        dflash_block_size: int | None = None,
+        dflash_draft_sliding_window_size: int | None = None,
         max_kv_size: int = 0,
     ):
         """
@@ -142,6 +146,10 @@ class SimpleEngine(BaseEngine):
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
             specprefill_draft_model: Path to small draft model for importance scoring
+            speculative_method: Explicit speculative backend ("dflash" or None)
+            dflash_draft_model: Qwen 35B DFlash draft model id or local path
+            dflash_block_size: Optional DFlash block-size override
+            dflash_draft_sliding_window_size: Reserved for SWA DFlash drafts
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
         """
         self._model_name = model_name
@@ -158,6 +166,13 @@ class SimpleEngine(BaseEngine):
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+        method = (speculative_method or "none").lower()
+        if method not in {"none", "dflash"}:
+            raise ValueError(f"Unsupported speculative_method: {speculative_method}")
+        self._speculative_method = None if method == "none" else method
+        self._dflash_draft_model_path = dflash_draft_model
+        self._dflash_block_size = dflash_block_size
+        self._dflash_draft_sliding_window_size = dflash_draft_sliding_window_size
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -171,6 +186,7 @@ class SimpleEngine(BaseEngine):
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
+        self._dflash_backend = None
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
@@ -347,6 +363,26 @@ class SimpleEngine(BaseEngine):
                     logger.error("SpecPrefill: draft model load failed: %s", e)
                     self._draft_model = None
 
+            if self._speculative_method == "dflash":
+                if not self._dflash_draft_model_path:
+                    raise RuntimeError(
+                        "DFlash requires dflash_draft_model to be configured"
+                    )
+                if self._dflash_draft_sliding_window_size is not None:
+                    raise RuntimeError(
+                        "DFlash sliding-window drafts are not supported by the "
+                        "Qwen 35B first milestone"
+                    )
+                if self._text_model is None or self._text_tokenizer is None:
+                    raise RuntimeError(
+                        "DFlash first milestone requires the MLLM text-model route"
+                    )
+                logger.info(
+                    "DFlash: draft model configured (%s), block_size=%s",
+                    self._dflash_draft_model_path,
+                    self._dflash_block_size,
+                )
+
             # Warn if MTP is enabled without continuous-batching and text routing not available
             if self._mtp and (not self._is_mllm or self._text_model is None):
                 logger.warning(
@@ -365,9 +401,11 @@ class SimpleEngine(BaseEngine):
             specprefill_info = (
                 ", SpecPrefill=active" if self._draft_model is not None else ""
             )
+            dflash_info = ", DFlash=active" if self._dflash_backend is not None else ""
             logger.info(
                 f"SimpleEngine loaded: {self._model_name} "
-                f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info})"
+                f"(MLLM={self._is_mllm}{mtp_info}{routing}{specprefill_info}"
+                f"{dflash_info})"
             )
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
@@ -379,6 +417,7 @@ class SimpleEngine(BaseEngine):
         self._text_model = None
         self._text_tokenizer = None
         self._draft_model = None
+        self._dflash_backend = None
         self._loaded = False
         self._system_kv_snapshot = None
         self._system_kv_hash = None
@@ -1560,6 +1599,90 @@ class SimpleEngine(BaseEngine):
         custom_logits_active = bool(all_processors)
         max_tokens = max_tokens or 4096
 
+        if self._speculative_method == "dflash":
+            dflash_blockers = []
+            if stop:
+                dflash_blockers.append("stop")
+            if custom_logits_active:
+                dflash_blockers.append("logits_processors")
+            if specprefill_override is not None:
+                dflash_blockers.append("specprefill_request_override")
+            if self._draft_model is not None:
+                dflash_blockers.append("specprefill_loaded")
+
+            if not dflash_blockers:
+                abort_event = threading.Event()
+
+                def _cancel_check() -> None:
+                    if abort_event.is_set():
+                        raise RuntimeError("DFlash generation canceled")
+
+                def _run_dflash():
+                    if self._dflash_backend is None:
+                        from ..dflash import DFlashSpeculativeDecoder
+
+                        self._dflash_backend = DFlashSpeculativeDecoder.load_qwen35(
+                            self._dflash_draft_model_path,
+                            target_model=self._text_model,
+                            target_tokenizer=self._text_tokenizer,
+                            block_size=self._dflash_block_size,
+                        )
+                    return list(
+                        self._dflash_backend.stream_generate(
+                            target_model=self._text_model,
+                            tokenizer=self._text_tokenizer,
+                            prompt=full_prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            min_p=min_p,
+                            cancel_check=_cancel_check,
+                        )
+                    )
+
+                all_resps = await self._run_blocking_serialized(
+                    _run_dflash, on_cancel=abort_event.set
+                )
+
+                accumulated_text = ""
+                completion_tokens = 0
+                finished = False
+                prompt_token_count = 0
+                for resp in all_resps:
+                    new_text = resp.text if hasattr(resp, "text") else str(resp)
+                    new_tokens = list(getattr(resp, "tokens", []) or [])
+                    if new_tokens:
+                        completion_tokens += len(new_tokens)
+                    elif new_text:
+                        completion_tokens += 1
+                    prompt_token_count = getattr(resp, "prompt_tokens", 0) or 0
+                    accumulated_text += new_text
+                    finish_reason = getattr(resp, "finish_reason", None)
+                    finished = (
+                        finish_reason is not None or completion_tokens >= max_tokens
+                    )
+                    if finish_reason is None and finished:
+                        finish_reason = "stop"
+
+                    yield GenerationOutput(
+                        text=accumulated_text,
+                        new_text=new_text,
+                        prompt_tokens=prompt_token_count,
+                        completion_tokens=completion_tokens,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                    )
+                    if finished:
+                        break
+                return
+
+            logger.info(
+                "DFlash disabled for this request because unsupported controls "
+                "are active: %s",
+                dflash_blockers,
+            )
+
         # --- System prompt KV caching ---
         backbone_cache = None  # Backbone-only cache (no MTP), used by both paths
         prompt_to_send = full_prompt  # Default: send full prompt text
@@ -2183,6 +2306,12 @@ class SimpleEngine(BaseEngine):
                 "draft_model": self._specprefill_draft_model_path,
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
+            }
+        if self._dflash_backend is not None:
+            stats["dflash"] = {
+                "enabled": True,
+                "draft_model": self._dflash_draft_model_path,
+                **self._dflash_backend.snapshot_stats(),
             }
 
         # System KV cache stats

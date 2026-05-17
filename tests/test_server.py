@@ -605,6 +605,36 @@ class TestLoadModelTrustRemoteCode:
 
         assert mock_engine.call_args.kwargs["trust_remote_code"] is False
 
+    def test_load_model_simple_forwards_dflash_config(self):
+        """DFlash config is explicit and default-off at the SimpleEngine boundary."""
+        from vllm_mlx import server
+
+        fake_engine = MagicMock()
+        fake_loop = MagicMock()
+
+        with (
+            patch.object(
+                server, "SimpleEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+            patch("vllm_mlx.server.asyncio.new_event_loop", return_value=fake_loop),
+            patch("vllm_mlx.server.asyncio.set_event_loop"),
+        ):
+            server.load_model(
+                "test-model",
+                use_batching=False,
+                speculative_method="dflash",
+                dflash_draft_model="z-lab/Qwen3.6-35B-A3B-DFlash",
+                dflash_block_size=16,
+            )
+
+        assert mock_engine.call_args.kwargs["speculative_method"] == "dflash"
+        assert (
+            mock_engine.call_args.kwargs["dflash_draft_model"]
+            == "z-lab/Qwen3.6-35B-A3B-DFlash"
+        )
+        assert mock_engine.call_args.kwargs["dflash_block_size"] == 16
+
     def test_load_model_batched_forwards_explicit_trust_remote_code(self):
         """BatchedEngine should receive explicit trust_remote_code opt-in."""
         from vllm_mlx import server

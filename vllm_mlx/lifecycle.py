@@ -41,6 +41,10 @@ class ModelSpec:
     specprefill_threshold: int = 8192
     specprefill_keep_pct: float = 0.3
     specprefill_draft_model: str | None = None
+    speculative_method: str | None = None
+    dflash_draft_model: str | None = None
+    dflash_block_size: int | None = None
+    dflash_draft_sliding_window_size: int | None = None
 
 
 @dataclass

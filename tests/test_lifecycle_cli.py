@@ -124,6 +124,42 @@ class TestLifecycleCli:
 
         assert captured["lazy_load_model"] is True
 
+    def test_main_parses_dflash_flags(self, monkeypatch):
+        """The top-level CLI should accept the explicit DFlash backend knobs."""
+        import vllm_mlx.cli as cli
+
+        captured = {}
+
+        def fake_serve_command(args):
+            captured["speculative_method"] = args.speculative_method
+            captured["dflash_draft_model"] = args.dflash_draft_model
+            captured["dflash_block_size"] = args.dflash_block_size
+
+        monkeypatch.setattr(cli, "serve_command", fake_serve_command)
+        monkeypatch.setattr(
+            cli.sys,
+            "argv",
+            [
+                "vllm-mlx",
+                "serve",
+                "mlx-community/Qwen3-0.6B-8bit",
+                "--speculative-method",
+                "dflash",
+                "--dflash-draft-model",
+                "z-lab/Qwen3.6-35B-A3B-DFlash",
+                "--dflash-block-size",
+                "16",
+            ],
+        )
+
+        cli.main()
+
+        assert captured == {
+            "speculative_method": "dflash",
+            "dflash_draft_model": "z-lab/Qwen3.6-35B-A3B-DFlash",
+            "dflash_block_size": 16,
+        }
+
     def test_main_defaults_lazy_load_model_to_false(self, monkeypatch):
         """Serve startup should stay eager unless the user explicitly opts in."""
         import vllm_mlx.cli as cli
