@@ -519,6 +519,7 @@ class DFlashSpeculativeDecoder:
         self._accepted_tokens = 0
         self._rejected_tokens = 0
         self._errors = 0
+        self._acceptance_by_block: list[dict[str, int | float | None]] = []
 
     @classmethod
     def load_qwen35(
@@ -545,6 +546,7 @@ class DFlashSpeculativeDecoder:
 
     def snapshot_stats(self) -> dict[str, Any]:
         total = self._draft_tokens
+        blocks = len(self._acceptance_by_block)
         return {
             "draft_model": self.draft_model_name,
             "block_size": self.block_size,
@@ -553,7 +555,26 @@ class DFlashSpeculativeDecoder:
             "rejected_tokens": self._rejected_tokens,
             "errors": self._errors,
             "acceptance_rate": (self._accepted_tokens / total if total > 0 else None),
+            "blocks": blocks,
+            "avg_accepted_per_block": (
+                self._accepted_tokens / blocks if blocks > 0 else None
+            ),
+            "acceptance_by_block": list(self._acceptance_by_block),
         }
+
+    def _record_block(self, *, draft_count: int, accepted_count: int) -> None:
+        self._draft_tokens += draft_count
+        self._accepted_tokens += accepted_count
+        self._rejected_tokens += draft_count - accepted_count
+        self._acceptance_by_block.append(
+            {
+                "draft_tokens": draft_count,
+                "accepted_tokens": accepted_count,
+                "acceptance_rate": (
+                    accepted_count / draft_count if draft_count > 0 else None
+                ),
+            }
+        )
 
     def stream_generate(
         self,
@@ -682,9 +703,10 @@ class DFlashSpeculativeDecoder:
                         ),
                         len(d_list),
                     )
-                    self._draft_tokens += len(d_list)
-                    self._accepted_tokens += accepted
-                    self._rejected_tokens += len(d_list) - accepted
+                    self._record_block(
+                        draft_count=len(d_list),
+                        accepted_count=accepted,
+                    )
 
                     new_tokens = d_list[:accepted] + [t_list[accepted]]
                     new_tokens = new_tokens[: max_tokens - generated]

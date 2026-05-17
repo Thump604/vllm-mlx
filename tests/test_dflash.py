@@ -202,3 +202,23 @@ def test_trim_recent_cache_rolls_back_rejected_tokens():
 
     assert cache.trimmed == [3]
     assert cache.offset == 6
+
+
+def test_dflash_stats_include_block_acceptance_telemetry():
+    """DFlash telemetry must expose whether acceptance is useful by block."""
+    from vllm_mlx.dflash import DFlashSpeculativeDecoder
+
+    draft = SimpleNamespace(config=SimpleNamespace(block_size=16))
+    decoder = DFlashSpeculativeDecoder(draft, draft_model_name="draft-path")
+
+    decoder._record_block(draft_count=15, accepted_count=3)
+    decoder._record_block(draft_count=15, accepted_count=0)
+
+    stats = decoder.snapshot_stats()
+
+    assert stats["blocks"] == 2
+    assert stats["avg_accepted_per_block"] == 1.5
+    assert stats["acceptance_by_block"] == [
+        {"draft_tokens": 15, "accepted_tokens": 3, "acceptance_rate": 0.2},
+        {"draft_tokens": 15, "accepted_tokens": 0, "acceptance_rate": 0.0},
+    ]

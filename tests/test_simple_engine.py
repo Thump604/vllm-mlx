@@ -1651,7 +1651,7 @@ class TestSimpleEngineConcurrency:
 
     @pytest.mark.anyio
     async def test_stream_generate_text_routes_to_dflash_when_configured(self):
-        """DFlash is explicit, default-off, and bypasses native MTP routing."""
+        """DFlash is explicit, default-off, and streams without buffering."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -1661,6 +1661,7 @@ class TestSimpleEngineConcurrency:
         class FakeDFlashBackend:
             def __init__(self):
                 self.calls = []
+                self.client_received_first = False
 
             def stream_generate(self, *, target_model, tokenizer, prompt, **kwargs):
                 self.calls.append(
@@ -1673,9 +1674,18 @@ class TestSimpleEngineConcurrency:
                     }
                 )
                 yield SimpleNamespace(
-                    text="Hello",
-                    tokens=[101, 102],
+                    text="Hel",
+                    tokens=[101],
                     accepted=1,
+                    prompt_tokens=3,
+                    generation_tokens=1,
+                    finish_reason=None,
+                )
+                assert self.client_received_first, "DFlash responses were buffered"
+                yield SimpleNamespace(
+                    text="lo",
+                    tokens=[102],
+                    accepted=0,
                     prompt_tokens=3,
                     generation_tokens=2,
                     finish_reason="stop",
@@ -1713,20 +1723,22 @@ class TestSimpleEngineConcurrency:
         engine._dflash_backend = backend
         engine._text_model_owner_thread = owner_thread
 
+        outputs = []
         with patch("mlx_lm.stream_generate") as normal_stream:
-            outputs = [
-                chunk
-                async for chunk in engine._stream_generate_text(
-                    messages=[{"role": "user", "content": "hello"}],
-                    max_tokens=16,
-                    temperature=0.6,
-                    top_p=0.95,
-                    top_k=20,
-                    min_p=0.0,
-                )
-            ]
+            async for chunk in engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=16,
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
+            ):
+                outputs.append(chunk)
+                if len(outputs) == 1:
+                    backend.client_received_first = True
 
-        assert [chunk.new_text for chunk in outputs] == ["Hello"]
+        assert [chunk.new_text for chunk in outputs] == ["Hel", "lo"]
+        assert outputs[-1].text == "Hello"
         assert outputs[-1].completion_tokens == 2
         assert outputs[-1].finish_reason == "stop"
         assert backend.calls[0]["target_model"] is text_model

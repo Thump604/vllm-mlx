@@ -1652,7 +1652,7 @@ class SimpleEngine(BaseEngine):
                     if abort_event.is_set():
                         raise RuntimeError("DFlash generation canceled")
 
-                def _run_dflash():
+                def _stream_dflash():
                     if self._dflash_backend is None:
                         from ..dflash import DFlashSpeculativeDecoder
 
@@ -1662,42 +1662,85 @@ class SimpleEngine(BaseEngine):
                             target_tokenizer=self._text_tokenizer,
                             block_size=self._dflash_block_size,
                         )
-                    return list(
-                        self._dflash_backend.stream_generate(
-                            target_model=self._text_model,
-                            tokenizer=self._text_tokenizer,
-                            prompt=full_prompt,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            top_k=top_k,
-                            min_p=min_p,
-                            cancel_check=_cancel_check,
-                        )
-                    )
-
-                if run_on_owner_thread:
-                    async with self._generation_lock:
-                        all_resps = _run_dflash()
-                else:
-                    all_resps = await self._run_blocking_serialized(
-                        _run_dflash, on_cancel=abort_event.set
+                    return self._dflash_backend.stream_generate(
+                        target_model=self._text_model,
+                        tokenizer=self._text_tokenizer,
+                        prompt=full_prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        cancel_check=_cancel_check,
                     )
 
                 accumulated_text = ""
                 completion_tokens = 0
                 finished = False
                 prompt_token_count = 0
-                for resp in all_resps:
+
+                def _response_parts(resp):
                     new_text = resp.text if hasattr(resp, "text") else str(resp)
                     new_tokens = list(getattr(resp, "tokens", []) or [])
                     if new_tokens:
-                        completion_tokens += len(new_tokens)
+                        token_increment = len(new_tokens)
                     elif new_text:
-                        completion_tokens += 1
-                    prompt_token_count = getattr(resp, "prompt_tokens", 0) or 0
-                    accumulated_text += new_text
+                        token_increment = 1
+                    else:
+                        token_increment = 0
                     finish_reason = getattr(resp, "finish_reason", None)
+                    return (
+                        new_text,
+                        token_increment,
+                        getattr(resp, "prompt_tokens", 0) or 0,
+                        finish_reason,
+                    )
+
+                if run_on_owner_thread:
+                    async with self._generation_lock:
+                        for resp in _stream_dflash():
+                            (
+                                new_text,
+                                token_increment,
+                                prompt_token_count,
+                                finish_reason,
+                            ) = _response_parts(resp)
+                            completion_tokens += token_increment
+                            accumulated_text += new_text
+                            finished = (
+                                finish_reason is not None
+                                or completion_tokens >= max_tokens
+                            )
+                            if finish_reason is None and finished:
+                                finish_reason = "stop"
+
+                            yield GenerationOutput(
+                                text=accumulated_text,
+                                new_text=new_text,
+                                prompt_tokens=prompt_token_count,
+                                completion_tokens=completion_tokens,
+                                finished=finished,
+                                finish_reason=finish_reason,
+                            )
+                            if finished:
+                                break
+                    return
+
+                def _run_dflash_list():
+                    return list(_stream_dflash())
+
+                all_resps = await self._run_blocking_serialized(
+                    _run_dflash_list, on_cancel=abort_event.set
+                )
+                for resp in all_resps:
+                    (
+                        new_text,
+                        token_increment,
+                        prompt_token_count,
+                        finish_reason,
+                    ) = _response_parts(resp)
+                    completion_tokens += token_increment
+                    accumulated_text += new_text
                     finished = (
                         finish_reason is not None or completion_tokens >= max_tokens
                     )
