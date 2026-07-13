@@ -1009,16 +1009,24 @@ def build_json_logits_processor(
         return None
 
     try:
-        from ..constrained import JSONSchemaLogitsProcessor, is_available
+        from ..constrained import (
+            JSONSchemaLogitsProcessor,
+            LLGuidanceJSONSchemaLogitsProcessor,
+            is_available,
+            is_strict_json_schema_available,
+        )
     except ImportError:
         raise RuntimeError("constrained decoding module could not be imported")
-
-    if not is_available():
-        raise RuntimeError("lm-format-enforcer is required for response_format")
 
     # ``json_schema`` without an actual schema degrades to ``json_object``
     # (both paths pass ``schema=None`` to the processor).
     if format_type == "json_object" or (format_type == "json_schema" and not schema):
         schema = None
 
+    if schema is not None:
+        if not is_strict_json_schema_available():
+            raise RuntimeError("llguidance is required for strict json_schema")
+        return LLGuidanceJSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
+    if not is_available():
+        raise RuntimeError("lm-format-enforcer is required for json_object")
     return JSONSchemaLogitsProcessor(schema=schema, tokenizer=tokenizer)
