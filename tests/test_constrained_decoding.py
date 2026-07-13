@@ -748,9 +748,9 @@ class TestIncrementalCaching:
             inc_text = processor._decode_suffix(suffix)
             # Full decode for reference.
             full_text = tok.decode(suffix)
-            assert inc_text == full_text, (
-                f"Step {step}: incremental={inc_text!r} != full={full_text!r}"
-            )
+            assert (
+                inc_text == full_text
+            ), f"Step {step}: incremental={inc_text!r} != full={full_text!r}"
 
     def test_non_concatenative_tokenizer_decode(self):
         """Regression test: BPE tokenizers where per-token decode differs
