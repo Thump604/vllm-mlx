@@ -24,6 +24,8 @@ import math
 
 import mlx.core as mx
 import pytest
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+from transformers import PreTrainedTokenizerFast
 
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
 from vllm_mlx.api.anthropic_models import AnthropicMessage, AnthropicRequest
@@ -94,6 +96,28 @@ class _FakeTokenizer:
         return dict(self._tok_to_id)
 
 
+def _fast_json_tokenizer() -> PreTrainedTokenizerFast:
+    backend = Tokenizer(models.BPE(unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(
+        add_prefix_space=False,
+        use_regex=False,
+    )
+    backend.decoder = decoders.ByteLevel()
+    backend.train_from_iterator(
+        ['{"p":true,"s":"ok","sc":[1,2,3,4,5,1,2,3,4],"i":[]}'],
+        trainers.BpeTrainer(
+            vocab_size=300,
+            special_tokens=["<unk>", "<eos>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        ),
+    )
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        eos_token="<eos>",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_cache():
     clear_cache()
@@ -157,7 +181,7 @@ class TestBuildJsonLogitsProcessor:
 
     @pytestmark_lmfe
     def test_json_schema_builds_processor(self):
-        tok = _FakeTokenizer()
+        tok = _fast_json_tokenizer()
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -177,7 +201,7 @@ class TestBuildJsonLogitsProcessor:
 
     @pytestmark_lmfe
     def test_json_schema_pydantic_model(self):
-        tok = _FakeTokenizer()
+        tok = _fast_json_tokenizer()
         response_format = ResponseFormat(
             type="json_schema",
             json_schema=ResponseFormatJsonSchema(
@@ -188,11 +212,144 @@ class TestBuildJsonLogitsProcessor:
         result = build_json_logits_processor(response_format, tok)
         assert result is not None
 
-    @pytestmark_lmfe
-    def test_heterogeneous_prefix_items_rejected_fail_closed(self):
-        from vllm_mlx.constrained import UnsupportedJSONSchemaError
+    def test_strict_schema_masks_preferred_out_of_range_integer(self):
+        tok = _fast_json_tokenizer()
+        schema = {
+            "type": "array",
+            "minItems": 9,
+            "maxItems": 9,
+            "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+            },
+        }
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "scores", "strict": True, "schema": schema},
+        }
+        processor = build_json_logits_processor(response_format, tok)
+        prompt = tok.encode("prompt", add_special_tokens=False)
+        processor(mx.array(prompt), mx.zeros((len(tok),)))
 
-        tok = _FakeTokenizer()
+        prefix = tok.encode("[", add_special_tokens=False)
+        logits = mx.zeros((len(tok),))
+        zero_id = tok.encode("0", add_special_tokens=False)[0]
+        one_id = tok.encode("1", add_special_tokens=False)[0]
+        logits[zero_id] = 100.0
+        masked = processor(mx.array(prompt + prefix), logits)
+
+        assert math.isinf(float(masked[zero_id]))
+        assert float(masked[zero_id]) < 0
+        assert not math.isinf(float(masked[one_id]))
+
+    def test_strict_schema_rejects_early_array_closure(self):
+        tok = _fast_json_tokenizer()
+        schema = {
+            "type": "array",
+            "minItems": 9,
+            "maxItems": 9,
+            "items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+            },
+        }
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "scores", "strict": True, "schema": schema},
+        }
+        processor = build_json_logits_processor(response_format, tok)
+        prompt = tok.encode("prompt", add_special_tokens=False)
+        processor(mx.array(prompt), mx.zeros((len(tok),)))
+
+        prefix = tok.encode("[1,2,3,4,5", add_special_tokens=False)
+        masked = processor(
+            mx.array(prompt + prefix),
+            mx.zeros((len(tok),)),
+        )
+        close_id = tok.encode("]", add_special_tokens=False)[0]
+
+        assert math.isinf(float(masked[close_id]))
+        assert float(masked[close_id]) < 0
+
+    def test_strict_schema_masks_model_vocab_padding(self):
+        tok = _fast_json_tokenizer()
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "strict": True,
+                "schema": {"type": "object"},
+            },
+        }
+        processor = build_json_logits_processor(response_format, tok)
+        prompt = tok.encode("prompt", add_special_tokens=False)
+        padded_vocab_size = len(tok) + 64
+
+        masked = processor(
+            mx.array(prompt),
+            mx.zeros((padded_vocab_size,)),
+        )
+
+        assert masked.shape == (padded_vocab_size,)
+        assert all(
+            math.isinf(float(masked[index]))
+            for index in range(len(tok), padded_vocab_size)
+        )
+
+    def test_strict_schema_accepts_eos_after_complete_value(self):
+        tok = _fast_json_tokenizer()
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "strict": True,
+                "schema": {"type": "object"},
+            },
+        }
+        processor = build_json_logits_processor(response_format, tok)
+        prompt = tok.encode("prompt", add_special_tokens=False)
+        value = tok.encode("{}", add_special_tokens=False)
+        processor(mx.array(prompt), mx.zeros((len(tok),)))
+        processor(mx.array(prompt + value), mx.zeros((len(tok),)))
+
+        masked = processor(
+            mx.array(prompt + value + [tok.eos_token_id]),
+            mx.zeros((len(tok),)),
+        )
+
+        assert not math.isinf(float(masked[tok.eos_token_id]))
+
+    def test_strict_schema_stops_nonprogress_whitespace_outside_strings(self):
+        tok = _fast_json_tokenizer()
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {"ok": {"type": "boolean"}},
+                },
+            },
+        }
+        processor = build_json_logits_processor(response_format, tok)
+        prompt = tok.encode("prompt", add_special_tokens=False)
+        prefix = tok.encode("{" + (" " * 300), add_special_tokens=False)
+        processor(mx.array(prompt), mx.zeros((len(tok),)))
+
+        masked = processor(
+            mx.array(prompt + prefix),
+            mx.zeros((len(tok),)),
+        )
+        space_id = tok.encode(" ", add_special_tokens=False)[0]
+
+        assert math.isinf(float(masked[space_id]))
+
+    def test_heterogeneous_prefix_items_compile_for_strict_schema(self):
+        tok = _fast_json_tokenizer()
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -209,8 +366,7 @@ class TestBuildJsonLogitsProcessor:
             },
         }
 
-        with pytest.raises(UnsupportedJSONSchemaError, match="prefixItems"):
-            build_json_logits_processor(response_format, tok)
+        assert build_json_logits_processor(response_format, tok) is not None
 
 
 # ---------------------------------------------------------------------------
