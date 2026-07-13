@@ -51,7 +51,7 @@ class _FakeTokenizer:
     """
 
     def __init__(self) -> None:
-        chars = list('0123456789{}[]:," \n\ttrueflasnul')
+        chars = list('0123456789{}[]:," \n\ttrueflasnulpci')
         # Deduplicate while preserving order.
         seen: set[str] = set()
         unique: list[str] = []
@@ -184,6 +184,30 @@ class TestBuildJsonLogitsProcessor:
         )
         result = build_json_logits_processor(response_format, tok)
         assert result is not None
+
+    @pytestmark_lmfe
+    def test_heterogeneous_prefix_items_rejected_fail_closed(self):
+        from vllm_mlx.constrained import UnsupportedJSONSchemaError
+
+        tok = _FakeTokenizer()
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "tuple",
+                "strict": True,
+                "schema": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "integer"},
+                        {"type": "string"},
+                    ],
+                    "maxItems": 2,
+                },
+            },
+        }
+
+        with pytest.raises(UnsupportedJSONSchemaError, match="prefixItems"):
+            build_json_logits_processor(response_format, tok)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +383,48 @@ class TestSimplifySchema:
         # Nested anyOf should be flattened to 3 branches.
         assert "anyOf" in result
         assert len(result["anyOf"]) == 3
+
+    def test_normalizes_homogeneous_prefix_items(self):
+        """Jobs' compact score array must retain its element constraints."""
+        from vllm_mlx.constrained.json_schema_processor import _simplify_schema
+
+        integer_score = {"type": "integer", "minimum": 1, "maximum": 5}
+        schema = {
+            "type": "array",
+            "prefixItems": [integer_score] * 9,
+            "minItems": 9,
+            "maxItems": 9,
+        }
+
+        result = _simplify_schema(schema)
+
+        assert result["items"] == integer_score
+        assert "prefixItems" not in result
+
+    @pytestmark_lmfe
+    def test_complete_json_requires_schema_valid_value(self):
+        """Syntactically complete JSON must not force EOS before schema validity."""
+        from vllm_mlx.constrained import JSONSchemaLogitsProcessor
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "sc": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "minItems": 1,
+                    "maxItems": 1,
+                }
+            },
+            "required": ["sc"],
+            "additionalProperties": False,
+        }
+        tokenizer = _FakeTokenizer()
+        processor = JSONSchemaLogitsProcessor(schema, tokenizer)
+        suffix = tokenizer.encode('{"sc":["s"]}')
+        processor._get_json_context(suffix)
+
+        assert processor._suffix_is_complete_json(suffix) is False
 
     def test_fact_batch_schema_simplifies_cleanly(self):
         """Regression test: the ``fact_batch`` schema that caused enforcer
