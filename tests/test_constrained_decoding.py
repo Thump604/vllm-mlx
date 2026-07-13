@@ -20,6 +20,9 @@ running with a minimal dependency set still passes.
 
 from __future__ import annotations
 
+import math
+
+import mlx.core as mx
 import pytest
 
 from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
@@ -398,8 +401,44 @@ class TestSimplifySchema:
 
         result = _simplify_schema(schema)
 
-        assert result["items"] == integer_score
+        assert result["items"] == {
+            **integer_score,
+            "enum": [1, 2, 3, 4, 5],
+        }
         assert "prefixItems" not in result
+
+    @pytestmark_lmfe
+    def test_integer_range_masks_preferred_out_of_range_token(self):
+        """A preferred zero must lose to a legal 1-5 score token."""
+        from vllm_mlx.constrained import JSONSchemaLogitsProcessor
+
+        tokenizer = _FakeTokenizer()
+        processor = JSONSchemaLogitsProcessor(
+            {"type": "integer", "minimum": 1, "maximum": 5},
+            tokenizer,
+        )
+        logits = mx.full((1, tokenizer.vocab_size), -100.0)
+        logits[0, tokenizer._tok_to_id["0"]] = 100.0
+        for score in range(1, 6):
+            logits[0, tokenizer._tok_to_id[str(score)]] = float(6 - score)
+
+        masked = processor(mx.array([999]), logits)
+        values = masked.tolist()[0]
+
+        zero_id = tokenizer._tok_to_id["0"]
+        assert math.isinf(values[zero_id]) and values[zero_id] < 0
+        assert int(mx.argmax(masked, axis=-1).item()) == tokenizer._tok_to_id["1"]
+
+    def test_integer_range_rejects_unenforceable_shapes(self):
+        from vllm_mlx.constrained.json_schema_processor import (
+            UnsupportedJSONSchemaError,
+            _simplify_schema,
+        )
+
+        with pytest.raises(UnsupportedJSONSchemaError, match="lower and upper"):
+            _simplify_schema({"type": "integer", "minimum": 1})
+        with pytest.raises(UnsupportedJSONSchemaError, match="exceeds"):
+            _simplify_schema({"type": "integer", "minimum": 0, "maximum": 5000})
 
     @pytestmark_lmfe
     def test_complete_json_requires_schema_valid_value(self):
@@ -589,9 +628,9 @@ class TestIncrementalCaching:
             inc_text = processor._decode_suffix(suffix)
             # Full decode for reference.
             full_text = tok.decode(suffix)
-            assert (
-                inc_text == full_text
-            ), f"Step {step}: incremental={inc_text!r} != full={full_text!r}"
+            assert inc_text == full_text, (
+                f"Step {step}: incremental={inc_text!r} != full={full_text!r}"
+            )
 
     def test_non_concatenative_tokenizer_decode(self):
         """Regression test: BPE tokenizers where per-token decode differs
