@@ -20,7 +20,6 @@ import copy
 import hashlib
 import json
 import logging
-import math
 from typing import Any, Callable
 
 import mlx.core as mx
@@ -54,7 +53,6 @@ class UnsupportedJSONSchemaError(ConstrainedDecodingError):
 # tool schemas, so unbounded growth is not a realistic concern.
 _parser_cache: dict[str, tuple[dict, Any]] = {}
 _MAX_NONPROGRESS_WHITESPACE_CHARS = 256
-_MAX_INTEGER_ENUM_VALUES = 4096
 _JSON_WHITESPACE = frozenset(" \t\r\n")
 
 
@@ -128,70 +126,6 @@ def _normalize_prefix_items(
     return node
 
 
-def _integer_lower_bound(node: dict) -> int | None:
-    lower: int | None = None
-    if "minimum" in node:
-        lower = math.ceil(node["minimum"])
-    if "exclusiveMinimum" in node:
-        exclusive_lower = math.floor(node["exclusiveMinimum"]) + 1
-        lower = exclusive_lower if lower is None else max(lower, exclusive_lower)
-    return lower
-
-
-def _integer_upper_bound(node: dict) -> int | None:
-    upper: int | None = None
-    if "maximum" in node:
-        upper = math.floor(node["maximum"])
-    if "exclusiveMaximum" in node:
-        exclusive_upper = math.ceil(node["exclusiveMaximum"]) - 1
-        upper = exclusive_upper if upper is None else min(upper, exclusive_upper)
-    return upper
-
-
-def _bounded_integer_values(node: dict) -> list[int]:
-    lower = _integer_lower_bound(node)
-    upper = _integer_upper_bound(node)
-
-    if lower is None or upper is None:
-        raise UnsupportedJSONSchemaError(
-            "integer ranges require finite lower and upper bounds"
-        )
-    if lower > upper:
-        raise UnsupportedJSONSchemaError("integer range contains no legal values")
-    if upper - lower + 1 > _MAX_INTEGER_ENUM_VALUES:
-        raise UnsupportedJSONSchemaError(
-            f"integer range exceeds {_MAX_INTEGER_ENUM_VALUES} enforceable values"
-        )
-    return list(range(lower, upper + 1))
-
-
-def _normalize_integer_bounds(node: dict) -> dict:
-    """Compile finite integer bounds into values the token parser enforces."""
-    range_keys = {
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-    }
-    if not range_keys.intersection(node):
-        return node
-    if node.get("type") != "integer":
-        raise UnsupportedJSONSchemaError(
-            "numeric ranges are supported only for integer schemas"
-        )
-
-    legal_values = _bounded_integer_values(node)
-    if "enum" in node:
-        legal_set = set(legal_values)
-        legal_values = [value for value in node["enum"] if value in legal_set]
-        if not legal_values:
-            raise UnsupportedJSONSchemaError(
-                "integer enum and range contain no common legal values"
-            )
-    node["enum"] = legal_values
-    return node
-
-
 def _allowed_tokens_or_raise(allowed_result: Any) -> list[int]:
     allowed = getattr(allowed_result, "allowed_tokens", allowed_result)
     if allowed is None:
@@ -262,8 +196,6 @@ def _simplify_schema(schema: dict) -> dict:
         node.pop("examples", None)
         node.pop("title", None)
         node.pop("description", None)
-
-        node = _normalize_integer_bounds(node)
 
         # --- type array → anyOf --------------------------------------------
         if isinstance(node.get("type"), list):
