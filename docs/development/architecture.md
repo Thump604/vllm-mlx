@@ -194,15 +194,25 @@ general hot-reconfiguration API for a running FastAPI server.
 
 ## Hardware Detection
 
-vllm-mlx auto-detects Apple Silicon:
-- Chip name (M1, M2, M3, M4, M5)
-- Total memory
-- Neural engine cores
-- GPU cores
+vllm-mlx exposes a read-only, source-attributed Apple Silicon inventory:
+- Operating system and architecture
+- Chip and machine model
+- Total unified memory
+- CPU and directly reported GPU core counts
+- macOS version and build
+
+Unknown facts remain unset rather than being filled from a guessed chip profile.
+The inventory output excludes serial numbers, UUIDs, and other device identifiers.
 
 ```python
-from vllm_mlx.hardware import get_hardware_info
+from vllm_mlx.hardware import collect_hardware_inventory
 
-hw = get_hardware_info()
-print(f"{hw.chip_name} ({hw.total_memory_gb:.0f} GB)")
+hw = collect_hardware_inventory()
+memory_gib = (
+    hw.total_unified_memory_bytes / (1024**3)
+    if hw.total_unified_memory_bytes is not None
+    else None
+)
+memory_label = f"{memory_gib:.0f} GiB" if memory_gib is not None else "unknown memory"
+print(f"{hw.chip_string or 'unknown chip'} ({memory_label})")
 ```
