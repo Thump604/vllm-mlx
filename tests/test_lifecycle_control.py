@@ -9,8 +9,9 @@ import json
 import pytest
 
 import vllm_mlx.lifecycle_control as lifecycle_control
-from vllm_mlx.lifecycle import ModelSpec, ResidencyManager
+from vllm_mlx.lifecycle import ModelSpec, ResidencyManager, bind_model_spec_to_profile
 from vllm_mlx.lifecycle_contract import LifecycleContractError
+from vllm_mlx.model_profile import compute_subject_digest
 
 
 class FakeEngine:
@@ -33,6 +34,55 @@ def _spec(name: str = "laguna") -> ModelSpec:
         profile_revision="rev-1",
         config_digest="digest-1",
     )
+
+
+def test_profile_binding_carries_immutable_identity_into_lifecycle(
+    tmp_path, monkeypatch
+):
+    profile = {
+        "profile_id": "laguna-s-2.1",
+        "profile_revision": 3,
+        "identity": {"served_model_name": "laguna-s-2.1"},
+    }
+    profile["subject_digest"] = compute_subject_digest(profile)
+    bound = bind_model_spec_to_profile(
+        ModelSpec(model_key="laguna", model_name="/models/laguna"), profile
+    )
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "state.json"))
+    manager = ResidencyManager(lambda spec: FakeEngine())
+    manager.register_model(bound)
+
+    control = manager.get_status("laguna")["control"]["snapshot"]
+    assert control["configured_profile"] == {
+        "profile_id": "laguna-s-2.1",
+        "profile_revision": "3",
+    }
+    assert control["resolved_process"]["config_digest"] == profile["subject_digest"]
+    manager._control.close()
+
+
+def test_profile_binding_rejects_stale_or_conflicting_identity():
+    profile = {
+        "profile_id": "laguna-s-2.1",
+        "profile_revision": 3,
+        "identity": {"served_model_name": "laguna-s-2.1"},
+    }
+    profile["subject_digest"] = compute_subject_digest(profile)
+
+    with pytest.raises(ValueError, match="conflicts"):
+        bind_model_spec_to_profile(
+            ModelSpec(
+                model_key="laguna",
+                model_name="/models/laguna",
+                profile_id="other",
+            ),
+            profile,
+        )
+    profile["subject_digest"] = "0" * 64
+    with pytest.raises(ValueError, match="stale"):
+        bind_model_spec_to_profile(
+            ModelSpec(model_key="laguna", model_name="/models/laguna"), profile
+        )
 
 
 @pytest.mark.anyio
@@ -127,6 +177,35 @@ async def test_restart_registers_spec_and_reconciles_stale_loaded_state(
     assert status["control"]["recovery"]["reason"] == (
         "persisted_and_resident_state_disagreed"
     )
+    await restarted.shutdown()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("persisted_state", ["loading", "unloading"])
+async def test_restart_reconciles_stale_in_progress_state(
+    tmp_path, monkeypatch, persisted_state
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(state_path))
+
+    async def factory(spec):
+        return FakeEngine()
+
+    first = ResidencyManager(factory)
+    first.register_model(_spec())
+    first._control.close()
+    payload = json.loads(state_path.read_text())
+    payload["snapshot"]["process_state"] = persisted_state
+    state_path.write_text(json.dumps(payload))
+
+    restarted = ResidencyManager(factory)
+    restarted.register_model(_spec())
+    status = restarted.get_status("laguna")
+    assert status["control"]["snapshot"]["process_state"] == "unloaded"
+    assert status["control"]["recovery"]["reason"] == (
+        "persisted_and_resident_state_disagreed"
+    )
+    await restarted.ensure_loaded("laguna")
     await restarted.shutdown()
 
 

@@ -40,6 +40,7 @@ ACQUISITION_MARKER_NAME = ".vllm_mlx_acquisition_operation.json"
 ACQUISITION_JOURNAL_VERSION = 1
 CONVERSION_MARKER_NAME = ".vllm_mlx_conversion_operation.json"
 CONVERSION_JOURNAL_VERSION = 1
+QUALIFICATION_JOURNAL_VERSION = 1
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -1674,6 +1675,7 @@ def normalize_qualification_result(
     *,
     expected_workload_sha256: str | None = None,
     expected_result_sha256: str | None = None,
+    evidence_location: str | Path | None = None,
 ) -> dict[str, Any]:
     """Bind one workload result artifact to an immutable profile subject.
 
@@ -1776,7 +1778,11 @@ def normalize_qualification_result(
     evidence = {
         "evidence_id": f"{run_id}-{artifact_sha256[:16]}",
         "kind": "qualification",
-        "location": str(path),
+        "location": str(
+            Path(evidence_location).expanduser().resolve()
+            if evidence_location is not None
+            else path
+        ),
         "artifact_sha256": artifact_sha256,
         "result": result,
         "hardware_fingerprint": hardware_fingerprint,
@@ -1798,7 +1804,14 @@ def normalize_qualification_result(
         "subject_digest": subject_digest,
         "qualification_status": current_status,
         "evidence": [evidence],
-        "raw_evidence": {"location": str(path), "sha256": artifact_sha256},
+        "raw_evidence": {
+            "location": str(
+                Path(evidence_location).expanduser().resolve()
+                if evidence_location is not None
+                else path
+            ),
+            "sha256": artifact_sha256,
+        },
         "promotion_required": True,
         "production_ready": False,
     }
@@ -1811,11 +1824,19 @@ def qualify_model(options: QualificationOptions) -> dict[str, Any]:
     run_options = options
     workload_sha256: str | None = None
     private_result_path: Path | None = None
+    qualification_journal_path: Path | None = None
+    qualification_lock: Any | None = None
+    qualification_journal: dict[str, Any] | None = None
     if options.profile_path:
         profile = _read_json_strict(
             Path(options.profile_path).expanduser(), label="model profile"
         )
         subject_digest = _validated_profile_subject(profile)
+        expected_model = profile.get("identity", {}).get("served_model_name")
+        if not isinstance(expected_model, str) or not expected_model:
+            raise ValueError("model profile served_model_name is missing")
+        if options.model_id != expected_model:
+            raise ValueError("qualification model_id does not match model profile")
         if not options.result_path:
             raise ValueError("profile-bound qualification requires result_path")
         if not options.workload_path:
@@ -1850,6 +1871,62 @@ def qualify_model(options: QualificationOptions) -> dict[str, Any]:
                 workload_path=str(workload_snapshot),
                 result_path=str(private_result_path),
             )
+            identity = {
+                "model_id": options.model_id,
+                "server_url": options.server_url,
+                "profile_subject_digest": subject_digest,
+                "workload_sha256": workload_sha256,
+                "result_path": str(final_result),
+                "repetitions": options.repetitions,
+                "extra_args": options.extra_args or [],
+            }
+            operation_id = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            qualification_journal_path = final_result.with_name(
+                f".{final_result.name}.qualification-operation.json"
+            )
+            qualification_lock_path = qualification_journal_path.with_suffix(
+                f"{qualification_journal_path.suffix}.lock"
+            )
+            qualification_lock = qualification_lock_path.open("a+")
+            fcntl.flock(qualification_lock.fileno(), fcntl.LOCK_EX)
+            existing = (
+                _read_json_strict(
+                    qualification_journal_path, label="qualification journal"
+                )
+                if qualification_journal_path.exists()
+                else {}
+            )
+            if existing and (
+                existing.get("kind") != "vllm-mlx-qualification-operation"
+                or existing.get("version") != QUALIFICATION_JOURNAL_VERSION
+                or existing.get("operation_id") != operation_id
+                or existing.get("identity") != identity
+            ):
+                fcntl.flock(qualification_lock.fileno(), fcntl.LOCK_UN)
+                qualification_lock.close()
+                qualification_lock = None
+                raise ValueError(
+                    f"qualification journal identity conflict at {qualification_journal_path}"
+                )
+            qualification_journal = {
+                "kind": "vllm-mlx-qualification-operation",
+                "version": QUALIFICATION_JOURNAL_VERSION,
+                "operation_id": operation_id,
+                "identity": identity,
+                "status": "running",
+                "attempt": int(existing.get("attempt", 0)) + 1,
+                "started_at": existing.get("started_at") or _now_iso(),
+                "updated_at": _now_iso(),
+            }
+            try:
+                _write_json_atomic(qualification_journal_path, qualification_journal)
+            except BaseException:
+                fcntl.flock(qualification_lock.fileno(), fcntl.LOCK_UN)
+                qualification_lock.close()
+                qualification_lock = None
+                raise
     command = _qualification_command(run_options)
     payload = {
         "kind": "vllm-mlx-model-qualification",
@@ -1865,6 +1942,9 @@ def qualify_model(options: QualificationOptions) -> dict[str, Any]:
         "dry_run": options.dry_run,
         "profile_path": options.profile_path,
         "profile_subject_digest": subject_digest,
+        "operation_journal_path": (
+            str(qualification_journal_path) if qualification_journal_path else None
+        ),
         "command": command,
         "production_ready": False,
     }
@@ -1902,22 +1982,48 @@ def qualify_model(options: QualificationOptions) -> dict[str, Any]:
                 final_result = Path(options.result_path).expanduser().resolve()
                 private_result = private_result_path.read_bytes()
                 private_result_sha256 = hashlib.sha256(private_result).hexdigest()
-                _write_bytes_atomic(final_result, private_result)
                 normalized = normalize_qualification_result(
                     profile,
-                    final_result,
+                    private_result_path,
                     run_options.workload_path,
                     expected_workload_sha256=workload_sha256,
                     expected_result_sha256=private_result_sha256,
+                    evidence_location=final_result,
                 )
+                _write_bytes_atomic(final_result, private_result)
                 payload["normalized_evidence"] = normalized
                 if options.evidence_output_path:
                     evidence_output = Path(options.evidence_output_path).expanduser()
                     _write_json_atomic(evidence_output, normalized)
                     payload["evidence_manifest_path"] = str(evidence_output)
+            if qualification_journal is not None and qualification_journal_path:
+                qualification_journal.update(
+                    status=payload["status"],
+                    updated_at=_now_iso(),
+                    completed_at=_now_iso(),
+                    returncode=completed.returncode,
+                    evidence_manifest_path=payload.get("evidence_manifest_path"),
+                )
+                _write_json_atomic(qualification_journal_path, qualification_journal)
+        except BaseException as exc:
+            if qualification_journal is not None and qualification_journal_path:
+                qualification_journal.update(
+                    status=(
+                        "cancelled"
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit))
+                        else "failed"
+                    ),
+                    updated_at=_now_iso(),
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+                _write_json_atomic(qualification_journal_path, qualification_journal)
+            raise
         finally:
             if private_result_path is not None:
                 private_result_path.unlink(missing_ok=True)
+            if qualification_lock is not None:
+                fcntl.flock(qualification_lock.fileno(), fcntl.LOCK_UN)
+                qualification_lock.close()
     else:
         payload["status"] = "dry_run"
 

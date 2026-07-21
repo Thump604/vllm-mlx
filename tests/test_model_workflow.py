@@ -627,6 +627,39 @@ def test_acquire_model_records_cancellation_without_deleting_staging(tmp_path):
     assert Path(journal["staging_path"]).exists()
 
 
+def test_acquire_model_retries_cancelled_operation(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+    calls = 0
+
+    def cancel_then_succeed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        staging = Path(kwargs["local_dir"])
+        if calls == 1:
+            raise KeyboardInterrupt()
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (staging / "model.safetensors").write_bytes(b"weights")
+        return str(staging)
+
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download", side_effect=cancel_then_succeed
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            acquire_model("org/model", options=options)
+        completed = acquire_model("org/model", options=options)
+
+    journal = json.loads(Path(completed["operation_journal_path"]).read_text())
+    assert journal["status"] == "succeeded"
+    assert journal["attempt"] == 2
+
+
 def test_acquire_model_resumes_finalization_after_target_move(tmp_path):
     target = tmp_path / "model-final"
     staging_root = tmp_path / "stage"
@@ -811,6 +844,36 @@ def test_convert_model_records_cancellation(tmp_path):
     journal = json.loads(journal_path.read_text())
     assert journal["status"] == "cancelled"
     assert journal["attempt"] == 1
+
+
+def test_convert_model_retries_cancelled_operation(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+    calls = 0
+
+    def cancel_then_succeed(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt()
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        _write_valid_weights(converted / "model.safetensors")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    options = ConversionOptions(source_path=str(source), output_path=str(output))
+    with patch(
+        "vllm_mlx.model_workflow.subprocess.run", side_effect=cancel_then_succeed
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            convert_model(options)
+        completed = convert_model(options)
+
+    journal = json.loads(Path(completed["operation_journal_path"]).read_text())
+    assert journal["status"] == "succeeded"
+    assert journal["attempt"] == 2
 
 
 def test_convert_model_recovers_after_publication_failure(tmp_path):
@@ -1475,6 +1538,7 @@ def test_qualify_model_rejects_stale_preexisting_result(tmp_path):
     workload_path.write_text('{"name":"coding-smoke"}')
     result_path = tmp_path / "raw.json"
     result_path.write_text(json.dumps(_qualification_result(profile, workload_path)))
+    stale_bytes = result_path.read_bytes()
 
     completed = SimpleNamespace(returncode=0, stdout="passed", stderr="")
     with patch("vllm_mlx.model_workflow.subprocess.run", return_value=completed):
@@ -1487,6 +1551,40 @@ def test_qualify_model_rejects_stale_preexisting_result(tmp_path):
                     profile_path=str(profile_path),
                 )
             )
+    assert result_path.read_bytes() == stale_bytes
+
+
+def test_qualify_model_does_not_publish_invalid_private_result(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "raw.json"
+    result_path.write_text(json.dumps(_qualification_result(profile, workload_path)))
+    published_bytes = result_path.read_bytes()
+
+    def fake_run(command, **kwargs):
+        Path(command[command.index("--output") + 1]).write_text("{}")
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        with pytest.raises(ValueError, match="run_id is missing"):
+            qualify_model(
+                QualificationOptions(
+                    model_id="laguna-s-2.1",
+                    workload_path=str(workload_path),
+                    result_path=str(result_path),
+                    profile_path=str(profile_path),
+                )
+            )
+
+    journal_path = result_path.with_name(
+        f".{result_path.name}.qualification-operation.json"
+    )
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "failed"
+    assert result_path.read_bytes() == published_bytes
 
 
 def test_qualify_model_rejects_workload_snapshot_mutation(tmp_path):
@@ -1515,6 +1613,65 @@ def test_qualify_model_rejects_workload_snapshot_mutation(tmp_path):
                     profile_path=str(profile_path),
                 )
             )
+
+
+def test_qualify_model_rejects_model_id_drift_before_launch(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+
+    with patch("vllm_mlx.model_workflow.subprocess.run") as mock_run:
+        with pytest.raises(ValueError, match="model_id does not match"):
+            qualify_model(
+                QualificationOptions(
+                    model_id="other-model",
+                    workload_path=str(tmp_path / "workload.json"),
+                    result_path=str(tmp_path / "result.json"),
+                    profile_path=str(profile_path),
+                )
+            )
+    mock_run.assert_not_called()
+
+
+def test_qualify_model_retries_cancelled_operation_with_same_identity(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "result.json"
+    calls = 0
+
+    def run_then_cancel_then_succeed(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt()
+        snapshot_path = Path(command[command.index("--workload") + 1])
+        Path(command[command.index("--output") + 1]).write_text(
+            json.dumps(_qualification_result(profile, snapshot_path))
+        )
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    options = QualificationOptions(
+        model_id="laguna-s-2.1",
+        workload_path=str(workload_path),
+        result_path=str(result_path),
+        profile_path=str(profile_path),
+    )
+    with patch(
+        "vllm_mlx.model_workflow.subprocess.run",
+        side_effect=run_then_cancel_then_succeed,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            qualify_model(options)
+        completed = qualify_model(options)
+
+    journal_path = Path(completed["operation_journal_path"])
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "succeeded"
+    assert journal["attempt"] == 2
+    assert completed["normalized_evidence"]["production_ready"] is False
 
 
 def test_drop_none_preserves_zero_and_false_values():

@@ -8,13 +8,14 @@ import inspect
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 from .engine.base import BaseEngine, suspend_cancellation
 from .lifecycle_contract import LifecycleEvent, ProcessState
 from .lifecycle_control import LifecycleControlState
+from .model_profile import compute_subject_digest
 
 
 class ResidentState(str, Enum):
@@ -48,6 +49,35 @@ class ModelSpec:
     profile_id: str | None = None
     profile_revision: str | None = None
     config_digest: str | None = None
+
+
+def bind_model_spec_to_profile(
+    spec: ModelSpec, profile: Mapping[str, Any]
+) -> ModelSpec:
+    """Bind a resolved serving spec to one immutable ModelProfile subject."""
+    profile_id = profile.get("profile_id")
+    profile_revision = profile.get("profile_revision")
+    stored_digest = profile.get("subject_digest")
+    computed_digest = str(compute_subject_digest(profile))
+    if not isinstance(profile_id, str) or not profile_id:
+        raise ValueError("model profile_id is missing")
+    if not isinstance(profile_revision, (str, int)):
+        raise ValueError("model profile_revision is missing")
+    if not isinstance(stored_digest, str) or stored_digest.lower() != computed_digest:
+        raise ValueError("model profile subject_digest is missing or stale")
+    for field_name, existing, expected in (
+        ("profile_id", spec.profile_id, profile_id),
+        ("profile_revision", spec.profile_revision, str(profile_revision)),
+        ("config_digest", spec.config_digest, computed_digest),
+    ):
+        if existing is not None and existing != expected:
+            raise ValueError(f"model spec {field_name} conflicts with profile")
+    return replace(
+        spec,
+        profile_id=profile_id,
+        profile_revision=str(profile_revision),
+        config_digest=computed_digest,
+    )
 
 
 @dataclass
