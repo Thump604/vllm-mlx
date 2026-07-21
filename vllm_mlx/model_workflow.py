@@ -17,11 +17,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from importlib.util import find_spec
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import fcntl
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
@@ -31,6 +34,8 @@ MODEL_MANIFEST_NAME = "vllm_mlx_model_manifest.json"
 CONVERSION_MANIFEST_NAME = "vllm_mlx_conversion_manifest.json"
 REGISTRATION_MANIFEST_NAME = "vllm_mlx_registration_manifest.json"
 QUALIFICATION_REQUEST_NAME = "vllm_mlx_qualification_request.json"
+ACQUISITION_MARKER_NAME = ".vllm_mlx_acquisition_operation.json"
+ACQUISITION_JOURNAL_VERSION = 1
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -51,6 +56,8 @@ _METADATA_FILENAMES = (
     "LICENSE.txt",
     "license",
 )
+_INTERNAL_WORKFLOW_FILENAMES = frozenset({ACQUISITION_MARKER_NAME})
+_ACQUISITION_ENV_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -133,6 +140,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _read_json_strict(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {label} at {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid {label} at {path}: expected a JSON object")
+    return value
 
 
 def _sha256_file(path: Path) -> str:
@@ -392,11 +409,64 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _acquisition_identity(
+    model_id: str,
+    options: AcquisitionOptions,
+    *,
+    target: Path,
+    staging_root: Path,
+) -> dict[str, Any]:
+    return {
+        "version": ACQUISITION_JOURNAL_VERSION,
+        "operation": "acquire",
+        "model_id": model_id,
+        "revision": options.revision,
+        "target_path": str(target.resolve()),
+        "staging_root": str(staging_root.resolve()),
+        "is_mllm": options.is_mllm,
+        "fast_transfer": options.fast_transfer,
+        "local_files_only": options.local_files_only,
+    }
+
+
+def _acquisition_operation_id(identity: dict[str, Any]) -> str:
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _acquisition_journal_path(staging_root: Path, target: Path) -> Path:
+    target_key = hashlib.sha256(str(target.resolve()).encode()).hexdigest()[:12]
+    return staging_root / f".{target.name}.{target_key}.acquisition.json"
+
+
 def _local_file_inventory(path: Path) -> tuple[list[dict[str, Any]], int]:
     files = []
     total = 0
     for item in sorted(path.rglob("*")):
         if not item.is_file():
+            continue
+        if item.name in _INTERNAL_WORKFLOW_FILENAMES:
             continue
         try:
             size = item.stat().st_size
@@ -761,39 +831,170 @@ def acquire_model(
     allow_patterns = MLLM_ALLOW_PATTERNS if options.is_mllm else LLM_ALLOW_PATTERNS
     env_updates, fast_transfer = _fast_transfer_env(options.fast_transfer)
 
-    old_env = {key: os.environ.get(key) for key in env_updates}
-    os.environ.update(env_updates)
+    old_env: dict[str, str | None] = {}
+    operation_lock = None
+    environment_lock_acquired = False
     try:
         if options.target_dir:
+            if not options.revision or not _IMMUTABLE_HF_REVISION_RE.fullmatch(
+                options.revision
+            ):
+                raise ValueError(
+                    "targeted resumable acquisition requires an immutable 40-64 character revision"
+                )
             target = Path(options.target_dir).expanduser()
-            if target.exists():
-                raise FileExistsError(f"target path already exists: {target}")
             staging_root = (
                 Path(options.staging_dir).expanduser()
                 if options.staging_dir
                 else target.parent
             )
             staging_root.mkdir(parents=True, exist_ok=True)
-            staging = Path(
-                tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=staging_root)
+            identity = _acquisition_identity(
+                model_id, options, target=target, staging_root=staging_root
             )
-            try:
-                downloaded = Path(
-                    snapshot_download(
-                        model_id,
-                        revision=options.revision,
-                        allow_patterns=allow_patterns,
-                        local_dir=str(staging),
-                        local_files_only=options.local_files_only,
+            operation_id = _acquisition_operation_id(identity)
+            journal_path = _acquisition_journal_path(staging_root, target)
+            lock_path = journal_path.with_suffix(f"{journal_path.suffix}.lock")
+            operation_lock = lock_path.open("a+")
+            fcntl.flock(operation_lock.fileno(), fcntl.LOCK_EX)
+            _ACQUISITION_ENV_LOCK.acquire()
+            environment_lock_acquired = True
+            old_env = {key: os.environ.get(key) for key in env_updates}
+            os.environ.update(env_updates)
+            journal = (
+                _read_json_strict(journal_path, label="acquisition journal")
+                if journal_path.exists()
+                else {}
+            )
+            if journal:
+                if (
+                    journal.get("kind") != "vllm-mlx-acquisition-operation"
+                    or journal.get("version") != ACQUISITION_JOURNAL_VERSION
+                    or journal.get("operation_id") != operation_id
+                    or journal.get("identity") != identity
+                ):
+                    raise ValueError(
+                        f"acquisition journal identity conflict at {journal_path}"
                     )
+            staging = staging_root / f".{target.name}.staging-{operation_id[:12]}"
+            recorded_staging = journal.get("staging_path")
+            if recorded_staging is not None and Path(recorded_staging).resolve() != (
+                staging.resolve()
+            ):
+                raise ValueError(
+                    f"acquisition journal staging path conflict at {journal_path}"
                 )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(downloaded), str(target))
-            except Exception:
-                shutil.rmtree(staging, ignore_errors=True)
+            attempt = int(journal.get("attempt", 0)) + 1
+            journal = {
+                "kind": "vllm-mlx-acquisition-operation",
+                "version": ACQUISITION_JOURNAL_VERSION,
+                "operation_id": operation_id,
+                "identity": identity,
+                "status": "running",
+                "attempt": attempt,
+                "started_at": journal.get("started_at") or _now_iso(),
+                "updated_at": _now_iso(),
+                "staging_path": str(staging),
+                "target_path": str(target),
+                "target_published": bool(journal.get("target_published", False)),
+                "target_published_at": journal.get("target_published_at"),
+            }
+            _write_json_atomic(journal_path, journal)
+            try:
+                if target.exists():
+                    existing_manifest = _read_json(target / MODEL_MANIFEST_NAME)
+                    if existing_manifest.get("operation_id") == operation_id:
+                        marker_path = target / ACQUISITION_MARKER_NAME
+                        if _read_json(marker_path).get("operation_id") == operation_id:
+                            marker_path.unlink(missing_ok=True)
+                        existing_manifest["manifest_path"] = str(
+                            target / MODEL_MANIFEST_NAME
+                        )
+                        journal.update(
+                            status="succeeded",
+                            updated_at=_now_iso(),
+                            completed_at=journal.get("completed_at") or _now_iso(),
+                        )
+                        _write_json_atomic(journal_path, journal)
+                        return existing_manifest
+                    marker = _read_json(target / ACQUISITION_MARKER_NAME)
+                    if marker.get("operation_id") != operation_id and not journal.get(
+                        "target_published"
+                    ):
+                        raise FileExistsError(f"target path already exists: {target}")
+                else:
+                    staging.mkdir(parents=True, exist_ok=True)
+                    _write_json_atomic(
+                        staging / ACQUISITION_MARKER_NAME,
+                        {"operation_id": operation_id, "identity": identity},
+                    )
+                    downloaded = Path(
+                        snapshot_download(
+                            model_id,
+                            revision=options.revision,
+                            allow_patterns=allow_patterns,
+                            local_dir=str(staging),
+                            local_files_only=options.local_files_only,
+                        )
+                    )
+                    _write_json_atomic(
+                        downloaded / ACQUISITION_MARKER_NAME,
+                        {"operation_id": operation_id, "identity": identity},
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(downloaded), str(target))
+                    journal.update(
+                        target_published=True,
+                        target_published_at=_now_iso(),
+                        updated_at=_now_iso(),
+                    )
+                    _write_json_atomic(journal_path, journal)
+
+                marker_path = target / ACQUISITION_MARKER_NAME
+                inspection = inspect_model(str(target), revision=options.revision)
+                manifest = {
+                    "kind": "vllm-mlx-model-artifact",
+                    "operation_id": operation_id,
+                    "operation_journal_path": str(journal_path),
+                    "model_id": model_id,
+                    "revision": options.revision,
+                    "path": str(target),
+                    "created_at": _now_iso(),
+                    "allow_patterns": allow_patterns,
+                    "fast_transfer": fast_transfer,
+                    "local_files_only": options.local_files_only,
+                    "inspection": inspection,
+                }
+                manifest_path = target / MODEL_MANIFEST_NAME
+                _write_json_atomic(manifest_path, manifest)
+                marker_path.unlink(missing_ok=True)
+                journal.update(
+                    status="succeeded",
+                    updated_at=_now_iso(),
+                    completed_at=_now_iso(),
+                    manifest_path=str(manifest_path),
+                )
+                _write_json_atomic(journal_path, journal)
+                manifest["manifest_path"] = str(manifest_path)
+                return manifest
+            except BaseException as exc:
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit))
+                    else "failed"
+                )
+                journal.update(
+                    status=status,
+                    updated_at=_now_iso(),
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+                _write_json_atomic(journal_path, journal)
                 raise
-            final_path = target
         else:
+            _ACQUISITION_ENV_LOCK.acquire()
+            environment_lock_acquired = True
+            old_env = {key: os.environ.get(key) for key in env_updates}
+            os.environ.update(env_updates)
             final_path = Path(
                 snapshot_download(
                     model_id,
@@ -808,6 +1009,11 @@ def acquire_model(
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        if environment_lock_acquired:
+            _ACQUISITION_ENV_LOCK.release()
+        if operation_lock is not None:
+            fcntl.flock(operation_lock.fileno(), fcntl.LOCK_UN)
+            operation_lock.close()
 
     inspection = inspect_model(str(final_path), revision=options.revision)
     manifest = {

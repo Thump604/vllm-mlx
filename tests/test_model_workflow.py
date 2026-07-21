@@ -3,6 +3,8 @@
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from vllm_mlx.model_workflow import (
+    ACQUISITION_MARKER_NAME,
     CONVERSION_MANIFEST_NAME,
     MODEL_MANIFEST_NAME,
     QUALIFICATION_REQUEST_NAME,
@@ -301,7 +304,7 @@ def test_acquire_model_finalizes_target_and_writes_manifest(tmp_path):
         manifest = acquire_model(
             "org/model",
             options=AcquisitionOptions(
-                revision="rev1",
+                revision="a" * 40,
                 target_dir=str(target),
                 staging_dir=str(staging_root),
                 fast_transfer=True,
@@ -313,10 +316,15 @@ def test_acquire_model_finalizes_target_and_writes_manifest(tmp_path):
     assert manifest["model_id"] == "org/model"
     assert manifest["path"] == str(target)
     assert manifest["fast_transfer"]["enabled"] is True
+    assert len(manifest["operation_id"]) == 64
     manifest_path = target / MODEL_MANIFEST_NAME
     assert manifest_path.exists()
     saved = json.loads(manifest_path.read_text())
     assert saved["inspection"]["file_count"] == 2
+    journal_path = Path(manifest["operation_journal_path"])
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "succeeded"
+    assert journal["attempt"] == 1
 
 
 def test_acquire_model_disables_fast_transfer_when_package_missing(tmp_path):
@@ -335,7 +343,11 @@ def test_acquire_model_disables_fast_transfer_when_package_missing(tmp_path):
         mock_download.side_effect = fake_snapshot_download
         manifest = acquire_model(
             "org/model",
-            options=AcquisitionOptions(target_dir=str(target), fast_transfer=True),
+            options=AcquisitionOptions(
+                revision="a" * 40,
+                target_dir=str(target),
+                fast_transfer=True,
+            ),
         )
 
     assert manifest["fast_transfer"]["requested"] is True
@@ -350,10 +362,326 @@ def test_acquire_model_refuses_existing_target(tmp_path):
     with patch("vllm_mlx.model_workflow.snapshot_download") as mock_download:
         with pytest.raises(FileExistsError):
             acquire_model(
-                "org/model", options=AcquisitionOptions(target_dir=str(target))
+                "org/model",
+                options=AcquisitionOptions(revision="a" * 40, target_dir=str(target)),
             )
 
     mock_download.assert_not_called()
+
+
+def test_targeted_acquisition_requires_immutable_revision(tmp_path):
+    with patch("vllm_mlx.model_workflow.snapshot_download") as mock_download:
+        with pytest.raises(ValueError, match="immutable"):
+            acquire_model(
+                "org/model",
+                options=AcquisitionOptions(
+                    revision="main", target_dir=str(tmp_path / "model")
+                ),
+            )
+
+    mock_download.assert_not_called()
+
+
+def test_acquire_model_retries_matching_failed_operation_in_same_staging_path(
+    tmp_path,
+):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+    seen_staging = []
+
+    def fake_snapshot_download(*args, **kwargs):
+        staging = Path(kwargs["local_dir"])
+        seen_staging.append(staging)
+        (staging / "partial.bin").write_bytes(b"partial")
+        if len(seen_staging) == 1:
+            raise RuntimeError("interrupted transfer")
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (staging / "model.safetensors").write_bytes(b"weights")
+        return str(staging)
+
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=fake_snapshot_download,
+    ):
+        with pytest.raises(RuntimeError, match="interrupted transfer"):
+            acquire_model("org/model", options=options)
+        manifest = acquire_model("org/model", options=options)
+
+    assert seen_staging[0] == seen_staging[1]
+    journal = json.loads(Path(manifest["operation_journal_path"]).read_text())
+    assert journal["attempt"] == 2
+    assert journal["status"] == "succeeded"
+
+
+def test_acquire_model_rejects_conflicting_identity_for_existing_journal(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=RuntimeError("failed"),
+    ) as mock_download:
+        with pytest.raises(RuntimeError, match="failed"):
+            acquire_model(
+                "org/model",
+                options=AcquisitionOptions(
+                    revision="a" * 40,
+                    target_dir=str(target),
+                    staging_dir=str(staging_root),
+                ),
+            )
+        with pytest.raises(ValueError, match="identity conflict"):
+            acquire_model(
+                "org/model",
+                options=AcquisitionOptions(
+                    revision="b" * 40,
+                    target_dir=str(target),
+                    staging_dir=str(staging_root),
+                ),
+            )
+
+    assert mock_download.call_count == 1
+
+
+def test_acquire_model_rejects_staging_path_escape_in_matching_journal(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=RuntimeError("failed"),
+    ) as mock_download:
+        with pytest.raises(RuntimeError, match="failed"):
+            acquire_model("org/model", options=options)
+        journal_path = next(staging_root.glob("*.acquisition.json"))
+        journal = json.loads(journal_path.read_text())
+        journal["staging_path"] = str(tmp_path.parent / "escaped")
+        journal_path.write_text(json.dumps(journal))
+
+        with pytest.raises(ValueError, match="staging path conflict"):
+            acquire_model("org/model", options=options)
+
+    assert mock_download.call_count == 1
+
+
+def test_acquire_model_rejects_malformed_existing_journal(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=RuntimeError("failed"),
+    ) as mock_download:
+        with pytest.raises(RuntimeError, match="failed"):
+            acquire_model("org/model", options=options)
+        journal_path = next(staging_root.glob("*.acquisition.json"))
+        journal_path.write_text("{not-json")
+
+        with pytest.raises(ValueError, match="invalid acquisition journal"):
+            acquire_model("org/model", options=options)
+
+    assert mock_download.call_count == 1
+
+
+def test_matching_concurrent_acquisitions_are_serialized(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_snapshot_download(*args, **kwargs):
+        staging = Path(kwargs["local_dir"])
+        calls.append(staging)
+        entered.set()
+        assert release.wait(timeout=5)
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (staging / "model.safetensors").write_bytes(b"weights")
+        return str(staging)
+
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=fake_snapshot_download,
+    ):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(acquire_model, "org/model", options=options)
+            assert entered.wait(timeout=5)
+            second = executor.submit(acquire_model, "org/model", options=options)
+            assert len(calls) == 1
+            release.set()
+            first_manifest = first.result(timeout=5)
+            second_manifest = second.result(timeout=5)
+
+    assert len(calls) == 1
+    assert first_manifest["operation_id"] == second_manifest["operation_id"]
+
+
+def test_different_target_acquisitions_serialize_transfer_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("HF_HUB_ENABLE_HF_TRANSFER", raising=False)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    observed = {}
+
+    def fake_snapshot_download(model_id, *args, **kwargs):
+        staging = Path(kwargs["local_dir"])
+        observed[model_id] = os.environ.get("HF_HUB_ENABLE_HF_TRANSFER")
+        if model_id == "org/first":
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_entered.set()
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        return str(staging)
+
+    first_options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(tmp_path / "first"),
+        staging_dir=str(tmp_path / "stage-first"),
+        fast_transfer=True,
+    )
+    second_options = AcquisitionOptions(
+        revision="b" * 40,
+        target_dir=str(tmp_path / "second"),
+        staging_dir=str(tmp_path / "stage-second"),
+        fast_transfer=False,
+    )
+    with (
+        patch("vllm_mlx.model_workflow.find_spec", return_value=object()),
+        patch(
+            "vllm_mlx.model_workflow.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ),
+    ):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(acquire_model, "org/first", options=first_options)
+            assert first_entered.wait(timeout=5)
+            second = executor.submit(
+                acquire_model, "org/second", options=second_options
+            )
+            assert not second_entered.wait(timeout=0.1)
+            release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+    assert observed == {"org/first": "1", "org/second": None}
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+
+
+def test_acquire_model_records_cancellation_without_deleting_staging(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=KeyboardInterrupt(),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            acquire_model(
+                "org/model",
+                options=AcquisitionOptions(
+                    revision="a" * 40,
+                    target_dir=str(target),
+                    staging_dir=str(staging_root),
+                ),
+            )
+
+    journal_path = next(staging_root.glob("*.acquisition.json"))
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "cancelled"
+    assert Path(journal["staging_path"]).exists()
+
+
+def test_acquire_model_resumes_finalization_after_target_move(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+
+    def fake_snapshot_download(*args, **kwargs):
+        staging = Path(kwargs["local_dir"])
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (staging / "model.safetensors").write_bytes(b"weights")
+        return str(staging)
+
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+    with (
+        patch(
+            "vllm_mlx.model_workflow.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ) as mock_download,
+        patch(
+            "vllm_mlx.model_workflow.inspect_model",
+            side_effect=[RuntimeError("inspection interrupted"), {"file_count": 2}],
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="inspection interrupted"):
+            acquire_model("org/model", options=options)
+        (target / ACQUISITION_MARKER_NAME).unlink()
+        manifest = acquire_model("org/model", options=options)
+
+    assert mock_download.call_count == 1
+    assert manifest["inspection"] == {"file_count": 2}
+    assert (target / MODEL_MANIFEST_NAME).exists()
+
+
+def test_idempotent_success_removes_matching_leftover_marker(tmp_path):
+    target = tmp_path / "model-final"
+    staging_root = tmp_path / "stage"
+
+    def fake_snapshot_download(*args, **kwargs):
+        staging = Path(kwargs["local_dir"])
+        (staging / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        return str(staging)
+
+    options = AcquisitionOptions(
+        revision="a" * 40,
+        target_dir=str(target),
+        staging_dir=str(staging_root),
+        fast_transfer=False,
+    )
+    with patch(
+        "vllm_mlx.model_workflow.snapshot_download",
+        side_effect=fake_snapshot_download,
+    ) as mock_download:
+        manifest = acquire_model("org/model", options=options)
+        marker = target / ACQUISITION_MARKER_NAME
+        marker.write_text(json.dumps({"operation_id": manifest["operation_id"]}))
+
+        repeated = acquire_model("org/model", options=options)
+
+    assert repeated["operation_id"] == manifest["operation_id"]
+    assert not marker.exists()
+    assert mock_download.call_count == 1
 
 
 def test_convert_model_dry_run_records_mlx_lm_command(tmp_path):
