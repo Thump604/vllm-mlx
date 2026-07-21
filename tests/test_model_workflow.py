@@ -1119,6 +1119,77 @@ def test_register_model_rejects_file_as_artifact(tmp_path):
         raise AssertionError("expected NotADirectoryError")
 
 
+def test_register_model_revalidates_converted_artifact_integrity(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "converted"
+
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        _write_valid_weights(converted / "model.safetensors")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with (
+        patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run),
+        patch("vllm_mlx.model_workflow.platform.platform", return_value="macOS"),
+    ):
+        converted = convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+
+    registered = register_model(RegistrationOptions(artifact_path=str(output)))
+    assert (
+        registered["artifact_validation"]["artifact_sha256"]
+        == converted["artifact_validation"]["artifact_sha256"]
+    )
+    registered_again = register_model(RegistrationOptions(artifact_path=str(output)))
+    assert (
+        registered_again["artifact_validation"]["artifact_sha256"]
+        == registered["artifact_validation"]["artifact_sha256"]
+    )
+
+    _write_valid_weights(output / "model.safetensors", value=2)
+    with pytest.raises(ValueError, match="recorded integrity digest"):
+        register_model(RegistrationOptions(artifact_path=str(output)))
+
+
+def test_register_model_rejects_artifact_change_during_registration(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "converted"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    _write_valid_weights(artifact / "model.safetensors")
+    operation_id = "a" * 64
+    (artifact / CONVERSION_MANIFEST_NAME).write_text(
+        json.dumps({"operation_id": operation_id})
+    )
+    initial = validate_converted_artifact(artifact, expected_operation_id=operation_id)
+    (artifact / CONVERSION_MANIFEST_NAME).write_text(
+        json.dumps({"operation_id": operation_id, "artifact_validation": initial})
+    )
+
+    original_validate = validate_converted_artifact
+    calls = 0
+
+    def mutate_after_first_validation(*args, **kwargs):
+        nonlocal calls
+        result = original_validate(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            (artifact / "config.json").write_text(json.dumps({"model_type": "qwen"}))
+        return result
+
+    monkeypatch.setattr(
+        "vllm_mlx.model_workflow.validate_converted_artifact",
+        mutate_after_first_validation,
+    )
+    with pytest.raises(ValueError, match="changed during registration"):
+        register_model(RegistrationOptions(artifact_path=str(artifact)))
+
+
 def test_qualify_model_dry_run_records_bench_command(tmp_path):
     output = tmp_path / QUALIFICATION_REQUEST_NAME
 
