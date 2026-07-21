@@ -60,7 +60,13 @@ _METADATA_FILENAMES = (
     "license",
 )
 _INTERNAL_WORKFLOW_FILENAMES = frozenset(
-    {ACQUISITION_MARKER_NAME, CONVERSION_MARKER_NAME, CONVERSION_MANIFEST_NAME}
+    {
+        ACQUISITION_MARKER_NAME,
+        CONVERSION_MARKER_NAME,
+        CONVERSION_MANIFEST_NAME,
+        REGISTRATION_MANIFEST_NAME,
+        QUALIFICATION_REQUEST_NAME,
+    }
 )
 _ACQUISITION_ENV_LOCK = threading.RLock()
 
@@ -1484,6 +1490,29 @@ def register_model(options: RegistrationOptions) -> dict[str, Any]:
     if not artifact.is_dir():
         raise NotADirectoryError(f"artifact path must be a directory: {artifact}")
 
+    artifact_validation: dict[str, Any] | None = None
+    conversion_manifest_path = artifact / CONVERSION_MANIFEST_NAME
+    if conversion_manifest_path.is_file():
+        conversion_manifest = _read_json_strict(
+            conversion_manifest_path, label="conversion manifest"
+        )
+        operation_id = conversion_manifest.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("conversion manifest operation_id is missing")
+        artifact_validation = validate_converted_artifact(
+            artifact, expected_operation_id=operation_id
+        )
+        recorded = conversion_manifest.get("artifact_validation")
+        recorded_digest = (
+            recorded.get("artifact_sha256") if isinstance(recorded, dict) else None
+        )
+        if not isinstance(recorded_digest, str):
+            raise ValueError("conversion manifest artifact digest is missing")
+        if artifact_validation["artifact_sha256"] != recorded_digest:
+            raise ValueError(
+                "converted artifact bytes differ from the recorded integrity digest"
+            )
+
     inspection = inspect_model(str(artifact))
     model_id = options.model_id or artifact.name
     serving_defaults = _drop_none(
@@ -1503,6 +1532,16 @@ def register_model(options: RegistrationOptions) -> dict[str, Any]:
             "reasoning_parser": options.reasoning_parser,
         }
     )
+    source_manifests = _existing_manifests(artifact)
+    if artifact_validation is not None:
+        revalidated = validate_converted_artifact(
+            artifact,
+            expected_operation_id=artifact_validation["manifest_operation_id"],
+        )
+        if revalidated["artifact_sha256"] != artifact_validation["artifact_sha256"]:
+            raise ValueError("converted artifact changed during registration")
+        artifact_validation = revalidated
+
     payload = {
         "kind": "vllm-mlx-model-registration",
         "schema_version": 1,
@@ -1516,7 +1555,8 @@ def register_model(options: RegistrationOptions) -> dict[str, Any]:
         "serving_defaults": serving_defaults,
         "parser_policy": parser_policy,
         "inspection": inspection,
-        "source_manifests": _existing_manifests(artifact),
+        "artifact_validation": artifact_validation,
+        "source_manifests": source_manifests,
         "qualification_required": True,
         "production_ready": False,
     }
