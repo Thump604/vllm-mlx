@@ -137,6 +137,13 @@ vocabularies, and passing evidence for `qualified`. P1.4 semantic validation
 must enforce digest equality, set disjointness, feature-policy linkage, context
 and KV relationships, and provenance coverage for optional sections.
 
+`vllm_mlx.model_profile` implements those P1.4 checks without importing serving
+code. It uses `rfc8785` for canonical JSON rather than relying on Python
+dictionary order or an approximate sorted-key encoding. Inactive feature modes
+(`guarded_off`, `deferred`, and `not_supported`) cannot expose request or
+activation controls. Validation collects all deterministic failures before
+raising `ModelProfileValidationError`.
+
 ## Legacy Import Envelope
 
 `schemas/model-profile-import-result-v1.schema.json` is the only compatibility

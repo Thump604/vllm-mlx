@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "example-text-model-default",
   "profile_revision": 1,
-  "subject_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "subject_digest": "d3e3f27c9ee80579771b650858cdfeee9ccb117cb1dfbe6283faf77fc7bd85fd",
   "description": "Non-production example for schema validation.",
   "identity": {
     "provider": "huggingface",
@@ -129,7 +129,7 @@
     },
     "request_policy": {
       "required_fields": {},
-      "allowed_fields": ["temperature", "top_p", "max_tokens"],
+      "allowed_fields": ["temperature", "top_p", "max_tokens", "stream"],
       "forbidden_fields": []
     }
   },
