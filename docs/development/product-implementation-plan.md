@@ -68,7 +68,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 |---|---|---|---|---|
 | P3.1 | complete | Define lifecycle API and state transitions over existing workflow, registry, and residency modules | Sol `high` | P1, P2 |
 | P3.2 | complete | Implement resumable acquire/convert/validate operations | Terra `medium` | P3.1 |
-| P3.3 | pending | Implement one-active-large-model activation, stop, status, and recovery | Terra `high` | P3.1 |
+| P3.3 | complete | Implement one-active-large-model activation, stop, status, and recovery | Terra `high` | P3.1 |
 | P3.4 | pending | Normalize qualification results into profile evidence without automatic over-promotion | Terra `medium` | P3.1 |
 | P3.5 | pending | Exercise crash, cancellation, partial download, and stale-state recovery | Luna `high` | P3.2, P3.3, P3.4 |
 
@@ -77,6 +77,11 @@ in separate reviews. No upstream PR should contain the full integration branch.
 - CLI and future UI consume the same lifecycle service.
 - Process state, configured state, and profile state cannot silently disagree.
 - Interrupted operations are resumable or produce an actionable terminal state.
+
+P3.3's one-active guarantee applies to the first product's single-model
+`MODEL` serving path with persistent lifecycle control. The existing
+`--models-config` registry remains an advanced multi-model interface and is not
+evidence for, or part of, the first product workflow.
 
 ### P3.2 Progress
 
@@ -120,7 +125,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Implement P3.3 by integrating the pure lifecycle contract with the existing
-registry and residency managers. Keep activation, stop, status, and stale-state
-recovery behind one service boundary; do not change inference generation or
-model-family behavior in that work package.
+Implement P3.4 by binding qualification results to immutable profile subjects
+and recording exact evidence without promoting a profile automatically. Keep
+benchmark execution, evidence normalization, and product policy as separate
+boundaries.

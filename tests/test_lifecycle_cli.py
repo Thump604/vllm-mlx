@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -282,6 +283,7 @@ class TestLifecycleCli:
         def fake_load_model(*args, **kwargs):
             captured["args"] = args
             captured["kwargs"] = kwargs
+            captured["lifecycle_path"] = os.environ.get("VLLM_MLX_LIFECYCLE_STATE_PATH")
 
         monkeypatch.setattr(srv, "load_model", fake_load_model)
         monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
@@ -357,6 +359,23 @@ class TestLifecycleCli:
         assert captured["kwargs"]["stream_interval"] == 1
         assert captured["kwargs"]["auto_unload_idle_seconds"] == 300
         assert captured["kwargs"]["lazy_load_model"] is True
+        assert captured["lifecycle_path"] == os.path.expanduser(
+            "~/.cache/vllm-mlx/lifecycle-state.json"
+        )
+        assert "VLLM_MLX_LIFECYCLE_STATE_PATH" not in os.environ
+
+        monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", "/existing/state.json")
+
+        def failing_load_model(*args, **kwargs):
+            assert os.environ["VLLM_MLX_LIFECYCLE_STATE_PATH"].endswith(
+                "/.cache/vllm-mlx/lifecycle-state.json"
+            )
+            raise RuntimeError("load failed")
+
+        monkeypatch.setattr(srv, "load_model", failing_load_model)
+        with pytest.raises(RuntimeError, match="load failed"):
+            cli.serve_command(args)
+        assert os.environ["VLLM_MLX_LIFECYCLE_STATE_PATH"] == "/existing/state.json"
 
     def test_serve_command_preserves_mtp_scheduler_config_with_residency(
         self, monkeypatch
