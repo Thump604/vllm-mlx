@@ -295,9 +295,28 @@ performance claims, and exposure policy.
 **Excluded:** Serving startup, model qualification, catalog curation, desktop
   UX, and broad refactoring of workflow modules.
 
+### LC-1: Pure lifecycle state contract
+
+**Depends on:** PR 4 and MI-7.
+
+**Scope:** Define immutable configured-profile, resolved-process,
+resident-process, and request-lease state plus legal transitions. Keep the
+contract synchronous and dependency-free so existing single-resident and
+registry managers can adopt it incrementally.
+
+**Files:** `vllm_mlx/lifecycle_contract.py` and
+`tests/test_lifecycle_contract.py`.
+
+**Acceptance checks:** Legal configure/resolve/load/acquire/release/unload/clear
+chains pass; illegal transitions, lease underflow, identity mismatch, and
+configuration changes while live fail with stable actionable errors.
+
+**Excluded:** Changes to `lifecycle.py`, `model_registry.py`, `server.py`, CLI,
+HTTP status, model processes, Jobs/Ops, or live state.
+
 ### PR 7: Lifecycle control API and one-active-model state
 
-**Depends on:** PR 4 and PR 6.
+**Depends on:** PR 4, PR 6, and LC-1.
 
 **Scope:** Expose acquire, validate, activate, stop, status, and recovery
   operations through the existing lifecycle/registry boundary. Make configured
