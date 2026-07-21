@@ -51,8 +51,8 @@ in separate reviews. No upstream PR should contain the full integration branch.
 | P2.1 | complete | Expand inspection to tokenizer, template, generation config, repository revision, license, and capability metadata | Terra `medium` | P1 |
 | P2.2 | complete | Implement Apple Silicon hardware inventory | Terra `medium` | P1 |
 | P2.3 | complete | Implement explainable weight, KV, context, conversion-disk, and safety-margin estimates | Terra `high` | P2.1, P2.2 |
-| P2.4 | pending | Add explicit family adapters for the first curated model set | Terra `high` | P2.1 |
-| P2.5 | pending | Validate recommendations against recorded hardware/model fixtures | Luna `high` | P2.3, P2.4 |
+| P2.4 | complete | Add explicit family adapters for the first curated model set | Terra `high` | P2.1 |
+| P2.5 | in_progress | Validate recommendations against recorded hardware/model fixtures | Luna `high` | P2.3, P2.4 |
 
 ### P2 Acceptance Gate
 
@@ -107,7 +107,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Start P2.4 with `terra-implementer` at `high`. Add explicit adapters for the
-first curated model families, beginning with fixture-backed metadata extraction
-into the generic estimator inputs. Adapters must be keyed by declared config
-structure, not model-name substrings, and unsupported layouts remain unknown.
+Complete P2.5 with `luna-verifier` at `high`. Validate adapter outputs and fit
+recommendations against pinned Qwen 3.6, Laguna S 2.1, synthetic dense/GQA,
+and source-attributed hardware fixtures. Keep hybrid-cache estimates unknown
+until an architecture-specific estimator exists; do not load a model.

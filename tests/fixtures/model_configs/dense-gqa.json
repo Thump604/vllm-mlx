@@ -1,0 +1,15 @@
+{
+  "fixture_metadata": {
+    "fixture_kind": "synthetic",
+    "purpose": "generic dense/GQA adapter contract; not a provider artifact"
+  },
+  "config": {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "max_position_embeddings": 131072
+  }
+}
