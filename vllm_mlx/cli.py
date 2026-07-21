@@ -509,6 +509,8 @@ def model_command(args):
                 repetitions=args.repetitions,
                 dry_run=args.dry_run,
                 extra_args=args.extra_arg,
+                profile_path=args.profile,
+                evidence_output_path=args.evidence_output,
             )
         )
         if payload.get("status") == "failed":
@@ -1960,6 +1962,18 @@ Examples:
         action="append",
         default=[],
         help="Extra argument passed through to bench-serve. Repeatable.",
+    )
+    model_qualify_parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="ModelProfile v1 path used to bind qualification evidence",
+    )
+    model_qualify_parser.add_argument(
+        "--evidence-output",
+        type=str,
+        default=None,
+        help="Path for normalized, profile-bound qualification evidence",
     )
 
     # Serving benchmark
