@@ -54,6 +54,7 @@ class TestContinuousBatchingBasic:
 
 
 @pytest.mark.anyio
+@pytest.mark.slow
 class TestContinuousBatchingIntegration:
     """Integration tests requiring actual model loading."""
 

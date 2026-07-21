@@ -238,6 +238,15 @@ Migration, Laguna, lifecycle, or product-strategy changes. Dependency-lock
 policy, if needed, belongs with the repository's packaging policy rather than
 being hidden inside a product contract PR.
 
+### Performance-test classification PR
+
+Keep model-loading throughput benchmarks out of the default correctness suite
+by applying the repository's existing `slow` marker. Preserve the benchmark
+logic and run it explicitly with `pytest -m slow`; do not replace measured
+throughput with a mocked correctness test or weaken the recorded thresholds in
+this classification-only PR. This patch must remain separate from model-fit,
+serving, scheduler, and engine behavior changes.
+
 ## Reviewer Handoff Format
 
 Every proposed PR should include:

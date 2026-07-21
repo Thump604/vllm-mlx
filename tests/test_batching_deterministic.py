@@ -189,6 +189,7 @@ class TestDeterministicConcurrentRequests:
         ), f"Results differ between runs: {all_results}"
 
 
+@pytest.mark.slow
 class TestBatchingPerformance:
     """Test that batching improves throughput."""
 
