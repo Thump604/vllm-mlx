@@ -78,6 +78,14 @@ in separate reviews. No upstream PR should contain the full integration branch.
 - Process state, configured state, and profile state cannot silently disagree.
 - Interrupted operations are resumable or produce an actionable terminal state.
 
+### P3.2 Progress
+
+- Targeted acquisition: complete. Immutable revisions, operation locking,
+  crash-durable journals, failed/cancelled retry, identity conflicts, atomic
+  publication, and finalization recovery are covered.
+- Conversion journaling/resume: pending.
+- Artifact validation result and source/output identity binding: pending.
+
 ## Stage 4: First Product Workflow
 
 | ID | Status | Work package | Agent | Depends on |
@@ -107,7 +115,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Inventory the existing acquisition and conversion checkpoint behavior for P3.2,
-then add one resumable operation boundary at a time. Preserve current commands,
-manifests, and artifact layout; do not combine serving activation or resident
-process state with acquire/convert/validate work.
+Continue P3.2 with conversion operation state. Preserve the existing conversion
+command and successful manifest, but make partial output, retries, cancellation,
+and source/output identity explicit before adding artifact validation. Do not
+combine serving activation or resident process state with this work.
