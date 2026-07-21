@@ -4,8 +4,22 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
 
-from vllm_mlx.model_profile_compat import import_legacy_model_profile
+import pytest
+
+from vllm_mlx.model_profile import compute_subject_digest
+from vllm_mlx.model_profile_compat import (
+    finalize_legacy_model_profile,
+    import_legacy_model_profile,
+)
+
+ROOT = Path(__file__).parents[1]
+
+
+def _load(path: str) -> dict:
+    return json.loads((ROOT / path).read_text())
 
 
 def _source(location: str, payload: dict) -> dict:
@@ -357,3 +371,67 @@ def test_malformed_policy_shapes_are_reported_without_membership_errors():
         "allowed_fields": ["temperature"],
         "forbidden_fields": [],
     }
+
+
+def test_explicit_completion_preserves_imported_facts_and_validates_profile():
+    imported = import_legacy_model_profile(
+        registration=_source(
+            "/manifests/registration.json",
+            {
+                "artifact_id": "example-model-mlx-q4",
+                "served_model_name": "example-model",
+                "created_at": "2026-07-21T00:00:00Z",
+            },
+        )
+    )
+    completed = _load("schemas/examples/model-profile-v1.example.json")
+    completed["provenance"]["records"].extend(imported.profile["provenance"]["records"])
+    completed["subject_digest"] = compute_subject_digest(completed)
+
+    result = finalize_legacy_model_profile(
+        imported,
+        completed,
+        profile_schema=_load("schemas/model-profile-v1.schema.json"),
+        import_schema=_load("schemas/model-profile-import-result-v1.schema.json"),
+    )
+
+    assert result.complete is True
+    assert result.profile == completed
+    assert not any(issue.severity == "error" for issue in result.issues)
+
+
+def test_explicit_completion_rejects_changed_facts_and_source_errors():
+    imported = import_legacy_model_profile(
+        registration=_source(
+            "/manifests/registration.json",
+            {
+                "artifact_id": "example-model-mlx-q4",
+                "served_model_name": "example-model",
+                "created_at": "2026-07-21T00:00:00Z",
+            },
+        )
+    )
+    changed = _load("schemas/examples/model-profile-v1.example.json")
+    changed["identity"]["artifact_id"] = "different-artifact"
+
+    with pytest.raises(ValueError, match="changes imported facts"):
+        finalize_legacy_model_profile(
+            imported,
+            changed,
+            profile_schema=_load("schemas/model-profile-v1.schema.json"),
+            import_schema=_load("schemas/model-profile-import-result-v1.schema.json"),
+        )
+
+    source_error = import_legacy_model_profile(
+        registration=_source(
+            "/manifests/registration-invalid.json",
+            {"model_id": "ambiguous", "served_model_name": "example-model"},
+        )
+    )
+    with pytest.raises(ValueError, match="ambiguous_registration_model_id"):
+        finalize_legacy_model_profile(
+            source_error,
+            _load("schemas/examples/model-profile-v1.example.json"),
+            profile_schema=_load("schemas/model-profile-v1.schema.json"),
+            import_schema=_load("schemas/model-profile-import-result-v1.schema.json"),
+        )

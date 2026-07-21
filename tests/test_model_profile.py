@@ -21,6 +21,10 @@ from vllm_mlx.model_profile import (
     validate_model_profile,
 )
 from vllm_mlx.model_profile_compat import import_legacy_model_profile
+from vllm_mlx.model_profile_resolution import (
+    ModelProfileResolutionError,
+    resolve_effective_serving_configuration,
+)
 
 ROOT = Path(__file__).parents[1]
 PROFILE_SCHEMA_PATH = ROOT / "schemas" / "model-profile-v1.schema.json"
@@ -269,7 +273,195 @@ def test_hardware_fit_requires_provenance_coverage(example_profile, profile_sche
 
     issues = collect_model_profile_issues(example_profile, profile_schema)
 
-    assert any(issue.code == "hardware_fit_without_provenance" for issue in issues)
+    assert any(
+        issue.code == "provenance_kind_mismatch"
+        and issue.pointer.startswith("/hardware_fit/0")
+        for issue in issues
+    )
+
+
+def test_maintainer_policy_cannot_establish_provider_and_measured_facts(
+    example_profile, profile_schema
+):
+    example_profile["hardware_fit"][0]["method"] = "measured"
+    example_profile["hardware_fit"][0]["measured_peak_memory_bytes"] = 5_000_000_000
+    example_profile["provenance"]["records"] = [
+        {
+            "field_paths": [
+                "/identity",
+                "/artifact",
+                "/capabilities",
+                "/serving",
+                "/hardware_fit",
+            ],
+            "kind": "maintainer_policy",
+            "source": "local-policy.yaml",
+            "revision": None,
+            "sha256": "a" * 64,
+            "rule_id": "local-policy-v1",
+            "observed_at": "2026-07-21T00:00:00Z",
+        }
+    ]
+    _refresh_digest(example_profile)
+
+    issues = collect_model_profile_issues(example_profile, profile_schema)
+    pointers = {issue.pointer for issue in issues}
+    codes = {issue.code for issue in issues}
+
+    assert "/identity/resolved_revision" in pointers
+    assert any(pointer.startswith("/artifact/") for pointer in pointers)
+    assert any(pointer.startswith("/capabilities/") for pointer in pointers)
+    assert any(
+        pointer.startswith("/serving/sampling/provider_defaults/")
+        for pointer in pointers
+    )
+    assert any(pointer.startswith("/hardware_fit/0/") for pointer in pointers)
+    assert "invalid_provenance_claim" in codes
+
+
+def test_provenance_rejects_nonexistent_descendants_and_unbound_sources(
+    example_profile, profile_schema
+):
+    provider = example_profile["provenance"]["records"][0]
+    provider["field_paths"] = [
+        "/identity/resolved_revision/not-a-real-field",
+        "/artifact",
+        "/serving/sampling/provider_defaults",
+    ]
+    provider["revision"] = None
+    provider["sha256"] = None
+    derived = example_profile["provenance"]["records"][1]
+    derived["rule_id"] = None
+    derived["observed_at"] = None
+    _refresh_digest(example_profile)
+
+    codes = {
+        issue.code
+        for issue in collect_model_profile_issues(example_profile, profile_schema)
+    }
+
+    assert "invalid_provenance_path" in codes
+    assert "provider_provenance_unbound" in codes
+    assert "derived_provenance_rule_missing" in codes
+    assert "provenance_timestamp_missing" in codes
+
+
+def test_measured_hardware_fit_requires_a_measurement(example_profile, profile_schema):
+    fit = example_profile["hardware_fit"][0]
+    fit["method"] = "measured"
+    fit["measured_peak_memory_bytes"] = None
+    evidence_record = example_profile["provenance"]["records"][1]
+    evidence_record["kind"] = "measured_result"
+    evidence_record["sha256"] = "e" * 64
+    evidence_record["rule_id"] = None
+    _refresh_digest(example_profile)
+
+    issues = collect_model_profile_issues(example_profile, profile_schema)
+
+    assert any(
+        issue.code == "measured_hardware_fit_without_measurement" for issue in issues
+    )
+
+
+def test_local_only_profile_uses_local_and_derived_provenance(
+    example_profile, profile_schema
+):
+    identity = example_profile["identity"]
+    identity.update(
+        {
+            "provider": "local",
+            "repository_id": None,
+            "requested_revision": None,
+            "resolved_revision": None,
+        }
+    )
+    example_profile["artifact"]["source_uri"] = "local://example-model"
+    example_profile["serving"]["sampling"]["provider_defaults"] = {}
+    example_profile["provenance"]["records"][0] = {
+        "field_paths": ["/artifact"],
+        "kind": "derived_recommendation",
+        "source": "/manifests/conversion.json",
+        "revision": None,
+        "sha256": "a" * 64,
+        "rule_id": "conversion-manifest-v1",
+        "observed_at": "2026-07-21T00:00:00Z",
+    }
+    example_profile["provenance"]["records"].append(
+        {
+            "field_paths": [
+                "/identity",
+                "/serving/sampling/provider_defaults",
+            ],
+            "kind": "maintainer_policy",
+            "source": "/catalog/local-example.json",
+            "revision": None,
+            "sha256": "b" * 64,
+            "rule_id": "local-catalog-v1",
+            "observed_at": "2026-07-21T00:00:00Z",
+        }
+    )
+    _refresh_digest(example_profile)
+
+    validate_model_profile(example_profile, profile_schema)
+
+
+def test_provenance_paths_use_rfc6901_escaping(example_profile, profile_schema):
+    example_profile["serving"]["template"]["default_kwargs"] = {"a/b~c": True}
+    _refresh_digest(example_profile)
+
+    validate_model_profile(example_profile, profile_schema)
+
+
+def test_effective_serving_precedence_is_field_specific(
+    example_profile, profile_schema
+):
+    example_profile["serving"]["sampling"]["provider_defaults"] = {
+        "temperature": 1.0,
+        "top_p": 0.95,
+    }
+    example_profile["serving"]["sampling"]["profile_defaults"] = {
+        "temperature": 0.6,
+    }
+    _refresh_digest(example_profile)
+
+    effective = resolve_effective_serving_configuration(
+        example_profile,
+        profile_schema=profile_schema,
+        runtime_fallbacks={"temperature": 0.1, "top_p": 0.8, "seed": 7},
+        activation_overrides={
+            "features.continuous_batching": True,
+            "limits.max_output_tokens": 2048,
+        },
+    )
+
+    assert effective.values["sampling"] == {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "seed": 7,
+    }
+    assert effective.sources["/sampling/temperature"] == "profile_default"
+    assert effective.sources["/sampling/top_p"] == "provider_default"
+    assert effective.sources["/sampling/seed"] == "runtime_fallback"
+    assert effective.values["features"]["continuous_batching"]["enabled"] is True
+    assert effective.values["limits"]["max_output_tokens"] == 2048
+
+
+def test_effective_serving_rejects_unapproved_or_invalid_overrides(
+    example_profile, profile_schema
+):
+    with pytest.raises(ModelProfileResolutionError, match="not allowed"):
+        resolve_effective_serving_configuration(
+            example_profile,
+            profile_schema=profile_schema,
+            activation_overrides={"limits.serving_context": 1024},
+        )
+
+    with pytest.raises(ModelProfileResolutionError, match="positive integer"):
+        resolve_effective_serving_configuration(
+            example_profile,
+            profile_schema=profile_schema,
+            activation_overrides={"limits.max_output_tokens": "2048"},
+        )
 
 
 def test_representative_legacy_import_is_incomplete_and_validates_envelope(

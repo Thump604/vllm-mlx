@@ -22,7 +22,7 @@ closes or materially replans a package.
 | P1.2 | complete | Define the versioned `ModelProfile` schema and provenance layers | Sol `high` | P1.1 |
 | P1.3 | complete | Map acquisition, conversion, registration, registry, and qualification data into the schema | Terra `medium` | P1.2 |
 | P1.4 | complete | Add schema validation and migration tests | Luna `medium` | P1.3 |
-| P1.5 | in_progress | Independent contract and compatibility review | Terra `high` | P1.4 |
+| P1.5 | complete | Independent contract and compatibility review | Terra `high` | P1.4 |
 
 ### P1 Acceptance Gate
 
@@ -31,6 +31,18 @@ closes or materially replans a package.
 - Existing manifests remain readable or have an explicit migration path.
 - Configuration precedence is deterministic and covered by tests.
 - No server route or generation behavior changes in this stage.
+- The Laguna S 2.1 handoff is represented by
+  `model-onboarding-acceptance-fixture.md`; every currently manual fact and
+  qualification boundary has a target product stage rather than remaining
+  chat-only knowledge.
+
+## Upstream Review Boundary
+
+`604/product-agent-strategy` is an integration branch, not an upstream PR.
+`upstream-delivery-plan.md` defines the dependency-ordered topic branches and
+keeps schemas, validation, compatibility mapping, precedence resolution,
+Laguna fixture data, lifecycle wiring, agent governance, and pre-commit repair
+in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Stage 2: Model Intelligence
 
@@ -93,10 +105,10 @@ closes or materially replans a package.
 - Audio, reranking, and exhaustive multimodal product UX.
 - Broad performance work not tied to a first-release profile or measured user bottleneck.
 
-## First Execution Step
+## Next Execution Step
 
-Start P1.1 with `luna-inventory` at `low`. Its artifact must map every current
-source of model identity, parser/template policy, sampling, context/output/KV
-limits, engine features, memory estimates, and qualification evidence. Sol then
-uses that inventory to design P1.2; implementation must not begin before the
-precedence conflicts are explicit.
+Start P2.1 with `terra-implementer` at `medium`. Expand the existing inspection
+boundary to emit tokenizer, template, generation-config, immutable revision,
+license, and capability metadata as provider facts. Use the Laguna fixture to
+prove that inspection removes manual handoff fields without inferring parser,
+feature, context, or qualification claims that the source does not establish.

@@ -7,6 +7,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
+from vllm_mlx.model_profile import validate_import_result, validate_model_profile
+
 SourceKind = Literal[
     "acquisition",
     "conversion",
@@ -97,6 +99,79 @@ class ModelProfileImportResult:
             "profile": deepcopy(self.profile),
             "issues": [issue.as_dict() for issue in self.issues],
         }
+
+
+def finalize_legacy_model_profile(
+    imported: ModelProfileImportResult,
+    completed_profile: Mapping[str, Any],
+    *,
+    profile_schema: Mapping[str, Any],
+    import_schema: Mapping[str, Any],
+) -> ModelProfileImportResult:
+    """Validate an explicit completion without discarding imported facts.
+
+    Legacy inputs are intentionally insufficient on their own. The caller must
+    supply a complete profile, and every fact imported from legacy sources must
+    remain unchanged. Only missing-fact errors are resolved by that explicit
+    completion; conflicts and malformed source evidence remain blocking.
+    """
+    if imported.complete:
+        raise ValueError("legacy import is already complete")
+    if imported.profile is None:
+        raise ValueError("legacy import does not contain a profile fragment")
+
+    blocking = tuple(
+        issue
+        for issue in imported.issues
+        if issue.severity == "error" and issue.code != "missing_required_fact"
+    )
+    if blocking:
+        codes = ", ".join(sorted({issue.code for issue in blocking}))
+        raise ValueError(f"legacy import has unresolved errors: {codes}")
+
+    conflicts = _fragment_conflicts(imported.profile, completed_profile)
+    if conflicts:
+        raise ValueError(
+            "completed profile changes imported facts: " + ", ".join(conflicts)
+        )
+
+    candidate = deepcopy(dict(completed_profile))
+    validate_model_profile(candidate, profile_schema)
+    result = ModelProfileImportResult(
+        complete=True,
+        sources=imported.sources,
+        profile=candidate,
+        issues=tuple(issue for issue in imported.issues if issue.severity == "warning"),
+    )
+    validate_import_result(result.as_dict(), import_schema, profile_schema)
+    return result
+
+
+def _fragment_conflicts(
+    fragment: Mapping[str, Any], candidate: Mapping[str, Any], pointer: str = ""
+) -> tuple[str, ...]:
+    conflicts: list[str] = []
+    for key, value in fragment.items():
+        child_pointer = f"{pointer}/{key}"
+        if key not in candidate:
+            conflicts.append(child_pointer)
+            continue
+        candidate_value = candidate[key]
+        if isinstance(value, Mapping):
+            if not isinstance(candidate_value, Mapping):
+                conflicts.append(child_pointer)
+            else:
+                conflicts.extend(
+                    _fragment_conflicts(value, candidate_value, child_pointer)
+                )
+        elif child_pointer == "/provenance/records" and isinstance(value, list):
+            if not isinstance(candidate_value, list) or any(
+                record not in candidate_value for record in value
+            ):
+                conflicts.append(child_pointer)
+        elif candidate_value != value:
+            conflicts.append(child_pointer)
+    return tuple(conflicts)
 
 
 def _is_sha256(value: Any) -> bool:

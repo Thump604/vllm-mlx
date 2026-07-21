@@ -330,16 +330,154 @@ def _check_provenance(
     profile: Mapping[str, Any], issues: list[ModelProfileValidationIssue]
 ) -> None:
     records = profile["provenance"]["records"]
-    if "hardware_fit" in profile and not any(
-        any(
-            path == "/hardware_fit" or path.startswith("/hardware_fit/")
-            for path in record["field_paths"]
-        )
-        for record in records
-    ):
+    subject_sections = ("identity", "artifact", "capabilities", "serving")
+    pointers = [
+        pointer
+        for section in subject_sections
+        for pointer in _leaf_pointers(profile[section], f"/{section}")
+    ]
+    pointers.extend(_leaf_pointers(profile.get("hardware_fit", []), "/hardware_fit"))
+
+    for index, record in enumerate(records):
+        for path in record["field_paths"]:
+            if not any(_path_covers(path, pointer) for pointer in pointers):
+                _issue(
+                    issues,
+                    "invalid_provenance_path",
+                    f"/provenance/records/{index}/field_paths",
+                    f"{path} does not identify a profile subject field",
+                )
+        _check_provenance_metadata(record, index, issues)
+
+    for pointer in pointers:
+        allowed_kinds = _allowed_provenance_kinds(profile, pointer)
+        covering = [
+            (index, record)
+            for index, record in enumerate(records)
+            if any(_path_covers(path, pointer) for path in record["field_paths"])
+        ]
+        if not any(record["kind"] in allowed_kinds for _, record in covering):
+            _issue(
+                issues,
+                "provenance_kind_mismatch",
+                pointer,
+                f"requires provenance kind in {sorted(allowed_kinds)}",
+            )
+        for index, record in covering:
+            if record["kind"] not in allowed_kinds:
+                _issue(
+                    issues,
+                    "invalid_provenance_claim",
+                    f"/provenance/records/{index}",
+                    f"{record['kind']} cannot establish {pointer}",
+                )
+
+    for index, fit in enumerate(profile.get("hardware_fit", [])):
+        if (
+            fit["method"] == "measured"
+            and fit.get("measured_peak_memory_bytes") is None
+        ):
+            _issue(
+                issues,
+                "measured_hardware_fit_without_measurement",
+                f"/hardware_fit/{index}/measured_peak_memory_bytes",
+                "measured hardware fit requires a measured peak-memory value",
+            )
+
+
+def _leaf_pointers(value: Any, pointer: str) -> list[str]:
+    if isinstance(value, Mapping):
+        if not value:
+            return [pointer]
+        return [
+            child
+            for key, item in value.items()
+            for child in _leaf_pointers(
+                item, f"{pointer}/{_escape_pointer_token(str(key))}"
+            )
+        ]
+    if isinstance(value, list):
+        if not value or all(not isinstance(item, (Mapping, list)) for item in value):
+            return [pointer]
+        return [
+            child
+            for index, item in enumerate(value)
+            for child in _leaf_pointers(item, f"{pointer}/{index}")
+        ]
+    return [pointer]
+
+
+def _path_covers(path: str, pointer: str) -> bool:
+    return path == pointer or pointer.startswith(f"{path}/")
+
+
+def _escape_pointer_token(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _check_provenance_metadata(
+    record: Mapping[str, Any],
+    index: int,
+    issues: list[ModelProfileValidationIssue],
+) -> None:
+    pointer = f"/provenance/records/{index}"
+    if record.get("observed_at") is None:
         _issue(
             issues,
-            "hardware_fit_without_provenance",
-            "/hardware_fit",
-            "hardware-fit claims require provenance coverage",
+            "provenance_timestamp_missing",
+            f"{pointer}/observed_at",
+            "provenance records require an observation timestamp",
         )
+    kind = record["kind"]
+    if kind == "provider_fact" and not (record.get("revision") or record.get("sha256")):
+        _issue(
+            issues,
+            "provider_provenance_unbound",
+            pointer,
+            "provider facts require an immutable revision or source hash",
+        )
+    elif kind == "derived_recommendation" and not record.get("rule_id"):
+        _issue(
+            issues,
+            "derived_provenance_rule_missing",
+            f"{pointer}/rule_id",
+            "derived recommendations require a resolver rule ID",
+        )
+    elif kind in {"measured_result", "maintainer_policy"} and not record.get("sha256"):
+        _issue(
+            issues,
+            "provenance_source_hash_missing",
+            f"{pointer}/sha256",
+            f"{kind} requires a hashed source artifact",
+        )
+
+
+def _allowed_provenance_kinds(profile: Mapping[str, Any], pointer: str) -> set[str]:
+    if pointer.startswith(
+        (
+            "/identity/provider",
+            "/identity/repository_id",
+            "/identity/requested_revision",
+            "/identity/resolved_revision",
+        )
+    ):
+        if profile["identity"]["provider"] == "local":
+            return {"derived_recommendation", "maintainer_policy"}
+        return {"provider_fact"}
+    if pointer.startswith("/identity/"):
+        return {"provider_fact", "derived_recommendation", "maintainer_policy"}
+    if pointer.startswith("/artifact/"):
+        return {"provider_fact", "derived_recommendation"}
+    if pointer.startswith("/capabilities/"):
+        return {"provider_fact", "derived_recommendation", "measured_result"}
+    if pointer.startswith("/serving/sampling/provider_defaults"):
+        if not profile["serving"]["sampling"]["provider_defaults"]:
+            return {"provider_fact", "derived_recommendation", "maintainer_policy"}
+        return {"provider_fact"}
+    if pointer.startswith("/serving/"):
+        return {"provider_fact", "derived_recommendation", "maintainer_policy"}
+    if pointer.startswith("/hardware_fit/"):
+        index = int(pointer.split("/", 3)[2])
+        method = profile["hardware_fit"][index]["method"]
+        return {"measured_result" if method == "measured" else "derived_recommendation"}
+    raise ValueError(f"no provenance policy for {pointer}")

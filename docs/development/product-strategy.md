@@ -41,6 +41,12 @@ desktop product.
 8. Use it in chat, supported coding clients, and local OpenAI/Anthropic APIs.
 9. Expose raw runtime controls only through an advanced view.
 
+`model-onboarding-acceptance-fixture.md` applies this workflow to Laguna S 2.1.
+It records the extensive source, conversion, parser, context, feature, and
+qualification information an owner currently has to transfer manually. The
+product succeeds when those inputs become versioned profile and lifecycle
+artifacts rather than another hand-authored Runtime handoff.
+
 ## Architecture Boundaries
 
 | Boundary | Responsibility |
@@ -119,3 +125,7 @@ feature combinations until the core workflow is reliable.
 Until stages 1-4 exist, avoid adding speculative backends, cache variants,
 isolated model-family workarounds, or new benchmark frameworks unless they
 directly unblock the first-release catalog.
+
+Upstream delivery follows `upstream-delivery-plan.md`. The implementation
+branch is intentionally broader than any proposed review; Wayner and Jan should
+receive small dependency-ordered PRs with one contract or behavior each.

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "example-text-model-default",
   "profile_revision": 1,
-  "subject_digest": "d3e3f27c9ee80579771b650858cdfeee9ccb117cb1dfbe6283faf77fc7bd85fd",
+  "subject_digest": "c1cbd492f88014504d4e28db4541169498945b831c6d11ba937a1d6495a29ade",
   "description": "Non-production example for schema validation.",
   "identity": {
     "provider": "huggingface",
@@ -152,7 +152,7 @@
   "provenance": {
     "records": [
       {
-        "field_paths": ["/identity", "/artifact"],
+        "field_paths": ["/identity", "/artifact", "/serving/sampling/provider_defaults"],
         "kind": "provider_fact",
         "source": "https://huggingface.co/example-org/example-model",
         "revision": "0123456789abcdef0123456789abcdef01234567",
@@ -161,7 +161,19 @@
         "observed_at": "2026-07-21T00:00:00Z"
       },
       {
-        "field_paths": ["/capabilities", "/serving", "/hardware_fit"],
+        "field_paths": [
+          "/capabilities",
+          "/serving/engine",
+          "/serving/route",
+          "/serving/template",
+          "/serving/parsers",
+          "/serving/sampling/profile_defaults",
+          "/serving/limits",
+          "/serving/features",
+          "/serving/activation_policy",
+          "/serving/request_policy",
+          "/hardware_fit"
+        ],
         "kind": "derived_recommendation",
         "source": "vllm-mlx-profile-resolver",
         "revision": "1",

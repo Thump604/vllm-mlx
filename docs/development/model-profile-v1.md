@@ -105,7 +105,7 @@ model-family-wide claim or being toggled through the wrong lifecycle boundary.
 
 The effective serving configuration must resolve values in this order:
 
-1. Non-overridable profile limits, required fields, and guarded-off behavior.
+1. Non-overridable advertised limits, required fields, and guarded-off behavior.
 2. User activation overrides explicitly listed in
    `activation_policy.owner_override_fields`.
 3. Profile serving defaults and enabled feature settings.
@@ -116,7 +116,9 @@ Request-time values use the closed v1 request-field vocabulary and must pass
 `request_policy`. They cannot change immutable identity, activation settings,
 parsers, template hash, route, engine, qualification, or provenance.
 
-Precedence is field-specific where values interact. In particular:
+Permitted activation limit overrides remain bounded by the immutable advertised
+limit and the relationships below. Precedence is field-specific where values
+interact. In particular:
 
 - `serving_context` must not exceed `advertised_context`.
 - `max_output_tokens` and `max_request_output_tokens` must not exceed
