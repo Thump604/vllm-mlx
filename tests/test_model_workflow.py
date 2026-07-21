@@ -3,6 +3,7 @@
 
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -48,6 +49,169 @@ def test_inspect_local_model_reports_size_and_config(tmp_path):
     assert payload["mlx"]["needs_conversion"] is False
 
 
+def test_inspect_local_model_collects_metadata_evidence_without_loading_weights(
+    tmp_path,
+):
+    template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    generation_config = {"eos_token_id": 42, "temperature": 0.7}
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "fixture",
+                "architectures": ["FixtureForCausalLM"],
+                "license": "apache-2.0",
+                "vision_config": {"model_type": "fixture_vision"},
+            }
+        )
+    )
+    (tmp_path / "tokenizer.json").write_text('{"version": "1.0"}')
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"model_max_length": 4096, "chat_template": template})
+    )
+    (tmp_path / "special_tokens_map.json").write_text('{"eos_token": "</s>"}')
+    (tmp_path / "generation_config.json").write_text(json.dumps(generation_config))
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+
+    payload = inspect_model(str(tmp_path))
+    evidence = payload["metadata_evidence"]
+
+    assert evidence["revision"] == {
+        "requested": None,
+        "resolved": None,
+        "source_kind": "local_directory",
+        "resolved_is_immutable": None,
+    }
+    assert evidence["files"]["config.json"]["source_kind"] == "local_file"
+    assert evidence["files"]["config.json"]["source_path"] == str(
+        (tmp_path / "config.json").resolve()
+    )
+    assert (
+        evidence["files"]["tokenizer.json"]["sha256"]
+        == sha256(b'{"version": "1.0"}').hexdigest()
+    )
+    assert set(evidence["tokenizer_assets"]) == {
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    }
+    assert evidence["chat_template"] == {
+        "value": template,
+        "sha256": sha256(template.encode()).hexdigest(),
+        "source_kind": "embedded_json_field",
+        "source_path": str((tmp_path / "tokenizer_config.json").resolve()),
+        "source_field": "chat_template",
+    }
+    assert evidence["generation_config"]["data"] == generation_config
+    assert evidence["license"] == {
+        "identifier": "apache-2.0",
+        "source_kind": "embedded_json_field",
+        "source_path": str((tmp_path / "config.json").resolve()),
+        "source_field": "license",
+    }
+    assert evidence["capabilities"]["declared_signals"]["vision_config_present"] is True
+    assert evidence["capabilities"]["unknown"] == {
+        "tool_calling": None,
+        "reasoning": None,
+        "structured_output": None,
+        "parser_support": None,
+        "runtime_support": None,
+        "local_serving_context": None,
+        "qualification": None,
+    }
+
+
+def test_inspect_local_model_uses_file_chat_template_and_preserves_unknowns(tmp_path):
+    template = "{{ bos_token }}{% for message in messages %}{{ message }}{% endfor %}"
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "fixture"}))
+    (tmp_path / "chat_template.jinja").write_text(template)
+    (tmp_path / "LICENSE").write_text("fixture license text")
+
+    payload = inspect_model(str(tmp_path))
+    evidence = payload["metadata_evidence"]
+
+    assert evidence["chat_template"] == {
+        "value": template,
+        "sha256": sha256(template.encode()).hexdigest(),
+        "source_kind": "local_file",
+        "source_path": str((tmp_path / "chat_template.jinja").resolve()),
+        "source_field": None,
+    }
+    assert evidence["license"] == {
+        "identifier": None,
+        "source_kind": "local_file",
+        "source_path": str((tmp_path / "LICENSE").resolve()),
+        "source_field": None,
+    }
+    assert evidence["generation_config"] == {
+        "data": None,
+        "sha256": None,
+        "source_kind": None,
+        "source_path": None,
+    }
+    assert evidence["capabilities"]["unknown"]["runtime_support"] is None
+
+
+def test_file_chat_template_overrides_tokenizer_config_template(tmp_path):
+    file_template = "{{ messages }}"
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "fixture"}))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ stale_template }}"})
+    )
+    (tmp_path / "chat_template.jinja").write_text(file_template)
+
+    evidence = inspect_model(str(tmp_path))["metadata_evidence"]
+
+    assert evidence["chat_template"]["value"] == file_template
+    assert evidence["chat_template"]["source_kind"] == "local_file"
+
+
+def test_unreadable_file_template_does_not_fall_back(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "fixture"}))
+    (tmp_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ stale_template }}"})
+    )
+    (tmp_path / "chat_template.jinja").write_bytes(b"\xff\xfe")
+
+    payload = inspect_model(str(tmp_path))
+
+    assert payload["metadata_evidence"]["chat_template"]["value"] is None
+    assert "not valid UTF-8" in payload["metadata_evidence"]["chat_template"]["error"]
+
+
+def test_malformed_json_is_reported_and_empty_generation_config_is_preserved(
+    tmp_path,
+):
+    (tmp_path / "config.json").write_text("{not-json")
+    (tmp_path / "generation_config.json").write_text("{}")
+
+    payload = inspect_model(str(tmp_path))
+    evidence = payload["metadata_evidence"]
+
+    assert any(
+        "could not parse config.json" in warning for warning in payload["warnings"]
+    )
+    assert "parse_error" in evidence["files"]["config.json"]
+    assert evidence["generation_config"]["data"] == {}
+
+
+def test_inspect_local_metadata_hashes_are_stable_and_optional_files_are_absent(
+    tmp_path,
+):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "fixture"}))
+
+    first = inspect_model(str(tmp_path))["metadata_evidence"]
+    second = inspect_model(str(tmp_path))["metadata_evidence"]
+
+    assert first["files"] == second["files"]
+    assert (
+        first["files"]["config.json"]["sha256"]
+        == sha256((tmp_path / "config.json").read_bytes()).hexdigest()
+    )
+    assert first["tokenizer_assets"] == {}
+    assert first["chat_template"]["value"] is None
+    assert first["license"]["identifier"] is None
+
+
 def test_inspect_hf_model_uses_metadata_without_weight_download(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -66,7 +230,14 @@ def test_inspect_hf_model_uses_metadata_without_weight_download(tmp_path):
         SimpleNamespace(rfilename="model-00001-of-00002.safetensors", size=1000),
         SimpleNamespace(rfilename="tokenizer.json", size=200),
     ]
-    info = SimpleNamespace(sha="abc123", siblings=siblings)
+    info = SimpleNamespace(
+        sha="a" * 40,
+        siblings=siblings,
+        card_data={"license": "apache-2.0"},
+        library_name="transformers",
+        pipeline_tag="text-generation",
+        tags=["text-generation", "custom_code"],
+    )
 
     with (
         patch("vllm_mlx.model_workflow.HfApi") as mock_api,
@@ -76,7 +247,7 @@ def test_inspect_hf_model_uses_metadata_without_weight_download(tmp_path):
         mock_download.return_value = str(config_path)
         payload = inspect_model("org/model", revision="main")
 
-    assert payload["revision"] == "abc123"
+    assert payload["revision"] == "a" * 40
     assert payload["total_size_bytes"] == 1300
     assert payload["model_files_size_gb"] == 0.0
     assert payload["model_family"]["model_type"] == "qwen3_5_moe"
@@ -84,6 +255,27 @@ def test_inspect_hf_model_uses_metadata_without_weight_download(tmp_path):
     assert payload["warnings"] == [
         "very large advertised context; choose an explicit serving context before loading"
     ]
+    assert payload["metadata_evidence"]["revision"] == {
+        "requested": "main",
+        "resolved": "a" * 40,
+        "source_kind": "huggingface_repository",
+        "resolved_is_immutable": True,
+    }
+    assert all(
+        call.kwargs["revision"] == "a" * 40 for call in mock_download.call_args_list
+    )
+    assert payload["metadata_evidence"]["files"]["config.json"]["source_path"] == (
+        "hf://org/model@" + "a" * 40 + "/config.json"
+    )
+    assert payload["metadata_evidence"]["license"] == {
+        "identifier": "apache-2.0",
+        "source_kind": "huggingface_model_card",
+        "source_path": "hf://org/model@" + "a" * 40 + "/README.md",
+        "source_field": "license",
+    }
+    declared = payload["metadata_evidence"]["capabilities"]["declared_signals"]
+    assert declared["pipeline_tag"] == "text-generation"
+    assert declared["library_name"] == "transformers"
 
 
 def test_acquire_model_finalizes_target_and_writes_manifest(tmp_path):

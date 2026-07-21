@@ -8,6 +8,7 @@ model can be qualified before it is served.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -32,6 +33,24 @@ REGISTRATION_MANIFEST_NAME = "vllm_mlx_registration_manifest.json"
 QUALIFICATION_REQUEST_NAME = "vllm_mlx_qualification_request.json"
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_METADATA_FILENAMES = (
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "spiece.model",
+    "vocab.json",
+    "merges.txt",
+    "added_tokens.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "generation_config.json",
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "license",
+)
 
 
 @dataclass(frozen=True)
@@ -110,9 +129,262 @@ def _bytes_to_gb(size: int | float | None) -> float | None:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        value = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _metadata_file_record(
+    path: Path,
+    *,
+    source_kind: str,
+    source_path: str,
+) -> dict[str, Any]:
+    """Describe a small inspected metadata file without interpreting weights."""
+    return {
+        "source_kind": source_kind,
+        "source_path": source_path,
+        "size_bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+    }
+
+
+def _hf_source_path(model_id: str, revision: str | None, filename: str) -> str:
+    resolved = revision or "unresolved"
+    return f"hf://{model_id}@{resolved}/{filename}"
+
+
+def _available_metadata_files(files: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(entry["path"])
+        for entry in files
+        if isinstance(entry.get("path"), str)
+        and str(entry["path"]) in _METADATA_FILENAMES
+    }
+
+
+def _local_metadata_files(path: Path) -> dict[str, tuple[Path, str, str]]:
+    metadata: dict[str, tuple[Path, str, str]] = {}
+    for filename in _METADATA_FILENAMES:
+        candidate = path / filename
+        if candidate.is_file():
+            metadata[filename] = (
+                candidate,
+                "local_file",
+                str(candidate.resolve()),
+            )
+    return metadata
+
+
+def _hf_metadata_files(
+    model_id: str,
+    *,
+    revision: str | None,
+    local_files_only: bool,
+    files: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, tuple[Path, str, str]]:
+    metadata: dict[str, tuple[Path, str, str]] = {}
+    filenames = _available_metadata_files(files) | {"config.json"}
+    for filename in sorted(filenames):
+        try:
+            cached_path = Path(
+                hf_hub_download(
+                    repo_id=model_id,
+                    filename=filename,
+                    revision=revision,
+                    local_files_only=local_files_only,
+                )
+            )
+        except Exception as exc:
+            warnings.append(f"could not read {filename}: {exc}")
+            continue
+        metadata[filename] = (
+            cached_path,
+            "huggingface_hub_file",
+            _hf_source_path(model_id, revision, filename),
+        )
+    return metadata
+
+
+def _json_metadata(
+    record: tuple[Path, str, str] | None,
+    *,
+    filename: str,
+    warnings: list[str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if record is None:
+        return None, None
+    path, source_kind, source_path = record
+    file_record = _metadata_file_record(
+        path, source_kind=source_kind, source_path=source_path
+    )
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        warnings.append(f"could not parse {filename}: {exc}")
+        file_record["parse_error"] = str(exc)
+        return None, file_record
+    if not isinstance(value, dict):
+        detail = "top-level JSON value must be an object"
+        warnings.append(f"could not parse {filename}: {detail}")
+        file_record["parse_error"] = detail
+        return None, file_record
+    return value, file_record
+
+
+def _text_metadata(
+    record: tuple[Path, str, str] | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if record is None:
+        return None, None
+    path, source_kind, source_path = record
+    try:
+        text = path.read_text()
+    except UnicodeDecodeError:
+        return None, _metadata_file_record(
+            path, source_kind=source_kind, source_path=source_path
+        )
+    return text, _metadata_file_record(
+        path, source_kind=source_kind, source_path=source_path
+    )
+
+
+def _chat_template_metadata(
+    tokenizer_config: dict[str, Any],
+    metadata_files: dict[str, tuple[Path, str, str]],
+    file_records: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    template_record = metadata_files.get("chat_template.jinja")
+    template, source = _text_metadata(template_record)
+    if template_record is not None and template is None:
+        return {
+            "value": None,
+            "sha256": source["sha256"] if source else None,
+            "source_kind": source["source_kind"] if source else None,
+            "source_path": source["source_path"] if source else None,
+            "source_field": None,
+            "error": "chat_template.jinja is not valid UTF-8",
+        }
+    if template is not None:
+        return {
+            "value": template,
+            "sha256": source["sha256"] if source else None,
+            "source_kind": source["source_kind"] if source else None,
+            "source_path": source["source_path"] if source else None,
+            "source_field": None,
+        }
+
+    template = tokenizer_config.get("chat_template")
+    if isinstance(template, (str, list, dict)):
+        source = file_records.get("tokenizer_config.json")
+        encoded = (
+            template.encode()
+            if isinstance(template, str)
+            else json.dumps(
+                template, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        )
+        return {
+            "value": template,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "source_kind": "embedded_json_field",
+            "source_path": source["source_path"] if source else None,
+            "source_field": "chat_template",
+        }
+    return {
+        "value": None,
+        "sha256": None,
+        "source_kind": None,
+        "source_path": None,
+        "source_field": None,
+    }
+
+
+def _license_metadata(
+    config: dict[str, Any],
+    repository_metadata: dict[str, Any],
+    repository_source: str | None,
+    resolved_revision: str | None,
+    metadata_files: dict[str, tuple[Path, str, str]],
+    file_records: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    repository_license = repository_metadata.get("license")
+    if isinstance(repository_license, str) and repository_license:
+        return {
+            "identifier": repository_license,
+            "source_kind": "huggingface_model_card",
+            "source_path": (
+                _hf_source_path(repository_source, resolved_revision, "README.md")
+                if repository_source is not None
+                else None
+            ),
+            "source_field": "license",
+        }
+    for field in ("license", "license_name"):
+        value = config.get(field)
+        if isinstance(value, str) and value:
+            source = file_records.get("config.json")
+            return {
+                "identifier": value,
+                "source_kind": "embedded_json_field",
+                "source_path": source["source_path"] if source else None,
+                "source_field": field,
+            }
+
+    for filename in ("LICENSE", "LICENSE.md", "LICENSE.txt", "license"):
+        record = metadata_files.get(filename)
+        if record is not None:
+            _, source = _text_metadata(record)
+            return {
+                "identifier": None,
+                "source_kind": source["source_kind"] if source else None,
+                "source_path": source["source_path"] if source else None,
+                "source_field": None,
+            }
+    return {
+        "identifier": None,
+        "source_kind": None,
+        "source_path": None,
+        "source_field": None,
+    }
+
+
+def _declared_capabilities(
+    config: dict[str, Any], repository_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Return only source-declared signals, never runtime capability claims."""
+    return {
+        "declared_signals": {
+            "architectures": _model_family(config)["architectures"],
+            "text_config_present": isinstance(config.get("text_config"), dict),
+            "vision_config_present": isinstance(config.get("vision_config"), dict),
+            "audio_config_present": isinstance(config.get("audio_config"), dict),
+            "image_token_id_declared": "image_token_id" in config,
+            "video_token_id_declared": "video_token_id" in config,
+            "pipeline_tag": repository_metadata.get("pipeline_tag"),
+            "library_name": repository_metadata.get("library_name"),
+            "repository_tags": repository_metadata.get("tags", []),
+        },
+        "unknown": {
+            "tool_calling": None,
+            "reasoning": None,
+            "structured_output": None,
+            "parser_support": None,
+            "runtime_support": None,
+            "local_serving_context": None,
+            "qualification": None,
+        },
+    }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -137,9 +409,9 @@ def _local_file_inventory(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 def _hf_file_inventory(
     model_id: str, *, revision: str | None, local_files_only: bool
-) -> tuple[list[dict[str, Any]], int | None, str | None]:
+) -> tuple[list[dict[str, Any]], int | None, str | None, dict[str, Any]]:
     if local_files_only:
-        return [], None, revision
+        return [], None, None, {}
 
     info = HfApi().model_info(model_id, revision=revision, files_metadata=True)
     files = []
@@ -155,19 +427,23 @@ def _hf_file_inventory(
         else:
             total += int(size)
         files.append({"path": filename, "size": size})
-    return files, total if total_known else None, getattr(info, "sha", revision)
-
-
-def _hf_config(
-    model_id: str, *, revision: str | None, local_files_only: bool
-) -> dict[str, Any]:
-    config_path = hf_hub_download(
-        repo_id=model_id,
-        filename="config.json",
-        revision=revision,
-        local_files_only=local_files_only,
+    card_data = getattr(info, "card_data", None)
+    repository_metadata = {
+        "license": (
+            card_data.get("license")
+            if isinstance(card_data, dict)
+            else getattr(card_data, "license", None)
+        ),
+        "library_name": getattr(info, "library_name", None),
+        "pipeline_tag": getattr(info, "pipeline_tag", None),
+        "tags": list(getattr(info, "tags", None) or []),
+    }
+    return (
+        files,
+        total if total_known else None,
+        getattr(info, "sha", revision),
+        repository_metadata,
     )
-    return _read_json(Path(config_path))
 
 
 def _config_value(config: dict[str, Any], key: str) -> Any:
@@ -208,7 +484,7 @@ def _estimate_fit(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     max_context = _model_family(config).get("max_context")
-    warnings = []
+    warnings: list[str] = []
     if isinstance(max_context, int) and max_context >= 262_144:
         warnings.append(
             "very large advertised context; choose an explicit serving context before loading"
@@ -305,12 +581,20 @@ def inspect_model(
 ) -> dict[str, Any]:
     """Inspect a local model path or Hugging Face model id without loading weights."""
     model_path = Path(model).expanduser()
-    warnings = []
+    warnings: list[str] = []
+    total_bytes: int | None
 
     if model_path.exists():
         files, total_bytes = _local_file_inventory(model_path)
-        config = _read_json(model_path / "config.json")
+        metadata_files = _local_metadata_files(model_path)
+        config_data, config_record = _json_metadata(
+            metadata_files.get("config.json"),
+            filename="config.json",
+            warnings=warnings,
+        )
+        config = config_data or {}
         resolved_revision = None
+        repository_metadata: dict[str, Any] = {}
         source = "local"
         location = str(model_path)
     else:
@@ -320,16 +604,112 @@ def inspect_model(
             )
         source = "huggingface"
         location = model
-        files, total_bytes, resolved_revision = _hf_file_inventory(
+        (
+            files,
+            total_bytes,
+            resolved_revision,
+            repository_metadata,
+        ) = _hf_file_inventory(
             model, revision=revision, local_files_only=local_files_only
         )
-        try:
-            config = _hf_config(
-                model, revision=revision, local_files_only=local_files_only
+        metadata_files = _hf_metadata_files(
+            model,
+            revision=resolved_revision or revision,
+            local_files_only=local_files_only,
+            files=files,
+            warnings=warnings,
+        )
+        config_data, config_record = _json_metadata(
+            metadata_files.get("config.json"),
+            filename="config.json",
+            warnings=warnings,
+        )
+        config = config_data or {}
+
+    tokenizer_config_data, tokenizer_config_record = _json_metadata(
+        metadata_files.get("tokenizer_config.json"),
+        filename="tokenizer_config.json",
+        warnings=warnings,
+    )
+    tokenizer_config = tokenizer_config_data or {}
+    generation_config, generation_config_record = _json_metadata(
+        metadata_files.get("generation_config.json"),
+        filename="generation_config.json",
+        warnings=warnings,
+    )
+    metadata_file_records = {
+        filename: _metadata_file_record(
+            path, source_kind=source_kind, source_path=source_path
+        )
+        for filename, (path, source_kind, source_path) in metadata_files.items()
+    }
+    if config_record is not None:
+        metadata_file_records["config.json"] = config_record
+    if tokenizer_config_record is not None:
+        metadata_file_records["tokenizer_config.json"] = tokenizer_config_record
+    if generation_config_record is not None:
+        metadata_file_records["generation_config.json"] = generation_config_record
+    resolved = resolved_revision if source == "huggingface" else None
+    revision_evidence = {
+        "requested": revision,
+        "resolved": resolved,
+        "source_kind": (
+            "huggingface_repository" if source == "huggingface" else "local_directory"
+        ),
+        "resolved_is_immutable": (
+            bool(resolved and _IMMUTABLE_HF_REVISION_RE.fullmatch(resolved))
+            if source == "huggingface"
+            else None
+        ),
+    }
+    metadata_evidence = {
+        "revision": revision_evidence,
+        "files": metadata_file_records,
+        "tokenizer_assets": {
+            filename: metadata_file_records[filename]
+            for filename in (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "tokenizer.model",
+                "spiece.model",
+                "vocab.json",
+                "merges.txt",
+                "added_tokens.json",
+                "special_tokens_map.json",
             )
-        except Exception as exc:
-            config = {}
-            warnings.append(f"could not read config.json: {exc}")
+            if filename in metadata_file_records
+        },
+        "chat_template": _chat_template_metadata(
+            tokenizer_config, metadata_files, metadata_file_records
+        ),
+        "generation_config": {
+            "data": generation_config,
+            "sha256": (
+                generation_config_record["sha256"]
+                if generation_config_record is not None
+                else None
+            ),
+            "source_kind": (
+                generation_config_record["source_kind"]
+                if generation_config_record is not None
+                else None
+            ),
+            "source_path": (
+                generation_config_record["source_path"]
+                if generation_config_record is not None
+                else None
+            ),
+        },
+        "license": _license_metadata(
+            config,
+            repository_metadata,
+            model if source == "huggingface" else None,
+            resolved_revision,
+            metadata_files,
+            metadata_file_records,
+        ),
+        "capabilities": _declared_capabilities(config, repository_metadata),
+    }
 
     model_files_bytes = _model_file_bytes(files)
     family = _model_family(config)
@@ -351,6 +731,7 @@ def inspect_model(
         "source": source,
         "location": location,
         "revision": resolved_revision or revision,
+        "metadata_evidence": metadata_evidence,
         "inspected_at": _now_iso(),
         "file_count": len(files),
         "total_size_bytes": total_bytes,

@@ -48,7 +48,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 | ID | Status | Work package | Agent | Depends on |
 |---|---|---|---|---|
-| P2.1 | pending | Expand inspection to tokenizer, template, generation config, repository revision, license, and capability metadata | Terra `medium` | P1 |
+| P2.1 | complete | Expand inspection to tokenizer, template, generation config, repository revision, license, and capability metadata | Terra `medium` | P1 |
 | P2.2 | pending | Implement Apple Silicon hardware inventory | Terra `medium` | P1 |
 | P2.3 | pending | Implement explainable weight, KV, context, conversion-disk, and safety-margin estimates | Terra `high` | P2.1, P2.2 |
 | P2.4 | pending | Add explicit family adapters for the first curated model set | Terra `high` | P2.1 |
@@ -107,8 +107,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Start P2.1 with `terra-implementer` at `medium`. Expand the existing inspection
-boundary to emit tokenizer, template, generation-config, immutable revision,
-license, and capability metadata as provider facts. Use the Laguna fixture to
-prove that inspection removes manual handoff fields without inferring parser,
-feature, context, or qualification claims that the source does not establish.
+Start P2.2 with `terra-implementer` at `medium`. Add a read-only Apple Silicon
+hardware inventory boundary that reports stable, source-attributed facts needed
+for later fit estimates. Keep recommendation policy and model loading out of the
+inventory package; P2.3 owns explainable fit calculations.
