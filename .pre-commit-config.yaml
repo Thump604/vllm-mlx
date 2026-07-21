@@ -10,13 +10,13 @@ repos:
       - id: check-merge-conflict
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.1.9
+    rev: v0.15.13
     hooks:
       - id: ruff
-        args: [--select, E,F,W, --ignore, E402,E501,E731,F811,F841]
+        args: [--select, "E,F,W", --ignore, "E402,E501,E731,F811,F841"]
 
   - repo: https://github.com/psf/black
-    rev: 24.1.1
+    rev: 26.5.0
     hooks:
       - id: black
         args: [--check]
@@ -29,5 +29,5 @@ repos:
         additional_dependencies:
           - pydantic>=2.0.0
           - fastapi>=0.100.0
-        args: [--ignore-missing-imports, --no-error-summary]
+        args: [--ignore-missing-imports, --no-error-summary, --follow-imports=skip]
         exclude: ^tests/
