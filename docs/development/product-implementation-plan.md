@@ -66,8 +66,8 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 | ID | Status | Work package | Agent | Depends on |
 |---|---|---|---|---|
-| P3.1 | in_progress | Define lifecycle API and state transitions over existing workflow, registry, and residency modules | Sol `high` | P1, P2 |
-| P3.2 | pending | Implement resumable acquire/convert/validate operations | Terra `medium` | P3.1 |
+| P3.1 | complete | Define lifecycle API and state transitions over existing workflow, registry, and residency modules | Sol `high` | P1, P2 |
+| P3.2 | in_progress | Implement resumable acquire/convert/validate operations | Terra `medium` | P3.1 |
 | P3.3 | pending | Implement one-active-large-model activation, stop, status, and recovery | Terra `high` | P3.1 |
 | P3.4 | pending | Normalize qualification results into profile evidence without automatic over-promotion | Terra `medium` | P3.1 |
 | P3.5 | pending | Exercise crash, cancellation, partial download, and stale-state recovery | Luna `high` | P3.2, P3.3, P3.4 |
@@ -107,8 +107,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Define P3.1 as a pure lifecycle contract before wiring behavior. Distinguish
-configured profile, resolved process configuration, loaded process state, and
-request lease state; reuse the existing residency/registry vocabulary where it
-is coherent. Do not modify server, registry, lifecycle, or live service behavior
-in this package.
+Inventory the existing acquisition and conversion checkpoint behavior for P3.2,
+then add one resumable operation boundary at a time. Preserve current commands,
+manifests, and artifact layout; do not combine serving activation or resident
+process state with acquire/convert/validate work.
