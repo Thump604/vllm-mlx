@@ -23,12 +23,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import fcntl
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
+from .model_profile import compute_subject_digest
 from .utils.download import LLM_ALLOW_PATTERNS, MLLM_ALLOW_PATTERNS
 
 MODEL_MANIFEST_NAME = "vllm_mlx_model_manifest.json"
@@ -133,6 +134,8 @@ class QualificationOptions:
     repetitions: int | None = None
     dry_run: bool = False
     extra_args: list[str] | None = None
+    profile_path: str | None = None
+    evidence_output_path: str | None = None
 
 
 def _now_iso() -> str:
@@ -437,6 +440,22 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp-", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1595,30 +1614,310 @@ def _qualification_command(options: QualificationOptions) -> list[str]:
     return command
 
 
+def _validated_profile_subject(profile: Mapping[str, Any]) -> str:
+    stored = profile.get("subject_digest")
+    computed = str(compute_subject_digest(profile))
+    if not isinstance(stored, str) or stored.lower() != computed:
+        raise ValueError("model profile subject_digest is missing or stale")
+    return computed
+
+
+def _validated_timestamp(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("qualification result timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("qualification result timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("qualification result timestamp must include a timezone")
+    return value
+
+
+def _snapshot_qualification_workload(
+    workload_path: str | Path, result_path: str | Path
+) -> tuple[Path, str]:
+    source = Path(workload_path).expanduser().resolve()
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"qualification workload is unreadable: {source}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    result = Path(result_path).expanduser().resolve()
+    snapshot = (
+        result.parent / f"{source.stem}.{digest[:16]}.qualification-workload.json"
+    )
+    if snapshot.exists():
+        if snapshot.read_bytes() != raw:
+            raise ValueError(f"qualification workload snapshot conflicts: {snapshot}")
+    else:
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{snapshot.name}.tmp-", dir=snapshot.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, snapshot)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return snapshot, digest
+
+
+def normalize_qualification_result(
+    profile: Mapping[str, Any],
+    result_path: str | Path,
+    workload_path: str | Path,
+    *,
+    expected_workload_sha256: str | None = None,
+    expected_result_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Bind one workload result artifact to an immutable profile subject.
+
+    This records evidence only. It never promotes the profile or marks an
+    installation production-ready.
+    """
+    subject_digest = _validated_profile_subject(profile)
+    path = Path(result_path).expanduser().resolve()
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"qualification result is unreadable: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("qualification result must be a JSON object")
+    artifact_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected_result_sha256 is not None and artifact_sha256 != expected_result_sha256:
+        raise ValueError("qualification result changed before normalization")
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("qualification result run_id is missing")
+    created_at = _validated_timestamp(payload.get("timestamp"))
+
+    workload = payload.get("workload")
+    if not isinstance(workload, dict):
+        raise ValueError("qualification result workload is missing")
+    workload_name = workload.get("name")
+    expected_workload_path = Path(workload_path).expanduser().resolve()
+    try:
+        workload_sha256 = hashlib.sha256(
+            expected_workload_path.read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise ValueError(
+            f"qualification workload is unreadable: {expected_workload_path}"
+        ) from exc
+    if (
+        expected_workload_sha256 is not None
+        and workload_sha256 != expected_workload_sha256
+    ):
+        raise ValueError("qualification workload snapshot changed during normalization")
+    if not isinstance(workload_name, str) or not workload_name:
+        raise ValueError("qualification workload name is missing")
+    result_workload_path = workload.get("path")
+    if not isinstance(result_workload_path, str) or (
+        Path(result_workload_path).expanduser().resolve() != expected_workload_path
+    ):
+        raise ValueError("qualification result workload path does not match request")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, dict) or not isinstance(summary.get("passed"), bool):
+        raise ValueError("qualification result summary.passed must be boolean")
+    records = payload.get("results")
+    if not isinstance(records, list) or not records:
+        raise ValueError("qualification result requires at least one case record")
+    expected_model = profile.get("identity", {}).get("served_model_name")
+    hardware: dict[str, Any] | None = None
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("qualification case record must be an object")
+        if record.get("run_id") != run_id or record.get("workload") != workload_name:
+            raise ValueError("qualification case identity does not match its run")
+        if _validated_timestamp(record.get("timestamp")) != created_at:
+            raise ValueError("qualification case timestamp does not match its run")
+        if record.get("model_id") != expected_model:
+            raise ValueError("qualification result served model does not match profile")
+        runtime = record.get("runtime")
+        if not isinstance(runtime, dict) or runtime.get("model_id") != expected_model:
+            raise ValueError(
+                "qualification runtime-detected model does not match profile"
+            )
+        quality = record.get("quality")
+        if (
+            not isinstance(record.get("ok"), bool)
+            or not isinstance(quality, dict)
+            or not isinstance(quality.get("ok"), bool)
+            or record["ok"] != quality["ok"]
+        ):
+            raise ValueError("qualification case outcome is missing or inconsistent")
+        record_hardware = record.get("hardware")
+        if not isinstance(record_hardware, dict) or not record_hardware:
+            raise ValueError("qualification case hardware fingerprint is missing")
+        if hardware is None:
+            hardware = record_hardware
+        elif record_hardware != hardware:
+            raise ValueError("qualification cases have inconsistent hardware")
+
+    assert hardware is not None
+    aggregate_passed = all(record["ok"] for record in records)
+    if summary["passed"] != aggregate_passed:
+        raise ValueError("qualification summary does not match case outcomes")
+    if summary.get("case_count") != len(records):
+        raise ValueError("qualification summary case_count does not match records")
+    if summary.get("failure_count") != sum(not record["ok"] for record in records):
+        raise ValueError("qualification summary failure_count does not match records")
+    result = "pass" if aggregate_passed else "fail"
+    hardware_fingerprint = hashlib.sha256(
+        json.dumps(hardware, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    evidence = {
+        "evidence_id": f"{run_id}-{artifact_sha256[:16]}",
+        "kind": "qualification",
+        "location": str(path),
+        "artifact_sha256": artifact_sha256,
+        "result": result,
+        "hardware_fingerprint": hardware_fingerprint,
+        "workload_id": f"{workload_name}@sha256:{workload_sha256}",
+        "subject_digest": subject_digest,
+        "created_at": created_at,
+    }
+    qualification = profile.get("qualification")
+    current_status = (
+        qualification.get("status")
+        if isinstance(qualification, Mapping)
+        else "not_qualified"
+    )
+    return {
+        "kind": "vllm-mlx-normalized-qualification-evidence",
+        "schema_version": 1,
+        "profile_id": profile.get("profile_id"),
+        "profile_revision": profile.get("profile_revision"),
+        "subject_digest": subject_digest,
+        "qualification_status": current_status,
+        "evidence": [evidence],
+        "raw_evidence": {"location": str(path), "sha256": artifact_sha256},
+        "promotion_required": True,
+        "production_ready": False,
+    }
+
+
 def qualify_model(options: QualificationOptions) -> dict[str, Any]:
     """Create or run a bench-serve qualification handoff."""
-    command = _qualification_command(options)
+    profile: dict[str, Any] | None = None
+    subject_digest: str | None = None
+    run_options = options
+    workload_sha256: str | None = None
+    private_result_path: Path | None = None
+    if options.profile_path:
+        profile = _read_json_strict(
+            Path(options.profile_path).expanduser(), label="model profile"
+        )
+        subject_digest = _validated_profile_subject(profile)
+        if not options.result_path:
+            raise ValueError("profile-bound qualification requires result_path")
+        if not options.workload_path:
+            raise ValueError("profile-bound qualification requires workload_path")
+        artifact_paths = [
+            Path(value).expanduser().resolve()
+            for value in (
+                options.result_path,
+                options.output_path,
+                options.evidence_output_path,
+            )
+            if value
+        ]
+        if len(artifact_paths) != len(set(artifact_paths)):
+            raise ValueError(
+                "qualification result, output, and evidence paths must differ"
+            )
+        if not options.dry_run:
+            workload_snapshot, workload_sha256 = _snapshot_qualification_workload(
+                options.workload_path, options.result_path
+            )
+            final_result = Path(options.result_path).expanduser().resolve()
+            final_result.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, private_name = tempfile.mkstemp(
+                prefix=f".{final_result.name}.run-", dir=final_result.parent
+            )
+            os.close(descriptor)
+            private_result_path = Path(private_name)
+            private_result_path.unlink()
+            run_options = replace(
+                options,
+                workload_path=str(workload_snapshot),
+                result_path=str(private_result_path),
+            )
+    command = _qualification_command(run_options)
     payload = {
         "kind": "vllm-mlx-model-qualification",
         "schema_version": 1,
         "created_at": _now_iso(),
         "model_id": options.model_id,
         "server_url": options.server_url,
-        "workload_path": options.workload_path,
+        "workload_path": run_options.workload_path,
+        "workload_source_path": options.workload_path,
+        "workload_snapshot_sha256": workload_sha256,
         "result_path": options.result_path,
         "repetitions": options.repetitions,
         "dry_run": options.dry_run,
+        "profile_path": options.profile_path,
+        "profile_subject_digest": subject_digest,
         "command": command,
         "production_ready": False,
     }
 
     if not options.dry_run:
-        completed = subprocess.run(command, text=True, capture_output=True, check=False)
-        payload["returncode"] = completed.returncode
-        payload["stdout"] = completed.stdout
-        payload["stderr"] = completed.stderr
-        payload["completed_at"] = _now_iso()
-        payload["status"] = "succeeded" if completed.returncode == 0 else "failed"
+        try:
+            completed = subprocess.run(
+                command, text=True, capture_output=True, check=False
+            )
+            payload["returncode"] = completed.returncode
+            payload["stdout"] = completed.stdout
+            payload["stderr"] = completed.stderr
+            payload["completed_at"] = _now_iso()
+            payload["status"] = "succeeded" if completed.returncode == 0 else "failed"
+            if (
+                completed.returncode == 0
+                and profile is not None
+                and options.result_path
+            ):
+                assert run_options.workload_path is not None
+                assert workload_sha256 is not None
+                if (
+                    hashlib.sha256(
+                        Path(run_options.workload_path).read_bytes()
+                    ).hexdigest()
+                    != workload_sha256
+                ):
+                    raise ValueError(
+                        "qualification workload snapshot changed during run"
+                    )
+                if private_result_path is None or not private_result_path.is_file():
+                    raise ValueError(
+                        "qualification command did not create a fresh result"
+                    )
+                final_result = Path(options.result_path).expanduser().resolve()
+                private_result = private_result_path.read_bytes()
+                private_result_sha256 = hashlib.sha256(private_result).hexdigest()
+                _write_bytes_atomic(final_result, private_result)
+                normalized = normalize_qualification_result(
+                    profile,
+                    final_result,
+                    run_options.workload_path,
+                    expected_workload_sha256=workload_sha256,
+                    expected_result_sha256=private_result_sha256,
+                )
+                payload["normalized_evidence"] = normalized
+                if options.evidence_output_path:
+                    evidence_output = Path(options.evidence_output_path).expanduser()
+                    _write_json_atomic(evidence_output, normalized)
+                    payload["evidence_manifest_path"] = str(evidence_output)
+        finally:
+            if private_result_path is not None:
+                private_result_path.unlink(missing_ok=True)
     else:
         payload["status"] = "dry_run"
 

@@ -14,6 +14,7 @@ import pytest
 from numpy import array
 from safetensors.numpy import save_file
 
+from vllm_mlx.model_profile import compute_subject_digest
 from vllm_mlx.model_workflow import (
     ACQUISITION_MARKER_NAME,
     CONVERSION_MANIFEST_NAME,
@@ -27,6 +28,7 @@ from vllm_mlx.model_workflow import (
     acquire_model,
     convert_model,
     inspect_model,
+    normalize_qualification_result,
     qualify_model,
     register_model,
     validate_converted_artifact,
@@ -1247,6 +1249,272 @@ def test_qualify_model_runs_command_and_records_failure(tmp_path):
     assert payload["status"] == "failed"
     assert payload["returncode"] == 7
     assert payload["stderr"] == "bad workload"
+
+
+def _qualification_profile():
+    profile = {
+        "profile_id": "laguna-s-2.1",
+        "profile_revision": 1,
+        "identity": {"served_model_name": "laguna-s-2.1"},
+        "qualification": {"status": "not_qualified", "evidence": []},
+    }
+    profile["subject_digest"] = compute_subject_digest(profile)
+    return profile
+
+
+def _qualification_result(profile, workload_path, *, passed=True):
+    return {
+        "run_id": "run-123",
+        "timestamp": "2026-07-21T12:00:00+00:00",
+        "workload": {"name": "coding-smoke", "path": str(workload_path)},
+        "summary": {
+            "passed": passed,
+            "case_count": 1,
+            "failure_count": 0 if passed else 1,
+        },
+        "results": [
+            {
+                "run_id": "run-123",
+                "timestamp": "2026-07-21T12:00:00+00:00",
+                "workload": "coding-smoke",
+                "model_id": "laguna-s-2.1",
+                "runtime": {"model_id": "laguna-s-2.1"},
+                "hardware": {"chip": "M4 Max", "memory_gb": 128},
+                "quality": {"ok": passed},
+                "ok": passed,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("passed,expected", [(True, "pass"), (False, "fail")])
+def test_normalize_qualification_result_binds_raw_evidence_without_promotion(
+    tmp_path, passed, expected
+):
+    profile = _qualification_profile()
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(_qualification_result(profile, workload_path, passed=passed))
+    )
+
+    normalized = normalize_qualification_result(profile, result_path, workload_path)
+    evidence = normalized["evidence"][0]
+
+    assert evidence["result"] == expected
+    assert evidence["subject_digest"] == profile["subject_digest"]
+    assert evidence["artifact_sha256"] == sha256(result_path.read_bytes()).hexdigest()
+    assert evidence["workload_id"] == (
+        f"coding-smoke@sha256:{sha256(workload_path.read_bytes()).hexdigest()}"
+    )
+    assert normalized["qualification_status"] == "not_qualified"
+    assert normalized["promotion_required"] is True
+    assert normalized["production_ready"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [
+        (lambda profile, result: profile.update(subject_digest="0" * 64), "stale"),
+        (
+            lambda profile, result: result["workload"].update(path="/other"),
+            "workload path",
+        ),
+        (
+            lambda profile, result: result["results"][0].update(model_id="other"),
+            "served model",
+        ),
+        (
+            lambda profile, result: result["results"][0]["runtime"].update(
+                model_id="other"
+            ),
+            "runtime-detected model",
+        ),
+        (
+            lambda profile, result: result.update(timestamp="not-time"),
+            "timestamp",
+        ),
+        (
+            lambda profile, result: result["results"][0].update(
+                timestamp="2026-07-21T12:01:00+00:00"
+            ),
+            "case timestamp",
+        ),
+        (
+            lambda profile, result: result["results"][0].update(
+                ok=False, quality={"ok": False}
+            ),
+            "summary",
+        ),
+        (
+            lambda profile, result: result["results"].append(
+                {
+                    **result["results"][0],
+                    "hardware": {"chip": "other"},
+                }
+            ),
+            "inconsistent hardware",
+        ),
+    ],
+)
+def test_normalize_qualification_result_rejects_contaminated_evidence(
+    tmp_path, mutation, error
+):
+    profile = _qualification_profile()
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result = _qualification_result(profile, workload_path)
+    mutation(profile, result)
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(result))
+
+    with pytest.raises(ValueError, match=error):
+        normalize_qualification_result(profile, result_path, workload_path)
+
+
+def test_normalize_qualification_result_rejects_changed_expected_workload(tmp_path):
+    profile = _qualification_profile()
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(_qualification_result(profile, workload_path)))
+
+    with pytest.raises(ValueError, match="changed during normalization"):
+        normalize_qualification_result(
+            profile,
+            result_path,
+            workload_path,
+            expected_workload_sha256="0" * 64,
+        )
+
+    with pytest.raises(ValueError, match="result changed"):
+        normalize_qualification_result(
+            profile,
+            result_path,
+            workload_path,
+            expected_result_sha256="0" * 64,
+        )
+
+
+def test_qualify_model_profile_binding_writes_normalized_evidence(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    result_path = tmp_path / "raw-result.json"
+    evidence_path = tmp_path / "evidence.json"
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+
+    def fake_run(command, **kwargs):
+        private_result = Path(command[-1])
+        assert command[-2] == "--output"
+        assert private_result != result_path
+        snapshot_path = Path(command[command.index("--workload") + 1])
+        assert snapshot_path != workload_path
+        assert snapshot_path.read_bytes() == workload_path.read_bytes()
+        private_result.write_text(
+            json.dumps(_qualification_result(profile, snapshot_path))
+        )
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        payload = qualify_model(
+            QualificationOptions(
+                model_id="laguna-s-2.1",
+                workload_path=str(workload_path),
+                result_path=str(result_path),
+                profile_path=str(profile_path),
+                evidence_output_path=str(evidence_path),
+            )
+        )
+
+    assert payload["status"] == "succeeded"
+    assert payload["normalized_evidence"]["promotion_required"] is True
+    assert result_path.is_file()
+    assert json.loads(evidence_path.read_text())["production_ready"] is False
+
+
+@pytest.mark.parametrize(
+    "collision",
+    ["output-evidence", "result-evidence", "result-output"],
+)
+def test_qualify_model_rejects_artifact_path_collision(tmp_path, collision):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    shared = tmp_path / "shared.json"
+    result_path = shared if collision != "output-evidence" else tmp_path / "raw.json"
+    output_path = (
+        shared if collision != "result-evidence" else tmp_path / "request.json"
+    )
+    evidence_path = (
+        shared if collision != "result-output" else tmp_path / "evidence.json"
+    )
+
+    with pytest.raises(ValueError, match="paths must differ"):
+        qualify_model(
+            QualificationOptions(
+                model_id="laguna-s-2.1",
+                workload_path=str(workload_path),
+                result_path=str(result_path),
+                profile_path=str(profile_path),
+                output_path=str(output_path),
+                evidence_output_path=str(evidence_path),
+            )
+        )
+
+
+def test_qualify_model_rejects_stale_preexisting_result(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "raw.json"
+    result_path.write_text(json.dumps(_qualification_result(profile, workload_path)))
+
+    completed = SimpleNamespace(returncode=0, stdout="passed", stderr="")
+    with patch("vllm_mlx.model_workflow.subprocess.run", return_value=completed):
+        with pytest.raises(ValueError, match="fresh result"):
+            qualify_model(
+                QualificationOptions(
+                    model_id="laguna-s-2.1",
+                    workload_path=str(workload_path),
+                    result_path=str(result_path),
+                    profile_path=str(profile_path),
+                )
+            )
+
+
+def test_qualify_model_rejects_workload_snapshot_mutation(tmp_path):
+    profile = _qualification_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile))
+    workload_path = tmp_path / "workload.json"
+    workload_path.write_text('{"name":"coding-smoke"}')
+    result_path = tmp_path / "raw.json"
+
+    def fake_run(command, **kwargs):
+        snapshot_path = Path(command[command.index("--workload") + 1])
+        snapshot_path.write_text('{"name":"mutated"}')
+        Path(command[-1]).write_text(
+            json.dumps(_qualification_result(profile, snapshot_path))
+        )
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        with pytest.raises(ValueError, match="snapshot changed"):
+            qualify_model(
+                QualificationOptions(
+                    model_id="laguna-s-2.1",
+                    workload_path=str(workload_path),
+                    result_path=str(result_path),
+                    profile_path=str(profile_path),
+                )
+            )
 
 
 def test_drop_none_preserves_zero_and_false_values():
