@@ -148,6 +148,136 @@ acceptance record and must not be published as portable profile fields.
   parser implementation, live serving, MTP/DFlash/SpecPrefill, and production
   exposure.
 
+## Model Intelligence PR Sequence
+
+These topic branches may proceed after the profile contract exists. They stay
+separate from lifecycle and serving work so reviewers can evaluate pure
+inspection and estimation logic without accepting the product roadmap.
+
+### MI-1: Evidence-backed model metadata inspection
+
+**Depends on:** PR 1 and PR 2.
+
+**Scope:** Extend artifact inspection to tokenizer, chat-template, generation,
+license, immutable revision, and declared-capability metadata. Preserve source
+attribution and return unknown rather than inferring unsupported capabilities.
+
+**Files:** `vllm_mlx/model_workflow.py` and its focused tests only.
+
+**Acceptance checks:** Local and repository-backed fixtures prove revision,
+digest, tokenizer/template, and generation metadata attribution; absent or
+ambiguous metadata stays unknown.
+
+**Excluded:** Download execution, conversion, model loading, family-specific
+fit estimates, serving registration, and live qualification.
+
+### MI-2: Apple Silicon hardware inventory
+
+**Depends on:** none.
+
+**Scope:** Add a read-only, source-attributed inventory of the Apple Silicon
+facts required by later fit calculations. Return an explicit privacy-safe
+allowlist rather than serial numbers, UUIDs, or unrelated host metadata.
+
+**Files:** `vllm_mlx/hardware.py` and `tests/test_hardware.py`.
+
+**Acceptance checks:** Parser fixtures and a native smoke prove memory, chip,
+GPU-core, and source attribution; privacy-sensitive identifiers never appear.
+
+**Excluded:** Recommendation policy, model selection, process control, and
+serving behavior.
+
+### MI-3: Explainable model-fit calculations
+
+**Depends on:** MI-2.
+
+**Scope:** Add pure calculations for exact artifact residency, dense/GQA KV
+cache, independent context bounds, conversion workspace, and memory margin.
+Every input is explicit and every result separates exact, derived, assumption,
+measured, and unknown values.
+
+**Files:** `vllm_mlx/model_fit.py` and `tests/test_model_fit.py`.
+
+**Acceptance checks:** Focused tests cover exact sums, boundary values,
+measured overrides, missing evidence, unsupported architectures, and hardware
+provenance. Hybrid and mixed-attention caches remain unknown.
+
+**Excluded:** Family recognition, model loading, policy-selected defaults, and
+live memory qualification.
+
+### MI-4: Dense/GQA config adapter
+
+**Depends on:** MI-3.
+
+**Scope:** Adapt declared dense or GQA config structure into the generic
+estimator. Cache dtype, context policy, concurrency, and quantization overhead
+remain explicit caller/profile inputs with provenance.
+
+**Files:** The dense/GQA slice of `vllm_mlx/model_family_adapters.py`, its
+synthetic fixture, and focused tests.
+
+**Acceptance checks:** MHA versus GQA classification follows declared head
+counts; fake provider fields are rejected; explicit profile inputs cannot be
+invented or silently ignored.
+
+**Excluded:** Qwen hybrid attention, Laguna mixed attention, and serving
+configuration.
+
+### MI-5: Qwen 3.6 hybrid config adapter
+
+**Depends on:** MI-1 and MI-3.
+
+**Scope:** Add a revision-pinned adapter for the declared Qwen 3.6 hybrid
+attention structure. Validate the exact full-attention cadence and expose
+linear-state, MoE, context, and MTP config facts without importing local overlay
+fields into the provider contract.
+
+**Files:** The Qwen slice of `vllm_mlx/model_family_adapters.py`, its pinned
+fixture, and focused tests.
+
+**Acceptance checks:** The provider config SHA and revision are recorded;
+malformed layer schedules fail unknown; generic KV remains unknown.
+
+**Excluded:** Qwen serving templates, parser behavior, generation, MTP
+execution, and architecture-specific cache formulas.
+
+### MI-6: Laguna S 2.1 config adapter
+
+**Depends on:** PR 5, MI-1, and MI-3.
+
+**Scope:** Add a revision-pinned adapter for Laguna S 2.1 structural identity:
+mixed global/sliding attention, per-layer heads, MoE routing, shared expert,
+per-head gating, and first-layer dense MLP.
+
+**Files:** The Laguna slice of `vllm_mlx/model_family_adapters.py`, its pinned
+fixture, and focused tests.
+
+**Acceptance checks:** Every identity-bearing array and exact numeric field is
+validated; adversarial variants fail unknown; no local artifact path is needed;
+mixed-attention KV remains unknown.
+
+**Excluded:** Full model load, logits, parser/tool support, generation,
+qualification, registration, and exposure.
+
+### MI-7: Recorded fixture recommendation validation
+
+**Depends on:** MI-2 through MI-6.
+
+**Scope:** Exercise the adapters and estimators together against portable,
+source-attributed fixtures. Use the Laguna handoff to prove that a future
+onboarding workflow can replace manual fact transcription without upgrading
+artifact evidence into runtime qualification.
+
+**Files:** A focused fixture-validation test module and portable fixture data
+only.
+
+**Acceptance checks:** Dense/GQA estimates are reproducible; hardware margins
+retain provenance; Qwen and Laguna unsupported cache estimates remain unknown;
+fixture revision or digest drift fails closed.
+
+**Excluded:** Local `/Volumes` access in CI, model loads, service changes,
+performance claims, and exposure policy.
+
 ### PR 6: Acquisition, conversion, and artifact validation integration
 
 **Depends on:** PR 3 and PR 5.
