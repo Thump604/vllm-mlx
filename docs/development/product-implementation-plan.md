@@ -67,7 +67,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 | ID | Status | Work package | Agent | Depends on |
 |---|---|---|---|---|
 | P3.1 | complete | Define lifecycle API and state transitions over existing workflow, registry, and residency modules | Sol `high` | P1, P2 |
-| P3.2 | in_progress | Implement resumable acquire/convert/validate operations | Terra `medium` | P3.1 |
+| P3.2 | complete | Implement resumable acquire/convert/validate operations | Terra `medium` | P3.1 |
 | P3.3 | pending | Implement one-active-large-model activation, stop, status, and recovery | Terra `high` | P3.1 |
 | P3.4 | pending | Normalize qualification results into profile evidence without automatic over-promotion | Terra `medium` | P3.1 |
 | P3.5 | pending | Exercise crash, cancellation, partial download, and stale-state recovery | Luna `high` | P3.2, P3.3, P3.4 |
@@ -83,8 +83,13 @@ in separate reviews. No upstream PR should contain the full integration branch.
 - Targeted acquisition: complete. Immutable revisions, operation locking,
   crash-durable journals, failed/cancelled retry, identity conflicts, atomic
   publication, and finalization recovery are covered.
-- Conversion journaling/resume: pending.
-- Artifact validation result and source/output identity binding: pending.
+- Conversion journaling/resume: complete. Conversion uses identity-bound,
+  operation-owned staging, crash-durable journals, serialized retries, explicit
+  cancellation/failure state, and atomic publication without overwriting an
+  unrelated output.
+- Artifact validation result and source/output identity binding: complete.
+  Successful output is content-hashed, checked for config and MLX weights, and
+  bound to its source metadata, exact recipe, and conversion operation.
 
 ## Stage 4: First Product Workflow
 
@@ -115,7 +120,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 
 ## Next Execution Step
 
-Continue P3.2 with conversion operation state. Preserve the existing conversion
-command and successful manifest, but make partial output, retries, cancellation,
-and source/output identity explicit before adding artifact validation. Do not
-combine serving activation or resident process state with this work.
+Implement P3.3 by integrating the pure lifecycle contract with the existing
+registry and residency managers. Keep activation, stop, status, and stale-state
+recovery behind one service boundary; do not change inference generation or
+model-family behavior in that work package.
