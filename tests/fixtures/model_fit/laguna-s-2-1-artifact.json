@@ -1,0 +1,21 @@
+{
+  "source_repository": "poolside/Laguna-S-2.1",
+  "source_revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
+  "converted_config_sha256": "8440d3ec23e275aa62bba1371c20cee4a72906fdc33ca37966ba7cd83472847b",
+  "indexed_tensor_bytes": 66147556864,
+  "weight_files": [
+    {"name": "model-00001-of-00013.safetensors", "size_bytes": 5345208527},
+    {"name": "model-00002-of-00013.safetensors", "size_bytes": 5189212969},
+    {"name": "model-00003-of-00013.safetensors", "size_bytes": 5138881112},
+    {"name": "model-00004-of-00013.safetensors", "size_bytes": 5107864121},
+    {"name": "model-00005-of-00013.safetensors", "size_bytes": 5138881212},
+    {"name": "model-00006-of-00013.safetensors", "size_bytes": 5138881120},
+    {"name": "model-00007-of-00013.safetensors", "size_bytes": 5097205816},
+    {"name": "model-00008-of-00013.safetensors", "size_bytes": 5138881262},
+    {"name": "model-00009-of-00013.safetensors", "size_bytes": 5138881138},
+    {"name": "model-00010-of-00013.safetensors", "size_bytes": 5097205804},
+    {"name": "model-00011-of-00013.safetensors", "size_bytes": 5138881236},
+    {"name": "model-00012-of-00013.safetensors", "size_bytes": 5138881196},
+    {"name": "model-00013-of-00013.safetensors", "size_bytes": 4338955210}
+  ]
+}
