@@ -362,31 +362,48 @@ def serve_command(args):
         load_model_registry(models_config, defaults=defaults)
     else:
         # Load model with unified server
-        load_model(
-            model_arg,
-            use_batching=args.continuous_batching,
-            scheduler_config=scheduler_config,
-            stream_interval=args.stream_interval if args.continuous_batching else 1,
-            max_tokens=args.max_tokens,
-            max_request_tokens=max_request_tokens,
-            force_mllm=getattr(args, "mllm", False),
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            served_model_name=args.served_model_name,
-            trust_remote_code=trust_remote_code,
-            mtp=args.enable_mtp,
-            prefill_step_size=args.prefill_step_size,
-            specprefill_enabled=args.specprefill,
-            specprefill_threshold=args.specprefill_threshold,
-            specprefill_keep_pct=args.specprefill_keep_pct,
-            specprefill_backbone_pct=specprefill_backbone_pct,
-            specprefill_draft_model=args.specprefill_draft_model,
-            mllm_draft_model=mllm_draft_model,
-            mllm_draft_kind=mllm_draft_kind,
-            mllm_draft_block_size=mllm_draft_block_size,
-            warm_prompts_path=getattr(args, "warm_prompts", None),
-            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
-            lazy_load_model=args.lazy_load_model,
-        )
+        lifecycle_env = "VLLM_MLX_LIFECYCLE_STATE_PATH"
+        previous_lifecycle_path = os.environ.get(lifecycle_env)
+        lifecycle_enabled = args.auto_unload_idle_seconds > 0 or args.lazy_load_model
+        try:
+            if lifecycle_enabled:
+                os.environ[lifecycle_env] = os.path.expanduser(
+                    getattr(
+                        args,
+                        "lifecycle_state_path",
+                        "~/.cache/vllm-mlx/lifecycle-state.json",
+                    )
+                )
+            load_model(
+                model_arg,
+                use_batching=args.continuous_batching,
+                scheduler_config=scheduler_config,
+                stream_interval=args.stream_interval if args.continuous_batching else 1,
+                max_tokens=args.max_tokens,
+                max_request_tokens=max_request_tokens,
+                force_mllm=getattr(args, "mllm", False),
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                served_model_name=args.served_model_name,
+                trust_remote_code=trust_remote_code,
+                mtp=args.enable_mtp,
+                prefill_step_size=args.prefill_step_size,
+                specprefill_enabled=args.specprefill,
+                specprefill_threshold=args.specprefill_threshold,
+                specprefill_keep_pct=args.specprefill_keep_pct,
+                specprefill_backbone_pct=specprefill_backbone_pct,
+                specprefill_draft_model=args.specprefill_draft_model,
+                mllm_draft_model=mllm_draft_model,
+                mllm_draft_kind=mllm_draft_kind,
+                mllm_draft_block_size=mllm_draft_block_size,
+                warm_prompts_path=getattr(args, "warm_prompts", None),
+                auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+                lazy_load_model=args.lazy_load_model,
+            )
+        finally:
+            if previous_lifecycle_path is None:
+                os.environ.pop(lifecycle_env, None)
+            else:
+                os.environ[lifecycle_env] = previous_lifecycle_path
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
@@ -1321,6 +1338,14 @@ Examples:
         "--lazy-load-model",
         action="store_true",
         help="Register the main model at startup but defer loading until first request",
+    )
+    serve_parser.add_argument(
+        "--lifecycle-state-path",
+        default="~/.cache/vllm-mlx/lifecycle-state.json",
+        help=(
+            "Persistent lifecycle control state used by lazy/idle residency "
+            "(default: ~/.cache/vllm-mlx/lifecycle-state.json)"
+        ),
     )
     serve_parser.add_argument(
         "--max-audio-upload-mb",

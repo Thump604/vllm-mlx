@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from enum import Enum
 from typing import Any
 
 from .engine.base import BaseEngine, suspend_cancellation
+from .lifecycle_contract import LifecycleEvent, ProcessState
+from .lifecycle_control import LifecycleControlState
 
 
 class ResidentState(str, Enum):
@@ -42,6 +45,9 @@ class ModelSpec:
     specprefill_keep_pct: float = 0.3
     specprefill_backbone_pct: float = 0.0
     specprefill_draft_model: str | None = None
+    profile_id: str | None = None
+    profile_revision: str | None = None
+    config_digest: str | None = None
 
 
 @dataclass
@@ -89,9 +95,21 @@ class ResidencyManager:
         self.auto_unload_idle_seconds = auto_unload_idle_seconds
         self._residents: dict[str, ResidentModel] = {}
         self._lock = asyncio.Lock()
+        self._shutting_down = False
+        self._control_sync_error: str | None = None
+        state_path = os.environ.get("VLLM_MLX_LIFECYCLE_STATE_PATH")
+        self._control = LifecycleControlState(state_path) if state_path else None
+        self._persistent_control_enabled = self._control is not None
 
     def register_model(self, spec: ModelSpec) -> str:
         """Register a model spec, or replace a dormant resident entry."""
+        if self._control is not None and self._control.model_key not in {
+            None,
+            spec.model_key,
+        }:
+            raise RuntimeError(
+                "Persistent lifecycle control permits one configured resident model"
+            )
         existing = self._residents.get(spec.model_key)
         if existing is not None:
             is_dormant = (
@@ -108,6 +126,9 @@ class ResidencyManager:
                 )
 
         self._residents[spec.model_key] = ResidentModel(spec=spec)
+        if self._control is not None:
+            self._control.configure(spec)
+            self._control.reconcile(ProcessState.UNLOADED, 0)
         return spec.model_key
 
     def get_engine(self, model_key: str) -> BaseEngine | None:
@@ -117,7 +138,9 @@ class ResidencyManager:
     def get_status(self, model_key: str) -> dict[str, Any]:
         """Return a serializable snapshot of resident state."""
         resident = self._resident(model_key)
-        return {
+        if self._control is not None and self._control.model_key == model_key:
+            self._reconcile_control(resident)
+        status: dict[str, Any] = {
             "model_key": resident.spec.model_key,
             "model_name": resident.spec.model_name,
             "state": resident.state.value,
@@ -128,6 +151,10 @@ class ResidencyManager:
             "estimated_memory_bytes": resident.estimated_memory_bytes,
             "auto_unload_idle_seconds": self.auto_unload_idle_seconds,
         }
+        if self._control is not None and self._control.model_key == model_key:
+            status["control"] = self._control.status()
+            status["control_sync_error"] = self._control_sync_error
+        return status
 
     async def ensure_loaded(self, model_key: str) -> BaseEngine:
         """Load and start a resident engine if needed."""
@@ -136,7 +163,10 @@ class ResidencyManager:
             unloading_task: asyncio.Task[bool] | None = None
 
             async with self._lock:
+                if self._shutting_down:
+                    raise RuntimeError("Residency manager is shutting down")
                 resident = self._resident(model_key)
+                self._reconcile_control(resident)
                 if (
                     resident.state == ResidentState.LOADED
                     and resident.engine is not None
@@ -147,8 +177,16 @@ class ResidencyManager:
                     unloading_task = resident._unloading_task
                 else:
                     if resident._loading_task is None:
+                        previous_state = resident.state
+                        previous_error = resident.last_error
                         resident.state = ResidentState.LOADING
                         resident.last_error = None
+                        try:
+                            self._apply_control(LifecycleEvent.BEGIN_LOAD, model_key)
+                        except BaseException:
+                            resident.state = previous_state
+                            resident.last_error = previous_error
+                            raise
                         resident._loading_task = asyncio.create_task(
                             self._load_engine(resident)
                         )
@@ -193,7 +231,10 @@ class ResidencyManager:
         while True:
             engine = await self.ensure_loaded(model_key)
             async with self._lock:
+                if self._shutting_down:
+                    raise RuntimeError("Residency manager is shutting down")
                 resident = self._resident(model_key)
+                self._reconcile_control(resident)
                 if (
                     resident.engine is not engine
                     or resident.state != ResidentState.LOADED
@@ -201,6 +242,11 @@ class ResidencyManager:
                 ):
                     continue
                 resident.active_requests += 1
+                try:
+                    self._apply_control(LifecycleEvent.ACQUIRE, model_key)
+                except BaseException:
+                    resident.active_requests -= 1
+                    raise
                 if count_activity:
                     resident.last_used_at = self._time_fn()
                 return engine
@@ -209,7 +255,9 @@ class ResidencyManager:
         """Release a previously acquired resident engine."""
         async with self._lock:
             resident = self._resident(model_key)
+            self._reconcile_control(resident)
             if resident.active_requests > 0:
+                self._apply_control(LifecycleEvent.RELEASE, model_key)
                 resident.active_requests -= 1
             if count_activity:
                 resident.last_used_at = self._time_fn()
@@ -223,6 +271,7 @@ class ResidencyManager:
             unloading_task: asyncio.Task[bool] | None = None
             async with self._lock:
                 resident = self._resident(model_key)
+                self._reconcile_control(resident)
 
                 if resident._loading_task is not None:
                     return False
@@ -243,6 +292,11 @@ class ResidencyManager:
                         return False
 
                     resident.state = ResidentState.UNLOADING
+                    try:
+                        self._apply_control(LifecycleEvent.BEGIN_UNLOAD, model_key)
+                    except BaseException:
+                        resident.state = ResidentState.LOADED
+                        raise
                     resident._unloading_task = asyncio.create_task(
                         self._unload_engine(resident)
                     )
@@ -252,64 +306,151 @@ class ResidencyManager:
                 return False
             return await asyncio.shield(unloading_task)
 
+    async def unload(self, model_key: str) -> bool:
+        """Explicitly unload one idle resident without applying idle-time policy."""
+        while True:
+            loading_task: asyncio.Task[BaseEngine] | None = None
+            unloading_task: asyncio.Task[bool] | None = None
+            async with self._lock:
+                resident = self._resident(model_key)
+                self._reconcile_control(resident)
+                if resident.active_requests:
+                    raise RuntimeError(
+                        f"Cannot unload resident model '{model_key}' with active requests"
+                    )
+                if resident._loading_task is not None:
+                    resident._loading_task.cancel()
+                    loading_task = resident._loading_task
+                elif resident._unloading_task is not None:
+                    unloading_task = resident._unloading_task
+                elif (
+                    resident.engine is None or resident.state == ResidentState.UNLOADED
+                ):
+                    resident.state = ResidentState.UNLOADED
+                    return False
+                else:
+                    resident.state = ResidentState.UNLOADING
+                    try:
+                        self._apply_control(LifecycleEvent.BEGIN_UNLOAD, model_key)
+                    except BaseException:
+                        resident.state = ResidentState.LOADED
+                        raise
+                    resident._unloading_task = asyncio.create_task(
+                        self._unload_engine(resident)
+                    )
+                    unloading_task = resident._unloading_task
+
+            if loading_task is not None:
+                with suppress(asyncio.CancelledError):
+                    await loading_task
+                continue
+            if unloading_task is not None:
+                return await asyncio.shield(unloading_task)
+
+    def list_status(self) -> list[dict[str, Any]]:
+        """Return snapshots for every registered resident."""
+        return [self.get_status(model_key) for model_key in sorted(self._residents)]
+
     async def shutdown(self) -> None:
         """Stop all loaded residents."""
-        keys = list(self._residents.keys())
+        async with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("Residency manager is already shutting down")
+            self._shutting_down = True
+
         failures: list[str] = []
-        for model_key in keys:
-            while True:
-                loading_task: asyncio.Task[BaseEngine] | None = None
-                unloading_task: asyncio.Task[bool] | None = None
+        try:
+            for model_key in list(self._residents):
+                while True:
+                    loading_task: asyncio.Task[BaseEngine] | None = None
+                    unloading_task: asyncio.Task[bool] | None = None
 
-                async with self._lock:
-                    resident = self._resident(model_key)
+                    async with self._lock:
+                        resident = self._resident(model_key)
+                        self._reconcile_control(resident)
+                        if resident._loading_task is not None:
+                            resident._loading_task.cancel()
+                            loading_task = resident._loading_task
+                        elif (
+                            resident.engine is None
+                            or resident.state == ResidentState.UNLOADED
+                        ):
+                            break
+                        else:
+                            if resident._unloading_task is None:
+                                resident.state = ResidentState.UNLOADING
+                                try:
+                                    self._apply_control(
+                                        LifecycleEvent.BEGIN_UNLOAD, model_key
+                                    )
+                                except BaseException:
+                                    resident.state = ResidentState.LOADED
+                                    raise
+                                resident._unloading_task = asyncio.create_task(
+                                    self._unload_engine(resident)
+                                )
+                            unloading_task = resident._unloading_task
 
-                    if resident._loading_task is not None:
-                        resident._loading_task.cancel()
-                        loading_task = resident._loading_task
-                    elif (
-                        resident.engine is None
-                        or resident.state == ResidentState.UNLOADED
-                    ):
-                        break
-                    else:
-                        if resident._unloading_task is None:
-                            resident.state = ResidentState.UNLOADING
-                            resident._unloading_task = asyncio.create_task(
-                                self._unload_engine(resident)
+                    if loading_task is not None:
+                        try:
+                            await asyncio.shield(loading_task)
+                        except asyncio.CancelledError:
+                            current = asyncio.current_task()
+                            cancelling = getattr(current, "cancelling", None)
+                            if cancelling is not None and cancelling() > 0:
+                                with suspend_cancellation():
+                                    with suppress(asyncio.CancelledError):
+                                        await loading_task
+                                self._close_control_if_fully_unloaded()
+                                raise
+                        continue
+
+                    if unloading_task is not None:
+                        try:
+                            unloaded = await asyncio.shield(unloading_task)
+                        except asyncio.CancelledError:
+                            with suspend_cancellation():
+                                unloaded = await unloading_task
+                            if unloaded:
+                                self._close_control_if_fully_unloaded()
+                            raise
+                        if not unloaded:
+                            async with self._lock:
+                                resident = self._resident(model_key)
+                                error = (
+                                    resident.last_error or "resident remained loaded"
+                                )
+                            failures.append(
+                                f"Failed to unload resident model '{model_key}' during shutdown: {error}"
                             )
-                        unloading_task = resident._unloading_task
-
-                if loading_task is not None:
-                    with suppress(asyncio.CancelledError):
-                        await loading_task
-                    continue
-
-                if unloading_task is not None:
-                    # Shield the unload so that cancelling shutdown() does not
-                    # orphan a half-stopped engine in UNLOADING state.
-                    try:
-                        unloaded = await asyncio.shield(unloading_task)
-                    except asyncio.CancelledError:
-                        # Shutdown itself was cancelled — finish the in-flight
-                        # unload deterministically before propagating.
-                        with suspend_cancellation():
-                            unloaded = await unloading_task
-                        raise
-                    if not unloaded:
-                        async with self._lock:
-                            resident = self._resident(model_key)
-                            error = resident.last_error or "resident remained loaded"
-                        failures.append(
-                            f"Failed to unload resident model '{model_key}' during shutdown: {error}"
-                        )
+                            break
                         break
-                    break
 
-        if failures:
-            if len(failures) == 1:
-                raise RuntimeError(failures[0])
-            raise RuntimeError("; ".join(failures))
+            if failures:
+                if len(failures) == 1:
+                    raise RuntimeError(failures[0])
+                raise RuntimeError("; ".join(failures))
+            if not self._close_control_if_fully_unloaded():
+                raise RuntimeError("Residency manager did not fully unload")
+        except BaseException:
+            if not self._persistent_control_enabled or (
+                self._control is not None and self._control.is_open
+            ):
+                self._shutting_down = False
+            raise
+
+    def _close_control_if_fully_unloaded(self) -> bool:
+        fully_unloaded = all(
+            resident.engine is None
+            and resident.state == ResidentState.UNLOADED
+            and resident._loading_task is None
+            and resident._unloading_task is None
+            for resident in self._residents.values()
+        )
+        if fully_unloaded and self._control is not None:
+            self._control.close()
+            self._control = None
+        return fully_unloaded
 
     async def _load_engine(self, resident: ResidentModel) -> BaseEngine:
         """Create and start a resident engine."""
@@ -336,6 +477,9 @@ class ResidencyManager:
                 resident.last_error = str(exc)
                 resident._abandoned_loading_task = None
                 resident._loading_task = None
+                self._apply_terminal_control(
+                    LifecycleEvent.LOAD_FAILED, resident.spec.model_key
+                )
             raise
 
         try:
@@ -347,6 +491,9 @@ class ResidencyManager:
                 resident.last_error = None
                 resident._abandoned_loading_task = None
                 resident._loading_task = None
+                self._apply_terminal_control(
+                    LifecycleEvent.LOAD_SUCCEEDED, resident.spec.model_key
+                )
         except asyncio.CancelledError:
             await self._cleanup_cancelled_load(resident, engine)
             raise
@@ -369,6 +516,9 @@ class ResidencyManager:
             async with self._lock:
                 resident.state = ResidentState.LOADED
                 resident._unloading_task = None
+                self._apply_terminal_control(
+                    LifecycleEvent.UNLOAD_FAILED, resident.spec.model_key
+                )
             raise
         except Exception as exc:
             async with self._lock:
@@ -376,6 +526,9 @@ class ResidencyManager:
                 resident.state = ResidentState.LOADED
                 resident.last_error = str(exc)
                 resident._unloading_task = None
+                self._apply_terminal_control(
+                    LifecycleEvent.UNLOAD_FAILED, resident.spec.model_key
+                )
             return False
 
         async with self._lock:
@@ -384,6 +537,9 @@ class ResidencyManager:
             resident.loaded_at = None
             resident.last_error = None
             resident._unloading_task = None
+            self._apply_terminal_control(
+                LifecycleEvent.UNLOAD_SUCCEEDED, resident.spec.model_key
+            )
 
         return True
 
@@ -463,6 +619,33 @@ class ResidencyManager:
                 # so late waiters on the old task can still recognize a retryable
                 # cancellation instead of inheriting CancelledError.
                 resident._loading_task = None
+                self._apply_terminal_control(
+                    LifecycleEvent.LOAD_CANCELLED, resident.spec.model_key
+                )
+
+    def _apply_control(self, event: LifecycleEvent, model_key: str) -> None:
+        if self._control is not None and self._control.model_key == model_key:
+            self._control.apply(event)
+
+    def _apply_terminal_control(self, event: LifecycleEvent, model_key: str) -> None:
+        try:
+            self._apply_control(event, model_key)
+            self._control_sync_error = None
+        except BaseException as exc:
+            self._control_sync_error = str(exc)
+            raise
+
+    def _reconcile_control(self, resident: ResidentModel) -> None:
+        if self._control is None or self._control.model_key != resident.spec.model_key:
+            return
+        try:
+            self._control.reconcile(
+                ProcessState(resident.state.value), resident.active_requests
+            )
+            self._control_sync_error = None
+        except BaseException as exc:
+            self._control_sync_error = str(exc)
+            raise
 
     async def _release_load_waiter(
         self,
