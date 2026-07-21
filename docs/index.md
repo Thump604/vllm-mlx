@@ -58,6 +58,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - [Mac-Native Product Strategy](development/product-strategy.md)
 - [Product Implementation Plan](development/product-implementation-plan.md)
 - [Model Configuration Authority Inventory](development/model-configuration-authority-inventory.md)
+- [ModelProfile v1](development/model-profile-v1.md)
 - [Plan-Driven Agent Execution](development/agent-execution-strategy.md)
 
 ## Requirements

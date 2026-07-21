@@ -19,8 +19,8 @@ closes or materially replans a package.
 | ID | Status | Work package | Agent | Depends on |
 |---|---|---|---|---|
 | P1.1 | complete | Inventory current configuration and manifest precedence | Luna `low` | None |
-| P1.2 | pending | Define the versioned `ModelProfile` schema and provenance layers | Sol `high` | P1.1 |
-| P1.3 | pending | Map acquisition, conversion, registration, registry, and qualification data into the schema | Terra `medium` | P1.2 |
+| P1.2 | complete | Define the versioned `ModelProfile` schema and provenance layers | Sol `high` | P1.1 |
+| P1.3 | in_progress | Map acquisition, conversion, registration, registry, and qualification data into the schema | Terra `medium` | P1.2 |
 | P1.4 | pending | Add schema validation and migration tests | Luna `medium` | P1.3 |
 | P1.5 | pending | Independent contract and compatibility review | Terra `high` | P1.4 |
 
