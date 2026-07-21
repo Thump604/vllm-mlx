@@ -19,8 +19,9 @@ import sys
 import tempfile
 import threading
 from importlib.util import find_spec
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ REGISTRATION_MANIFEST_NAME = "vllm_mlx_registration_manifest.json"
 QUALIFICATION_REQUEST_NAME = "vllm_mlx_qualification_request.json"
 ACQUISITION_MARKER_NAME = ".vllm_mlx_acquisition_operation.json"
 ACQUISITION_JOURNAL_VERSION = 1
+CONVERSION_MARKER_NAME = ".vllm_mlx_conversion_operation.json"
+CONVERSION_JOURNAL_VERSION = 1
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -56,7 +59,9 @@ _METADATA_FILENAMES = (
     "LICENSE.txt",
     "license",
 )
-_INTERNAL_WORKFLOW_FILENAMES = frozenset({ACQUISITION_MARKER_NAME})
+_INTERNAL_WORKFLOW_FILENAMES = frozenset(
+    {ACQUISITION_MARKER_NAME, CONVERSION_MARKER_NAME, CONVERSION_MANIFEST_NAME}
+)
 _ACQUISITION_ENV_LOCK = threading.RLock()
 
 
@@ -1061,8 +1066,176 @@ def _conversion_command(options: ConversionOptions) -> list[str]:
     return command
 
 
+def _conversion_source_identity(source: Path) -> dict[str, Any]:
+    """Bind conversion state to stable source metadata and artifact bytes."""
+    if not source.is_dir():
+        raise NotADirectoryError(f"conversion source must be a directory: {source}")
+    acquisition_manifest = source / MODEL_MANIFEST_NAME
+    config = source / "config.json"
+    if not config.is_file():
+        raise ValueError(f"conversion source is missing config.json: {source}")
+    records = _artifact_file_records(source)
+    digest_input = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    identity: dict[str, Any] = {
+        "path": str(source.resolve()),
+        "config_sha256": _sha256_file(config),
+        "artifact_sha256": hashlib.sha256(digest_input).hexdigest(),
+        "file_count": len(records),
+        "total_size_bytes": sum(record["size"] for record in records),
+    }
+    if acquisition_manifest.is_file():
+        manifest = _read_json_strict(
+            acquisition_manifest, label="source acquisition manifest"
+        )
+        identity.update(
+            acquisition_manifest_sha256=_sha256_file(acquisition_manifest),
+            model_id=manifest.get("model_id"),
+            revision=manifest.get("revision"),
+            acquisition_operation_id=manifest.get("operation_id"),
+        )
+    return identity
+
+
+def _conversion_identity(
+    options: ConversionOptions, *, source: Path, output: Path
+) -> dict[str, Any]:
+    return {
+        "version": CONVERSION_JOURNAL_VERSION,
+        "operation": "convert",
+        "backend": "mlx-lm",
+        "source": _conversion_source_identity(source),
+        "output_path": str(output.resolve()),
+        "recipe": {
+            "quantize": options.quantize,
+            "q_bits": options.q_bits,
+            "q_group_size": options.q_group_size,
+            "q_mode": options.q_mode,
+            "quant_predicate": options.quant_predicate,
+            "dtype": options.dtype,
+            "trust_remote_code": options.trust_remote_code,
+        },
+    }
+
+
+def _conversion_operation_id(identity: dict[str, Any]) -> str:
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _conversion_journal_path(output: Path) -> Path:
+    output_key = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:12]
+    return output.parent / f".{output.name}.{output_key}.conversion.json"
+
+
+def _artifact_file_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in sorted(path.rglob("*")):
+        if not item.is_file() or item.name in _INTERNAL_WORKFLOW_FILENAMES:
+            continue
+        records.append(
+            {
+                "path": str(item.relative_to(path)),
+                "size": item.stat().st_size,
+                "sha256": _sha256_file(item),
+            }
+        )
+    return records
+
+
+def _package_version(distribution: str) -> str | None:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return None
+
+
+def _validate_weight_file(path: Path) -> None:
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+
+        try:
+            with safe_open(path, framework="np") as handle:
+                if not list(handle.keys()):
+                    raise ValueError("contains no tensors")
+        except Exception as exc:
+            raise ValueError(f"invalid safetensors weight file {path}: {exc}") from exc
+        return
+
+    import numpy as np
+
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if not archive.files:
+                raise ValueError("contains no arrays")
+    except Exception as exc:
+        raise ValueError(f"invalid NPZ weight file {path}: {exc}") from exc
+
+
+def validate_converted_artifact(
+    path: str | Path,
+    *,
+    expected_operation_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate a converted artifact and return content-bound integrity evidence."""
+    artifact = Path(path).expanduser()
+    if not artifact.is_dir():
+        raise NotADirectoryError(f"converted artifact must be a directory: {artifact}")
+    config = artifact / "config.json"
+    if not config.is_file():
+        raise ValueError(f"converted artifact is missing config.json: {artifact}")
+    config_payload = _read_json_strict(config, label="converted artifact config")
+    if not config_payload.get("model_type") and not config_payload.get("architectures"):
+        raise ValueError(
+            f"converted artifact config lacks model_type or architectures: {config}"
+        )
+    weight_files = sorted(
+        item
+        for pattern in ("*.safetensors", "*.npz")
+        for item in artifact.rglob(pattern)
+        if item.is_file()
+    )
+    if not weight_files:
+        raise ValueError(f"converted artifact has no MLX weight files: {artifact}")
+    for weight_file in weight_files:
+        _validate_weight_file(weight_file)
+
+    records = _artifact_file_records(artifact)
+    digest_input = json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    evidence: dict[str, Any] = {
+        "kind": "vllm-mlx-converted-artifact-validation",
+        "path": str(artifact.resolve()),
+        "validated_at": _now_iso(),
+        "file_count": len(records),
+        "total_size_bytes": sum(record["size"] for record in records),
+        "artifact_sha256": hashlib.sha256(digest_input).hexdigest(),
+        "files": records,
+        "config_sha256": _sha256_file(config),
+        "weight_file_count": len(weight_files),
+    }
+    manifest_path = artifact / CONVERSION_MANIFEST_NAME
+    if manifest_path.is_file():
+        manifest = _read_json_strict(manifest_path, label="conversion manifest")
+        evidence["manifest_operation_id"] = manifest.get("operation_id")
+        if (
+            expected_operation_id is not None
+            and manifest.get("operation_id") != expected_operation_id
+        ):
+            raise ValueError(
+                "converted artifact manifest operation_id does not match the expected operation"
+            )
+    elif expected_operation_id is not None:
+        raise ValueError(
+            f"converted artifact is missing conversion manifest: {artifact}"
+        )
+    return evidence
+
+
+def _publish_conversion_output(staging: Path, output: Path) -> None:
+    os.replace(staging, output)
+
+
 def convert_model(options: ConversionOptions) -> dict[str, Any]:
-    """Run mlx-lm conversion and record the exact recipe."""
+    """Run a resumable, identity-bound mlx-lm conversion operation."""
     command = _conversion_command(options)
     started = _now_iso()
     source_inspection = inspect_model(options.source_path)
@@ -1086,6 +1259,7 @@ def convert_model(options: ConversionOptions) -> dict[str, Any]:
         "environment": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),
+            "mlx_lm": _package_version("mlx-lm"),
         },
         "source_inspection": source_inspection,
     }
@@ -1094,22 +1268,189 @@ def convert_model(options: ConversionOptions) -> dict[str, Any]:
         result["status"] = "dry_run"
         return result
 
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
-    result["returncode"] = completed.returncode
-    result["stdout"] = completed.stdout
-    result["stderr"] = completed.stderr
-    result["completed_at"] = _now_iso()
-    result["status"] = "succeeded" if completed.returncode == 0 else "failed"
-    if completed.returncode != 0:
-        return result
-
+    source_path = Path(options.source_path).expanduser()
     output_path = Path(options.output_path).expanduser()
-    output_inspection = inspect_model(str(output_path))
-    result["output_inspection"] = output_inspection
-    manifest_path = output_path / CONVERSION_MANIFEST_NAME
-    _write_json(manifest_path, result)
-    result["manifest_path"] = str(manifest_path)
-    return result
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    identity = _conversion_identity(options, source=source_path, output=output_path)
+    operation_id = _conversion_operation_id(identity)
+    journal_path = _conversion_journal_path(output_path)
+    lock_path = journal_path.with_suffix(f"{journal_path.suffix}.lock")
+    staging = output_path.parent / f".{output_path.name}.conversion-{operation_id[:12]}"
+
+    with lock_path.open("a+") as operation_lock:
+        fcntl.flock(operation_lock.fileno(), fcntl.LOCK_EX)
+        journal = (
+            _read_json_strict(journal_path, label="conversion journal")
+            if journal_path.exists()
+            else {}
+        )
+        if journal and (
+            journal.get("kind") != "vllm-mlx-conversion-operation"
+            or journal.get("version") != CONVERSION_JOURNAL_VERSION
+            or journal.get("operation_id") != operation_id
+            or journal.get("identity") != identity
+        ):
+            raise ValueError(f"conversion journal identity conflict at {journal_path}")
+
+        if output_path.exists():
+            manifest = _read_json(output_path / CONVERSION_MANIFEST_NAME)
+            if (
+                manifest.get("operation_id") != operation_id
+                or manifest.get("identity") != identity
+            ):
+                raise FileExistsError(
+                    f"conversion output path already exists with different identity: {output_path}"
+                )
+            validation = validate_converted_artifact(
+                output_path, expected_operation_id=operation_id
+            )
+            recorded_validation = manifest.get("artifact_validation")
+            recorded_digest = (
+                recorded_validation.get("artifact_sha256")
+                if isinstance(recorded_validation, dict)
+                else None
+            )
+            journal_digest = journal.get("artifact_sha256")
+            expected_digest = recorded_digest or journal_digest
+            if expected_digest is None:
+                raise ValueError(
+                    "published conversion artifact has no recorded integrity digest"
+                )
+            if validation["artifact_sha256"] != expected_digest:
+                raise ValueError(
+                    "published conversion artifact bytes differ from the recorded integrity digest"
+                )
+            if journal_digest is not None and journal_digest != expected_digest:
+                raise ValueError(
+                    "conversion manifest and journal integrity digests disagree"
+                )
+            manifest.update(
+                manifest_path=str(output_path / CONVERSION_MANIFEST_NAME),
+                artifact_validation=validation,
+            )
+            _write_json_atomic(output_path / CONVERSION_MANIFEST_NAME, manifest)
+            (output_path / CONVERSION_MARKER_NAME).unlink(missing_ok=True)
+            journal.update(
+                kind="vllm-mlx-conversion-operation",
+                version=CONVERSION_JOURNAL_VERSION,
+                operation_id=operation_id,
+                identity=identity,
+                status="succeeded",
+                attempt=max(1, int(journal.get("attempt", 0))),
+                started_at=journal.get("started_at") or manifest.get("started_at"),
+                updated_at=_now_iso(),
+                completed_at=journal.get("completed_at") or _now_iso(),
+                output_published=True,
+                manifest_path=str(output_path / CONVERSION_MANIFEST_NAME),
+                artifact_sha256=validation["artifact_sha256"],
+            )
+            _write_json_atomic(journal_path, journal)
+            return manifest
+
+        if staging.exists():
+            marker = _read_json(staging / CONVERSION_MARKER_NAME)
+            if marker.get("operation_id") != operation_id:
+                raise FileExistsError(
+                    f"conversion staging path is not owned by this operation: {staging}"
+                )
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        _write_json_atomic(
+            staging / CONVERSION_MARKER_NAME,
+            {"operation_id": operation_id, "identity": identity},
+        )
+
+        attempt = int(journal.get("attempt", 0)) + 1
+        journal = {
+            "kind": "vllm-mlx-conversion-operation",
+            "version": CONVERSION_JOURNAL_VERSION,
+            "operation_id": operation_id,
+            "identity": identity,
+            "status": "running",
+            "attempt": attempt,
+            "started_at": journal.get("started_at") or started,
+            "updated_at": _now_iso(),
+            "staging_path": str(staging),
+            "output_path": str(output_path),
+            "output_published": False,
+        }
+        _write_json_atomic(journal_path, journal)
+
+        execution_options = replace(options, output_path=str(staging))
+        execution_command = _conversion_command(execution_options)
+        result.update(
+            operation_id=operation_id,
+            operation_journal_path=str(journal_path),
+            attempt=attempt,
+            execution_command=execution_command,
+            source_identity=identity["source"],
+            identity=identity,
+        )
+        try:
+            completed = subprocess.run(
+                execution_command, text=True, capture_output=True, check=False
+            )
+            result["returncode"] = completed.returncode
+            result["stdout"] = completed.stdout
+            result["stderr"] = completed.stderr
+            result["completed_at"] = _now_iso()
+            result["status"] = "succeeded" if completed.returncode == 0 else "failed"
+            if completed.returncode != 0:
+                journal.update(
+                    status="failed",
+                    updated_at=_now_iso(),
+                    error={
+                        "type": "ConversionProcessError",
+                        "message": completed.stderr,
+                        "returncode": completed.returncode,
+                    },
+                )
+                _write_json_atomic(journal_path, journal)
+                return result
+
+            output_inspection = inspect_model(str(staging))
+            if _conversion_source_identity(source_path) != identity["source"]:
+                raise ValueError(
+                    "conversion source changed while conversion was running; output was not published"
+                )
+            result["output_inspection"] = output_inspection
+            manifest_path = staging / CONVERSION_MANIFEST_NAME
+            _write_json_atomic(manifest_path, result)
+            validation = validate_converted_artifact(
+                staging, expected_operation_id=operation_id
+            )
+            result["artifact_validation"] = validation
+            final_manifest_path = output_path / CONVERSION_MANIFEST_NAME
+            validation["path"] = str(output_path.resolve())
+            output_inspection["model"] = str(output_path)
+            output_inspection["location"] = str(output_path)
+            result["manifest_path"] = str(final_manifest_path)
+            _write_json_atomic(manifest_path, result)
+            _publish_conversion_output(staging, output_path)
+            (output_path / CONVERSION_MARKER_NAME).unlink(missing_ok=True)
+            journal.update(
+                status="succeeded",
+                updated_at=_now_iso(),
+                completed_at=_now_iso(),
+                output_published=True,
+                manifest_path=str(final_manifest_path),
+                artifact_sha256=validation["artifact_sha256"],
+            )
+            _write_json_atomic(journal_path, journal)
+            return result
+        except BaseException as exc:
+            status = (
+                "cancelled"
+                if isinstance(exc, (KeyboardInterrupt, SystemExit))
+                else "failed"
+            )
+            journal.update(
+                status=status,
+                updated_at=_now_iso(),
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            _write_json_atomic(journal_path, journal)
+            raise
 
 
 def _existing_manifests(path: Path) -> dict[str, Any]:

@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from numpy import array
+from safetensors.numpy import save_file
 
 from vllm_mlx.model_workflow import (
     ACQUISITION_MARKER_NAME,
@@ -27,7 +29,12 @@ from vllm_mlx.model_workflow import (
     inspect_model,
     qualify_model,
     register_model,
+    validate_converted_artifact,
 )
+
+
+def _write_valid_weights(path: Path, value: int = 1) -> None:
+    save_file({"weight": array([value])}, path)
 
 
 def test_inspect_local_model_reports_size_and_config(tmp_path):
@@ -716,12 +723,12 @@ def test_convert_model_success_writes_manifest(tmp_path):
     (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
     output = tmp_path / "out"
 
-    def fake_run(*args, **kwargs):
-        output.mkdir()
-        (output / "config.json").write_text(
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(
             json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
         )
-        (output / "model.safetensors").write_bytes(b"weights")
+        _write_valid_weights(converted / "model.safetensors")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
@@ -731,6 +738,246 @@ def test_convert_model_success_writes_manifest(tmp_path):
 
     assert payload["status"] == "succeeded"
     assert (output / CONVERSION_MANIFEST_NAME).exists()
+    assert payload["artifact_validation"]["weight_file_count"] == 1
+    assert payload["execution_command"] != payload["command"]
+
+
+def test_convert_model_retries_owned_partial_output(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "partial.bin").write_bytes(b"partial")
+        if calls == 1:
+            return SimpleNamespace(returncode=1, stdout="", stderr="failed")
+        (converted / "partial.bin").unlink()
+        (converted / "config.json").write_text(
+            json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+        )
+        _write_valid_weights(converted / "model.safetensors")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        first = convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+        second = convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+
+    assert first["status"] == "failed"
+    assert second["status"] == "succeeded"
+    assert second["attempt"] == 2
+    journal = json.loads(Path(second["operation_journal_path"]).read_text())
+    assert journal["status"] == "succeeded"
+    assert journal["attempt"] == 2
+
+
+def test_convert_model_rejects_existing_output_with_different_identity(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+    with pytest.raises(FileExistsError, match="different identity"):
+        convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+
+
+def test_convert_model_records_cancellation(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            convert_model(
+                ConversionOptions(source_path=str(source), output_path=str(output))
+            )
+
+    journal_path = next(tmp_path.glob("*.conversion.json"))
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "cancelled"
+    assert journal["attempt"] == 1
+
+
+def test_convert_model_recovers_after_publication_failure(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(
+            json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+        )
+        _write_valid_weights(converted / "model.safetensors")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with (
+        patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run),
+        patch(
+            "vllm_mlx.model_workflow._publish_conversion_output",
+            side_effect=OSError("publish failed"),
+        ),
+    ):
+        with pytest.raises(OSError, match="publish failed"):
+            convert_model(
+                ConversionOptions(source_path=str(source), output_path=str(output))
+            )
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        recovered = convert_model(
+            ConversionOptions(source_path=str(source), output_path=str(output))
+        )
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["attempt"] == 2
+
+
+def test_convert_model_finalizes_crash_after_publication(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(
+            json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+        )
+        _write_valid_weights(converted / "model.safetensors")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    def publish_then_interrupt(staging, target):
+        os.replace(staging, target)
+        raise KeyboardInterrupt
+
+    with (
+        patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run),
+        patch(
+            "vllm_mlx.model_workflow._publish_conversion_output",
+            side_effect=publish_then_interrupt,
+        ),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            convert_model(
+                ConversionOptions(source_path=str(source), output_path=str(output))
+            )
+
+    recovered = convert_model(
+        ConversionOptions(source_path=str(source), output_path=str(output))
+    )
+    persisted = json.loads((output / CONVERSION_MANIFEST_NAME).read_text())
+    journal = json.loads(Path(recovered["operation_journal_path"]).read_text())
+
+    assert recovered["status"] == "succeeded"
+    assert recovered["artifact_validation"]["path"] == str(output.resolve())
+    assert persisted["artifact_validation"]["path"] == str(output.resolve())
+    assert journal["status"] == "succeeded"
+
+
+def test_convert_model_rejects_source_change_during_conversion(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    config = source / "config.json"
+    config.write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(
+            json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+        )
+        _write_valid_weights(converted / "model.safetensors")
+        config.write_text(json.dumps({"model_type": "changed"}))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        with pytest.raises(ValueError, match="source changed"):
+            convert_model(
+                ConversionOptions(source_path=str(source), output_path=str(output))
+            )
+
+    assert not output.exists()
+
+
+def test_convert_model_rejects_published_artifact_drift(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    output = tmp_path / "out"
+
+    def fake_run(command, **kwargs):
+        converted = Path(command[command.index("--mlx-path") + 1])
+        (converted / "config.json").write_text(
+            json.dumps({"model_type": "llama", "quantization": {"bits": 4}})
+        )
+        _write_valid_weights(converted / "model.safetensors", 1)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    options = ConversionOptions(source_path=str(source), output_path=str(output))
+    with patch("vllm_mlx.model_workflow.subprocess.run", side_effect=fake_run):
+        convert_model(options)
+    _write_valid_weights(output / "model.safetensors", 2)
+
+    with pytest.raises(ValueError, match="bytes differ"):
+        convert_model(options)
+
+
+def test_validate_converted_artifact_binds_content(tmp_path):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    weights = artifact / "model.safetensors"
+    _write_valid_weights(weights, 1)
+
+    first = validate_converted_artifact(artifact)
+    _write_valid_weights(weights, 2)
+    second = validate_converted_artifact(artifact)
+
+    assert first["artifact_sha256"] != second["artifact_sha256"]
+    assert first["files"] != second["files"]
+
+
+def test_validate_converted_artifact_rejects_missing_weights(tmp_path):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(json.dumps({"model_type": "llama"}))
+
+    with pytest.raises(ValueError, match="no MLX weight files"):
+        validate_converted_artifact(artifact)
+
+
+def test_validate_converted_artifact_rejects_invalid_config(tmp_path):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text("not-json")
+    _write_valid_weights(artifact / "model.safetensors")
+
+    with pytest.raises(ValueError, match="invalid converted artifact config"):
+        validate_converted_artifact(artifact)
+
+
+def test_validate_converted_artifact_rejects_invalid_weights(tmp_path):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (artifact / "model.safetensors").write_bytes(b"not-safetensors")
+
+    with pytest.raises(ValueError, match="invalid safetensors weight file"):
+        validate_converted_artifact(artifact)
 
 
 def test_convert_model_failure_reports_status_and_stderr(tmp_path):
