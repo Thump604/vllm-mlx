@@ -50,7 +50,7 @@ in separate reviews. No upstream PR should contain the full integration branch.
 |---|---|---|---|---|
 | P2.1 | complete | Expand inspection to tokenizer, template, generation config, repository revision, license, and capability metadata | Terra `medium` | P1 |
 | P2.2 | complete | Implement Apple Silicon hardware inventory | Terra `medium` | P1 |
-| P2.3 | pending | Implement explainable weight, KV, context, conversion-disk, and safety-margin estimates | Terra `high` | P2.1, P2.2 |
+| P2.3 | in_progress | Implement explainable weight, KV, context, conversion-disk, and safety-margin estimates | Terra `high` | P2.1, P2.2 |
 | P2.4 | pending | Add explicit family adapters for the first curated model set | Terra `high` | P2.1 |
 | P2.5 | pending | Validate recommendations against recorded hardware/model fixtures | Luna `high` | P2.3, P2.4 |
 
