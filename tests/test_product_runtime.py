@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import vllm_mlx.control.runtime as control_runtime
 from vllm_mlx.control.runtime import (
     ManagedProductRuntime,
     ManagedRuntimeError,
@@ -98,6 +99,58 @@ def test_profile_to_model_spec_applies_only_declared_overrides(tmp_path):
     assert spec.scheduler_config.max_kv_size == 32768
     assert spec.max_tokens == 2048
     assert spec.profile_id == "release-model"
+
+
+def test_laguna_text_profile_uses_mlx_vlm_loader(tmp_path):
+    profile = _profile(tmp_path)
+    profile["artifact"]["model_type"] = "laguna"
+    profile["serving"]["route"] = "text"
+    profile["subject_digest"] = compute_subject_digest(profile)
+
+    spec = profile_to_model_spec(profile, tmp_path)
+
+    assert spec.force_mllm is True
+    assert spec.use_batching is False
+
+
+@pytest.mark.anyio
+async def test_laguna_managed_acquisition_uses_mlx_vlm_download_rules(
+    tmp_path, monkeypatch
+):
+    profile = _profile(tmp_path)
+    profile["artifact"]["model_type"] = "laguna"
+    profile["serving"]["route"] = "text"
+    profile["subject_digest"] = compute_subject_digest(profile)
+    observed = {}
+
+    def fake_acquire(_repository, *, options):
+        observed["is_mllm"] = options.is_mllm
+
+    monkeypatch.setattr(control_runtime, "acquire_model", fake_acquire)
+    monkeypatch.setattr(
+        control_runtime,
+        "verify_profile_artifact",
+        lambda _profile, target: {"artifact_path": str(target)},
+    )
+    monkeypatch.setenv(
+        "VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "lifecycle.json")
+    )
+
+    async def factory(spec):
+        return FakeEngine(spec)
+
+    manager = ResidencyManager(factory)
+    runtime = ManagedProductRuntime(
+        manager,
+        model_root=tmp_path / "managed",
+        endpoint="http://127.0.0.1:8080",
+    )
+
+    installed = await runtime.install(profile)
+
+    assert observed == {"is_mllm": True}
+    assert installed["managed"] is True
+    manager._control.close()
 
 
 @pytest.mark.anyio

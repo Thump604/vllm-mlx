@@ -30,6 +30,44 @@ def test_build_text_model_none_vlm():
     assert result is None
 
 
+def test_build_text_model_skips_laguna_mlx_vlm_native_path(tmp_path, monkeypatch):
+    model_path = tmp_path / "laguna"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(json.dumps({"model_type": "laguna"}))
+
+    def unexpected_dispatch(_model_type):
+        raise AssertionError("Laguna must remain on its mlx_vlm language model")
+
+    monkeypatch.setattr(
+        text_model_from_vlm, "_import_text_model_classes", unexpected_dispatch
+    )
+
+    assert build_text_model(object(), model_path) is None
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_build_text_model_dispatches_supported_qwen_text_types(
+    tmp_path, monkeypatch, model_type
+):
+    model_path = tmp_path / model_type
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"text_config": {"model_type": model_type}})
+    )
+    dispatched = []
+
+    def record_dispatch(actual_model_type):
+        dispatched.append(actual_model_type)
+        raise ImportError("stop after dispatch selection")
+
+    monkeypatch.setattr(
+        text_model_from_vlm, "_import_text_model_classes", record_dispatch
+    )
+
+    assert build_text_model(object(), model_path) is None
+    assert dispatched == [model_type]
+
+
 def test_build_text_model_dispatches_gemma4_text_model(tmp_path, monkeypatch):
     """Gemma 4 text configs should use mlx_lm.models.gemma4_text classes."""
 

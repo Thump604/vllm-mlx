@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 from vllm_mlx.catalog import load_catalog
 from vllm_mlx.model_profile import compute_subject_digest
+from vllm_mlx.reasoning import get_parser as get_reasoning_parser
+from vllm_mlx.tool_parsers import ToolParserManager
 
 ROOT = Path(__file__).parents[1]
 PROFILE_ROOT = ROOT / "catalog" / "profiles"
@@ -82,9 +84,32 @@ def test_laguna_is_artifact_only_and_not_exposed_by_structural_fixture():
         "top_k": 20,
         "min_p": 0.0,
     }
+    assert profile["serving"]["limits"]["max_output_tokens"] == 32768
+    assert profile["capabilities"]["tools"] == {
+        "supported": True,
+        "format": "poolside_v1",
+        "notes": "Provider-declared capability; local qualification remains separate.",
+    }
+    assert profile["capabilities"]["reasoning"] == {
+        "supported": True,
+        "format": "poolside_v1",
+        "notes": "Provider-declared interleaved thinking; local qualification remains separate.",
+    }
     assert all(
         feature["mode"] in {"deferred", "not_supported"}
         for feature in profile["serving"]["features"].values()
+    )
+
+
+def test_laguna_profile_names_registered_poolside_parsers():
+    profile = load_catalog(PROFILE_ROOT).get("laguna-s-2.1-mlx-q4", 1)
+    parsers = profile["serving"]["parsers"]
+
+    assert get_reasoning_parser(parsers["reasoning"]).__name__ == (
+        "PoolsideV1ReasoningParser"
+    )
+    assert ToolParserManager.get_tool_parser(parsers["tool"]).__name__ == (
+        "PoolsideV1ToolParser"
     )
 
 

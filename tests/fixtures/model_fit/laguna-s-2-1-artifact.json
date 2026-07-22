@@ -3,6 +3,10 @@
   "source_revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
   "converted_config_sha256": "8440d3ec23e275aa62bba1371c20cee4a72906fdc33ca37966ba7cd83472847b",
   "indexed_tensor_bytes": 66147556864,
+  "quantization": {
+    "default": {"mode": "affine", "bits": 4, "group_size": 64},
+    "router": {"mode": "affine", "bits": 8, "group_size": 64, "overrides": 47}
+  },
   "weight_files": [
     {"name": "model-00001-of-00013.safetensors", "size_bytes": 5345208527},
     {"name": "model-00002-of-00013.safetensors", "size_bytes": 5189212969},

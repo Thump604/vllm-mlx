@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "laguna-s-2.1-mlx-q4",
   "profile_revision": 1,
-  "subject_digest": "b0f4021acefcd76cfca4960ced95b0cdeec355c5428f61867f61dfb5b452f45c",
+  "subject_digest": "b5e8b705a9ca7cf9bc2296b8d3b2026b1265090825f3466540f603c3d97664a3",
   "description": "Portable Laguna S 2.1 MLX 4-bit onboarding fixture; artifact-only and unqualified.",
   "identity": {
     "provider": "huggingface",
@@ -31,9 +31,9 @@
   },
   "capabilities": {
     "modalities": ["text"],
-    "streaming": false,
-    "tools": {"supported": false, "format": null, "notes": "Qualification is still required."},
-    "reasoning": {"supported": false, "format": null, "notes": "Provider-native thinking is recorded in serving defaults; no live qualification claim."},
+    "streaming": true,
+    "tools": {"supported": true, "format": "poolside_v1", "notes": "Provider-declared capability; local qualification remains separate."},
+    "reasoning": {"supported": true, "format": "poolside_v1", "notes": "Provider-declared interleaved thinking; local qualification remains separate."},
     "structured_output": {"json_object": false, "json_schema": false, "supported_schema_keywords": []},
     "api_surfaces": ["openai_chat"]
   },
@@ -43,7 +43,7 @@
     "template": {"source": "profile_override", "sha256": "2d3c724b3c2e9eb71fe9ccc5423ff268a370a8bfa89e9238b6de14fe000825c8", "default_kwargs": {"enable_thinking": true, "preserve_thinking": true}},
     "parsers": {"tool": "poolside_v1", "reasoning": "poolside_v1"},
     "sampling": {"provider_defaults": {}, "profile_defaults": {"temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0}},
-    "limits": {"advertised_context": 1048576, "serving_context": 32768, "max_output_tokens": 8192, "max_request_output_tokens": 8192, "max_kv_size": 32768},
+    "limits": {"advertised_context": 1048576, "serving_context": 32768, "max_output_tokens": 32768, "max_request_output_tokens": 32768, "max_kv_size": 32768},
     "features": {
       "continuous_batching": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
       "constrained_json": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},

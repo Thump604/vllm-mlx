@@ -20,6 +20,9 @@ import mlx.nn as nn
 import mlx.utils
 
 logger = logging.getLogger(__name__)
+_SUPPORTED_TEXT_MODEL_TYPES = frozenset(
+    {"gemma4_text", "qwen3_5_text", "qwen3_5_moe_text"}
+)
 
 
 def _import_text_model_classes(model_type: str):
@@ -48,14 +51,19 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     if vlm_model is None:
         return None
 
-    model_path = Path(model_path) if model_path else None
-    if model_path is None or not (model_path / "config.json").exists():
+    resolved_path = Path(model_path) if model_path else None
+    if resolved_path is None or not (resolved_path / "config.json").exists():
         return None
 
     try:
-        config = json.loads((model_path / "config.json").read_text())
+        config = json.loads((resolved_path / "config.json").read_text())
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
+        if model_type not in _SUPPORTED_TEXT_MODEL_TYPES:
+            logger.info(
+                "Skipping parallel mlx_lm TextModel for model_type=%r", model_type
+            )
+            return None
         TextModel, TextModelArgs = _import_text_model_classes(model_type)
 
         # Build args with proper __post_init__ (handles partial_rotary_factor,
@@ -66,7 +74,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # Collect all weights first: backbone from vlm + MTP from safetensors
         vlm_lm = vlm_model.language_model
         vlm_weights = mlx.utils.tree_flatten(vlm_lm.parameters())
-        mtp_weights = _load_mtp_weights(model_path)
+        mtp_weights = _load_mtp_weights(resolved_path)
 
         all_weight_names = set(name for name, _ in vlm_weights)
         all_weight_names.update(name for name, _ in mtp_weights)
@@ -119,7 +127,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             text_model.load_weights(mtp_weights, strict=False)
             logger.info("Loaded %d MTP weights from safetensors", len(mtp_weights))
         else:
-            logger.warning("No MTP weights found in %s", model_path.name)
+            logger.warning("No MTP weights found in %s", resolved_path.name)
 
         # Inject MTP if TextModel doesn't have native MTP support.
         # mlx_lm's qwen3_5.TextModel strips MTP weights in sanitize(),
@@ -131,7 +139,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
             if num_mtp > 0:
                 from .patches.qwen3_5_mtp import inject_mtp_support
 
-                inject_mtp_support(text_model, model_path, config)
+                inject_mtp_support(text_model, resolved_path, config)
 
         if hasattr(text_model, "mtp") and text_model.mtp is not None:
             mx.eval(text_model.mtp.parameters())

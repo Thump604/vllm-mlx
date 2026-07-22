@@ -26,6 +26,14 @@ _HASH_FILES = {
     "generation_config_sha256": ("generation_config.json",),
     "weights_manifest_sha256": ("model.safetensors.index.json", "SHA256SUMS"),
 }
+_MLX_VLM_TEXT_MODEL_TYPES = frozenset({"laguna"})
+
+
+def _requires_mlx_vlm(profile: Mapping[str, Any]) -> bool:
+    return (
+        profile["serving"]["route"] == "multimodal"
+        or profile["artifact"]["model_type"] in _MLX_VLM_TEXT_MODEL_TYPES
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -107,7 +115,7 @@ def profile_to_model_spec(
         use_batching=use_batching,
         scheduler_config=scheduler,
         max_tokens=int(limits["max_output_tokens"]),
-        force_mllm=serving["route"] == "multimodal",
+        force_mllm=_requires_mlx_vlm(profile),
         mtp=enabled("mtp"),
         specprefill_enabled=enabled("specprefill"),
     )
@@ -170,7 +178,7 @@ class ManagedProductRuntime:
             options=AcquisitionOptions(
                 revision=revision,
                 target_dir=str(target),
-                is_mllm=profile["serving"]["route"] == "multimodal",
+                is_mllm=_requires_mlx_vlm(profile),
             ),
         )
         evidence = await asyncio.to_thread(verify_profile_artifact, profile, target)
