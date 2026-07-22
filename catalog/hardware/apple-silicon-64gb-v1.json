@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "hardware_profile_id": "apple-silicon-64gb",
+  "hardware_class": "apple-silicon-64gb",
+  "platform": "Darwin/arm64",
+  "unified_memory_bytes": 68719476736,
+  "measurement": {"method": "envelope_only", "source": "vllm-mlx first-release catalog", "measured": false},
+  "model_fit": [
+    {"profile_id": "qwen3.6-35b-a3b-8bit", "status": "unknown", "method": "not_measured", "serving_context": null, "max_concurrency": null, "notes": "Portable envelope only; no fit claim."},
+    {"profile_id": "laguna-s-2.1-mlx-q4", "status": "unknown", "method": "not_measured", "serving_context": null, "max_concurrency": null, "notes": "Portable envelope only; no fit claim."}
+  ]
+}

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "profile_id": "laguna-s-2.1-mlx-q4",
+  "profile_revision": 1,
+  "subject_digest": "b0f4021acefcd76cfca4960ced95b0cdeec355c5428f61867f61dfb5b452f45c",
+  "description": "Portable Laguna S 2.1 MLX 4-bit onboarding fixture; artifact-only and unqualified.",
+  "identity": {
+    "provider": "huggingface",
+    "repository_id": "poolside/Laguna-S-2.1",
+    "requested_revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
+    "resolved_revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
+    "artifact_id": "laguna-s-2.1-mlx-q4",
+    "served_model_name": "laguna-s-2.1-mlx-q4",
+    "aliases": []
+  },
+  "artifact": {
+    "source_uri": "https://huggingface.co/poolside/Laguna-S-2.1/tree/a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
+    "format": "mlx",
+    "model_type": "laguna",
+    "architectures": ["LagunaForCausalLM"],
+    "dtype": null,
+    "size_bytes": 66147820723,
+    "quantization": {"method": "affine", "bits": 4, "group_size": 64, "mode": "affine", "source": "conversion_manifest"},
+    "hashes": {
+      "config_sha256": "8440d3ec23e275aa62bba1371c20cee4a72906fdc33ca37966ba7cd83472847b",
+      "tokenizer_sha256": "ff04405d2d1e1b6c77a8be25f0fce9371003a558b055c23248d9e8ca1d956d92",
+      "chat_template_sha256": "2d3c724b3c2e9eb71fe9ccc5423ff268a370a8bfa89e9238b6de14fe000825c8",
+      "generation_config_sha256": "2deeac08584c9177028e108a994e37dffd06acf61ca429dc064f76fee52e2bea",
+      "weights_manifest_sha256": "e0974415a8e0a449f2b80e39fb6cc7ee9594ecff9c6aed00a93f96427678000a"
+    }
+  },
+  "capabilities": {
+    "modalities": ["text"],
+    "streaming": false,
+    "tools": {"supported": false, "format": null, "notes": "Qualification is still required."},
+    "reasoning": {"supported": false, "format": null, "notes": "Provider-native thinking is recorded in serving defaults; no live qualification claim."},
+    "structured_output": {"json_object": false, "json_schema": false, "supported_schema_keywords": []},
+    "api_surfaces": ["openai_chat"]
+  },
+  "serving": {
+    "engine": "simple",
+    "route": "text",
+    "template": {"source": "profile_override", "sha256": "2d3c724b3c2e9eb71fe9ccc5423ff268a370a8bfa89e9238b6de14fe000825c8", "default_kwargs": {"enable_thinking": true, "preserve_thinking": true}},
+    "parsers": {"tool": "poolside_v1", "reasoning": "poolside_v1"},
+    "sampling": {"provider_defaults": {}, "profile_defaults": {"temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0}},
+    "limits": {"advertised_context": 1048576, "serving_context": 32768, "max_output_tokens": 8192, "max_request_output_tokens": 8192, "max_kv_size": 32768},
+    "features": {
+      "continuous_batching": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
+      "constrained_json": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
+      "kvq4": {"mode": "not_supported", "control": "none", "control_field": null, "settings": {}, "reason": "Not part of the onboarding fixture."},
+      "kvq8": {"mode": "not_supported", "control": "none", "control_field": null, "settings": {}, "reason": "Not part of the onboarding fixture."},
+      "mtp": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
+      "prefix_cache": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
+      "specprefill": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."},
+      "streaming": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "Qualification required."}
+    },
+    "activation_policy": {"owner_override_fields": []},
+    "request_policy": {"required_fields": {}, "allowed_fields": ["chat_template_kwargs.enable_thinking", "chat_template_kwargs.preserve_thinking"], "forbidden_fields": []}
+  },
+  "hardware_fit": [
+    {"hardware_class": "apple-silicon-128gb", "method": "derived", "estimated_peak_memory_bytes": 66147556864, "measured_peak_memory_bytes": null, "serving_context": 32768, "max_concurrency": 1, "notes": "Indexed tensor residency lower bound from the acceptance fixture; not a runtime fit claim."}
+  ],
+  "qualification": {"status": "not_qualified", "reason": "Artifact-only onboarding fixture; live qualification and exposure are intentionally separate.", "evidence": []},
+  "provenance": {
+    "records": [
+      {"field_paths": ["/identity"], "kind": "provider_fact", "source": "https://huggingface.co/poolside/Laguna-S-2.1", "revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38", "sha256": null, "rule_id": null, "observed_at": "2026-07-21T00:00:00Z"},
+      {"field_paths": ["/artifact"], "kind": "derived_recommendation", "source": "docs/development/model-onboarding-acceptance-fixture.md and conversion-manifest.json", "revision": "1", "sha256": "87b0100ac765c706ada4566ae37eef67b85f0ee9728fc4f1c0ed8ed6f22ad07d", "rule_id": "portable-artifact-hash-v1", "observed_at": "2026-07-21T00:00:00Z"},
+      {"field_paths": ["/capabilities", "/serving"], "kind": "provider_fact", "source": "docs/development/model-onboarding-acceptance-fixture.md", "revision": "1", "sha256": "87b0100ac765c706ada4566ae37eef67b85f0ee9728fc4f1c0ed8ed6f22ad07d", "rule_id": null, "observed_at": "2026-07-21T00:00:00Z"},
+      {"field_paths": ["/hardware_fit"], "kind": "derived_recommendation", "source": "tests/fixtures/model_fit/laguna-s-2-1-artifact.json", "revision": "1", "sha256": "87b0100ac765c706ada4566ae37eef67b85f0ee9728fc4f1c0ed8ed6f22ad07d", "rule_id": "artifact-residency-lower-bound-v1", "observed_at": "2026-07-21T00:00:00Z"}
+    ]
+  }
+}
