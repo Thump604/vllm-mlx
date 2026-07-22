@@ -53,6 +53,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from typing import Any, cast
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -505,7 +506,7 @@ def _build_thinking_processor(
     """Build a ThinkingAwareLogitsProcessor if the tokenizer has think tokens."""
     from .constrained.thinking_processor import ThinkingAwareLogitsProcessor
 
-    tokenizer = _get_engine_tokenizer(engine)
+    tokenizer = cast(Any, _get_engine_tokenizer(engine))
     if tokenizer is None:
         return None
 
@@ -549,7 +550,7 @@ def _build_thinking_processor(
         start_ids,
         end_ids,
     )
-    return proc
+    return cast(object, proc)
 
 
 def _resolve_no_final_content_token_limit() -> int | None:
@@ -729,7 +730,7 @@ def _coerce_logit_bias(logit_bias: dict[str, float]) -> dict[int, float]:
 
 
 def _attach_logit_bias_processor(
-    chat_kwargs: dict, logit_bias: dict[str, float] | None
+    chat_kwargs: dict[str, object], logit_bias: dict[str, float] | None
 ):
     if not logit_bias:
         return
@@ -738,7 +739,7 @@ def _attach_logit_bias_processor(
 
     processors = make_logits_processors(logit_bias=_coerce_logit_bias(logit_bias))
     if processors:
-        existing = chat_kwargs.get("logits_processors") or []
+        existing = cast(list[object], chat_kwargs.get("logits_processors") or [])
         chat_kwargs["logits_processors"] = list(existing) + list(processors)
 
 
@@ -761,7 +762,7 @@ def _prepare_chat_completion_invocation(
         thinking_model=bool(_reasoning_parser),
     )
 
-    chat_kwargs = {
+    chat_kwargs: dict[str, object] = {
         "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
@@ -835,7 +836,9 @@ def _prepare_chat_completion_invocation(
         if thinking_proc is not None:
             # Replace the logits_processors list: the thinking processor wraps
             # the JSON processor as its inner delegate, so we don't double-add.
-            existing_processors = list(chat_kwargs.get("logits_processors") or [])
+            existing_processors: list[object] = list(
+                cast(list[object] | None, chat_kwargs.get("logits_processors")) or []
+            )
             if (
                 json_logits_processor is not None
                 and existing_processors
@@ -871,7 +874,7 @@ def _prepare_anthropic_invocation(
         thinking_model=bool(_reasoning_parser),
     )
 
-    chat_kwargs = {
+    chat_kwargs: dict[str, object] = {
         "max_tokens": effective_max_tokens,
         "temperature": _resolve_temperature(openai_request.temperature),
         "top_p": _resolve_top_p(openai_request.top_p),
@@ -913,7 +916,7 @@ _mcp_manager = None
 _mcp_executor = None
 
 # Global embedding engine (lazy loaded)
-_embedding_engine = None
+_embedding_engine: Any | None = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
 
 # Global reranker engine (lazy loaded)
@@ -925,7 +928,7 @@ _api_key: str | None = None
 _auth_warning_logged: bool = False
 
 # Reasoning parser (for models like Qwen3, DeepSeek-R1)
-_reasoning_parser = None  # ReasoningParser instance when enabled
+_reasoning_parser: Any | None = None  # ReasoningParser instance when enabled
 _reasoning_parser_name: str | None = None
 
 
@@ -951,7 +954,7 @@ def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
-_tool_parser_instance = None  # Instantiated parser
+_tool_parser_instance: Any | None = None  # Instantiated parser
 _responses_store: OrderedDict[str, dict] = OrderedDict()
 _RESPONSES_STORE_MAX_SIZE: int = 1000
 
@@ -1049,7 +1052,7 @@ class RequestModelContext:
 
 def _list_available_model_names() -> list[str]:
     if _model_manager is not None:
-        return _model_manager.registered_model_names
+        return cast(list[str], _model_manager.registered_model_names)
     return [_model_name] if _model_name else []
 
 
@@ -1330,7 +1333,7 @@ def _get_lifecycle_status() -> dict | None:
     """Get lifecycle status for the default resident if lifecycle is enabled."""
     if _residency_manager is None or _default_model_key is None:
         return None
-    return _residency_manager.get_status(_default_model_key)
+    return cast(dict, _residency_manager.get_status(_default_model_key))
 
 
 def _public_lifecycle_status(lifecycle: dict | None) -> dict | None:
@@ -1760,10 +1763,11 @@ def _get_engine_tokenizer(engine: BaseEngine | None) -> object | None:
     """Return tokenizer-like parser state from the active engine."""
     if engine is None:
         return None
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is not None:
-        return tokenizer
-    return getattr(engine, "_tokenizer", None)
+    for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
+        tokenizer = getattr(engine, attr, None)
+        if tokenizer is not None:
+            return cast(object, tokenizer)
+    return None
 
 
 def _get_or_init_tool_parser(engine: BaseEngine | None = None):
@@ -1812,7 +1816,9 @@ def _parse_tool_calls_with_parser(
 
     # If auto tool choice is not enabled, use the generic parser
     if not _enable_auto_tool_choice or not _tool_call_parser:
-        return parse_tool_calls(output_text, request_dict)
+        return cast(
+            tuple[str, list | None], parse_tool_calls(output_text, request_dict)
+        )
 
     # Initialize parser if needed
     if _tool_parser_instance is None:
@@ -1825,11 +1831,14 @@ def _parse_tool_calls_with_parser(
                 _sanitize_log_text(e, limit=500),
             )
             logger.warning("Falling back to generic parser")
-            return parse_tool_calls(output_text, request_dict)
+            return cast(
+                tuple[str, list | None], parse_tool_calls(output_text, request_dict)
+            )
 
     # Use the configured parser
     try:
         # Reset parser state between requests
+        assert _tool_parser_instance is not None
         _tool_parser_instance.reset()
         result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
@@ -1851,7 +1860,9 @@ def _parse_tool_calls_with_parser(
 
         # Specific parser didn't find any tool calls. Try the generic parser
         # which handles additional formats (e.g. Nemotron XML).
-        fallback_text, fallback_calls = parse_tool_calls(output_text, request_dict)
+        fallback_text, fallback_calls = cast(
+            tuple[str, list | None], parse_tool_calls(output_text, request_dict)
+        )
         if fallback_calls:
             return fallback_text, fallback_calls
 
@@ -1865,7 +1876,9 @@ def _parse_tool_calls_with_parser(
         return fallback_text, None
     except Exception as e:
         logger.warning("Tool parser error: %s", _sanitize_log_text(e, limit=500))
-        return parse_tool_calls(output_text, request_dict)
+        return cast(
+            tuple[str, list | None], parse_tool_calls(output_text, request_dict)
+        )
 
 
 def _apply_response_format_or_raise(
@@ -1887,15 +1900,17 @@ def _apply_response_format_or_raise(
                 "message": exc.message,
             },
         ) from exc
-    return _strip_backslash_before_unicode(text)
+    return cast(str, _strip_backslash_before_unicode(text))
 
 
 def _response_format_type(response_format: object | None) -> str | None:
     if response_format is None:
         return None
     if isinstance(response_format, dict):
-        return response_format.get("type")
-    return getattr(response_format, "type", None)
+        value = response_format.get("type")
+    else:
+        value = getattr(response_format, "type", None)
+    return str(value) if value is not None else None
 
 
 def _promote_streaming_response_format_delta(
@@ -2901,7 +2916,7 @@ def _detect_native_tool_support() -> bool:
 
     try:
         parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-        return parser_cls.supports_native_format()
+        return bool(parser_cls.supports_native_format())
     except KeyError:
         # Parser not found - this is a configuration error, log as error
         logger.error(
@@ -2963,7 +2978,7 @@ def _tool_choice_disabled(request: ChatCompletionRequest | None) -> bool:
     if tool_choice is None:
         request_dict = request.model_dump()
         tool_choice = request_dict.get("tool_choice")
-    return tool_choice == "none"
+    return bool(tool_choice == "none")
 
 
 def _get_streaming_tool_parser(
@@ -2995,6 +3010,7 @@ def _get_streaming_tool_parser(
                     _sanitize_log_text(e, limit=500),
                 )
                 return None
+        assert _tool_parser_instance is not None
         _tool_parser_instance.reset()
         return _tool_parser_instance
 
@@ -3111,7 +3127,7 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_backbone_pct: float = 0.0,
-    specprefill_draft_model: str = None,
+    specprefill_draft_model: str | None = None,
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
     mllm_draft_block_size: int | None = None,
@@ -3651,7 +3667,7 @@ async def delete_request(request_id: str):
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models() -> ModelsResponse:
     """List available models."""
-    models = []
+    models: list[ModelInfo] = []
     if _model_manager is not None:
         models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
     elif _model_name:
@@ -3740,6 +3756,10 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         # Lazy-load or swap embedding engine
         load_embedding_model(model_name, lock=False, reuse_existing=True)
+        if _embedding_engine is None:
+            raise HTTPException(
+                status_code=503, detail="Embedding model failed to load"
+            )
 
         # Normalise input to list
         texts = request.input if isinstance(request.input, list) else [request.input]
@@ -5060,21 +5080,6 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     return merged
 
 
-def _get_engine_tokenizer(engine) -> object | None:
-    """
-    Return the tokenizer backing ``engine``, if exposed.
-
-    Different engine classes store the tokenizer under different attributes.
-    We try the common ones and return ``None`` if nothing matches, so that
-    optional features like constrained decoding can degrade gracefully.
-    """
-    for attr in ("_tokenizer", "tokenizer", "_processor", "processor"):
-        tok = getattr(engine, attr, None)
-        if tok is not None:
-            return tok
-    return None
-
-
 @app.post(
     "/v1/responses",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
@@ -5237,6 +5242,7 @@ def _prepare_anthropic_endpoint_invocation(
         )
     except UnsafeRemoteURLError as exc:
         _raise_remote_media_http_error(exc)
+        raise AssertionError("remote media error helper must raise")
 
 
 @app.post(
@@ -5659,6 +5665,7 @@ async def _stream_anthropic_messages(
     )
 
     if use_reasoning:
+        assert _reasoning_parser is not None
         _reasoning_parser.reset_state()
 
     # Block index tracking: with reasoning parser we use index 0 for
@@ -5744,6 +5751,7 @@ async def _stream_anthropic_messages(
             # Reasoning parser path
             previous_text = accumulated_text
             accumulated_text += filtered
+            assert _reasoning_parser is not None
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, filtered
             )
