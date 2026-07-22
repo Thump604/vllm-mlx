@@ -225,6 +225,11 @@ class ProductControlService:
                 "operation_not_cancellable",
                 f"operation {operation_id} has no cancellable in-process task",
             )
+        self.operation_state.update_control_operation(
+            operation_id,
+            status="cancelled",
+            error={"code": "operation_cancelled", "message": "operation cancelled"},
+        )
         task.cancel()
         try:
             await task

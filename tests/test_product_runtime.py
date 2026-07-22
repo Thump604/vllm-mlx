@@ -184,11 +184,13 @@ async def test_failed_first_activation_clears_persisted_candidate(
         raise RuntimeError("engine start failed")
 
     manager = ResidencyManager(failing_factory)
+    cleared = []
     runtime = ManagedProductRuntime(
         manager,
         model_root=tmp_path / "managed",
         endpoint="http://127.0.0.1:8080",
         artifact_bindings={"release-model": artifact},
+        clear_profile=lambda: cleared.append(True),
     )
     await runtime.install(profile)
 
@@ -196,6 +198,7 @@ async def test_failed_first_activation_clears_persisted_candidate(
         await runtime.activate(profile, {})
 
     assert runtime.status()["active_profile"] is None
+    assert cleared == [True]
     assert manager._control.model_key is None
     manager._control.close()
 
@@ -203,6 +206,42 @@ async def test_failed_first_activation_clears_persisted_candidate(
     assert restarted._control.model_key is None
     assert restarted.list_status() == []
     restarted._control.close()
+
+
+@pytest.mark.anyio
+async def test_remove_stopped_managed_profile_clears_restart_state(
+    tmp_path, monkeypatch
+):
+    managed_root = tmp_path / "managed"
+    artifact = managed_root / "release-model"
+    artifact.mkdir(parents=True)
+    profile = _profile(artifact)
+    state_path = tmp_path / "lifecycle.json"
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(state_path))
+
+    async def factory(spec):
+        return FakeEngine(spec)
+
+    manager = ResidencyManager(factory)
+    cleared = []
+    runtime = ManagedProductRuntime(
+        manager,
+        model_root=managed_root,
+        endpoint="http://127.0.0.1:8080",
+        clear_profile=lambda: cleared.append(True),
+    )
+    runtime._installed["release-model"] = artifact
+
+    await runtime.activate(profile, {})
+    await runtime.stop()
+    removed = await runtime.remove(profile)
+
+    assert removed == {"removed": True, "artifact_path": str(artifact)}
+    assert not artifact.exists()
+    assert runtime.status()["active_profile"] is None
+    assert manager._control.model_key is None
+    assert cleared == [True]
+    await manager.shutdown()
 
 
 @pytest.mark.anyio

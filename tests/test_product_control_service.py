@@ -285,8 +285,6 @@ async def test_cancel_is_idempotent_and_rejects_key_reuse(product_service):
         },
         route_profile_id=profile["profile_id"],
     )
-    await asyncio.sleep(0)
-
     first = await service.cancel(
         operation["operation_id"], {"idempotency_key": "cancel-once"}
     )

@@ -213,6 +213,7 @@ _force_mllm_model: bool = False
 _default_thinking_token_budget: int | None = (
     None  # Set via --default-thinking-token-budget
 )
+_managed_product_base_defaults: dict[str, Any] | None = None
 _auto_unload_idle_seconds: float = 0.0
 _lazy_load_model: bool = False
 _residency_manager: ResidencyManager | None = None
@@ -6577,6 +6578,8 @@ def _persisted_product_profile(state_path: Path, catalog) -> dict[str, Any] | No
         raise RuntimeError(
             "persisted product profile digest does not match the catalog"
         )
+    if profile["qualification"]["status"] != "qualified":
+        raise RuntimeError("persisted product profile is no longer qualified")
     return profile
 
 
@@ -6640,11 +6643,47 @@ def _sync_managed_product_runtime() -> None:
     _sync_engine_from_residency()
 
 
+def _clear_managed_product_profile() -> None:
+    """Clear product-selected metadata after failed or removed activation."""
+    global _model_name, _model_path, _reasoning_parser, _reasoning_parser_name
+    global _tool_call_parser, _enable_auto_tool_choice, _tool_parser_instance
+    global _force_mllm_model
+    global _default_max_tokens, _max_request_tokens, _default_temperature
+    global _default_top_p, _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
+    global _default_chat_template_kwargs, _default_thinking_token_budget
+
+    _model_name = None
+    _model_path = None
+    _reasoning_parser = None
+    _reasoning_parser_name = None
+    _tool_call_parser = None
+    _enable_auto_tool_choice = False
+    _tool_parser_instance = None
+    _force_mllm_model = False
+    defaults = _managed_product_base_defaults
+    if defaults is not None:
+        _default_max_tokens = defaults["max_tokens"]
+        _max_request_tokens = defaults["max_request_tokens"]
+        _default_temperature = defaults["temperature"]
+        _default_top_p = defaults["top_p"]
+        _default_top_k = defaults["top_k"]
+        _default_min_p = defaults["min_p"]
+        _default_presence_penalty = defaults["presence_penalty"]
+        _default_repetition_penalty = defaults["repetition_penalty"]
+        template_kwargs = defaults["chat_template_kwargs"]
+        _default_chat_template_kwargs = (
+            dict(template_kwargs) if template_kwargs is not None else None
+        )
+        _default_thinking_token_budget = defaults["thinking_token_budget"]
+
+
 def _configure_managed_product(args) -> None:
     """Configure the first-product control plane without a second runtime owner."""
     global _engine, _model_name, _model_path, _default_model_key
     global _residency_manager, _auto_unload_idle_seconds, _lazy_load_model
     global _product_control_service
+    global _managed_product_base_defaults
 
     from .catalog import load_catalog
     from .control.runtime import (
@@ -6660,22 +6699,41 @@ def _configure_managed_product(args) -> None:
     catalog = load_catalog(args.product_catalog)
     bindings = _parse_product_artifact_bindings(args.product_artifact_binding)
     model_root = Path(args.product_model_root).expanduser().resolve()
-    manager = ResidencyManager(
-        _engine_factory,
-        on_engine_loaded=_restore_engine_state,
-        on_engine_unloading=_persist_engine_state,
-        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
-    )
+    _managed_product_base_defaults = {
+        "max_tokens": _default_max_tokens,
+        "max_request_tokens": _max_request_tokens,
+        "temperature": _default_temperature,
+        "top_p": _default_top_p,
+        "top_k": _default_top_k,
+        "min_p": _default_min_p,
+        "presence_penalty": _default_presence_penalty,
+        "repetition_penalty": _default_repetition_penalty,
+        "chat_template_kwargs": (
+            dict(_default_chat_template_kwargs)
+            if _default_chat_template_kwargs is not None
+            else None
+        ),
+        "thinking_token_budget": _default_thinking_token_budget,
+    }
     initial_profile = _persisted_product_profile(state_path, catalog)
+    initial_spec = None
     if initial_profile is not None:
         profile_id = str(initial_profile["profile_id"])
         artifact = bindings.get(profile_id) or (
             model_root / str(initial_profile["identity"]["artifact_id"])
         )
         verify_profile_artifact(initial_profile, artifact)
-        spec = profile_to_model_spec(initial_profile, artifact)
-        manager.register_model(spec)
-        _apply_managed_product_profile(initial_profile, spec)
+        initial_spec = profile_to_model_spec(initial_profile, artifact)
+
+    manager = ResidencyManager(
+        _engine_factory,
+        on_engine_loaded=_restore_engine_state,
+        on_engine_unloading=_persist_engine_state,
+        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+    )
+    if initial_profile is not None and initial_spec is not None:
+        manager.register_model(initial_spec)
+        _apply_managed_product_profile(initial_profile, initial_spec)
         _lazy_load_model = args.lazy_load_model
     else:
         _model_name = None
@@ -6694,6 +6752,7 @@ def _configure_managed_product(args) -> None:
         artifact_bindings=bindings,
         initial_profile=initial_profile,
         apply_profile=_apply_managed_product_profile,
+        clear_profile=_clear_managed_product_profile,
         sync_runtime=_sync_managed_product_runtime,
     )
     _product_control_service = ProductControlService(catalog, manager, runtime)

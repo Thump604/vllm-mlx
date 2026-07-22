@@ -128,6 +128,7 @@ class ManagedProductRuntime:
         apply_profile: (
             Callable[[Mapping[str, Any], ModelSpec], Awaitable[None] | None] | None
         ) = None,
+        clear_profile: Callable[[], None] | None = None,
         sync_runtime: Callable[[], None] | None = None,
     ) -> None:
         self.manager = manager
@@ -139,6 +140,7 @@ class ManagedProductRuntime:
             for profile_id, path in (artifact_bindings or {}).items()
         }
         self.apply_profile = apply_profile
+        self.clear_profile = clear_profile
         self.sync_runtime = sync_runtime
         self._active_profile = (
             deepcopy(dict(initial_profile)) if initial_profile is not None else None
@@ -206,6 +208,7 @@ class ManagedProductRuntime:
             else:
                 self.manager.clear_dormant_model("default")
                 self._active_profile = None
+                self._clear_profile()
             self._sync()
             raise
         self._active_profile = deepcopy(dict(profile))
@@ -241,6 +244,15 @@ class ManagedProductRuntime:
             ) from exc
         if target.exists():
             await asyncio.to_thread(verify_profile_artifact, profile, target)
+        if (
+            self._active_profile is not None
+            and self._active_profile["profile_id"] == profile_id
+        ):
+            self.manager.clear_dormant_model("default")
+            self._active_profile = None
+            self._clear_profile()
+            self._sync()
+        if target.exists():
             await asyncio.to_thread(shutil.rmtree, target)
         self._installed.pop(profile_id, None)
         return {"removed": True, "artifact_path": str(target)}
@@ -312,6 +324,10 @@ class ManagedProductRuntime:
     def _sync(self) -> None:
         if self.sync_runtime is not None:
             self.sync_runtime()
+
+    def _clear_profile(self) -> None:
+        if self.clear_profile is not None:
+            self.clear_profile()
 
     @staticmethod
     def _profile_reference(profile: Mapping[str, Any] | None) -> dict[str, Any] | None:

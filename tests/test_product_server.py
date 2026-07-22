@@ -56,6 +56,23 @@ def _catalog_and_artifact(tmp_path):
         "weights_manifest_sha256": _sha(artifact / "model.safetensors.index.json"),
     }
     profile["subject_digest"] = compute_subject_digest(profile)
+    profile["qualification"] = {
+        "status": "qualified",
+        "reason": "test fixture",
+        "evidence": [
+            {
+                "evidence_id": "product-server-fixture",
+                "kind": "test",
+                "location": "tests/test_product_server.py",
+                "artifact_sha256": "a" * 64,
+                "result": "pass",
+                "hardware_fingerprint": "test-host",
+                "workload_id": "product-server",
+                "subject_digest": profile["subject_digest"],
+                "created_at": "2026-07-21T00:00:00Z",
+            }
+        ],
+    }
     catalog = tmp_path / "catalog"
     catalog.mkdir()
     (catalog / "managed.json").write_text(json.dumps(profile))
@@ -97,6 +114,78 @@ async def test_product_server_configures_routes_without_loading_a_model(
         server._residency_manager = None
         server._product_control_service = None
         os.environ.pop("VLLM_MLX_LIFECYCLE_STATE_PATH", None)
+
+
+def test_product_server_rejects_persisted_profile_downgraded_after_activation(
+    tmp_path, monkeypatch
+):
+    catalog, artifact, profile = _catalog_and_artifact(tmp_path)
+    state_path = tmp_path / "state" / "lifecycle.json"
+    state_path.parent.mkdir()
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(state_path))
+    first = ResidencyManager(lambda spec: FakeEngine())
+    first.register_model(
+        bind_model_spec_to_profile(ModelSpec("default", str(artifact)), profile)
+    )
+    first._control.close()
+
+    profile["qualification"] = {
+        "status": "not_qualified",
+        "reason": "evidence withdrawn",
+        "evidence": [],
+    }
+    (catalog / "managed.json").write_text(json.dumps(profile))
+
+    with pytest.raises(RuntimeError, match="no longer qualified"):
+        server._configure_managed_product(_args(tmp_path, catalog, artifact))
+
+    # Restore validation happens before the persistent lifecycle lock is acquired.
+    second = ResidencyManager(lambda spec: FakeEngine())
+    second._control.close()
+    os.environ.pop("VLLM_MLX_LIFECYCLE_STATE_PATH", None)
+
+
+def test_clear_managed_product_profile_restores_pre_profile_defaults(monkeypatch):
+    baseline = {
+        "max_tokens": 101,
+        "max_request_tokens": 202,
+        "temperature": 0.3,
+        "top_p": 0.8,
+        "top_k": 17,
+        "min_p": 0.1,
+        "presence_penalty": 0.2,
+        "repetition_penalty": 1.1,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "thinking_token_budget": 303,
+    }
+    monkeypatch.setattr(server, "_managed_product_base_defaults", baseline)
+    monkeypatch.setattr(server, "_model_name", "stale-model")
+    monkeypatch.setattr(server, "_model_path", "/stale/model")
+    monkeypatch.setattr(server, "_default_max_tokens", 999)
+    monkeypatch.setattr(server, "_max_request_tokens", 999)
+    monkeypatch.setattr(server, "_default_temperature", 1.0)
+    monkeypatch.setattr(server, "_default_top_p", 1.0)
+    monkeypatch.setattr(server, "_default_top_k", 99)
+    monkeypatch.setattr(server, "_default_min_p", 0.9)
+    monkeypatch.setattr(server, "_default_presence_penalty", 0.9)
+    monkeypatch.setattr(server, "_default_repetition_penalty", 1.9)
+    monkeypatch.setattr(server, "_default_chat_template_kwargs", {"stale": True})
+    monkeypatch.setattr(server, "_default_thinking_token_budget", 999)
+
+    server._clear_managed_product_profile()
+
+    assert server._model_name is None
+    assert server._model_path is None
+    assert server._default_max_tokens == 101
+    assert server._max_request_tokens == 202
+    assert server._default_temperature == 0.3
+    assert server._default_top_p == 0.8
+    assert server._default_top_k == 17
+    assert server._default_min_p == 0.1
+    assert server._default_presence_penalty == 0.2
+    assert server._default_repetition_penalty == 1.1
+    assert server._default_chat_template_kwargs == {"enable_thinking": False}
+    assert server._default_thinking_token_budget == 303
 
 
 @pytest.mark.anyio
