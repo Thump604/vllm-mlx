@@ -831,6 +831,29 @@ class TestHelperFunctions:
         assert isinstance(parser, FakeParser)
         assert parser.tokenizer is FakeEngine.tokenizer
 
+    def test_build_tool_parser_returns_request_local_instances(self, monkeypatch):
+        import vllm_mlx.server as server
+
+        class FakeParser:
+            def __init__(self, tokenizer=None):
+                self.tokenizer = tokenizer
+
+        class FakeEngine:
+            tokenizer = object()
+
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "fake")
+        monkeypatch.setattr(server, "_tool_parser_instance", FakeParser())
+
+        first = server._build_tool_parser(FakeEngine())
+        second = server._build_tool_parser(FakeEngine())
+
+        assert isinstance(first, FakeParser)
+        assert isinstance(second, FakeParser)
+        assert first is not second
+        assert first.tokenizer is FakeEngine.tokenizer
+        assert second.tokenizer is FakeEngine.tokenizer
+
     def test_is_mllm_model_patterns(self):
         """Test MLLM model detection patterns."""
         from vllm_mlx.server import is_mllm_model
@@ -2110,8 +2133,9 @@ class TestStreamChatCompletion:
                 pass
 
             def extract_tool_calls_streaming(
-                self, previous_text, current_text, delta_text
+                self, previous_text, current_text, delta_text, request=None
             ):
+                assert request == {"tools": []}
                 if "</tool_call>" in current_text:
                     return {
                         "tool_calls": [
@@ -2223,7 +2247,7 @@ class TestStreamChatCompletion:
                 pass
 
             def extract_tool_calls_streaming(
-                self, previous_text, current_text, delta_text
+                self, previous_text, current_text, delta_text, request=None
             ):
                 if "<tool_call|>" not in current_text:
                     return None
@@ -2335,7 +2359,7 @@ class TestStreamChatCompletion:
                 self.calls.clear()
 
             def extract_tool_calls_streaming(
-                self, previous_text, current_text, delta_text
+                self, previous_text, current_text, delta_text, request=None
             ):
                 self.calls.append((previous_text, current_text, delta_text))
                 return {"content": delta_text}
@@ -3372,7 +3396,7 @@ class TestChatCompletionStreamingModeSwitching:
                 return None
 
             def extract_tool_calls_streaming(
-                self, previous_text, current_text, delta_text
+                self, previous_text, current_text, delta_text, request=None
             ):
                 return {"content": delta_text}
 

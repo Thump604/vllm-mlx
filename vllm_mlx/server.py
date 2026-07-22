@@ -1102,14 +1102,16 @@ def _build_tool_parser(engine: BaseEngine | None):
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return None
 
-    if _tool_parser_instance is not None:
-        if hasattr(_tool_parser_instance, "reset"):
-            _tool_parser_instance.reset()
-        return _tool_parser_instance
-
-    parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
-    return parser_cls(tokenizer)
+    parser_cls = (
+        type(_tool_parser_instance)
+        if _tool_parser_instance is not None
+        else ToolParserManager.get_tool_parser(_tool_call_parser)
+    )
+    tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+    try:
+        return parser_cls(tokenizer)
+    except TypeError:
+        return parser_cls()
 
 
 def _build_reasoning_parser(engine: BaseEngine | None = None):
@@ -2420,6 +2422,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
         request
     )
+    tool_request_context = chat_request.model_dump()
 
     response_id = _new_response_item_id("resp")
     sequence = 1
@@ -2534,32 +2537,13 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             sequence += 1
         return events
 
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
+    reasoning_parser = _build_reasoning_parser(engine)
+    if reasoning_parser:
+        reasoning_parser.reset_state()
 
-    global _tool_parser_instance
-    tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    if _enable_auto_tool_choice and _tool_call_parser:
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(
-                    "Initialized tool call parser for responses streaming: %s",
-                    _tool_call_parser,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to init tool parser for responses streaming: %s", e
-                )
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+    tool_parser = _get_streaming_tool_parser(chat_request, engine)
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2576,8 +2560,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if _reasoning_parser and not _thinking_disabled(request, chat_kwargs):
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+        if reasoning_parser and not _thinking_disabled(request, chat_kwargs):
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
             if delta_msg is None:
@@ -2633,12 +2617,12 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             else:
                 if not tool_markup_possible:
                     tool_markup_possible = True
-                tool_result = tool_parser.extract_tool_calls_streaming(
+                tool_accumulated_text, tool_result = _extract_streaming_tool_delta(
+                    tool_parser,
                     tool_accumulated_text,
-                    tool_accumulated_text + delta_text,
                     delta_text,
+                    tool_request_context,
                 )
-                tool_accumulated_text += delta_text
                 if tool_result is None:
                     continue
                 if "tool_calls" in tool_result:
@@ -2986,17 +2970,14 @@ def _get_streaming_tool_parser(
     tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
 
     if _enable_auto_tool_choice and _tool_call_parser:
-        if _tool_parser_instance is None:
-            try:
-                _get_or_init_tool_parser(engine)
-            except Exception as e:
-                logger.warning(
-                    "Failed to init tool parser for streaming: %s",
-                    _sanitize_log_text(e, limit=500),
-                )
-                return None
-        _tool_parser_instance.reset()
-        return _tool_parser_instance
+        try:
+            return _build_tool_parser(engine)
+        except Exception as e:
+            logger.warning(
+                "Failed to init tool parser for streaming: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+            return None
 
     if not getattr(request, "tools", None):
         return None
@@ -3009,6 +2990,51 @@ def _get_streaming_tool_parser(
     except Exception as e:
         logger.warning(f"Failed to init generic streaming tool parser: {e}")
         return None
+
+
+def _extract_streaming_tool_delta(
+    parser,
+    previous_text: str,
+    delta_text: str,
+    request_context: dict,
+) -> tuple[str, dict | None]:
+    """Parse one request-local streaming delta and return new accumulated text."""
+    current_text = previous_text + delta_text
+    result = parser.extract_tool_calls_streaming(
+        previous_text,
+        current_text,
+        delta_text,
+        request=request_context,
+    )
+    return current_text, result
+
+
+def _stream_request_metadata(
+    request: ChatCompletionRequest,
+) -> tuple[dict, list | None, bool]:
+    tools = (
+        request.model_dump(include={"tools"}).get("tools") if request.tools else None
+    )
+    include_usage = bool(
+        request.stream_options and request.stream_options.include_usage
+    )
+    return {"tools": tools or []}, tools, include_usage
+
+
+def _parse_streaming_tool_content(
+    parser,
+    accumulated_text: str,
+    delta_text: str,
+    request_context: dict,
+) -> tuple[str, dict | None, bool]:
+    accumulated_text, result = _extract_streaming_tool_delta(
+        parser,
+        accumulated_text,
+        delta_text,
+        request_context,
+    )
+    suppress = result is None or "tool_calls" in result
+    return accumulated_text, result, suppress
 
 
 def _streaming_tool_markup_possible(text: str) -> bool:
@@ -5652,14 +5678,15 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
+    reasoning_parser = _build_reasoning_parser(engine)
     use_reasoning = (
-        _reasoning_parser is not None
+        reasoning_parser is not None
         and not chat_kwargs.get("logits_processors")
         and not _thinking_disabled(openai_request, chat_kwargs)
     )
 
     if use_reasoning:
-        _reasoning_parser.reset_state()
+        reasoning_parser.reset_state()
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -5679,10 +5706,10 @@ async def _stream_anthropic_messages(
 
     # Tool call streaming suppression — prevents raw tool markup from leaking
     # as text_delta events. Mirrors the OpenAI streaming path logic.
-    tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
     tool_parser = _get_streaming_tool_parser(openai_request, engine)
+    tool_request_context = openai_request.model_dump()
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -5722,12 +5749,15 @@ async def _stream_anthropic_messages(
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_previous = tool_accumulated_text
-                        tool_accumulated_text += content_to_emit
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, content_to_emit
+                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                            _parse_streaming_tool_content(
+                                tool_parser,
+                                tool_accumulated_text,
+                                content_to_emit,
+                                tool_request_context,
+                            )
                         )
-                        if tool_result is None or "tool_calls" in tool_result:
+                        if suppress_tool_text:
                             # Inside tool markup or tool calls detected — suppress
                             continue
                         content_to_emit = tool_result.get("content", "")
@@ -5744,7 +5774,8 @@ async def _stream_anthropic_messages(
             # Reasoning parser path
             previous_text = accumulated_text
             accumulated_text += filtered
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            assert reasoning_parser is not None
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, filtered
             )
 
@@ -5772,12 +5803,15 @@ async def _stream_anthropic_messages(
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_previous = tool_accumulated_text
-                        tool_accumulated_text += content_to_emit
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, content_to_emit
+                        tool_accumulated_text, tool_result, suppress_tool_text = (
+                            _parse_streaming_tool_content(
+                                tool_parser,
+                                tool_accumulated_text,
+                                content_to_emit,
+                                tool_request_context,
+                            )
                         )
-                        if tool_result is None or "tool_calls" in tool_result:
+                        if suppress_tool_text:
                             # Inside tool markup or tool calls detected — suppress
                             continue
                         content_to_emit = tool_result.get("content", "")
@@ -5975,14 +6009,7 @@ async def stream_chat_completion(
     # Tools schema for argument coercion is invariant for the request;
     # compute once instead of model_dump()-ing the whole request on every
     # tool-call delta during streaming.
-    tools_dict = (
-        request.model_dump(include={"tools"}).get("tools")
-        if request and request.tools
-        else None
-    )
-
-    # Check if we should include usage in the final chunk
-    include_usage = request.stream_options and request.stream_options.include_usage
+    tool_request_context, tools_dict, include_usage = _stream_request_metadata(request)
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -5998,14 +6025,15 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
+    reasoning_parser = _build_reasoning_parser(engine)
     is_thinking_model = (
-        "nemotron" in (engine.model_name or "").lower() and not _reasoning_parser
+        "nemotron" in (engine.model_name or "").lower() and not reasoning_parser
     )
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
+    if reasoning_parser:
+        reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -6055,13 +6083,13 @@ async def stream_chat_completion(
             # is set either on the request or via the resolved chat template
             # kwargs / server default).
             if (
-                _reasoning_parser
+                reasoning_parser
                 and delta_text
                 and not _thinking_disabled(request, kwargs)
             ):
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                delta_msg = reasoning_parser.extract_reasoning_streaming(
                     previous_text, accumulated_text, delta_text
                 )
 
@@ -6098,10 +6126,13 @@ async def stream_chat_completion(
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_previous = tool_accumulated_text
-                        tool_accumulated_text += content
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, content
+                        tool_accumulated_text, tool_result = (
+                            _extract_streaming_tool_delta(
+                                tool_parser,
+                                tool_accumulated_text,
+                                content,
+                                tool_request_context,
+                            )
                         )
 
                         if tool_result is None:
@@ -6217,10 +6248,13 @@ async def stream_chat_completion(
                     else:
                         if not tool_markup_possible:
                             tool_markup_possible = True
-                        tool_previous = tool_accumulated_text
-                        tool_accumulated_text += delta_text
-                        tool_result = tool_parser.extract_tool_calls_streaming(
-                            tool_previous, tool_accumulated_text, delta_text
+                        tool_accumulated_text, tool_result = (
+                            _extract_streaming_tool_delta(
+                                tool_parser,
+                                tool_accumulated_text,
+                                delta_text,
+                                tool_request_context,
+                            )
                         )
 
                         if tool_result is None:
@@ -6297,7 +6331,9 @@ async def stream_chat_completion(
             and not tool_calls_detected
             and _streaming_tool_markup_possible(tool_accumulated_text)
         ):
-            final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
+            final_parse_result = tool_parser.extract_tool_calls(
+                tool_accumulated_text, tool_request_context
+            )
             if final_parse_result.tools_called:
                 tool_chunk = ChatCompletionChunk(
                     id=response_id,
