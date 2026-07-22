@@ -8,7 +8,10 @@ import os
 import tempfile
 import threading
 import time
+import uuid
+from copy import deepcopy
 from dataclasses import asdict
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -37,6 +40,16 @@ def model_spec_digest(spec: object) -> str:
         payload = asdict(cast(Any, spec))
     except (TypeError, ValueError) as exc:
         raise LifecycleContractError("model spec must be a dataclass instance") from exc
+    # Default-valued fields added for dynamic activation do not change engine
+    # construction and therefore must not invalidate legacy lifecycle state.
+    for field_name, default in (
+        ("trust_remote_code", False),
+        ("mllm_draft_model", None),
+        ("mllm_draft_kind", None),
+        ("mllm_draft_block_size", None),
+    ):
+        if payload.get(field_name) == default:
+            payload.pop(field_name, None)
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()
@@ -117,6 +130,10 @@ class LifecycleControlState:
         self._model_key: str | None = None
         self._snapshot = LifecycleSnapshot()
         self._recovery: dict[str, Any] | None = None
+        self._product_control: dict[str, dict[str, Any]] = {
+            "operations": {},
+            "idempotency": {},
+        }
         self._acquire_owner_lock()
         try:
             if self._state_path.exists():
@@ -177,6 +194,29 @@ class LifecycleControlState:
                 self._snapshot, self._model_key, self._recovery = previous
                 raise
 
+    def clear_configuration(self) -> None:
+        """Remove a dormant candidate that never became resident."""
+        if (
+            self._snapshot.process_state
+            not in {
+                ProcessState.UNLOADED,
+                ProcessState.FAILED,
+            }
+            or self._snapshot.active_leases
+        ):
+            raise LifecycleContractError(
+                "cannot clear lifecycle configuration while a model is active"
+            )
+        previous = (self._snapshot, self._model_key, self._recovery)
+        try:
+            self._snapshot = LifecycleSnapshot()
+            self._model_key = None
+            self._recovery = {"reason": "failed_candidate_cleared"}
+            self._persist()
+        except BaseException:
+            self._snapshot, self._model_key, self._recovery = previous
+            raise
+
     def reconcile(self, state: ProcessState, active_leases: int) -> None:
         if self._snapshot.configured_profile is None:
             raise LifecycleContractError("lifecycle control is not configured")
@@ -218,8 +258,113 @@ class LifecycleControlState:
             "model_key": self._model_key,
             "snapshot": _snapshot_payload(self._snapshot),
             "recovery": self._recovery,
+            "product_control": deepcopy(self._product_control),
             "owner": {"pid": os.getpid(), "acquired_at": self._owner_acquired_at},
         }
+
+    def create_product_operation(
+        self,
+        *,
+        operation_kind: str,
+        idempotency_key: str,
+        request_digest: str,
+        profile: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one durable queued operation or replay its exact prior record."""
+        ledger_key = f"{operation_kind}:{idempotency_key}"
+        binding = self._product_control["idempotency"].get(ledger_key)
+        if binding is not None:
+            if binding["request_digest"] != request_digest:
+                raise LifecycleContractError(
+                    "idempotency key was already used for a different request"
+                )
+            return self.get_product_operation(binding["operation_id"]), True
+
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        operation_id = uuid.uuid4().hex
+        record = {
+            "operation_id": operation_id,
+            "operation_kind": operation_kind,
+            "status": "queued",
+            "profile": deepcopy(profile),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "result": None,
+            "error": None,
+            "recovery": None,
+        }
+        self._product_control["operations"][operation_id] = record
+        self._product_control["idempotency"][ledger_key] = {
+            "operation_id": operation_id,
+            "request_digest": request_digest,
+        }
+        self._persist()
+        return deepcopy(record), False
+
+    def bind_product_idempotency(
+        self,
+        *,
+        operation_kind: str,
+        idempotency_key: str,
+        request_digest: str,
+        operation_id: str,
+    ) -> bool:
+        """Bind an idempotent command to an existing durable operation."""
+        if operation_id not in self._product_control["operations"]:
+            raise KeyError(operation_id)
+        ledger_key = f"{operation_kind}:{idempotency_key}"
+        binding = self._product_control["idempotency"].get(ledger_key)
+        if binding is not None:
+            if (
+                binding["request_digest"] != request_digest
+                or binding["operation_id"] != operation_id
+            ):
+                raise LifecycleContractError(
+                    "idempotency key was already used for a different request"
+                )
+            return True
+        self._product_control["idempotency"][ledger_key] = {
+            "operation_id": operation_id,
+            "request_digest": request_digest,
+        }
+        self._persist()
+        return False
+
+    def get_product_operation(self, operation_id: str) -> dict[str, Any]:
+        """Return one durable product operation record."""
+        record = self._product_control["operations"].get(operation_id)
+        if record is None:
+            raise KeyError(operation_id)
+        return deepcopy(record)
+
+    def update_product_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a legal product-operation state transition."""
+        if status not in {"queued", "running", "succeeded", "failed", "cancelled"}:
+            raise ValueError(f"invalid product operation status: {status}")
+        record = self._product_control["operations"].get(operation_id)
+        if record is None:
+            raise KeyError(operation_id)
+        if record["status"] in {"succeeded", "failed", "cancelled"}:
+            if record["status"] != status:
+                raise LifecycleContractError(
+                    "terminal product operation status cannot change"
+                )
+            return deepcopy(record)
+        record.update(
+            status=status,
+            updated_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            result=deepcopy(result),
+            error=deepcopy(error),
+        )
+        self._persist()
+        return deepcopy(record)
 
     def close(self) -> None:
         handle = self._lock_handle
@@ -271,10 +416,41 @@ class LifecycleControlState:
             raise LifecycleContractError(
                 f"unsupported lifecycle control state at {self._state_path}"
             )
-        model_key = payload.get("model_key")
-        if not isinstance(model_key, str) or not model_key:
-            raise LifecycleContractError("lifecycle control model_key is invalid")
-        self._model_key = model_key
         self._snapshot = _snapshot_from_payload(payload.get("snapshot"))
+        model_key = payload.get("model_key")
+        if model_key is None and self._snapshot == LifecycleSnapshot():
+            self._model_key = None
+        elif isinstance(model_key, str) and model_key:
+            self._model_key = model_key
+        else:
+            raise LifecycleContractError("lifecycle control model_key is invalid")
         recovery = payload.get("recovery")
         self._recovery = recovery if isinstance(recovery, dict) else None
+        product_control = payload.get("product_control")
+        if product_control is not None:
+            if (
+                not isinstance(product_control, dict)
+                or not isinstance(product_control.get("operations"), dict)
+                or not isinstance(product_control.get("idempotency"), dict)
+            ):
+                raise LifecycleContractError(
+                    f"invalid product control state at {self._state_path}"
+                )
+            self._product_control = deepcopy(product_control)
+        interrupted = False
+        for record in self._product_control["operations"].values():
+            if record.get("status") in {"queued", "running"}:
+                record.update(
+                    status="failed",
+                    updated_at=datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    error={
+                        "code": "runtime_unavailable",
+                        "message": "operation was interrupted by control-plane restart",
+                    },
+                    recovery={"reason": "control_plane_restart"},
+                )
+                interrupted = True
+        if interrupted:
+            self._persist()

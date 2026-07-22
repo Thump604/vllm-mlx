@@ -46,6 +46,10 @@ class ModelSpec:
     specprefill_keep_pct: float = 0.3
     specprefill_backbone_pct: float = 0.0
     specprefill_draft_model: str | None = None
+    trust_remote_code: bool = False
+    mllm_draft_model: str | None = None
+    mllm_draft_kind: str | None = None
+    mllm_draft_block_size: int | None = None
     profile_id: str | None = None
     profile_revision: str | None = None
     config_digest: str | None = None
@@ -164,6 +168,28 @@ class ResidencyManager:
     def get_engine(self, model_key: str) -> BaseEngine | None:
         """Get the currently loaded engine, if any."""
         return self._resident(model_key).engine
+
+    def get_spec(self, model_key: str) -> ModelSpec:
+        """Return the immutable construction inputs for one resident."""
+        return self._resident(model_key).spec
+
+    def clear_dormant_model(self, model_key: str) -> None:
+        """Forget a model candidate that failed before becoming resident."""
+        resident = self._resident(model_key)
+        if (
+            resident.engine is not None
+            or resident.active_requests
+            or resident._load_waiters
+            or resident._loading_task is not None
+            or resident._unloading_task is not None
+            or resident.state not in {ResidentState.UNLOADED, ResidentState.FAILED}
+        ):
+            raise RuntimeError(
+                f"Cannot clear resident model '{model_key}' while it is live"
+            )
+        del self._residents[model_key]
+        if self._control is not None and self._control.model_key == model_key:
+            self._control.clear_configuration()
 
     def get_status(self, model_key: str) -> dict[str, Any]:
         """Return a serializable snapshot of resident state."""
@@ -380,6 +406,63 @@ class ResidencyManager:
     def list_status(self) -> list[dict[str, Any]]:
         """Return snapshots for every registered resident."""
         return [self.get_status(model_key) for model_key in sorted(self._residents)]
+
+    def create_control_operation(
+        self,
+        *,
+        operation_kind: str,
+        idempotency_key: str,
+        request_digest: str,
+        profile: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create or replay a durable product operation."""
+        if self._control is None:
+            raise RuntimeError("Persistent lifecycle control is not enabled")
+        return self._control.create_product_operation(
+            operation_kind=operation_kind,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            profile=profile,
+        )
+
+    def get_control_operation(self, operation_id: str) -> dict[str, Any]:
+        """Read one durable product operation."""
+        if self._control is None:
+            raise RuntimeError("Persistent lifecycle control is not enabled")
+        return self._control.get_product_operation(operation_id)
+
+    def update_control_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a product-operation transition."""
+        if self._control is None:
+            raise RuntimeError("Persistent lifecycle control is not enabled")
+        return self._control.update_product_operation(
+            operation_id, status=status, result=result, error=error
+        )
+
+    def bind_control_idempotency(
+        self,
+        *,
+        operation_kind: str,
+        idempotency_key: str,
+        request_digest: str,
+        operation_id: str,
+    ) -> bool:
+        """Bind an idempotent command to an existing durable operation."""
+        if self._control is None:
+            raise RuntimeError("Persistent lifecycle control is not enabled")
+        return self._control.bind_product_idempotency(
+            operation_kind=operation_kind,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            operation_id=operation_id,
+        )
 
     async def shutdown(self) -> None:
         """Stop all loaded residents."""
