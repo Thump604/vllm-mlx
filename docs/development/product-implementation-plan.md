@@ -102,8 +102,8 @@ evidence for, or part of, the first product workflow.
 |---|---|---|---|---|
 | P4.1 | complete | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
 | P4.2 | complete | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
-| P4.3 | in_progress | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
-| P4.4 | pending | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
+| P4.3 | complete | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
+| P4.4 | in_progress | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
 | P4.5 | pending | Independent release-readiness review | Terra `high` | P4.4 |
 
 ### P4 Acceptance Gate
@@ -125,7 +125,6 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Implement P4.3 with golden install-to-chat and install-to-code workflows over
-the control client and injected catalog. Exercise exact identity,
-idempotency, recovery, and no-implicit-activation behavior without live model
-loads in CI.
+Implement P4.4 with portable first-release profile fixtures and supported Mac
+hardware envelopes. Use Laguna S 2.1 as the acceptance fixture, preserving its
+artifact-only/unqualified boundary until live qualification evidence exists.
