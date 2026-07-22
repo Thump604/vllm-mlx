@@ -114,6 +114,19 @@ evidence for, or part of, the first product workflow.
 - Advanced controls remain available without becoming required setup steps.
 - Recovery and uninstall paths are tested.
 
+### P4.4 Progress
+
+- Portable Qwen 3.6 35B and Laguna S 2.1 profiles: complete.
+- Recorded 64 GB and 128 GB Apple Silicon hardware envelopes: complete.
+- Product control service, managed runtime adapter, restart validation, and
+  focused regression coverage: complete in the integration branch.
+- Laguna S 2.1 live qualification: pending. The profile remains
+  `not_qualified` and cannot be activated through the product API until a
+  bounded non-live run binds passing evidence to the exact local artifact and
+  profile digest.
+- Qwen remains the portable known-good first-release reference; Laguna is the
+  first new-model onboarding acceptance proof.
+
 ## Deferred Until The First Product Workflow Passes
 
 - Additional speculative backends or cache tiers.
@@ -125,6 +138,9 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Implement P4.4 with portable first-release profile fixtures and supported Mac
-hardware envelopes. Use Laguna S 2.1 as the acceptance fixture, preserving its
-artifact-only/unqualified boundary until live qualification evidence exists.
+Allocate one non-live model window for the exact Laguna S 2.1 artifact, run the
+bounded P4.4 load/generation/parser/tool/memory checks, and bind the resulting
+evidence to the profile. After that passes, run P4.5 independent
+release-readiness review and close the roadmap. Ops is needed only to allocate
+and restore the serving slot; Jobs has no action until a qualified workload
+contract is intentionally published.

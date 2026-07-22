@@ -350,15 +350,121 @@ HTTP status, model processes, Jobs/Ops, or live state.
 **Excluded:** Exhaustive model/feature combinations, Jobs production policy,
   default/resident selection, and desktop UX.
 
-### PR 9: Product workflow integration
+### PW-1: Versioned product control contract
 
 **Depends on:** PR 7 and PR 8.
 
-**Scope:** Integrate catalog, install, activation, chat, coding-client setup,
-  diagnostics, and uninstall/recovery around the stable control API.
+**Scope:** Add only the versioned request/response envelope, operation models,
+and pure validation helpers used by future product clients.
 
-**Files:** Product workflow modules, API compatibility documentation, golden
-  install-to-chat/code tests, and only the required client integration files.
+**Files:** `vllm_mlx/control_api.py`, `tests/test_control_api.py`, and the
+versioned control schema/documentation.
+
+**Acceptance checks:** Valid envelopes round-trip; incompatible API versions,
+malformed profile references, and idempotency conflicts fail deterministically.
+
+**Excluded:** HTTP routes, server wiring, lifecycle mutation, model loading,
+catalog data, and client UX.
+
+### PW-2: Catalog loader and portable first-release profiles
+
+**Depends on:** PR 1, PR 2, PR 5, and MI-7.
+
+**Scope:** Add the read-only validated catalog loader plus portable Qwen and
+Laguna first-release profile documents. Laguna remains artifact-only until its
+separate qualification evidence exists.
+
+**Files:** `vllm_mlx/catalog/**`, `catalog/profiles/**`,
+`catalog/hardware/**`, and focused catalog/profile tests.
+
+**Acceptance checks:** Catalog order and identity are deterministic; duplicate
+or invalid profiles fail; qualification state controls normal visibility; no
+local absolute artifact path is published.
+
+**Excluded:** Download, conversion, activation, live qualification, HTTP
+routes, and model-family serving patches.
+
+### PW-3: Durable product operations service
+
+**Depends on:** LC-1, PR 7, and PW-1.
+
+**Scope:** Add durable install/activate/stop/remove operation records,
+idempotency, cancellation, sanitized failures, and the service protocol over
+the existing lifecycle owner.
+
+**Files:** `vllm_mlx/control/service.py`, the narrow product-operation additions
+to lifecycle state, and focused operation/service tests.
+
+**Acceptance checks:** Operation replay survives restart; conflicting keys fail;
+pre-start cancellation reaches a durable terminal state; failures do not leak
+local paths or tracebacks.
+
+**Excluded:** Artifact acquisition, engine construction, server globals, HTTP
+routes, profile fixtures, and live model calls.
+
+### PW-4: Managed artifact and residency adapter
+
+**Depends on:** PR 6, PR 7, PW-2, and PW-3.
+
+**Scope:** Bind exact profile hashes to local or managed artifacts and adapt one
+validated profile to the existing single-resident lifecycle manager. Preserve
+the prior model on failed replacement and clear dormant state on removal.
+
+**Files:** `vllm_mlx/control/runtime.py` and
+`tests/test_product_runtime.py`.
+
+**Acceptance checks:** Content mismatch fails before load; conversion artifacts
+require an explicit binding; failed activation restores prior state; removing a
+stopped managed artifact clears restart configuration.
+
+**Excluded:** HTTP routes, server startup, catalog authoring, model
+qualification, and desktop/client behavior.
+
+### PW-5: Product control HTTP routes
+
+**Depends on:** PW-1 and PW-3.
+
+**Scope:** Expose catalog, operation, status, diagnostics, activation, stop,
+remove, and cancellation through one versioned authenticated FastAPI router.
+
+**Files:** `vllm_mlx/control/routes.py`, route registration only, and focused
+route/transport tests.
+
+**Acceptance checks:** Authentication and all errors preserve the versioned
+envelope; route parameters participate in idempotency; protected diagnostics
+remain protected.
+
+**Excluded:** Runtime globals, engine behavior, model loading, catalog fixtures,
+and client setup.
+
+### PW-6: Managed product server integration
+
+**Depends on:** PW-2 through PW-5.
+
+**Scope:** Wire the validated catalog, lifecycle manager, runtime adapter, and
+HTTP service into the existing server behind explicit product-control flags.
+Restore only exact, still-qualified persisted profiles.
+
+**Files:** Narrow `vllm_mlx/server.py` helpers, CLI argument definitions, and
+focused product-server/restart tests.
+
+**Acceptance checks:** Startup without a configured model stays unloaded;
+restart restores exact qualified identity; downgraded or changed profiles fail
+before taking the lifecycle lock; ordinary serving remains unchanged when the
+feature is not configured.
+
+**Excluded:** New inference routes, model-specific patches, qualification runs,
+Ops/Jobs policy, and desktop UI.
+
+### PW-7: Product command shell and golden workflows
+
+**Depends on:** PW-1 and PW-5.
+
+**Scope:** Add the thin control client/CLI and golden install-to-chat and
+install-to-code workflows around the stable API.
+
+**Files:** `vllm_mlx/control/client.py`, `vllm_mlx/product_cli.py`, CLI entrypoint
+wiring, `tests/product_workflows/**`, and focused client/CLI tests.
 
 **Acceptance checks:** A user can select a curated model, receive an
   explainable profile, activate it, chat, configure a supported coding client,
