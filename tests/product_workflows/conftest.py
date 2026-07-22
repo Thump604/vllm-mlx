@@ -19,6 +19,23 @@ def product_catalog(tmp_path):
     from vllm_mlx.model_profile import compute_subject_digest
 
     profile["subject_digest"] = compute_subject_digest(profile)
+    profile["qualification"] = {
+        "status": "qualified",
+        "reason": None,
+        "evidence": [
+            {
+                "evidence_id": "golden-workflow-pass",
+                "kind": "golden_test",
+                "location": "tests/product_workflows",
+                "artifact_sha256": "1" * 64,
+                "result": "pass",
+                "hardware_fingerprint": "test-host",
+                "workload_id": "install-to-code",
+                "subject_digest": profile["subject_digest"],
+                "created_at": "2026-07-21T00:00:00Z",
+            }
+        ],
+    }
     (tmp_path / "golden.json").write_text(json.dumps(profile))
     return load_catalog(tmp_path)
 
