@@ -10,7 +10,7 @@ import pytest
 
 import vllm_mlx.lifecycle_control as lifecycle_control
 from vllm_mlx.lifecycle import ModelSpec, ResidencyManager, bind_model_spec_to_profile
-from vllm_mlx.lifecycle_contract import LifecycleContractError
+from vllm_mlx.lifecycle_contract import LifecycleContractError, ProcessState
 from vllm_mlx.model_profile import compute_subject_digest
 
 
@@ -36,6 +36,32 @@ def _spec(name: str = "laguna") -> ModelSpec:
     )
 
 
+def test_optional_dynamic_activation_defaults_preserve_legacy_spec_digest():
+    spec = _spec()
+    legacy = {
+        key: value
+        for key, value in spec.__dict__.items()
+        if key
+        not in {
+            "trust_remote_code",
+            "mllm_draft_model",
+            "mllm_draft_kind",
+            "mllm_draft_block_size",
+        }
+    }
+    expected = (
+        __import__("hashlib")
+        .sha256(
+            json.dumps(
+                legacy, sort_keys=True, separators=(",", ":"), default=str
+            ).encode()
+        )
+        .hexdigest()
+    )
+
+    assert lifecycle_control.model_spec_digest(spec) == expected
+
+
 def test_profile_binding_carries_immutable_identity_into_lifecycle(
     tmp_path, monkeypatch
 ):
@@ -59,6 +85,127 @@ def test_profile_binding_carries_immutable_identity_into_lifecycle(
     }
     assert control["resolved_process"]["config_digest"] == profile["subject_digest"]
     manager._control.close()
+
+
+def test_product_operation_replays_exact_request_and_survives_restart(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(state_path))
+    manager = ResidencyManager(lambda spec: FakeEngine())
+    manager.register_model(_spec())
+    profile = {
+        "profile_id": "laguna",
+        "profile_revision": 1,
+        "subject_digest": "a" * 64,
+    }
+
+    first, replayed = manager._control.create_product_operation(
+        operation_kind="model.install",
+        idempotency_key="install-laguna",
+        request_digest="digest-1",
+        profile=profile,
+    )
+    second, replayed_again = manager._control.create_product_operation(
+        operation_kind="model.install",
+        idempotency_key="install-laguna",
+        request_digest="digest-1",
+        profile=profile,
+    )
+
+    assert replayed is False
+    assert replayed_again is True
+    assert second == first
+    manager._control.close()
+
+    restarted = ResidencyManager(lambda spec: FakeEngine())
+    restarted.register_model(_spec())
+    recovered = restarted._control.get_product_operation(first["operation_id"])
+    assert recovered["status"] == "failed"
+    assert recovered["recovery"] == {"reason": "control_plane_restart"}
+    restarted._control.close()
+
+
+def test_product_operation_rejects_idempotency_conflict(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "state.json"))
+    manager = ResidencyManager(lambda spec: FakeEngine())
+    manager.register_model(_spec())
+    manager._control.create_product_operation(
+        operation_kind="model.activate",
+        idempotency_key="activate-laguna",
+        request_digest="digest-1",
+        profile=None,
+    )
+
+    with pytest.raises(LifecycleContractError, match="different request"):
+        manager._control.create_product_operation(
+            operation_kind="model.activate",
+            idempotency_key="activate-laguna",
+            request_digest="digest-2",
+            profile=None,
+        )
+    manager._control.close()
+
+
+def test_product_command_binding_replays_and_rejects_cross_operation_reuse(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "state.json"))
+    manager = ResidencyManager(lambda spec: FakeEngine())
+    manager.register_model(_spec())
+    first, _ = manager.create_control_operation(
+        operation_kind="model.activate",
+        idempotency_key="activate-first",
+        request_digest="activate-digest",
+        profile=None,
+    )
+    second, _ = manager.create_control_operation(
+        operation_kind="model.stop",
+        idempotency_key="stop-second",
+        request_digest="stop-digest",
+        profile=None,
+    )
+
+    replayed = manager.bind_control_idempotency(
+        operation_kind="operation.cancel",
+        idempotency_key="cancel-first",
+        request_digest="cancel-digest",
+        operation_id=first["operation_id"],
+    )
+    exact_replay = manager.bind_control_idempotency(
+        operation_kind="operation.cancel",
+        idempotency_key="cancel-first",
+        request_digest="cancel-digest",
+        operation_id=first["operation_id"],
+    )
+
+    assert replayed is False
+    assert exact_replay is True
+    with pytest.raises(LifecycleContractError, match="different request"):
+        manager.bind_control_idempotency(
+            operation_kind="operation.cancel",
+            idempotency_key="cancel-first",
+            request_digest="cancel-digest",
+            operation_id=second["operation_id"],
+        )
+    manager._control.close()
+
+
+def test_dormant_failed_candidate_can_be_cleared_and_reopened(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("VLLM_MLX_LIFECYCLE_STATE_PATH", str(state_path))
+    manager = ResidencyManager(lambda spec: FakeEngine())
+    manager.register_model(_spec())
+    manager._control.reconcile(ProcessState.FAILED, 0)
+
+    manager.clear_dormant_model("laguna")
+
+    assert manager.list_status() == []
+    assert manager._control.model_key is None
+    manager._control.close()
+    restarted = ResidencyManager(lambda spec: FakeEngine())
+    assert restarted._control.model_key is None
+    restarted._control.close()
 
 
 def test_profile_binding_rejects_stale_or_conflicting_identity():
