@@ -1976,6 +1976,10 @@ Examples:
         help="Path for normalized, profile-bound qualification evidence",
     )
 
+    from .product_cli import add_product_parser
+
+    add_product_parser(subparsers)
+
     # Serving benchmark
     bench_serve_parser = subparsers.add_parser(
         "bench-serve", help="Benchmark a running vllm-mlx server via HTTP API"
@@ -2164,6 +2168,10 @@ def main():
         download_command(args)
     elif args.command == "model":
         model_command(args)
+    elif args.command == "product":
+        from .product_cli import product_command
+
+        product_command(args)
     elif args.command == "bench-serve":
         bench_serve_command(args)
     else:
