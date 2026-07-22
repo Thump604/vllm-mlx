@@ -100,8 +100,8 @@ evidence for, or part of, the first product workflow.
 
 | ID | Status | Work package | Agent | Depends on |
 |---|---|---|---|---|
-| P4.1 | pending | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
-| P4.2 | pending | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
+| P4.1 | complete | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
+| P4.2 | in_progress | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
 | P4.3 | pending | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
 | P4.4 | pending | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
 | P4.5 | pending | Independent release-readiness review | Terra `high` | P4.4 |
@@ -125,6 +125,6 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Implement P4.1 by defining the versioned desktop/control client API over the
-completed profile, workflow, qualification, and lifecycle contracts. Keep the
-API transport-independent and preserve the existing serving routes.
+Implement P4.2 as a thin product shell over the versioned HTTP control API and
+existing inference endpoints. Do not create a second registry, lifecycle
+manager, or active-model state authority.

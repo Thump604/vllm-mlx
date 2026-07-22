@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waybarrios.github.io/vllm-mlx/schemas/control-api-v1.schema.json",
+  "title": "vllm-mlx Control API Descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "api_version",
+    "minimum_client_version",
+    "runtime_version",
+    "profile_schema_version",
+    "lifecycle_schema_version",
+    "error_codes",
+    "operations"
+  ],
+  "properties": {
+    "kind": {"const": "vllm-mlx-control-api"},
+    "api_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "minimum_client_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+    "runtime_version": {"type": "string", "minLength": 1},
+    "profile_schema_version": {"type": "string", "const": "1"},
+    "lifecycle_schema_version": {"type": "string", "const": "1"},
+    "error_codes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z]+(?:_[a-z]+)+$"}
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation_id", "operation_version", "method", "path", "mutating", "idempotent"],
+        "properties": {
+          "operation_id": {"type": "string", "pattern": "^[a-z]+(?:[.-][a-z]+)+$"},
+          "operation_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+$"},
+          "method": {"enum": ["GET", "POST", "PUT", "DELETE"]},
+          "path": {"type": "string", "pattern": "^/api/v1/control(?:/.*)?$"},
+          "mutating": {"type": "boolean"},
+          "idempotent": {"type": "boolean"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "profile_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_revision", "subject_digest"],
+      "properties": {
+        "profile_id": {"type": "string", "minLength": 1},
+        "profile_revision": {"type": "integer", "minimum": 1},
+        "subject_digest": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"}
+      }
+    },
+    "activation_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "idempotency_key"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/profile_reference"},
+        "idempotency_key": {"$ref": "#/$defs/idempotency_key"},
+        "overrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^limits\\.[a-z][a-z0-9_]*$": {"type": "integer", "minimum": 1},
+            "^features\\.[a-z][a-z0-9_]*$": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "profile_mutation_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "idempotency_key"],
+      "properties": {
+        "profile": {"$ref": "#/$defs/profile_reference"},
+        "idempotency_key": {"$ref": "#/$defs/idempotency_key"}
+      }
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "idempotent_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idempotency_key"],
+      "properties": {
+        "idempotency_key": {"$ref": "#/$defs/idempotency_key"}
+      }
+    },
+    "response_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "request_id", "data", "error"],
+      "properties": {
+        "api_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+        "request_id": {"type": "string", "minLength": 1},
+        "data": {},
+        "error": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code", "message"],
+              "properties": {
+                "code": {"type": "string"},
+                "message": {"type": "string"}
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
