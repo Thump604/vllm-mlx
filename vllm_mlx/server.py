@@ -39,6 +39,7 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib
 import copy
 from dataclasses import dataclass
 import json
@@ -3456,6 +3457,7 @@ async def health():
             else "llm"
         ),
         "engine_type": engine_stats.get("engine_type", "unknown"),
+        "artifact_identity": _health_artifact_identity(),
         "mcp": mcp_info,
     }
     if lifecycle is not None:
@@ -3472,6 +3474,36 @@ async def health():
             )
         payload.update(lifecycle_fields)
     return payload
+
+
+def _health_artifact_identity() -> dict[str, str] | None:
+    """Return content hashes for the metadata of the loaded local artifact."""
+    if not _model_path:
+        return None
+    root = Path(_model_path).expanduser()
+    if not root.is_dir():
+        return None
+    candidates = {
+        "config_sha256": ("config.json",),
+        "tokenizer_sha256": ("tokenizer.json",),
+        "chat_template_sha256": ("chat_template.jinja",),
+        "generation_config_sha256": ("generation_config.json",),
+        "weights_manifest_sha256": ("model.safetensors.index.json", "SHA256SUMS"),
+    }
+    identity: dict[str, str] = {}
+    for field, names in candidates.items():
+        path = next((root / name for name in names if (root / name).is_file()), None)
+        if path is None:
+            continue
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            continue
+        identity[field] = digest.hexdigest()
+    return identity or None
 
 
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])

@@ -126,6 +126,12 @@ evidence for, or part of, the first product workflow.
 - Golden workflow tests now use the shipped Qwen profile identity with an
   explicit test-only qualification overlay. They prove workflow behavior, not
   live model eligibility.
+- The Qwen qualification package now uses the provider's mode-specific sampling
+  tuples and nested `chat_template_kwargs.enable_thinking` request shape. A
+  zero-valued pseudo-timeout was removed.
+- Runtime health now reports content hashes for the loaded local artifact's
+  metadata, and qualification normalization rejects served-name matches whose
+  artifact hashes do not match the profile.
 - Remaining P4.4 gate: bind one exact Qwen 3.6 35B artifact, serving profile,
   measured 128 GB Apple Silicon envelope, and passing install/activate/chat
   evidence to the catalog subject digest. Then run the catalog-backed
@@ -152,4 +158,5 @@ subject and recorded 128 GB Apple Silicon envelope. The package must bind the
 artifact revision and digest, resolved serving profile, measured hardware, and
 managed install/activate/healthy-chat/coding-setup evidence. Ops must provide an
 isolated Qwen qualification window; Jobs must release or suspend its lease for
-that window. Resume P4.5 only after the profile-bound package passes.
+that window. The live run is the remaining source for measured peak memory and
+profile-bound behavior evidence. Resume P4.5 only after that package passes.

@@ -3,15 +3,6 @@
   "description": "Profile-bound first-release qualification for direct chat, coding output, tool use, and post-tool continuation.",
   "defaults": {
     "max_tokens": 512,
-    "policy_timeout_ms": 0,
-    "extra_body": {
-      "temperature": 1.0,
-      "top_p": 0.95,
-      "top_k": 20,
-      "min_p": 0.0,
-      "presence_penalty": 0.0,
-      "repetition_penalty": 1.0
-    },
     "checks": {
       "finish_reason": "stop",
       "forbidden_regex": ["<think>", "<tool_call>"],
@@ -21,7 +12,15 @@
   "cases": [
     {
       "id": "direct-no-think",
-      "enable_thinking": false,
+      "extra_body": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
       "messages": [
         {
           "role": "user",
@@ -36,7 +35,15 @@
     },
     {
       "id": "coding-no-think",
-      "enable_thinking": false,
+      "extra_body": {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
       "messages": [
         {
           "role": "user",
@@ -52,7 +59,6 @@
     },
     {
       "id": "forced-tool-call",
-      "enable_thinking": true,
       "messages": [
         {
           "role": "user",
@@ -60,6 +66,13 @@
         }
       ],
       "extra_body": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": true},
         "tools": [
           {
             "type": "function",
@@ -91,7 +104,15 @@
     },
     {
       "id": "post-tool-continuation",
-      "enable_thinking": true,
+      "extra_body": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": true}
+      },
       "messages": [
         {
           "role": "user",

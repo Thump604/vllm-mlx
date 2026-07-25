@@ -464,6 +464,7 @@ def parse_health_response(data: dict) -> dict:
     return {
         "model_name": data.get("model_name", ""),
         "model_type": data.get("model_type", ""),
+        "artifact_identity": data.get("artifact_identity") or {},
     }
 
 
@@ -600,6 +601,7 @@ async def auto_detect_runtime(client: httpx.AsyncClient, base_url: str) -> dict:
         "metal_active_gb": 0.0,
         "metal_peak_gb": 0.0,
         "metal_cache_gb": 0.0,
+        "artifact_identity": {},
     }
 
     # /health
@@ -608,6 +610,7 @@ async def auto_detect_runtime(client: httpx.AsyncClient, base_url: str) -> dict:
         resp.raise_for_status()
         health = parse_health_response(resp.json())
         result["model_type"] = health.get("model_type", "")
+        result["artifact_identity"] = health.get("artifact_identity", {})
     except httpx.HTTPError:
         pass
 

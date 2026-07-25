@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "qwen3.6-35b-a3b-8bit",
   "profile_revision": 1,
-  "subject_digest": "aa327c8180eb19a383b1ee8cc154851b9197b6bd9665a4c0e93c584b4ef8b7f6",
+  "subject_digest": "43bd86c1d21a811715e3c442c2e0cf04aadef6e156bae63948419109e5fbd778",
   "description": "Portable Qwen 3.6 35B A3B MLX 8-bit profile fixture.",
   "identity": {
     "provider": "huggingface",
@@ -54,7 +54,7 @@
     "parsers": {"tool": "qwen3_xml", "reasoning": "qwen3"},
     "sampling": {
       "provider_defaults": {},
-      "profile_defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}
+      "profile_defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5, "repetition_penalty": 1.0}
     },
     "limits": {
       "advertised_context": 262144,

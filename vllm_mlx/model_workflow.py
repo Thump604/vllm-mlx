@@ -1747,6 +1747,15 @@ def normalize_qualification_result(
             raise ValueError(
                 "qualification runtime-detected model does not match profile"
             )
+        expected_hashes = {
+            key: value
+            for key, value in profile.get("artifact", {}).get("hashes", {}).items()
+            if value is not None
+        }
+        if runtime.get("artifact_identity") != expected_hashes:
+            raise ValueError(
+                "qualification runtime artifact identity does not match profile"
+            )
         quality = record.get("quality")
         if (
             not isinstance(record.get("ok"), bool)

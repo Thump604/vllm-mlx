@@ -1319,6 +1319,7 @@ def _qualification_profile():
         "profile_id": "laguna-s-2.1",
         "profile_revision": 1,
         "identity": {"served_model_name": "laguna-s-2.1"},
+        "artifact": {"hashes": {"config_sha256": "a" * 64}},
         "qualification": {"status": "not_qualified", "evidence": []},
     }
     profile["subject_digest"] = compute_subject_digest(profile)
@@ -1341,7 +1342,10 @@ def _qualification_result(profile, workload_path, *, passed=True):
                 "timestamp": "2026-07-21T12:00:00+00:00",
                 "workload": "coding-smoke",
                 "model_id": "laguna-s-2.1",
-                "runtime": {"model_id": "laguna-s-2.1"},
+                "runtime": {
+                    "model_id": "laguna-s-2.1",
+                    "artifact_identity": profile["artifact"]["hashes"],
+                },
                 "hardware": {"chip": "M4 Max", "memory_gb": 128},
                 "quality": {"ok": passed},
                 "ok": passed,
@@ -1393,6 +1397,12 @@ def test_normalize_qualification_result_binds_raw_evidence_without_promotion(
                 model_id="other"
             ),
             "runtime-detected model",
+        ),
+        (
+            lambda profile, result: result["results"][0]["runtime"].update(
+                artifact_identity={"config_sha256": "b" * 64}
+            ),
+            "artifact identity",
         ),
         (
             lambda profile, result: result.update(timestamp="not-time"),

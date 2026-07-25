@@ -524,10 +524,12 @@ class TestAutoDetectionParsing:
             "model_loaded": True,
             "model_name": "mlx-community/Llama-3.2-1B-Instruct-4bit",
             "model_type": "llm",
+            "artifact_identity": {"config_sha256": "a" * 64},
         }
         result = parse_health_response(data)
         assert result["model_name"] == "mlx-community/Llama-3.2-1B-Instruct-4bit"
         assert result["model_type"] == "llm"
+        assert result["artifact_identity"] == {"config_sha256": "a" * 64}
 
     def test_parse_health_mllm(self):
         data = {

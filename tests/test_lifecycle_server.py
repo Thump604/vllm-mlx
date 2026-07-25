@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from contextlib import suppress
 from types import SimpleNamespace
@@ -536,6 +537,22 @@ class TestStatusEndpointEngineRace:
         result = await srv.health()
         assert result["status"] == "healthy"
         assert result["model_loaded"] is False
+
+    def test_health_artifact_identity_hashes_loaded_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+
+        config = tmp_path / "config.json"
+        tokenizer = tmp_path / "tokenizer.json"
+        config.write_bytes(b'{"model_type":"qwen"}')
+        tokenizer.write_bytes(b'{"version":"1"}')
+        monkeypatch.setattr(srv, "_model_path", str(tmp_path))
+
+        assert srv._health_artifact_identity() == {
+            "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "tokenizer_sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
+        }
 
     @pytest.mark.anyio
     async def test_status_endpoint_returns_disabled_mtp_object_when_absent(
