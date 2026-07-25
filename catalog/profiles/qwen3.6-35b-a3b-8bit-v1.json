@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile_id": "qwen3.6-35b-a3b-8bit",
   "profile_revision": 1,
-  "subject_digest": "f2d5d55b78ea4bef2b01169e8eedc0fffaa09bb99489a31410eef5ea8066a4f0",
+  "subject_digest": "aa327c8180eb19a383b1ee8cc154851b9197b6bd9665a4c0e93c584b4ef8b7f6",
   "description": "Portable Qwen 3.6 35B A3B MLX 8-bit profile fixture.",
   "identity": {
     "provider": "huggingface",
@@ -10,7 +10,7 @@
     "requested_revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0",
     "resolved_revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0",
     "artifact_id": "qwen3.6-35b-a3b-8bit",
-    "served_model_name": "qwen3.6-35b-a3b-8bit",
+    "served_model_name": "qwen3.6-35b-a3b",
     "aliases": []
   },
   "artifact": {
@@ -37,9 +37,9 @@
   },
   "capabilities": {
     "modalities": ["text", "image", "video"],
-    "streaming": false,
-    "tools": {"supported": false, "format": null, "notes": "Not asserted by this structural fixture."},
-    "reasoning": {"supported": false, "format": null, "notes": "Not asserted by this structural fixture."},
+    "streaming": true,
+    "tools": {"supported": true, "format": "qwen3_xml", "notes": "Candidate capability requiring exact profile-bound qualification."},
+    "reasoning": {"supported": true, "format": "qwen3", "notes": "Candidate capability requiring exact profile-bound qualification."},
     "structured_output": {"json_object": false, "json_schema": false, "supported_schema_keywords": []},
     "api_surfaces": ["openai_chat"]
   },
@@ -51,7 +51,7 @@
       "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
       "default_kwargs": {}
     },
-    "parsers": {"tool": null, "reasoning": null},
+    "parsers": {"tool": "qwen3_xml", "reasoning": "qwen3"},
     "sampling": {
       "provider_defaults": {},
       "profile_defaults": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}
@@ -71,10 +71,27 @@
       "mtp": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "No profile-bound evidence."},
       "prefix_cache": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "No profile-bound evidence."},
       "specprefill": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "No profile-bound evidence."},
-      "streaming": {"mode": "deferred", "control": "none", "control_field": null, "settings": {}, "reason": "No profile-bound evidence."}
+      "streaming": {"mode": "available_per_request", "control": "request", "control_field": "stream", "settings": {}, "reason": "Candidate request capability pending exact profile-bound qualification."}
     },
     "activation_policy": {"owner_override_fields": []},
-    "request_policy": {"required_fields": {}, "allowed_fields": [], "forbidden_fields": []}
+    "request_policy": {
+      "required_fields": {},
+      "allowed_fields": [
+        "chat_template_kwargs.enable_thinking",
+        "chat_template_kwargs.preserve_thinking",
+        "max_tokens",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "stream",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_k",
+        "top_p"
+      ],
+      "forbidden_fields": ["reasoning_effort", "response_format"]
+    }
   },
   "hardware_fit": [
     {"hardware_class": "apple-silicon-128gb", "method": "derived", "estimated_peak_memory_bytes": 37823196585, "measured_peak_memory_bytes": null, "serving_context": 32768, "max_concurrency": 1, "notes": "Artifact-residency lower bound from the local fixture; not a runtime fit claim."}
@@ -84,7 +101,8 @@
     "records": [
       {"field_paths": ["/identity"], "kind": "provider_fact", "source": "https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-8bit", "revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0", "sha256": null, "rule_id": null, "observed_at": "2026-07-21T00:00:00Z"},
       {"field_paths": ["/artifact"], "kind": "derived_recommendation", "source": "tests/fixtures/model_configs/qwen3-5-hybrid.json and local artifact metadata", "revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0", "sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296", "rule_id": "portable-artifact-hash-v1", "observed_at": "2026-07-21T00:00:00Z"},
-      {"field_paths": ["/capabilities", "/serving", "/hardware_fit"], "kind": "derived_recommendation", "source": "tests/fixtures/model_configs/qwen3-5-hybrid.json", "revision": "1", "sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296", "rule_id": "structural-fixture-only-v1", "observed_at": "2026-07-21T00:00:00Z"}
+      {"field_paths": ["/capabilities"], "kind": "provider_fact", "source": "https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-8bit", "revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0", "sha256": null, "rule_id": null, "observed_at": "2026-07-25T00:00:00Z"},
+      {"field_paths": ["/serving", "/hardware_fit"], "kind": "derived_recommendation", "source": "tests/fixtures/model_configs/qwen3-5-hybrid.json", "revision": "1", "sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296", "rule_id": "qwen3.6-first-release-candidate-v1", "observed_at": "2026-07-25T00:00:00Z"}
     ]
   }
 }

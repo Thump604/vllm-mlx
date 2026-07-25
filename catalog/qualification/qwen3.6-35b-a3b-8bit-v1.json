@@ -1,0 +1,129 @@
+{
+  "name": "qwen3.6-35b-a3b-8bit-first-release",
+  "description": "Profile-bound first-release qualification for direct chat, coding output, tool use, and post-tool continuation.",
+  "defaults": {
+    "max_tokens": 512,
+    "policy_timeout_ms": 0,
+    "extra_body": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0
+    },
+    "checks": {
+      "finish_reason": "stop",
+      "forbidden_regex": ["<think>", "<tool_call>"],
+      "min_chars": 8
+    }
+  },
+  "cases": [
+    {
+      "id": "direct-no-think",
+      "enable_thinking": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with exactly: QWEN_PROFILE_OK"
+        }
+      ],
+      "checks": {
+        "finish_reason": "stop",
+        "required_regex": ["^QWEN_PROFILE_OK$"],
+        "forbidden_regex": ["<think>", "<tool_call>"]
+      }
+    },
+    {
+      "id": "coding-no-think",
+      "enable_thinking": false,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Python function named clamp with type hints that returns value limited to the inclusive low and high bounds. Return code only."
+        }
+      ],
+      "checks": {
+        "finish_reason": "stop",
+        "required_regex": ["def clamp", "->"],
+        "forbidden_regex": ["<think>", "<tool_call>", "TODO"],
+        "min_chars": 40
+      }
+    },
+    {
+      "id": "forced-tool-call",
+      "enable_thinking": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use get_weather for Chicago."
+        }
+      ],
+      "extra_body": {
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Return weather for a city.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {"type": "string"}
+                },
+                "required": ["city"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {"name": "get_weather"}
+        }
+      },
+      "checks": {
+        "finish_reason": ["stop", "tool_calls"],
+        "tool_call_count": 1,
+        "tool_call_names": ["get_weather"],
+        "tool_call_args_required_keys": {"get_weather": ["city"]}
+      }
+    },
+    {
+      "id": "post-tool-continuation",
+      "enable_thinking": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use get_weather for Chicago, then summarize the result."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_weather",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Chicago\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_weather",
+          "content": "{\"condition\":\"clear\",\"temperature_f\":72}"
+        }
+      ],
+      "checks": {
+        "finish_reason": "stop",
+        "required_regex": ["(?i)clear", "72"],
+        "forbidden_regex": ["<think>", "<tool_call>"],
+        "no_tool_calls": true,
+        "min_chars": 20
+      }
+    }
+  ]
+}

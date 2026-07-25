@@ -7,6 +7,7 @@ import json
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
+from vllm_mlx.bench_serve import load_workload
 from vllm_mlx.catalog import load_catalog
 from vllm_mlx.model_profile import compute_subject_digest
 from vllm_mlx.reasoning import get_parser as get_reasoning_parser
@@ -15,6 +16,7 @@ from vllm_mlx.tool_parsers import ToolParserManager
 ROOT = Path(__file__).parents[1]
 PROFILE_ROOT = ROOT / "catalog" / "profiles"
 HARDWARE_ROOT = ROOT / "catalog" / "hardware"
+QUALIFICATION_ROOT = ROOT / "catalog" / "qualification"
 
 
 def _read(path: Path) -> dict:
@@ -117,7 +119,34 @@ def test_qwen_fixture_uses_the_multimodal_route_declared_by_its_artifact():
     profile = load_catalog(PROFILE_ROOT).get("qwen3.6-35b-a3b-8bit", 1)
 
     assert profile["capabilities"]["modalities"] == ["text", "image", "video"]
+    assert profile["identity"]["served_model_name"] == "qwen3.6-35b-a3b"
     assert profile["serving"]["route"] == "multimodal"
+    assert profile["serving"]["parsers"] == {
+        "tool": "qwen3_xml",
+        "reasoning": "qwen3",
+    }
+    assert profile["serving"]["features"]["streaming"] == {
+        "mode": "available_per_request",
+        "control": "request",
+        "control_field": "stream",
+        "settings": {},
+        "reason": (
+            "Candidate request capability pending exact profile-bound qualification."
+        ),
+    }
+
+
+def test_qwen_first_release_qualification_workload_is_bounded_and_loadable():
+    workload = load_workload(QUALIFICATION_ROOT / "qwen3.6-35b-a3b-8bit-v1.json")
+
+    assert workload.name == "qwen3.6-35b-a3b-8bit-first-release"
+    assert [case.case_id for case in workload.cases] == [
+        "direct-no-think",
+        "coding-no-think",
+        "forced-tool-call",
+        "post-tool-continuation",
+    ]
+    assert all(case.max_tokens == 512 for case in workload.cases)
 
 
 def test_hardware_envelopes_are_explicit_without_invented_model_fit():
