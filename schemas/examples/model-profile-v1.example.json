@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "profile_id": "example-text-model-default",
+  "profile_revision": 1,
+  "subject_digest": "c1cbd492f88014504d4e28db4541169498945b831c6d11ba937a1d6495a29ade",
+  "description": "Non-production example for schema validation.",
+  "identity": {
+    "provider": "huggingface",
+    "repository_id": "example-org/example-model",
+    "requested_revision": "main",
+    "resolved_revision": "0123456789abcdef0123456789abcdef01234567",
+    "artifact_id": "example-model-mlx-q4",
+    "served_model_name": "example-model",
+    "aliases": []
+  },
+  "artifact": {
+    "source_uri": "https://huggingface.co/example-org/example-model",
+    "format": "mlx",
+    "model_type": "example",
+    "architectures": ["ExampleForCausalLM"],
+    "dtype": "float16",
+    "size_bytes": 4294967296,
+    "quantization": {
+      "method": "affine",
+      "bits": 4,
+      "group_size": 64,
+      "mode": "affine",
+      "source": "conversion_manifest"
+    },
+    "hashes": {
+      "config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tokenizer_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "chat_template_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "weights_manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "capabilities": {
+    "modalities": ["text"],
+    "streaming": true,
+    "tools": { "supported": false, "format": null, "notes": null },
+    "reasoning": { "supported": false, "format": null, "notes": null },
+    "structured_output": {
+      "json_object": false,
+      "json_schema": false,
+      "supported_schema_keywords": []
+    },
+    "api_surfaces": ["openai_chat", "anthropic_messages"]
+  },
+  "serving": {
+    "engine": "simple",
+    "route": "text",
+    "template": {
+      "source": "tokenizer",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "default_kwargs": {}
+    },
+    "parsers": { "tool": null, "reasoning": null },
+    "sampling": {
+      "provider_defaults": { "temperature": 0.7, "top_p": 0.9 },
+      "profile_defaults": { "temperature": 0.7, "top_p": 0.9 }
+    },
+    "limits": {
+      "advertised_context": 32768,
+      "serving_context": 32768,
+      "max_output_tokens": 4096,
+      "max_request_output_tokens": 4096,
+      "max_kv_size": 32768
+    },
+    "features": {
+      "continuous_batching": {
+        "mode": "available_on_activation",
+        "control": "activation",
+        "control_field": "features.continuous_batching",
+        "settings": { "max_concurrency": 1 },
+        "reason": null
+      },
+      "constrained_json": {
+        "mode": "not_supported",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not supported by this example"
+      },
+      "kvq4": {
+        "mode": "not_supported",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not supported by this example"
+      },
+      "kvq8": {
+        "mode": "not_supported",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not supported by this example"
+      },
+      "mtp": {
+        "mode": "not_supported",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not supported by this example"
+      },
+      "prefix_cache": {
+        "mode": "guarded_off",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not qualified in this example"
+      },
+      "specprefill": {
+        "mode": "not_supported",
+        "control": "none",
+        "control_field": null,
+        "settings": {},
+        "reason": "Not supported by this example"
+      },
+      "streaming": {
+        "mode": "available_per_request",
+        "control": "request",
+        "control_field": "stream",
+        "settings": {},
+        "reason": null
+      }
+    },
+    "activation_policy": {
+      "owner_override_fields": ["features.continuous_batching", "limits.max_output_tokens"]
+    },
+    "request_policy": {
+      "required_fields": {},
+      "allowed_fields": ["temperature", "top_p", "max_tokens", "stream"],
+      "forbidden_fields": []
+    }
+  },
+  "hardware_fit": [
+    {
+      "hardware_class": "apple-silicon-16gb",
+      "method": "derived",
+      "estimated_peak_memory_bytes": 6442450944,
+      "measured_peak_memory_bytes": null,
+      "serving_context": 32768,
+      "max_concurrency": 1,
+      "notes": "Example only"
+    }
+  ],
+  "qualification": {
+    "status": "not_qualified",
+    "reason": "Example profile",
+    "evidence": []
+  },
+  "provenance": {
+    "records": [
+      {
+        "field_paths": ["/identity", "/artifact", "/serving/sampling/provider_defaults"],
+        "kind": "provider_fact",
+        "source": "https://huggingface.co/example-org/example-model",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "sha256": null,
+        "rule_id": null,
+        "observed_at": "2026-07-21T00:00:00Z"
+      },
+      {
+        "field_paths": [
+          "/capabilities",
+          "/serving/engine",
+          "/serving/route",
+          "/serving/template",
+          "/serving/parsers",
+          "/serving/sampling/profile_defaults",
+          "/serving/limits",
+          "/serving/features",
+          "/serving/activation_policy",
+          "/serving/request_policy",
+          "/hardware_fit"
+        ],
+        "kind": "derived_recommendation",
+        "source": "vllm-mlx-profile-resolver",
+        "revision": "1",
+        "sha256": null,
+        "rule_id": "example-rule-v1",
+        "observed_at": "2026-07-21T00:00:00Z"
+      }
+    ]
+  }
+}

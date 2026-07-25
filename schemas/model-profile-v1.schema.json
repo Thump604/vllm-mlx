@@ -1,0 +1,565 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waybarrios.github.io/vllm-mlx/schemas/model-profile-v1.schema.json",
+  "title": "vllm-mlx ModelProfile v1",
+  "description": "Immutable model and serving profile with explicit provenance and qualification evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "profile_revision",
+    "subject_digest",
+    "identity",
+    "artifact",
+    "capabilities",
+    "serving",
+    "qualification",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_id": { "$ref": "#/$defs/non_empty_string" },
+    "profile_revision": { "type": "integer", "minimum": 1 },
+    "subject_digest": { "$ref": "#/$defs/sha256" },
+    "description": { "type": "string" },
+    "identity": { "$ref": "#/$defs/identity" },
+    "artifact": { "$ref": "#/$defs/artifact" },
+    "capabilities": { "$ref": "#/$defs/capabilities" },
+    "serving": { "$ref": "#/$defs/serving" },
+    "hardware_fit": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hardware_fit" }
+    },
+    "qualification": { "$ref": "#/$defs/qualification" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "extensions": {
+      "type": "object",
+      "description": "Namespaced experimental data that cannot alter v1 semantics.",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+$" },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "artifact_id", "served_model_name"],
+      "properties": {
+        "provider": { "type": "string", "enum": ["huggingface", "local", "other"] },
+        "repository_id": { "type": ["string", "null"] },
+        "requested_revision": { "type": ["string", "null"] },
+        "resolved_revision": { "type": ["string", "null"] },
+        "artifact_id": { "$ref": "#/$defs/non_empty_string" },
+        "served_model_name": { "$ref": "#/$defs/non_empty_string" },
+        "aliases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "provider": { "const": "huggingface" } } },
+          "then": {
+            "required": ["repository_id", "resolved_revision"],
+            "properties": {
+              "repository_id": { "$ref": "#/$defs/non_empty_string" },
+              "resolved_revision": { "type": "string", "pattern": "^[a-fA-F0-9]{40,64}$" }
+            }
+          }
+        }
+      ]
+    },
+    "quantization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method"],
+      "properties": {
+        "method": { "$ref": "#/$defs/non_empty_string" },
+        "bits": { "type": ["integer", "null"], "minimum": 1 },
+        "group_size": { "type": ["integer", "null"], "minimum": 1 },
+        "mode": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_uri", "format", "model_type", "architectures", "quantization", "hashes"],
+      "properties": {
+        "source_uri": { "$ref": "#/$defs/non_empty_string" },
+        "format": { "$ref": "#/$defs/non_empty_string" },
+        "model_type": { "$ref": "#/$defs/non_empty_string" },
+        "architectures": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/non_empty_string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "dtype": { "type": ["string", "null"] },
+        "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "quantization": { "$ref": "#/$defs/quantization" },
+        "hashes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["config_sha256", "tokenizer_sha256", "chat_template_sha256", "weights_manifest_sha256"],
+          "properties": {
+            "config_sha256": { "$ref": "#/$defs/sha256" },
+            "tokenizer_sha256": { "$ref": "#/$defs/sha256" },
+            "chat_template_sha256": { "$ref": "#/$defs/sha256" },
+            "generation_config_sha256": { "$ref": "#/$defs/sha256" },
+            "weights_manifest_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "format": { "type": ["string", "null"] },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modalities", "streaming", "tools", "reasoning", "structured_output", "api_surfaces"],
+      "properties": {
+        "modalities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["text", "image", "video", "audio"]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "streaming": { "type": "boolean" },
+        "tools": { "$ref": "#/$defs/capability" },
+        "reasoning": { "$ref": "#/$defs/capability" },
+        "structured_output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["json_object", "json_schema"],
+          "properties": {
+            "json_object": { "type": "boolean" },
+            "json_schema": { "type": "boolean" },
+            "supported_schema_keywords": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/non_empty_string" },
+              "uniqueItems": true
+            }
+          }
+        },
+        "api_surfaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["openai_chat", "openai_responses", "anthropic_messages"]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "sampling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "temperature": { "type": "number", "minimum": 0 },
+        "top_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "top_k": { "type": "integer", "minimum": 0 },
+        "min_p": { "type": "number", "minimum": 0, "maximum": 1 },
+        "presence_penalty": { "type": "number" },
+        "repetition_penalty": { "type": "number", "exclusiveMinimum": 0 },
+        "seed": { "type": ["integer", "null"] }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["advertised_context", "serving_context", "max_output_tokens", "max_request_output_tokens"],
+      "properties": {
+        "advertised_context": { "type": "integer", "minimum": 1 },
+        "serving_context": { "type": "integer", "minimum": 1 },
+        "max_output_tokens": { "type": "integer", "minimum": 1 },
+        "max_request_output_tokens": { "type": "integer", "minimum": 1 },
+        "max_kv_size": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "request_field": {
+      "type": "string",
+      "enum": [
+        "chat_template_kwargs.enable_thinking",
+        "chat_template_kwargs.preserve_thinking",
+        "max_tokens",
+        "min_p",
+        "presence_penalty",
+        "reasoning_effort",
+        "repetition_penalty",
+        "response_format",
+        "seed",
+        "stream",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_k",
+        "top_p"
+      ]
+    },
+    "activation_field": {
+      "type": "string",
+      "enum": [
+        "features.continuous_batching",
+        "features.kvq4",
+        "features.kvq8",
+        "features.mtp",
+        "features.prefix_cache",
+        "features.specprefill",
+        "limits.max_kv_size",
+        "limits.max_output_tokens",
+        "limits.max_request_output_tokens",
+        "limits.serving_context"
+      ]
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "control"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["enabled_by_default", "available_on_activation", "available_per_request", "diagnostic_only", "guarded_off", "deferred", "not_supported"]
+        },
+        "control": { "type": "string", "enum": ["activation", "request", "none"] },
+        "control_field": {
+          "oneOf": [
+            { "$ref": "#/$defs/activation_field" },
+            { "$ref": "#/$defs/request_field" },
+            { "type": "null" }
+          ]
+        },
+        "settings": {
+          "type": "object",
+          "propertyNames": {
+            "enum": ["bits", "cache_memory_mb", "cache_type", "draft_model", "group_size", "max_concurrency", "num_draft_tokens"]
+          },
+          "additionalProperties": { "type": ["boolean", "integer", "number", "string", "null"] }
+        },
+        "reason": { "type": ["string", "null"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "control": { "const": "activation" } } },
+          "then": {
+            "required": ["control_field"],
+            "properties": {
+              "control_field": { "$ref": "#/$defs/activation_field" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "control": { "const": "request" } } },
+          "then": {
+            "required": ["control_field"],
+            "properties": {
+              "control_field": { "$ref": "#/$defs/request_field" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "control": { "const": "none" } } },
+          "then": { "properties": { "control_field": { "type": "null" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": { "const": "available_on_activation" }
+            }
+          },
+          "then": { "properties": { "control": { "const": "activation" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": { "const": "available_per_request" }
+            }
+          },
+          "then": { "properties": { "control": { "const": "request" } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "enum": [
+                  "enabled_by_default",
+                  "diagnostic_only",
+                  "guarded_off",
+                  "deferred",
+                  "not_supported"
+                ]
+              }
+            }
+          },
+          "then": { "properties": { "control": { "const": "none" } } }
+        }
+      ]
+    },
+    "activation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_override_fields"],
+      "properties": {
+        "owner_override_fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/activation_field" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "request_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_fields", "allowed_fields", "forbidden_fields"],
+      "properties": {
+        "required_fields": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/request_field" },
+          "additionalProperties": true
+        },
+        "allowed_fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_field" },
+          "uniqueItems": true
+        },
+        "forbidden_fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_field" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "serving": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "route", "template", "parsers", "sampling", "limits", "features", "activation_policy", "request_policy"],
+      "properties": {
+        "engine": { "$ref": "#/$defs/non_empty_string" },
+        "route": { "$ref": "#/$defs/non_empty_string" },
+        "template": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "sha256", "default_kwargs"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["tokenizer", "processor", "profile_override"]
+            },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "default_kwargs": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "parsers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tool", "reasoning"],
+          "properties": {
+            "tool": { "type": ["string", "null"] },
+            "reasoning": { "type": ["string", "null"] }
+          }
+        },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider_defaults", "profile_defaults"],
+          "properties": {
+            "provider_defaults": { "$ref": "#/$defs/sampling" },
+            "profile_defaults": { "$ref": "#/$defs/sampling" }
+          }
+        },
+        "limits": { "$ref": "#/$defs/limits" },
+        "features": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["continuous_batching", "constrained_json", "kvq4", "kvq8", "mtp", "prefix_cache", "specprefill", "streaming"],
+          "properties": {
+            "continuous_batching": { "$ref": "#/$defs/feature" },
+            "constrained_json": { "$ref": "#/$defs/feature" },
+            "kvq4": { "$ref": "#/$defs/feature" },
+            "kvq8": { "$ref": "#/$defs/feature" },
+            "mtp": { "$ref": "#/$defs/feature" },
+            "prefix_cache": { "$ref": "#/$defs/feature" },
+            "specprefill": { "$ref": "#/$defs/feature" },
+            "streaming": { "$ref": "#/$defs/feature" }
+          }
+        },
+        "activation_policy": { "$ref": "#/$defs/activation_policy" },
+        "request_policy": { "$ref": "#/$defs/request_policy" }
+      }
+    },
+    "hardware_fit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hardware_class", "method", "estimated_peak_memory_bytes", "serving_context"],
+      "properties": {
+        "hardware_class": { "$ref": "#/$defs/non_empty_string" },
+        "method": {
+          "type": "string",
+          "enum": ["derived", "measured"]
+        },
+        "estimated_peak_memory_bytes": { "type": "integer", "minimum": 0 },
+        "measured_peak_memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "serving_context": { "type": "integer", "minimum": 1 },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "notes": { "type": ["string", "null"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "kind", "location", "artifact_sha256", "result", "hardware_fingerprint", "workload_id", "subject_digest", "created_at"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/non_empty_string" },
+        "kind": { "$ref": "#/$defs/non_empty_string" },
+        "location": { "$ref": "#/$defs/non_empty_string" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "result": {
+          "type": "string",
+          "enum": ["pass", "fail", "incomplete"]
+        },
+        "hardware_fingerprint": { "$ref": "#/$defs/non_empty_string" },
+        "workload_id": { "$ref": "#/$defs/non_empty_string" },
+        "subject_digest": { "$ref": "#/$defs/sha256" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "evidence"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["not_qualified", "qualified", "failed", "blocked"]
+        },
+        "reason": { "type": ["string", "null"] },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "qualified" } } },
+          "then": {
+            "properties": {
+              "evidence": {
+                "minItems": 1,
+                "contains": {
+                  "type": "object",
+                  "required": ["result"],
+                  "properties": { "result": { "const": "pass" } }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "provenance_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_paths", "kind", "source"],
+      "properties": {
+        "field_paths": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^/" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["provider_fact", "derived_recommendation", "measured_result", "maintainer_policy"]
+        },
+        "source": { "$ref": "#/$defs/non_empty_string" },
+        "revision": { "type": ["string", "null"] },
+        "sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "rule_id": { "type": ["string", "null"] },
+        "observed_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["records"],
+      "properties": {
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/provenance_record" },
+          "minItems": 1
+        }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "records": {
+              "contains": {
+                "properties": {
+                  "field_paths": { "contains": { "pattern": "^/identity(?:/|$)" } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "records": {
+              "contains": {
+                "properties": {
+                  "field_paths": { "contains": { "pattern": "^/artifact(?:/|$)" } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "records": {
+              "contains": {
+                "properties": {
+                  "field_paths": { "contains": { "pattern": "^/capabilities(?:/|$)" } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "records": {
+              "contains": {
+                "properties": {
+                  "field_paths": { "contains": { "pattern": "^/serving(?:/|$)" } }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
