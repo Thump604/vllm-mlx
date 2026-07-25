@@ -201,9 +201,7 @@ class PoolsideV1ToolParser(Glm47ToolParser):
         """Consume plain text or enter the next ``<tool_call>`` state."""
         start = self._buffer.find(self._START)
         if start < 0:
-            emitted, self._buffer = self._hold_partial_suffix(
-                self._buffer, self._START
-            )
+            emitted, self._buffer = self._hold_partial_suffix(self._buffer, self._START)
             return False, emitted
 
         content = self._buffer[:start]
@@ -259,9 +257,7 @@ class PoolsideV1ToolParser(Glm47ToolParser):
             self._reject_current = True
             return self._discard_through_tool_end()
 
-        emitted, self._buffer = self._hold_partial_suffix(
-            self._buffer, self._VALUE_END
-        )
+        emitted, self._buffer = self._hold_partial_suffix(self._buffer, self._VALUE_END)
         if emitted:
             self._delta(pending, arguments=self._escape_string_content(emitted))
         return False

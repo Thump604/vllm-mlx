@@ -337,12 +337,13 @@ def _build_model_chat_messages(
     all_image_urls: list[str],
     video_frame_counts: dict[int, int],
 ) -> list[dict]:
-    return _build_mllm_chat_messages(
-        messages,
-        all_image_urls=all_image_urls,
-        video_frame_counts=video_frame_counts,
-        text_content_as_string=_mllm_text_content_as_string(config),
-    )
+    kwargs = {
+        "all_image_urls": all_image_urls,
+        "video_frame_counts": video_frame_counts,
+    }
+    if _mllm_text_content_as_string(config):
+        kwargs["text_content_as_string"] = True
+    return _build_mllm_chat_messages(messages, **kwargs)
 
 
 @dataclass
