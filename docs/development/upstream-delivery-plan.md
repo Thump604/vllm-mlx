@@ -31,6 +31,9 @@ reviewer to reconstruct later product stages from a large mixed diff.
 
 **Depends on:** none.
 
+**Upstream:** [waybarrios/vllm-mlx#645](https://github.com/waybarrios/vllm-mlx/pull/645)
+is open, assigned to Jan, and awaiting review/CI.
+
 **Scope:** Add the versioned profile schema, provenance vocabulary, example,
 and concise contract documentation. Define provider facts, derived
 recommendations, measured qualification, and user overrides without wiring a
@@ -41,6 +44,7 @@ server or lifecycle path.
 - `schemas/model-profile-v1.schema.json`
 - `schemas/examples/model-profile-v1.example.json`
 - `docs/development/model-profile-v1.md`
+- `tests/test_model_profile_schema.py`
 
 **Acceptance checks:** Schema validation succeeds for the example; required
 identity, artifact, capability, serving, hardware, qualification, evidence,

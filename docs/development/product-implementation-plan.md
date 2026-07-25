@@ -147,7 +147,9 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Run P4.5 independent release-readiness review against the completed P4.4
-evidence and the dependency-ordered upstream patch split. Ops is needed only to
-restore or select the serving slot; Jobs has no action until a workload
-contract is intentionally published.
+Complete the P4.4 Qwen 3.6 35B qualification package against the exact catalog
+subject and recorded 128 GB Apple Silicon envelope. The package must bind the
+artifact revision and digest, resolved serving profile, measured hardware, and
+managed install/activate/healthy-chat/coding-setup evidence. Ops must provide an
+isolated Qwen qualification window; Jobs must release or suspend its lease for
+that window. Resume P4.5 only after the profile-bound package passes.
