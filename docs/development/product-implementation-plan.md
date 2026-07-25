@@ -103,7 +103,7 @@ evidence for, or part of, the first product workflow.
 | P4.1 | complete | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
 | P4.2 | complete | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
 | P4.3 | complete | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
-| P4.4 | in_progress | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
+| P4.4 | complete | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
 | P4.5 | pending | Independent release-readiness review | Terra `high` | P4.4 |
 
 ### P4 Acceptance Gate
@@ -120,16 +120,24 @@ evidence for, or part of, the first product workflow.
 - Recorded 64 GB and 128 GB Apple Silicon hardware envelopes: complete.
 - Product control service, managed runtime adapter, restart validation, and
   focused regression coverage: complete in the integration branch.
-- Laguna S 2.1 live qualification: pending. The profile remains
-  `not_qualified` and cannot be activated through the product API until a
-  bounded non-live run binds passing evidence to the exact local artifact and
-  profile digest.
+- Laguna S 2.1 bounded serving qualification: complete for the exact local Q4
+  target plus Q4 DFlash draft. Load, model-card sampling, native parser and tool
+  call, streamed post-tool continuation, visible final content, request-local
+  speculative metadata, cleanup, 128K bounded KV, and peak memory were
+  exercised. The provider-recommended seven speculative tokens map to MLX
+  verify block size eight.
+- Long-horizon coding suitability remains a product/workload evaluation, not a
+  serving qualification claim. A bounded Fibonacci probe used 1,972 completion
+  tokens and roughly 5.6K reasoning characters; community reports also describe
+  reasoning loops on larger tasks. Neither observation is classified as a
+  Runtime defect without a controlled differential.
 - Qwen remains the portable known-good first-release reference; Laguna is the
   first new-model onboarding acceptance proof.
 
 ## Deferred Until The First Product Workflow Passes
 
-- Additional speculative backends or cache tiers.
+- Additional speculative backends or cache tiers beyond the Laguna DFlash
+  first-release path.
 - Arbitrary Hugging Face model auto-configuration.
 - Simultaneous large-model residency as a product requirement.
 - A new first-party coding-agent engine.
@@ -138,9 +146,7 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Allocate one non-live model window for the exact Laguna S 2.1 artifact, run the
-bounded P4.4 load/generation/parser/tool/memory checks, and bind the resulting
-evidence to the profile. After that passes, run P4.5 independent
-release-readiness review and close the roadmap. Ops is needed only to allocate
-and restore the serving slot; Jobs has no action until a qualified workload
+Run P4.5 independent release-readiness review against the completed P4.4
+evidence and the dependency-ordered upstream patch split. Ops is needed only to
+restore or select the serving slot; Jobs has no action until a workload
 contract is intentionally published.

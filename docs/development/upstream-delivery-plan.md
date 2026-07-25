@@ -148,6 +148,91 @@ acceptance record and must not be published as portable profile fields.
   parser implementation, live serving, MTP/DFlash/SpecPrefill, and production
   exposure.
 
+## Laguna Operational Serving PR Sequence
+
+The operational implementation is intentionally separate from the portable
+profile roadmap above. Do not combine these patches into one review.
+
+### Laguna Runtime PR A: mlx-vlm baseline integration correctness
+
+**Repository:** `Blaizzy/mlx-vlm`
+
+**Scope:** Preserve Laguna special-token and string-message behavior required by
+the provider chat template, and load the processor regex without changing other
+model families.
+
+**Acceptance checks:** Focused tokenizer/template, plain message, tool-call, and
+post-tool continuation tests fail before the fix and pass after it.
+
+**Excluded:** DFlash, vllm-mlx server wiring, Runtime registry data, local model
+paths, qualification claims, and broad model-loader cleanup.
+
+### Laguna Runtime PR B: mlx-vlm generic DFlash backend
+
+**Repository:** `Blaizzy/mlx-vlm`
+
+**Depends on:** Laguna Runtime PR A.
+
+**Scope:** Add the Laguna DFlash drafter, exact checkpoint/target compatibility
+validation, request-local hidden-state capture and teardown, speculative cache
+rollback, converter support for processor-less DFlash checkpoints, and focused
+metadata/cleanup tests.
+
+**Acceptance checks:** Config and weight mismatch rejection, disabled-path
+no-op, success/error/cancel cleanup, cache rollback, Q4 draft loading, and the
+documented mapping from seven speculative tokens to verify block size eight.
+
+**Excluded:** vllm-mlx CLI/server changes, local Runtime contracts, Jobs/Ops
+policy, Gemma or Qwen speculative changes, and long-horizon quality claims.
+
+### Laguna Runtime PR C: vllm-mlx request-local Poolside v1 parsers
+
+**Repository:** `waybarrios/vllm-mlx`
+
+**Scope:** Add provider-compatible `poolside_v1` reasoning and tool parsers,
+construct their incremental state per request, and cover direct, tool, and
+streaming parsing.
+
+**Acceptance checks:** Direct reasoning extraction, structured tool calls,
+fragmented arguments, post-tool continuation, and concurrent request-local
+state.
+
+**Excluded:** Laguna loading, DFlash, local Runtime contracts, model downloads,
+and model-quality claims.
+
+### Laguna Runtime PR D: vllm-mlx generic MLLM draft wiring
+
+**Repository:** `waybarrios/vllm-mlx`
+
+**Depends on:** Laguna Runtime PR B.
+
+**Scope:** Generalize MLLM draft loading for `dflash`, `eagle3`, and `mtp`; pass
+through trust-remote-code; expose method-neutral speculative metadata; and add
+an explicit default-off `--default-mllm-draft` option with per-request opt-out.
+
+**Acceptance checks:** Exact draft-kind validation, disabled default behavior,
+explicit enable/disable behavior, metadata counters, and focused MLLM server
+tests.
+
+**Excluded:** Laguna-specific model paths, Runtime registry rows, resident or
+Jobs defaults, continuous batching, unrelated speculative backends, and product
+quality claims.
+
+### Laguna Runtime PR E: vllm-mlx Laguna OpenAI message support
+
+**Repository:** `waybarrios/vllm-mlx`
+
+**Depends on:** Laguna Runtime PR C.
+
+**Scope:** Preserve Laguna string messages through OpenAI normalization and make
+the existing `poolside_v1` parser selectable from the CLI.
+
+**Acceptance checks:** Direct chat, structured tool call, and streamed post-tool
+continuation retain user content and produce clean final assistant content.
+
+**Excluded:** Generic DFlash engine work, local Runtime contracts, model
+downloads/conversion, and broad message-normalization refactors.
+
 ## Model Intelligence PR Sequence
 
 These topic branches may proceed after the profile contract exists. They stay
