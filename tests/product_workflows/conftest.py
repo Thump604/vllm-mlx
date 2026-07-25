@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import json
 from pathlib import Path
 
@@ -11,21 +12,16 @@ from vllm_mlx.catalog import load_catalog
 @pytest.fixture
 def product_catalog(tmp_path):
     root = Path(__file__).parents[2]
-    profile = json.loads(
-        (root / "schemas/examples/model-profile-v1.example.json").read_text()
+    profile = copy.deepcopy(
+        load_catalog(root / "catalog" / "profiles").get("qwen3.6-35b-a3b-8bit", 1)
     )
-    profile["profile_id"] = "golden-model"
-    profile["profile_revision"] = 1
-    from vllm_mlx.model_profile import compute_subject_digest
-
-    profile["subject_digest"] = compute_subject_digest(profile)
     profile["qualification"] = {
         "status": "qualified",
-        "reason": None,
+        "reason": "Test-only qualification overlay for workflow behavior.",
         "evidence": [
             {
-                "evidence_id": "golden-workflow-pass",
-                "kind": "golden_test",
+                "evidence_id": "qwen-catalog-workflow-test",
+                "kind": "workflow_test",
                 "location": "tests/product_workflows",
                 "artifact_sha256": "1" * 64,
                 "result": "pass",
@@ -36,7 +32,7 @@ def product_catalog(tmp_path):
             }
         ],
     }
-    (tmp_path / "golden.json").write_text(json.dumps(profile))
+    (tmp_path / "qwen3.6-35b-a3b-8bit.json").write_text(json.dumps(profile))
     return load_catalog(tmp_path)
 
 
@@ -125,7 +121,7 @@ class FakeProductClient:
 
 @pytest.fixture
 def profile_reference(product_catalog):
-    profile = product_catalog.get("golden-model", 1)
+    profile = product_catalog.get("qwen3.6-35b-a3b-8bit", 1)
     return {
         "profile_id": profile["profile_id"],
         "profile_revision": profile["profile_revision"],

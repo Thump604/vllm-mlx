@@ -86,7 +86,7 @@ def test_install_to_code_runs_through_real_control_transport(
         result = install_to_code(
             client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden",
             activate_idempotency_key="activate-golden",

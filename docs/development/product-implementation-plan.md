@@ -103,8 +103,8 @@ evidence for, or part of, the first product workflow.
 | P4.1 | complete | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
 | P4.2 | complete | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
 | P4.3 | complete | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
-| P4.4 | complete | Verify first-release models and supported Mac hardware profiles | Luna `high` | P4.3 |
-| P4.5 | pending | Independent release-readiness review | Terra `high` | P4.4 |
+| P4.4 | in progress | Verify one activatable first-release model and supported Mac hardware profile | Luna `high` | P4.3 |
+| P4.5 | blocked | Independent release-readiness review | Terra `high` | P4.4 |
 
 ### P4 Acceptance Gate
 
@@ -116,23 +116,24 @@ evidence for, or part of, the first product workflow.
 
 ### P4.4 Progress
 
-- Portable Qwen 3.6 35B and Laguna S 2.1 profiles: complete.
-- Recorded 64 GB and 128 GB Apple Silicon hardware envelopes: complete.
+- Portable Qwen 3.6 35B and Laguna S 2.1 structural profiles: complete. Both
+  remain non-activatable until exact profile-bound qualification evidence is
+  recorded; portable catalog facts are not local Runtime qualification.
+- Recorded 64 GB and 128 GB Apple Silicon hardware-envelope schemas: complete.
+  Model fit remains unknown until measured evidence is bound to a profile.
 - Product control service, managed runtime adapter, restart validation, and
   focused regression coverage: complete in the integration branch.
-- Laguna S 2.1 bounded serving qualification: complete for the exact local Q4
-  target plus Q4 DFlash draft. Load, model-card sampling, native parser and tool
-  call, streamed post-tool continuation, visible final content, request-local
-  speculative metadata, cleanup, 128K bounded KV, and peak memory were
-  exercised. The provider-recommended seven speculative tokens map to MLX
-  verify block size eight.
-- Long-horizon coding suitability remains a product/workload evaluation, not a
-  serving qualification claim. A bounded Fibonacci probe used 1,972 completion
-  tokens and roughly 5.6K reasoning characters; community reports also describe
-  reasoning loops on larger tasks. Neither observation is classified as a
-  Runtime defect without a controlled differential.
-- Qwen remains the portable known-good first-release reference; Laguna is the
-  first new-model onboarding acceptance proof.
+- Golden workflow tests now use the shipped Qwen profile identity with an
+  explicit test-only qualification overlay. They prove workflow behavior, not
+  live model eligibility.
+- Remaining P4.4 gate: bind one exact Qwen 3.6 35B artifact, serving profile,
+  measured 128 GB Apple Silicon envelope, and passing install/activate/chat
+  evidence to the catalog subject digest. Then run the catalog-backed
+  install-to-chat and install-to-code workflows without inventing a model
+  identity.
+- Laguna S 2.1 local Runtime evidence remains useful onboarding evidence but
+  does not make the portable profile qualified. Long-horizon coding suitability
+  remains a product/workload evaluation, not a serving qualification claim.
 
 ## Deferred Until The First Product Workflow Passes
 

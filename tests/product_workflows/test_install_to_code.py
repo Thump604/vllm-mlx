@@ -11,7 +11,7 @@ def test_golden_install_to_code_emits_auth_aware_configuration(
     result = install_to_code(
         product_client,
         product_catalog,
-        profile_id="golden-model",
+        profile_id="qwen3.6-35b-a3b-8bit",
         profile_revision=1,
         install_idempotency_key="install-golden-1",
         activate_idempotency_key="activate-golden-1",
@@ -39,7 +39,7 @@ def test_golden_workflow_stops_on_failed_operation(product_catalog, product_clie
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -60,7 +60,7 @@ def test_golden_workflow_stops_when_activation_fails(product_catalog, product_cl
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -81,7 +81,7 @@ def test_golden_workflow_rejects_substituted_operation(product_catalog, product_
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -107,7 +107,7 @@ def test_golden_workflow_rejects_wrong_profile_operation(
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -129,7 +129,7 @@ def test_golden_workflow_cancels_and_reports_recovery_on_poll_exhaustion(
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -155,7 +155,7 @@ def test_golden_workflow_validates_final_polled_record_before_cancellation(
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -188,7 +188,7 @@ def test_golden_workflow_rejects_unbound_cancellation_record(
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -204,7 +204,7 @@ def test_golden_workflow_replay_uses_same_idempotency_keys(
     product_catalog, product_client
 ):
     arguments = {
-        "profile_id": "golden-model",
+        "profile_id": "qwen3.6-35b-a3b-8bit",
         "profile_revision": 1,
         "install_idempotency_key": "install-golden-1",
         "activate_idempotency_key": "activate-golden-1",
@@ -236,7 +236,7 @@ def test_golden_workflow_rejects_missing_active_endpoint(
         install_to_code(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",

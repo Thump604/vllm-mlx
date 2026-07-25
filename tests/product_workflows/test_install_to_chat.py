@@ -11,7 +11,7 @@ def test_golden_install_to_chat_uses_exact_identity_and_waits_for_activation(
     result = install_to_chat(
         product_client,
         product_catalog,
-        profile_id="golden-model",
+        profile_id="qwen3.6-35b-a3b-8bit",
         profile_revision=1,
         install_idempotency_key="install-golden-1",
         activate_idempotency_key="activate-golden-1",
@@ -49,7 +49,7 @@ def test_golden_chat_fails_before_inference_when_active_identity_drifts(
         install_to_chat(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
@@ -75,7 +75,7 @@ def test_golden_chat_requires_loaded_healthy_runtime(
         install_to_chat(
             product_client,
             product_catalog,
-            profile_id="golden-model",
+            profile_id="qwen3.6-35b-a3b-8bit",
             profile_revision=1,
             install_idempotency_key="install-golden-1",
             activate_idempotency_key="activate-golden-1",
