@@ -520,6 +520,23 @@ class TestServeCli:
 
         assert args.tool_call_parser == "gpt-oss"
 
+    def test_tool_call_parser_accepts_poolside_v1(self):
+        """Laguna's registered parser must be selectable from the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        args = create_parser().parse_args(
+            [
+                "serve",
+                "poolside/Laguna-S-2.1",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "poolside_v1",
+            ]
+        )
+
+        assert args.tool_call_parser == "poolside_v1"
+        assert args.enable_auto_tool_choice is True
+
     def test_models_config_allows_registry_backed_serve(self):
         """Registry-backed serving should not require a positional model."""
         from vllm_mlx.cli import create_parser
