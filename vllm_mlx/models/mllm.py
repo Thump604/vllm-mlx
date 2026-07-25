@@ -174,10 +174,12 @@ def _append_text_content_part(
     text_parts.append(text)
 
 
-def _build_string_mllm_message_content(content: str, role: str) -> tuple[object, bool]:
+def _build_string_mllm_message_content(
+    content: str, role: str, *, text_content_as_string: bool = False
+) -> tuple[object, bool]:
     if not content:
         return "", False
-    if role == "assistant":
+    if role == "assistant" or text_content_as_string:
         return content, True
     return [_text_content_part(content)], True
 
@@ -226,10 +228,13 @@ def _build_ordered_mllm_message_content(
     role: str,
     all_image_urls: list[str],
     video_frame_count: int = 0,
+    text_content_as_string: bool = False,
 ) -> tuple[object, bool]:
     """Build template content while preserving OpenAI media/text part order."""
     if isinstance(content, str):
-        return _build_string_mllm_message_content(content, role)
+        return _build_string_mllm_message_content(
+            content, role, text_content_as_string=text_content_as_string
+        )
 
     if not isinstance(content, list):
         return "", False
@@ -247,7 +252,10 @@ def _build_ordered_mllm_message_content(
             video_frame_count=remaining_video_frames,
         )
 
-    if role == "assistant":
+    if role == "assistant" or (
+        text_content_as_string
+        and all(part.get("type") == "text" for part in built_parts)
+    ):
         text = "".join(text_parts)
         return text, bool(text)
 
@@ -273,6 +281,7 @@ def _build_mllm_chat_messages(
     *,
     all_image_urls: list[str],
     video_frame_counts: dict[int, int],
+    text_content_as_string: bool = False,
 ) -> list[dict]:
     """Build chat-template messages without reordering multimodal content parts."""
     chat_messages: list[dict] = []
@@ -286,6 +295,7 @@ def _build_mllm_chat_messages(
             role=role,
             all_image_urls=all_image_urls,
             video_frame_count=video_frame_counts.get(msg_idx, 0),
+            text_content_as_string=text_content_as_string,
         )
         chat_message = {"role": role, "content": content}
 
@@ -313,6 +323,27 @@ def _build_mllm_chat_messages(
         if has_content:
             chat_messages.append(chat_message)
     return chat_messages
+
+
+def _mllm_text_content_as_string(config: object) -> bool:
+    if isinstance(config, dict):
+        return config.get("model_type") == "laguna"
+    return getattr(config, "model_type", None) == "laguna"
+
+
+def _build_model_chat_messages(
+    config: object,
+    messages: list[dict],
+    all_image_urls: list[str],
+    video_frame_counts: dict[int, int],
+) -> list[dict]:
+    kwargs = {
+        "all_image_urls": all_image_urls,
+        "video_frame_counts": video_frame_counts,
+    }
+    if _mllm_text_content_as_string(config):
+        kwargs["text_content_as_string"] = True
+    return _build_mllm_chat_messages(messages, **kwargs)
 
 
 @dataclass
@@ -2210,10 +2241,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        chat_messages = _build_mllm_chat_messages(
+        chat_messages = _build_model_chat_messages(
+            self.config,
             messages,
-            all_image_urls=all_image_urls,
-            video_frame_counts=_msg_video_frame_counts,
+            all_image_urls,
+            _msg_video_frame_counts,
         )
 
         # Process images
@@ -2613,10 +2645,11 @@ class MLXMultimodalLM:
         for aud_inputs in _msg_audio_inputs.values():
             all_audio_inputs.extend(aud_inputs)
 
-        chat_messages = _build_mllm_chat_messages(
+        chat_messages = _build_model_chat_messages(
+            self.config,
             messages,
-            all_image_urls=all_image_urls,
-            video_frame_counts=_msg_video_frame_counts,
+            all_image_urls,
+            _msg_video_frame_counts,
         )
 
         all_images = []

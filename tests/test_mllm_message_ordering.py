@@ -1,6 +1,26 @@
 import json
+from types import SimpleNamespace
 
-from vllm_mlx.models.mllm import _build_mllm_chat_messages
+from vllm_mlx.models.mllm import (
+    _build_mllm_chat_messages,
+    _build_model_chat_messages,
+    _mllm_text_content_as_string,
+)
+
+
+def test_laguna_text_content_helper_accepts_config_shapes():
+    assert _mllm_text_content_as_string({"model_type": "laguna"}) is True
+    assert _mllm_text_content_as_string(SimpleNamespace(model_type="laguna")) is True
+    assert _mllm_text_content_as_string({"model_type": "other"}) is False
+
+
+def test_model_chat_message_helper_preserves_laguna_text_shape():
+    assert _build_model_chat_messages(
+        {"model_type": "laguna"},
+        [{"role": "user", "content": "Keep this text"}],
+        [],
+        {},
+    ) == [{"role": "user", "content": "Keep this text"}]
 
 
 def test_mllm_chat_messages_preserve_text_only_shape():
@@ -39,6 +59,43 @@ def test_mllm_chat_messages_preserve_text_only_shape():
         },
         {"role": "assistant", "content": "Ready."},
     ]
+
+
+def test_mllm_chat_messages_can_preserve_string_content_for_text_templates():
+    messages = [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+
+    chat_messages = _build_mllm_chat_messages(
+        messages,
+        all_image_urls=[],
+        video_frame_counts={},
+        text_content_as_string=True,
+    )
+
+    assert chat_messages == messages
+
+
+def test_mllm_chat_messages_flatten_text_parts_for_text_templates():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is "},
+                {"type": "text", "text": "2+2?"},
+            ],
+        }
+    ]
+
+    chat_messages = _build_mllm_chat_messages(
+        messages,
+        all_image_urls=[],
+        video_frame_counts={},
+        text_content_as_string=True,
+    )
+
+    assert chat_messages == [{"role": "user", "content": "What is 2+2?"}]
 
 
 def test_mllm_chat_messages_preserve_image_text_order():

@@ -1362,12 +1362,13 @@ Examples:
             "gemma4",
             "glm47",
             "minimax",
+            "poolside_v1",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
             "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
-            "xlam, functionary, glm47, minimax. "
+            "xlam, functionary, glm47, minimax, poolside_v1. "
             "Required for --enable-auto-tool-choice."
         ),
     )
