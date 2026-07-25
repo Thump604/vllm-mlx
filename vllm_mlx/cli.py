@@ -16,7 +16,30 @@ import argparse
 import json
 import sys
 
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import make_json_object_arg_parser
+from .drafter_options import add_mllm_draft_arguments
+
+
+def _configure_generation_defaults(server, args) -> None:
+    """Apply request defaults while preserving explicit per-request overrides."""
+    server._default_mllm_draft = bool(getattr(args, "default_mllm_draft", False))
+    for name in (
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+    ):
+        value = getattr(args, f"default_{name}", None)
+        if value is not None:
+            setattr(server, f"_default_{name}", value)
+    server._default_chat_template_kwargs = getattr(
+        args, "default_chat_template_kwargs", None
+    )
+    thinking_budget = getattr(args, "default_thinking_token_budget", None)
+    if thinking_budget is not None:
+        server._default_thinking_token_budget = thinking_budget
 
 
 def serve_command(args):
@@ -110,31 +133,13 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
-    # Configure generation defaults
-    if args.default_temperature is not None:
-        server._default_temperature = args.default_temperature
-    if args.default_top_p is not None:
-        server._default_top_p = args.default_top_p
-    server._default_chat_template_kwargs = getattr(
-        args, "default_chat_template_kwargs", None
-    )
-    if args.default_top_k is not None:
-        server._default_top_k = args.default_top_k
-    if args.default_min_p is not None:
-        server._default_min_p = args.default_min_p
-    if args.default_presence_penalty is not None:
-        server._default_presence_penalty = args.default_presence_penalty
-    if args.default_repetition_penalty is not None:
-        server._default_repetition_penalty = args.default_repetition_penalty
+    _configure_generation_defaults(server, args)
     max_audio_upload_mb = getattr(args, "max_audio_upload_mb", 25)
     max_tts_input_chars = getattr(args, "max_tts_input_chars", 4096)
     server._max_audio_upload_bytes = max_audio_upload_mb * 1024 * 1024
     server._max_tts_input_chars = max_tts_input_chars
 
-    # Configure thinking token budget
     default_thinking_token_budget = getattr(args, "default_thinking_token_budget", None)
-    if default_thinking_token_budget is not None:
-        server._default_thinking_token_budget = default_thinking_token_budget
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -1260,26 +1265,7 @@ Examples:
         "Must share the same tokenizer as the target model.",
     )
     # MLLM speculative draft/assistant model
-    serve_parser.add_argument(
-        "--mllm-draft-model",
-        type=str,
-        default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model. "
-        "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
-    )
-    serve_parser.add_argument(
-        "--mllm-draft-kind",
-        type=str,
-        default=None,
-        choices=["mtp"],
-        help="mlx-vlm draft kind for --mllm-draft-model.",
-    )
-    serve_parser.add_argument(
-        "--mllm-draft-block-size",
-        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
-        default=None,
-        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
-    )
+    add_mllm_draft_arguments(serve_parser, include_default=True)
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",

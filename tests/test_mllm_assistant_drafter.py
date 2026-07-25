@@ -7,6 +7,101 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_mllm_loads_dflash_through_drafter_loader(monkeypatch):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    draft = SimpleNamespace(config=SimpleNamespace(model_type="laguna"))
+    captured = {}
+
+    def load_drafter(path, kind=None):
+        captured["load"] = (path, kind)
+        return draft, "dflash"
+
+    def validate(target, loaded_draft, kind):
+        captured["validate"] = (target, loaded_draft, kind)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(
+            load_drafter=load_drafter,
+            validate_drafter_compatibility=validate,
+        ),
+    )
+
+    target = object()
+    model = MLXMultimodalLM(
+        "target", draft_model="draft", draft_kind="dflash", draft_block_size=16
+    )
+    model.model = target
+
+    assert model._load_draft_model() is draft
+    assert captured["load"] == ("draft", "dflash")
+    assert captured["validate"] == (target, draft, "dflash")
+    assert model.draft_kind == "dflash"
+
+
+def test_mllm_load_forwards_trust_remote_code(monkeypatch):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    captured = {}
+
+    def load(path, **kwargs):
+        captured["load"] = (path, kwargs)
+        return SimpleNamespace(config=SimpleNamespace()), object()
+
+    monkeypatch.setitem(sys.modules, "mlx_vlm", SimpleNamespace(load=load))
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(load_config=lambda path: {"model_type": "laguna"}),
+    )
+
+    model = MLXMultimodalLM("local-laguna", trust_remote_code=True)
+    model.load()
+
+    assert captured["load"] == (
+        "local-laguna",
+        {"trust_remote_code": True},
+    )
+
+
+def test_mllm_uses_resolved_drafter_kind(monkeypatch):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(
+            load_drafter=lambda *args, **kwargs: (object(), "dflash"),
+            validate_drafter_compatibility=lambda *args: None,
+        ),
+    )
+
+    model = MLXMultimodalLM("target", draft_model="draft", draft_kind=None)
+    model.model = object()
+    model._load_draft_model()
+
+    assert model.draft_kind == "dflash"
+
+
+def test_server_cli_accepts_dflash_drafter_kind():
+    from vllm_mlx import server
+
+    args = server.create_parser().parse_args(
+        [
+            "--model",
+            "target",
+            "--mllm-draft-model",
+            "draft",
+            "--mllm-draft-kind",
+            "dflash",
+        ]
+    )
+
+    assert args.mllm_draft_kind == "dflash"
+
+
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
     from vllm_mlx.models.mllm import MLXMultimodalLM
 
@@ -243,6 +338,42 @@ def test_chat_request_passes_mllm_draft_opt_in():
     prepared = _prepare_chat_completion_invocation(Engine(), request, 16)
 
     assert prepared.chat_kwargs["mllm_draft"] is True
+
+
+def test_chat_request_uses_server_draft_default_and_allows_opt_out(monkeypatch):
+    from vllm_mlx import server
+    from vllm_mlx.server import (
+        ChatCompletionRequest,
+        Message,
+        _prepare_chat_completion_invocation,
+    )
+
+    class Engine:
+        is_mllm = True
+        preserve_native_tool_format = False
+
+    monkeypatch.setattr(server, "_default_mllm_draft", True)
+    implicit = ChatCompletionRequest(
+        model="laguna", messages=[Message(role="user", content="hello")]
+    )
+    disabled = ChatCompletionRequest(
+        model="laguna",
+        messages=[Message(role="user", content="hello")],
+        mllm_draft=False,
+    )
+
+    assert (
+        _prepare_chat_completion_invocation(Engine(), implicit, 16).chat_kwargs[
+            "mllm_draft"
+        ]
+        is True
+    )
+    assert (
+        _prepare_chat_completion_invocation(Engine(), disabled, 16).chat_kwargs[
+            "mllm_draft"
+        ]
+        is False
+    )
 
 
 @pytest.mark.anyio

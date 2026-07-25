@@ -265,6 +265,9 @@ class GenerationMetadata(BaseModel):
 
     no_final_content_watchdog_tokens: int | None = None
     no_final_content_watchdog_enforced: bool = False
+    speculative_method: str | None = None
+    speculative_drafts: int = 0
+    speculative_accepted: int = 0
 
 
 class ChatCompletionResponse(BaseModel):

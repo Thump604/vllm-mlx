@@ -106,6 +106,21 @@ def test_generation_metadata_omitted_without_thinking_processor(monkeypatch):
     assert server._generation_metadata(None) is None
 
 
+def test_generation_metadata_reports_method_neutral_speculative_counters(monkeypatch):
+    from vllm_mlx import server
+
+    output = SimpleNamespace(mtp_drafts=30, mtp_accepted=21)
+    engine = SimpleNamespace(_model=SimpleNamespace(draft_kind="dflash"))
+    monkeypatch.setattr(server, "_engine", engine)
+
+    metadata = server._generation_metadata(None, output)
+
+    assert metadata is not None
+    assert metadata.speculative_method == "dflash"
+    assert metadata.speculative_drafts == 30
+    assert metadata.speculative_accepted == 21
+
+
 def test_build_thinking_processor_warns_when_watchdog_cannot_fire(monkeypatch, caplog):
     from vllm_mlx import server
 
