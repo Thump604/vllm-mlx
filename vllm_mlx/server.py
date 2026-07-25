@@ -154,7 +154,8 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import make_json_object_arg_parser
+from .drafter_options import add_mllm_draft_arguments
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
     resolve_embedding_model_name,
@@ -191,6 +192,7 @@ _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+_default_mllm_draft: bool = False
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _default_chat_template_kwargs: dict[str, object] | None = None
@@ -573,11 +575,60 @@ def _resolve_no_final_content_token_limit() -> int | None:
     return value
 
 
+def _resolve_mllm_draft_request(request: ChatCompletionRequest) -> bool | None:
+    """Resolve request opt-out precedence against the server drafter default."""
+    requested = getattr(request, "mllm_draft", None)
+    if requested is not None:
+        return requested
+    return True if _default_mllm_draft else None
+
+
+def _attach_thinking_processor(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    chat_kwargs: dict,
+    json_logits_processor: object | None,
+) -> object | None:
+    """Attach the optional thinking wrapper without changing request defaults."""
+    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
+    enable_thinking = chat_kwargs.get("enable_thinking", True)
+    if thinking_budget is None or enable_thinking is False:
+        return None
+
+    thinking_proc = _build_thinking_processor(
+        engine,
+        thinking_budget,
+        inner=json_logits_processor,
+        prompt_has_think_tag=bool(enable_thinking),
+    )
+    if thinking_proc is None:
+        return None
+
+    # The thinking processor delegates to the JSON processor, so it must be the
+    # final processor rather than having the JSON processor applied twice.
+    existing_processors = list(chat_kwargs.get("logits_processors") or [])
+    if (
+        json_logits_processor is not None
+        and existing_processors
+        and existing_processors[-1] is json_logits_processor
+    ):
+        existing_processors = existing_processors[:-1]
+    chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
+    return thinking_proc
+
+
 def _generation_metadata(
     thinking_processor: object | None,
+    output: GenerationOutput | None = None,
 ) -> GenerationMetadata | None:
-    if thinking_processor is None:
+    speculative_drafts = int(getattr(output, "mtp_drafts", 0) or 0)
+    speculative_accepted = int(getattr(output, "mtp_accepted", 0) or 0)
+    if thinking_processor is None and speculative_drafts == 0:
         return None
+    speculative_method = None
+    if speculative_drafts:
+        engine_model = getattr(_engine, "_model", None)
+        speculative_method = getattr(engine_model, "draft_kind", None)
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
             thinking_processor, "_no_final_content_token_limit", None
@@ -585,6 +636,9 @@ def _generation_metadata(
         no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
+        speculative_method=speculative_method,
+        speculative_drafts=speculative_drafts,
+        speculative_accepted=speculative_accepted,
     )
 
 
@@ -805,7 +859,7 @@ def _prepare_chat_completion_invocation(
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
 
-    mllm_draft = getattr(request, "mllm_draft", None)
+    mllm_draft = _resolve_mllm_draft_request(request)
     if mllm_draft is not None:
         chat_kwargs["mllm_draft"] = mllm_draft
 
@@ -826,30 +880,9 @@ def _prepare_chat_completion_invocation(
             chat_kwargs, json_logits_processor
         )
 
-    # Thinking-aware logits processor: cap reasoning tokens when a budget is set.
-    # Only build when thinking is actually enabled for this request -- a CLI
-    # default budget should not alter non-thinking requests.
-    thinking_budget = request.thinking_token_budget or _default_thinking_token_budget
-    enable_thinking = chat_kwargs.get("enable_thinking", True)
-    thinking_proc = None
-    if thinking_budget is not None and enable_thinking is not False:
-        thinking_proc = _build_thinking_processor(
-            engine,
-            thinking_budget,
-            inner=json_logits_processor,
-            prompt_has_think_tag=bool(enable_thinking),
-        )
-        if thinking_proc is not None:
-            # Replace the logits_processors list: the thinking processor wraps
-            # the JSON processor as its inner delegate, so we don't double-add.
-            existing_processors = list(chat_kwargs.get("logits_processors") or [])
-            if (
-                json_logits_processor is not None
-                and existing_processors
-                and existing_processors[-1] is json_logits_processor
-            ):
-                existing_processors = existing_processors[:-1]
-            chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
+    thinking_proc = _attach_thinking_processor(
+        engine, request, chat_kwargs, json_logits_processor
+    )
 
     return PreparedChatInvocation(
         messages=messages,
@@ -5084,7 +5117,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
-            generation_metadata=_generation_metadata(prepared.thinking_processor),
+            generation_metadata=_generation_metadata(
+                prepared.thinking_processor, output
+            ),
         )
     finally:
         if release_on_exit:
@@ -6735,25 +6770,7 @@ Examples:
         action="store_true",
         help="Enable continuous batching for multiple concurrent users",
     )
-    parser.add_argument(
-        "--mllm-draft-model",
-        type=str,
-        default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model.",
-    )
-    parser.add_argument(
-        "--mllm-draft-kind",
-        type=str,
-        default=None,
-        choices=["mtp"],
-        help="mlx-vlm draft kind for --mllm-draft-model.",
-    )
-    parser.add_argument(
-        "--mllm-draft-block-size",
-        type=make_positive_int_arg_parser("--mllm-draft-block-size"),
-        default=None,
-        help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
-    )
+    add_mllm_draft_arguments(parser)
     parser.add_argument(
         "--mcp-config",
         type=str,

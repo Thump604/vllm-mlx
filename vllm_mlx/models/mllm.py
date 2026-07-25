@@ -1395,7 +1395,9 @@ class MLXMultimodalLM:
 
             logger.info(f"Loading MLLM: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
+            self.model, self.processor = load(
+                self.model_name, trust_remote_code=self.trust_remote_code
+            )
             self.config = load_config(self.model_name)
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
@@ -1433,9 +1435,16 @@ class MLXMultimodalLM:
         if self.draft_kind == "mtp":
             return load_gemma4_assistant_drafter(self.draft_model_path)
 
-        from mlx_vlm.utils import load
+        from mlx_vlm.speculative.drafters import (
+            load_drafter,
+            validate_drafter_compatibility,
+        )
 
-        draft_model, _ = load(self.draft_model_path)
+        draft_model, resolved_kind = load_drafter(
+            self.draft_model_path, kind=self.draft_kind
+        )
+        validate_drafter_compatibility(self.model, draft_model, resolved_kind)
+        self.draft_kind = resolved_kind
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
