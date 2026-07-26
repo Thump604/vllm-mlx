@@ -1,17 +1,17 @@
 # ModelProfile Legacy Compatibility Mapping
 
-Status: PR3B registry and CLI serving import slice
+Status: PR3C qualification import slice
 Runtime wiring: none
 
 ## Boundary
 
 `vllm_mlx.model_profile_compat` is a pure adapter for already-loaded legacy
-records. This slice accepts acquisition, conversion, registration, registry, and
-CLI-server inputs and returns an incomplete ModelProfile v1 import-result
+records. This slice accepts acquisition, conversion, registration, registry,
+CLI-server, and qualification inputs and returns an incomplete ModelProfile v1 import-result
 envelope. It does not read files, download artifacts, mutate runtime state,
 start a server, qualify a model, or finalize a profile.
 
-The implementation has five ownership modules:
+The implementation has six ownership modules:
 
 - `vllm_mlx/model_profile_compat.py` is the stable public facade. It re-exports
   the three result/input dataclasses and owns the keyword-only dispatcher.
@@ -26,6 +26,9 @@ The implementation has five ownership modules:
   owns nested-serving normalization and serving diagnostics.
 - `vllm_mlx/_model_profile_serving_vocab.py` owns the closed feature, sampling,
   policy, limit, and top-level serving vocabularies used by the PR3B mapper.
+- `vllm_mlx/_model_profile_qualification_compat.py` owns PR3C normalization of
+  already-recorded qualification evidence. It does not run a qualification,
+  recompute a subject digest, finalize a profile, or mutate runtime state.
 
 Each input carries a payload, source location, and SHA-256. Output source
 descriptors intentionally omit payloads. The result is an audit record and is
@@ -40,6 +43,7 @@ not an activation input: `complete` is always `false` in this slice.
 | Registration | artifact ID, served name, alias, profile sampling defaults, template kwargs, parser declarations | Registration feature flags and `production_ready` are not v1 feature state or qualification evidence. |
 | Registry entry | Serving facts only | Registry names, paths, sources, preload, memory, and MLLM hints do not establish identity or aliases; fields without a lossless v1 target are diagnosed. |
 | CLI server | Serving facts only | Nested `serving` values take precedence over conflicting top-level values and the conflict is retained as a diagnostic. |
+| Qualification record | Qualification status and evidence history only | Each evidence record must have the exact v1 fields, hashes, result, and timestamp. `qualified` requires a structurally valid passing record; `fail` and `incomplete` records remain preserved history. |
 
 The adapter copies imported values and never mutates input mappings. When two
 accepted sources assign different values to one destination pointer, the first
@@ -60,10 +64,16 @@ setting, `max_tokens`, `max_request_tokens`, and `max_kv_size`. Unknown fields,
 features, and settings; malformed policies; and non-boolean feature declarations
 remain deterministic diagnostics rather than inferred facts.
 
-Every required v1 fact not established by these five source kinds produces a
+Every required v1 fact not established by these six source kinds produces a
 `missing_required_fact` issue with its JSON Pointer. The mapper does not infer
 capabilities, hashes, context limits, feature states, policies, or
 qualification from model names, parser names, feature flags, or booleans.
+
+Generic command `status`, `production_ready`, and bare qualification booleans
+are recorded only as deterministic warnings. They never establish qualification
+truth. PR3C preserves a valid `not_qualified`, `failed`, or `blocked` status,
+but it always returns `complete=false`; binding evidence to the final canonical
+subject digest and promoting a complete profile remain PR3D responsibilities.
 
 The serialized result follows
 `schemas/model-profile-import-result-v1.schema.json` and can be checked with

@@ -13,8 +13,14 @@ SourceKind = Literal[
     "registration",
     "registry",
     "cli_server",
+    "qualification",
 ]
-ProvenanceKind = Literal["provider_fact", "derived_recommendation", "maintainer_policy"]
+ProvenanceKind = Literal[
+    "provider_fact",
+    "derived_recommendation",
+    "measured_result",
+    "maintainer_policy",
+]
 
 _SHA256_LENGTH = 64
 

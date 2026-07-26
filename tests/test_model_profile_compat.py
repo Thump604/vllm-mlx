@@ -289,7 +289,7 @@ def test_as_dict_omits_payloads_and_deep_copies_nested_values():
     assert "/unrelated" not in result.issues[0].sources
 
 
-def test_dispatcher_exposes_pr3b_keyword_only_inputs_without_expanding_exports():
+def test_dispatcher_exposes_pr3c_keyword_only_inputs_without_expanding_exports():
     signature = inspect.signature(import_legacy_model_profile)
     assert model_profile_compat.__all__ == (
         "LegacySourceInput",
@@ -306,6 +306,7 @@ def test_dispatcher_exposes_pr3b_keyword_only_inputs_without_expanding_exports()
         "registration",
         "registry_entry",
         "cli_server",
+        "qualification",
     ]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY

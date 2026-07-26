@@ -17,6 +17,10 @@ from vllm_mlx._model_profile_serving_compat import (
     import_registry as _import_registry,
     import_serving as _import_serving,
 )
+from vllm_mlx._model_profile_qualification_compat import (
+    import_qualification as _import_qualification,
+    is_rfc3339_datetime,
+)
 
 
 def _is_immutable_revision(value: Any) -> bool:
@@ -58,7 +62,12 @@ class _Importer:
         self.profile: dict[str, Any] = {"schema_version": 1}
         self.issues: list[CompatibilityIssue] = []
         self._field_sources: dict[str, LegacySourceInput] = {}
-        self._provenance: dict[tuple[SourceKind, ProvenanceKind], list[str]] = {}
+        self._provenance: dict[
+            tuple[SourceKind, str, str, ProvenanceKind], list[str]
+        ] = {}
+        self._provenance_sources: dict[
+            tuple[SourceKind, str, str, ProvenanceKind], LegacySourceInput
+        ] = {}
 
     def assign(
         self,
@@ -93,7 +102,14 @@ class _Importer:
             return
         target[key] = deepcopy(value)
         self._field_sources[pointer] = source
-        self._provenance.setdefault((source.kind, provenance_kind), []).append(pointer)
+        provenance_key = (
+            source.kind,
+            source.location,
+            source.sha256,
+            provenance_kind,
+        )
+        self._provenance.setdefault(provenance_key, []).append(pointer)
+        self._provenance_sources[provenance_key] = source
 
     def import_acquisition(self, source: LegacySourceInput) -> None:
         payload = source.payload
@@ -337,6 +353,9 @@ class _Importer:
     def import_cli_server(self, source: LegacySourceInput) -> None:
         _import_serving(source, self.assign, self.issues)
 
+    def import_qualification(self, source: LegacySourceInput) -> None:
+        _import_qualification(source, self.assign, self.issues)
+
     def _mapping_field(
         self,
         payload: Mapping[str, Any],
@@ -363,8 +382,9 @@ class _Importer:
     def finish(self) -> ModelProfileImportResult:
         if self._provenance:
             records = []
-            for (kind, provenance_kind), paths in self._provenance.items():
-                source = next(item for item in self.sources if item.kind == kind)
+            for key, paths in self._provenance.items():
+                provenance_kind = key[-1]
+                source = self._provenance_sources[key]
                 revision, rule_id, observed_at = _provenance_metadata(
                     source, provenance_kind
                 )
@@ -475,6 +495,7 @@ def _provenance_metadata(
             for value in (
                 payload.get("completed_at"),
                 payload.get("created_at"),
+                _qualification_observed_at(source),
                 inspection.get("inspected_at"),
             )
             if isinstance(value, str) and value
@@ -482,6 +503,20 @@ def _provenance_metadata(
         None,
     )
     return revision, rule_id, observed_at
+
+
+def _qualification_observed_at(source: LegacySourceInput) -> str | None:
+    if source.kind != "qualification":
+        return None
+    evidence = source.payload.get("evidence")
+    if not isinstance(evidence, list):
+        return None
+    for record in evidence:
+        if isinstance(record, Mapping):
+            created_at = record.get("created_at")
+            if is_rfc3339_datetime(created_at):
+                return created_at
+    return None
 
 
 def _import_legacy_sources(
@@ -502,6 +537,7 @@ def _import_legacy_sources(
         "registration": importer.import_registration,
         "registry": importer.import_registry,
         "cli_server": importer.import_cli_server,
+        "qualification": importer.import_qualification,
     }
     for source in sources:
         dispatch[source.kind](source)
