@@ -32,7 +32,7 @@ reviewer to reconstruct later product stages from a large mixed diff.
 **Depends on:** none.
 
 **Upstream:** [waybarrios/vllm-mlx#645](https://github.com/waybarrios/vllm-mlx/pull/645)
-is open, assigned to Jan, and awaiting review/CI.
+is open, mergeable, CI-green, assigned to Jan, and awaiting review.
 
 **Scope:** Add the versioned profile schema, provenance vocabulary, example,
 and concise contract documentation. Define provider facts, derived
@@ -139,12 +139,25 @@ explicit completion, registry mutation, serving activation, and product UI.
 
 **Depends on:** PR 3A.
 
+**Prepared branch:** `604/model-profile-import-serving-v1`, stacked on the
+prepared PR 3A branch at `8494643`. Focused profile suites pass (`37 passed`);
+Ruff, Black, focused mypy, touched slop, claim lint, and diff checks are clean.
+The final blind Desloppify review reports overall `90.0`, strict `89.9`, and no
+open T1/T2 or review findings. A complete-suite run under concurrent review
+load finished with `2289 passed, 24 skipped, 23 deselected` and one unrelated
+continuous-batching throughput-threshold failure (`41.5 tok/s` versus the
+test's fixed `100 tok/s` threshold); do not represent that run as a clean full
+suite. Do not open PR 3B before PR 3A is accepted.
+
 **Scope:** Add registry and CLI/server source mapping, shared serving
 normalization, boolean feature translation, and unknown-policy reporting.
 
 **Acceptance checks:** Registry identity remains distinct from served aliases;
 invalid booleans and same-source conflicts cannot silently change engine or
-feature state; unsupported policy shapes produce stable issues.
+feature state; unsupported policy shapes produce stable issues; malformed
+nested values and direct limits remain diagnostics rather than empty or
+ill-typed established facts; nested registry-only fields cannot disappear
+without a target-contract diagnostic.
 
 **Excluded:** Qualification evidence, explicit completion, live activation,
 and product UI.
