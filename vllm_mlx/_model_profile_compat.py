@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Mapping
 
 from vllm_mlx._model_profile_compat_types import (
     CompatibilityIssue,
     LegacySourceInput,
     ModelProfileImportResult,
+    ProvenanceKind,
     SourceKind,
 )
-
-ProvenanceKind = Literal["provider_fact", "derived_recommendation", "maintainer_policy"]
+from vllm_mlx._model_profile_serving_compat import (
+    import_registry as _import_registry,
+    import_serving as _import_serving,
+)
 
 
 def _is_immutable_revision(value: Any) -> bool:
@@ -24,11 +27,11 @@ def _is_immutable_revision(value: Any) -> bool:
     )
 
 
-def _mapping(value: Any) -> Mapping[str, Any]:
+def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _source(
+def _normalize_source_input(
     kind: SourceKind, value: LegacySourceInput | Mapping[str, Any] | None
 ) -> LegacySourceInput | None:
     if value is None:
@@ -94,8 +97,15 @@ class _Importer:
 
     def import_acquisition(self, source: LegacySourceInput) -> None:
         payload = source.payload
-        inspection = _mapping(payload.get("inspection"))
-        family = _mapping(inspection.get("model_family"))
+        inspection = self._mapping_field(
+            payload, "inspection", source, "/acquisition/inspection"
+        )
+        family = self._mapping_field(
+            inspection,
+            "model_family",
+            source,
+            "/acquisition/inspection/model_family",
+        )
         self.assign("/identity/provider", "huggingface", source, "provider_fact")
         self.assign(
             "/identity/repository_id", payload.get("model_id"), source, "provider_fact"
@@ -138,11 +148,16 @@ class _Importer:
                 )
             )
             return
-        inspection = _mapping(output_inspection)
-        family = _mapping(inspection.get("model_family"))
+        inspection = output_inspection
+        family = self._mapping_field(
+            inspection,
+            "model_family",
+            source,
+            "/conversion/output_inspection/model_family",
+        )
         self.assign("/artifact/format", "mlx", source, "derived_recommendation")
         self._import_inspection(family, inspection, source, "derived_recommendation")
-        recipe = _mapping(payload.get("recipe"))
+        recipe = self._mapping_field(payload, "recipe", source, "/conversion/recipe")
         for pointer, key in (
             ("/artifact/quantization/bits", "q_bits"),
             ("/artifact/quantization/group_size", "q_group_size"),
@@ -182,7 +197,12 @@ class _Importer:
             source,
             provenance_kind,
         )
-        quantization = _mapping(family.get("quantization"))
+        quantization = self._mapping_field(
+            family,
+            "quantization",
+            source,
+            "/inspection/model_family/quantization",
+        )
         self.assign(
             "/artifact/quantization/method",
             quantization.get("method", quantization.get("quant_method")),
@@ -232,7 +252,12 @@ class _Importer:
         alias = payload.get("preset_alias")
         if alias is not None:
             self.assign("/identity/aliases", [alias], source, "maintainer_policy")
-        defaults = _mapping(payload.get("serving_defaults"))
+        defaults = self._mapping_field(
+            payload,
+            "serving_defaults",
+            source,
+            "/registration/serving_defaults",
+        )
         sampling = {
             key: defaults[key]
             for key in (
@@ -259,7 +284,12 @@ class _Importer:
                 source,
                 "maintainer_policy",
             )
-        parsers = _mapping(payload.get("parser_policy"))
+        parsers = self._mapping_field(
+            payload,
+            "parser_policy",
+            source,
+            "/registration/parser_policy",
+        )
         self.assign(
             "/serving/parsers/tool",
             parsers.get("tool_call_parser"),
@@ -300,6 +330,35 @@ class _Importer:
                     ),
                 )
             )
+
+    def import_registry(self, source: LegacySourceInput) -> None:
+        _import_registry(source, self.assign, self.issues)
+
+    def import_cli_server(self, source: LegacySourceInput) -> None:
+        _import_serving(source, self.assign, self.issues)
+
+    def _mapping_field(
+        self,
+        payload: Mapping[str, Any],
+        field: str,
+        source: LegacySourceInput,
+        pointer: str,
+    ) -> Mapping[str, Any]:
+        value = payload.get(field)
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            return value
+        self.issues.append(
+            CompatibilityIssue(
+                code="invalid_source_field_shape",
+                severity="error",
+                pointer=pointer,
+                sources=(source.location,),
+                detail=f"legacy field {field!r} must be an object",
+            )
+        )
+        return {}
 
     def finish(self) -> ModelProfileImportResult:
         if self._provenance:
@@ -409,7 +468,7 @@ def _provenance_metadata(
         if provenance_kind == "provider_fact"
         else f"model-profile-compat-v1:{source.kind}"
     )
-    inspection = _mapping(payload.get("inspection"))
+    inspection = _mapping_or_empty(payload.get("inspection"))
     observed_at = next(
         (
             value
@@ -430,11 +489,20 @@ def _import_legacy_sources(
         tuple[SourceKind, LegacySourceInput | Mapping[str, Any] | None], ...
     ],
 ) -> ModelProfileImportResult:
-    source_values = tuple(_source(kind, value) for kind, value in source_inputs)
+    source_values = tuple(
+        _normalize_source_input(kind, value) for kind, value in source_inputs
+    )
     sources = tuple(source for source in source_values if source is not None)
     if not sources:
         raise ValueError("at least one legacy source is required")
     importer = _Importer(sources)
+    dispatch: dict[SourceKind, Callable[[LegacySourceInput], None]] = {
+        "acquisition": importer.import_acquisition,
+        "conversion": importer.import_conversion,
+        "registration": importer.import_registration,
+        "registry": importer.import_registry,
+        "cli_server": importer.import_cli_server,
+    }
     for source in sources:
-        getattr(importer, f"import_{source.kind}")(source)
+        dispatch[source.kind](source)
     return importer.finish()

@@ -1,17 +1,17 @@
 # ModelProfile Legacy Compatibility Mapping
 
-Status: first reviewable import slice
+Status: PR3B registry and CLI serving import slice
 Runtime wiring: none
 
 ## Boundary
 
 `vllm_mlx.model_profile_compat` is a pure adapter for already-loaded legacy
-records. This slice accepts acquisition, conversion, and registration inputs and
-returns an incomplete ModelProfile v1 import-result envelope. It does not read
-files, download artifacts, mutate runtime state, start a server, qualify a
-model, or finalize a profile.
+records. This slice accepts acquisition, conversion, registration, registry, and
+CLI-server inputs and returns an incomplete ModelProfile v1 import-result
+envelope. It does not read files, download artifacts, mutate runtime state,
+start a server, qualify a model, or finalize a profile.
 
-The implementation has three ownership modules:
+The implementation has five ownership modules:
 
 - `vllm_mlx/model_profile_compat.py` is the stable public facade. It re-exports
   the three result/input dataclasses and owns the keyword-only dispatcher.
@@ -20,7 +20,12 @@ The implementation has three ownership modules:
   `vllm_mlx.model_profile_compat`.
 - `vllm_mlx/_model_profile_compat.py` is the private import engine. It owns
   source normalization, assignment and conflict tracking, source-specific
-  mapping, provenance, and missing-fact collection.
+  orchestration, provenance, and missing-fact collection.
+- `vllm_mlx/_model_profile_serving_compat.py` is the private PR3B serving
+  mapper. It depends only on the shared types and serving-vocabulary modules and
+  owns nested-serving normalization and serving diagnostics.
+- `vllm_mlx/_model_profile_serving_vocab.py` owns the closed feature, sampling,
+  policy, limit, and top-level serving vocabularies used by the PR3B mapper.
 
 Each input carries a payload, source location, and SHA-256. Output source
 descriptors intentionally omit payloads. The result is an audit record and is
@@ -33,6 +38,8 @@ not an activation input: `complete` is always `false` in this slice.
 | Acquisition | provider, repository ID, requested/resolved revision, artifact source and inspection facts | A requested revision is not an immutable resolved revision. |
 | Conversion | MLX format, output inspection facts, quantization recipe | Failed or unverified conversion output contributes no artifact facts. |
 | Registration | artifact ID, served name, alias, profile sampling defaults, template kwargs, parser declarations | Registration feature flags and `production_ready` are not v1 feature state or qualification evidence. |
+| Registry entry | Serving facts only | Registry names, paths, sources, preload, memory, and MLLM hints do not establish identity or aliases; fields without a lossless v1 target are diagnosed. |
+| CLI server | Serving facts only | Nested `serving` values take precedence over conflicting top-level values and the conflict is retained as a diagnostic. |
 
 The adapter copies imported values and never mutates input mappings. When two
 accepted sources assign different values to one destination pointer, the first
@@ -45,7 +52,15 @@ Imported fields are grouped into `provenance.records` as provider facts,
 derived recommendations, or maintainer policy. Source location and SHA-256 are
 preserved; an immutable source revision is included when present.
 
-Every required v1 fact not established by these three source kinds produces a
+Registry and CLI sources map the closed v1 serving vocabulary only: engine,
+route, template, parsers, sampling, limits, features, activation policy, and
+request policy. Direct legacy flags map only where their semantics are explicit:
+`continuous_batching`, `enable_mtp`, SpecPrefill enablement and draft-model
+setting, `max_tokens`, `max_request_tokens`, and `max_kv_size`. Unknown fields,
+features, and settings; malformed policies; and non-boolean feature declarations
+remain deterministic diagnostics rather than inferred facts.
+
+Every required v1 fact not established by these five source kinds produces a
 `missing_required_fact` issue with its JSON Pointer. The mapper does not infer
 capabilities, hashes, context limits, feature states, policies, or
 qualification from model names, parser names, feature flags, or booleans.

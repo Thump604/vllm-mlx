@@ -7,7 +7,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
-SourceKind = Literal["acquisition", "conversion", "registration"]
+SourceKind = Literal[
+    "acquisition",
+    "conversion",
+    "registration",
+    "registry",
+    "cli_server",
+]
+ProvenanceKind = Literal["provider_fact", "derived_recommendation", "maintainer_policy"]
 
 _SHA256_LENGTH = 64
 

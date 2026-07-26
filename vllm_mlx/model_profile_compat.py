@@ -25,8 +25,10 @@ def import_legacy_model_profile(
     acquisition: LegacySourceInput | Mapping[str, Any] | None = None,
     conversion: LegacySourceInput | Mapping[str, Any] | None = None,
     registration: LegacySourceInput | Mapping[str, Any] | None = None,
+    registry_entry: LegacySourceInput | Mapping[str, Any] | None = None,
+    cli_server: LegacySourceInput | Mapping[str, Any] | None = None,
 ) -> ModelProfileImportResult:
-    """Map acquisition, conversion, and registration records only.
+    """Map acquisition, conversion, registration, registry, and CLI records only.
 
     Raises:
         ValueError: No source was supplied, a source kind does not match its
@@ -38,5 +40,7 @@ def import_legacy_model_profile(
             ("acquisition", acquisition),
             ("conversion", conversion),
             ("registration", registration),
+            ("registry", registry_entry),
+            ("cli_server", cli_server),
         )
     )

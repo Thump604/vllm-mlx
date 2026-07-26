@@ -289,7 +289,7 @@ def test_as_dict_omits_payloads_and_deep_copies_nested_values():
     assert "/unrelated" not in result.issues[0].sources
 
 
-def test_dispatcher_exposes_only_three_keyword_only_inputs():
+def test_dispatcher_exposes_pr3b_keyword_only_inputs_without_expanding_exports():
     signature = inspect.signature(import_legacy_model_profile)
     assert model_profile_compat.__all__ == (
         "LegacySourceInput",
@@ -300,8 +300,274 @@ def test_dispatcher_exposes_only_three_keyword_only_inputs():
     assert model_profile_compat.LegacySourceInput is (
         _model_profile_compat_types.LegacySourceInput
     )
-    assert list(signature.parameters) == ["acquisition", "conversion", "registration"]
+    assert list(signature.parameters) == [
+        "acquisition",
+        "conversion",
+        "registration",
+        "registry_entry",
+        "cli_server",
+    ]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
         for parameter in signature.parameters.values()
     )
+
+
+def test_registry_and_cli_server_map_serving_without_claiming_identity():
+    registry = _source(
+        "/config/models.yaml",
+        {
+            "name": "registry-key",
+            "source": "/models/qwen",
+            "continuous_batching": True,
+            "serving": {"preload": True},
+        },
+    )
+    cli_server = _source(
+        "/commands/serve.json",
+        {
+            "serving": {
+                "engine": "simple",
+                "route": "openai_chat",
+                "template": {
+                    "source": "tokenizer",
+                    "sha256": "c" * 64,
+                    "default_kwargs": {},
+                },
+                "parsers": {"tool": "qwen3_coder", "reasoning": "qwen3"},
+                "sampling": {"profile_defaults": {"temperature": 0.6}},
+                "limits": {
+                    "max_output_tokens": 1024,
+                    "max_request_output_tokens": 2048,
+                    "unknown_limit": 7,
+                },
+                "features": {"not_a_v1_feature": {"mode": "enabled_by_default"}},
+                "activation_policy": {
+                    "owner_override_fields": [
+                        "limits.serving_context",
+                        "identity.provider",
+                    ]
+                },
+                "request_policy": {
+                    "required_fields": {"unsupported": True},
+                    "allowed_fields": ["temperature", "unsupported"],
+                    "forbidden_fields": [],
+                },
+                "outside": "ignored",
+            },
+            "continuous_batching": True,
+            "enable_mtp": True,
+            "specprefill_enabled": True,
+            "specprefill_threshold": 16,
+            "specprefill_draft_model": "org/draft",
+            "max_tokens": 4096,
+            "max_request_tokens": 8192,
+            "max_kv_size": 16384,
+        },
+    )
+    original = deepcopy((registry, cli_server))
+
+    result = import_legacy_model_profile(registry_entry=registry, cli_server=cli_server)
+
+    assert (registry, cli_server) == original
+    assert tuple(source.kind for source in result.sources) == ("registry", "cli_server")
+    assert "identity" not in result.profile
+    serving = result.profile["serving"]
+    assert serving["engine"] == "batched"
+    assert serving["route"] == "openai_chat"
+    assert serving["template"]["sha256"] == "c" * 64
+    assert serving["parsers"] == {"tool": "qwen3_coder", "reasoning": "qwen3"}
+    assert serving["sampling"] == {"profile_defaults": {"temperature": 0.6}}
+    assert serving["limits"] == {
+        "max_output_tokens": 1024,
+        "max_request_output_tokens": 2048,
+        "max_kv_size": 16384,
+    }
+    assert serving["features"]["continuous_batching"]["mode"] == "enabled_by_default"
+    assert serving["features"]["mtp"]["control"] == "none"
+    assert serving["features"]["specprefill"]["settings"] == {
+        "draft_model": "org/draft"
+    }
+    conflict = next(
+        issue for issue in result.issues if issue.code == "conflicting_value"
+    )
+    assert conflict.pointer == "/serving/engine"
+    assert conflict.sources == ("/config/models.yaml", "/commands/serve.json")
+    assert any(issue.code == "unknown_feature_declaration" for issue in result.issues)
+    assert any(issue.code == "unsupported_feature_setting" for issue in result.issues)
+    assert any(
+        issue.code == "registry_field_requires_target_contract"
+        for issue in result.issues
+    )
+    assert any(
+        issue.code == "registry_field_requires_target_contract"
+        and "preload" in issue.detail
+        for issue in result.issues
+    )
+    unknown_pointers = {
+        issue.pointer
+        for issue in result.issues
+        if issue.code == "unknown_serving_field"
+    }
+    assert "/serving/outside" in unknown_pointers
+    assert "/serving/limits/unknown_limit" in unknown_pointers
+    assert any(issue.code == "invalid_policy_field" for issue in result.issues)
+    assert serving["activation_policy"] == {
+        "owner_override_fields": ["limits.serving_context"]
+    }
+    assert serving["request_policy"] == {
+        "required_fields": {},
+        "allowed_fields": ["temperature"],
+        "forbidden_fields": [],
+    }
+
+
+def test_registry_invalid_boolean_and_cli_malformed_policies_are_diagnostic():
+    invalid_boolean = import_legacy_model_profile(
+        registry_entry=_source(
+            "/config/models.yaml",
+            {
+                "continuous_batching": "false",
+                "engine": "simple",
+                "serving": {"engine": "batched"},
+                "preload": True,
+            },
+        )
+    )
+    malformed_members = import_legacy_model_profile(
+        cli_server=_source(
+            "/commands/serve.json",
+            {
+                "activation_policy": {
+                    "owner_override_fields": [[], "limits.max_kv_size"]
+                },
+                "request_policy": {
+                    "required_fields": [],
+                    "allowed_fields": [{}, "temperature"],
+                    "forbidden_fields": [],
+                },
+            },
+        )
+    )
+    malformed_container = import_legacy_model_profile(
+        cli_server=_source(
+            "/commands/serve-invalid.json",
+            {"activation_policy": "invalid"},
+        )
+    )
+
+    assert invalid_boolean.profile["serving"]["engine"] == "batched"
+    assert "features" not in invalid_boolean.profile["serving"]
+    assert {issue.code for issue in invalid_boolean.issues} >= {
+        "invalid_feature_declaration",
+        "same_source_conflict",
+        "registry_field_requires_target_contract",
+    }
+    assert any(
+        issue.code == "invalid_policy_field" for issue in malformed_members.issues
+    )
+    assert any(
+        issue.code == "invalid_policy_shape" for issue in malformed_container.issues
+    )
+    serving = malformed_members.profile["serving"]
+    assert serving["activation_policy"]["owner_override_fields"] == [
+        "limits.max_kv_size"
+    ]
+    assert serving["request_policy"] == {
+        "allowed_fields": ["temperature"],
+        "forbidden_fields": [],
+    }
+    assert any(
+        issue.code == "missing_required_fact"
+        and issue.pointer == "/serving/request_policy/required_fields"
+        for issue in malformed_members.issues
+    )
+
+
+def test_malformed_nested_source_fields_are_diagnostic_and_not_established():
+    result = import_legacy_model_profile(
+        acquisition=_source(
+            "/manifests/acquisition.json",
+            {"model_id": "org/model", "inspection": []},
+        ),
+        registration=_source(
+            "/manifests/registration.json",
+            {
+                "artifact_id": "artifact",
+                "served_model_name": "served",
+                "serving_defaults": "invalid",
+                "parser_policy": [],
+            },
+        ),
+        cli_server=_source(
+            "/commands/serve.json",
+            {
+                "sampling": {"profile_defaults": "invalid"},
+                "features": {
+                    "continuous_batching": True,
+                    "mtp": {"mode": "enabled_by_default", "settings": []},
+                },
+                "limits": [],
+            },
+        ),
+    )
+
+    invalid_shapes = {
+        issue.pointer
+        for issue in result.issues
+        if issue.code in {"invalid_source_field_shape", "invalid_feature_declaration"}
+    }
+    assert invalid_shapes >= {
+        "/acquisition/inspection",
+        "/registration/serving_defaults",
+        "/registration/parser_policy",
+        "/serving/sampling/profile_defaults",
+        "/serving/features/continuous_batching",
+        "/serving/features/mtp/settings",
+        "/serving/limits",
+    }
+    serving = result.profile.get("serving", {})
+    assert "sampling" not in serving
+    assert "features" not in serving
+    assert "limits" not in serving
+
+    malformed_serving = import_legacy_model_profile(
+        cli_server=_source("/commands/serve-invalid.json", {"serving": []})
+    )
+    assert any(
+        issue.code == "invalid_source_field_shape" and issue.pointer == "/serving"
+        for issue in malformed_serving.issues
+    )
+
+    malformed_direct = import_legacy_model_profile(
+        cli_server=_source(
+            "/commands/serve-direct-invalid.json",
+            {
+                "max_tokens": "8192",
+                "max_request_tokens": 0,
+                "max_kv_size": False,
+                "specprefill_draft_model": "org/draft",
+                "specprefill_threshold": 16,
+            },
+        )
+    )
+    invalid_direct_pointers = {
+        issue.pointer
+        for issue in malformed_direct.issues
+        if issue.code == "invalid_source_field_shape"
+    }
+    assert invalid_direct_pointers >= {
+        "/serving/limits/max_output_tokens",
+        "/serving/limits/max_request_output_tokens",
+        "/serving/limits/max_kv_size",
+    }
+    assert any(
+        issue.code == "invalid_feature_declaration"
+        and issue.pointer == "/serving/features/specprefill"
+        for issue in malformed_direct.issues
+    )
+    assert any(
+        issue.code == "unsupported_feature_setting" for issue in malformed_direct.issues
+    )
+    assert "limits" not in malformed_direct.profile.get("serving", {})
+    assert "features" not in malformed_direct.profile.get("serving", {})
