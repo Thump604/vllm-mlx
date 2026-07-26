@@ -57,6 +57,10 @@ model downloads, qualification runs, Jobs/Ops, desktop UI, and governance files.
 
 **Depends on:** PR 1.
 
+**Prepared branch:** `604/model-profile-validation-v1` at `397554a`,
+rebased onto the exact PR 1 head. Focused schema and semantic validation tests
+pass (`24 passed`). Do not open this PR until PR 1 is accepted.
+
 **Scope:** Implement deterministic semantic validation for profile documents,
 including canonical identity binding, provenance-source invariants, evidence
 references, limits, request policy, and feature controls.
@@ -177,6 +181,11 @@ paths, qualification claims, and broad model-loader cleanup.
 
 **Depends on:** Laguna Runtime PR A.
 
+**Prepared branch:** `604/laguna-dflash-backend` at `4575acd0`, stacked on
+Laguna Runtime PR A. Focused config/lifecycle, speculative, and server tests
+pass (`20`, `19`, and `5` relevant tests). Do not open this PR until PR A is
+accepted.
+
 **Scope:** Add the Laguna DFlash drafter, exact checkpoint/target compatibility
 validation, request-local hidden-state capture and teardown, speculative cache
 rollback, converter support for processor-less DFlash checkpoints, and focused
@@ -210,6 +219,10 @@ and model-quality claims.
 
 **Depends on:** Laguna Runtime PR B.
 
+**Prepared branch:** `604/mllm-generic-draft-wiring` at `df7aef4`. Focused
+drafter-option, MLLM adapter, and watchdog tests pass (`19 passed`). Do not open
+this PR until the mlx-vlm DFlash API is accepted and its final surface is known.
+
 **Scope:** Generalize MLLM draft loading for `dflash`, `eagle3`, and `mtp`; pass
 through trust-remote-code; expose method-neutral speculative metadata; and add
 an explicit default-off `--default-mllm-draft` option with per-request opt-out.
@@ -227,6 +240,10 @@ quality claims.
 **Repository:** `waybarrios/vllm-mlx`
 
 **Depends on:** Laguna Runtime PR C.
+
+**Prepared branch:** `604/laguna-openai-message-path` at `9f790eb`, stacked on
+PR C. Focused message-ordering, parser-selection, and server tests pass
+(`13 passed`). Do not open this PR until PR C is accepted.
 
 **Scope:** Preserve Laguna string messages through OpenAI normalization and make
 the existing `poolside_v1` parser selectable from the CLI.
@@ -263,6 +280,11 @@ fit estimates, serving registration, and live qualification.
 ### MI-2: Apple Silicon hardware inventory
 
 **Depends on:** none.
+
+**Prepared branch:** `604/apple-silicon-hardware-inventory` at `6e9efba`.
+The branch contains only the inventory module and focused tests; all seven
+tests, including the native macOS smoke, pass. Hold it while PRs 1 and C occupy
+the active vllm-mlx review slots.
 
 **Scope:** Add a read-only, source-attributed inventory of the Apple Silicon
 facts required by later fit calculations. Return an explicit privacy-safe
