@@ -173,8 +173,9 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Complete P4.5 as an independent review of the Qwen evidence, managed lifecycle
-fix, dependency floor, and upstream delivery boundaries. Resolve any blocking
-finding without broadening the model-profile PR sequence. After P4.5 passes,
-resume the dependency-ordered upstream topic branches; do not publish the
-integration branch as one pull request.
+P1-P4 are complete on the local integration branch. Continue extracting that
+work into the dependency-ordered upstream topic branches without publishing the
+integration branch as one pull request. The current sequence is PR 1 schema,
+PR 2 semantic validation, PR 2.5 import envelope, and four bounded
+compatibility-mapper slices before later lifecycle and product wiring. Live
+model inference is not required for these contract and migration slices.

@@ -82,15 +82,94 @@ substitute for the focused contract suite.
 lifecycle operations, model-family code, live qualification, and pre-commit
 repair.
 
-### PR 3: Legacy manifest compatibility mapper
+### PR 2.5: Legacy import-result envelope
 
 **Depends on:** PR 1 and PR 2.
 
-**Scope:** Map existing acquisition, conversion, registration, registry, and
-qualification records into a profile fragment without pretending that missing
-facts are known. Provide a pure finalization path that accepts explicitly
-supplied missing facts, rejects conflicting values, revalidates the complete
-profile, and returns `complete=true` only after validation passes.
+**Prepared branch:** `604/model-profile-import-envelope-v1` at `273ce09`,
+stacked on the prepared PR 2 branch. The focused schema, semantic-validation,
+and import-envelope suites pass together (`28 passed`); the complete upstream
+suite also passes (`2277 passed, 24 skipped, 23 deselected`). Do not open it
+before PR 2 is accepted.
+
+**Scope:** Define the only compatibility envelope allowed to carry an
+incomplete ModelProfile fragment. Validate complete results against both the
+envelope schema and ModelProfile semantic contract without importing serving
+code.
+
+**Files:**
+
+- `schemas/model-profile-import-result-v1.schema.json`
+- `vllm_mlx/model_profile_import.py`
+- `tests/test_model_profile_import_result.py`
+- `docs/development/model-profile-v1.md` for current-state wording
+- `pyproject.toml` for the directly imported validation dependency
+
+**Acceptance checks:** Incomplete results require explicit issues; complete
+results reject error-severity issues and invalid profiles; semantic failures
+retain `/profile` pointers; the raising API preserves collected issues.
+
+**Excluded:** Legacy source mapping, configuration resolution, serving
+activation, qualification promotion, and lifecycle behavior.
+
+### PR 3A: Legacy artifact and identity import
+
+**Depends on:** PR 2.5.
+
+**Prepared branch:** `604/model-profile-import-core-v1`, stacked on the
+prepared import-envelope branch at `da89453`. The focused contract suites pass
+(`38 passed`), the complete upstream suite passes (`2287 passed, 24 skipped,
+23 deselected`), touched slop and claim gates are clean, and the final blind
+Desloppify review reports objective/verified `100.0` and strict `96.5`. Do not
+open it until PR 2.5 is accepted.
+
+**Scope:** Map acquisition, conversion, and registration records into an
+incomplete profile fragment without pretending that missing facts are known.
+Keep source validation, provenance, conflict tracking, and input immutability
+inside this pure adapter slice.
+
+**Acceptance checks:** Existing inputs remain unchanged; missing required facts
+remain explicit issues; failed conversions cannot contribute artifact claims;
+registration feature flags do not silently become complete feature policy.
+
+**Excluded:** Registry and CLI/server mapping, qualification evidence,
+explicit completion, registry mutation, serving activation, and product UI.
+
+### PR 3B: Legacy registry and serving import
+
+**Depends on:** PR 3A.
+
+**Scope:** Add registry and CLI/server source mapping, shared serving
+normalization, boolean feature translation, and unknown-policy reporting.
+
+**Acceptance checks:** Registry identity remains distinct from served aliases;
+invalid booleans and same-source conflicts cannot silently change engine or
+feature state; unsupported policy shapes produce stable issues.
+
+**Excluded:** Qualification evidence, explicit completion, live activation,
+and product UI.
+
+### PR 3C: Legacy qualification import
+
+**Depends on:** PR 3B.
+
+**Scope:** Add qualification-source and evidence normalization without
+promoting weak or unbound booleans into qualification truth.
+
+**Acceptance checks:** Weak signals remain issues; passing evidence becomes
+eligible only when bound to the imported identity and artifact; the result
+remains incomplete until the separate finalization boundary runs.
+
+**Excluded:** Explicit completion, automatic promotion, live qualification,
+and product UI.
+
+### PR 3D: Explicit compatibility finalization
+
+**Depends on:** PR 3C.
+
+**Scope:** Add the pure finalization path that accepts explicitly supplied
+missing facts, rejects changed imported facts and source errors, revalidates
+the complete profile, and returns `complete=true` only after validation passes.
 
 **Files:**
 
@@ -98,9 +177,8 @@ profile, and returns `complete=true` only after validation passes.
 - `tests/test_model_profile_compat.py`
 - `docs/development/model-profile-compatibility-mapping.md`
 
-**Acceptance checks:** Existing inputs remain readable; missing required facts
-produce an incomplete result; conflict resolution is fail-closed; completed
-profiles pass the schema and semantic validators; no finalizer can upgrade an
+**Acceptance checks:** Conflict resolution is fail-closed; completed profiles
+pass the envelope, schema, and semantic validators; no finalizer can upgrade an
 incomplete fragment without the required facts and evidence.
 
 **Excluded:** Registry mutation, download/conversion execution, serving
@@ -136,7 +214,7 @@ client behavior, feature qualification, or resident/default policy.
 
 ### PR 5: Laguna S 2.1 onboarding fixture
 
-**Depends on:** PR 1, PR 2, and PR 3.
+**Depends on:** PR 1, PR 2, and PR 3D.
 
 **Scope:** Add the Laguna acceptance fixture and immutable artifact metadata as
 test data/documentation. Demonstrate the boundary between structural artifact
