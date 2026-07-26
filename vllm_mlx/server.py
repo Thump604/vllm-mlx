@@ -3488,7 +3488,7 @@ def _health_artifact_identity() -> dict[str, str] | None:
         "tokenizer_sha256": ("tokenizer.json",),
         "chat_template_sha256": ("chat_template.jinja",),
         "generation_config_sha256": ("generation_config.json",),
-        "weights_manifest_sha256": ("model.safetensors.index.json", "SHA256SUMS"),
+        "weights_manifest_sha256": ("SHA256SUMS", "model.safetensors.index.json"),
     }
     identity: dict[str, str] = {}
     for field, names in candidates.items():
@@ -6616,7 +6616,8 @@ def _persisted_product_profile(state_path: Path, catalog) -> dict[str, Any] | No
 
 def _apply_managed_product_profile(profile: Mapping[str, Any], spec: ModelSpec) -> None:
     """Apply one profile to the existing server globals before engine loading."""
-    global _model_name, _model_path, _default_max_tokens, _max_request_tokens
+    global _model_name, _model_path, _default_model_key
+    global _default_max_tokens, _max_request_tokens
     global _default_temperature, _default_top_p, _default_top_k, _default_min_p
     global _default_presence_penalty, _default_repetition_penalty
     global _default_chat_template_kwargs, _default_thinking_token_budget
@@ -6643,6 +6644,7 @@ def _apply_managed_product_profile(profile: Mapping[str, Any], spec: ModelSpec) 
 
     _model_path = spec.model_name
     _model_name = str(identity["served_model_name"])
+    _default_model_key = spec.model_key
     _default_max_tokens = int(limits["max_output_tokens"])
     _max_request_tokens = int(limits["max_request_output_tokens"])
     _default_temperature = defaults.get("temperature")
@@ -6676,7 +6678,8 @@ def _sync_managed_product_runtime() -> None:
 
 def _clear_managed_product_profile() -> None:
     """Clear product-selected metadata after failed or removed activation."""
-    global _model_name, _model_path, _reasoning_parser, _reasoning_parser_name
+    global _model_name, _model_path, _default_model_key
+    global _reasoning_parser, _reasoning_parser_name
     global _tool_call_parser, _enable_auto_tool_choice, _tool_parser_instance
     global _force_mllm_model
     global _default_max_tokens, _max_request_tokens, _default_temperature
@@ -6686,6 +6689,7 @@ def _clear_managed_product_profile() -> None:
 
     _model_name = None
     _model_path = None
+    _default_model_key = None
     _reasoning_parser = None
     _reasoning_parser_name = None
     _tool_call_parser = None
@@ -6772,7 +6776,7 @@ def _configure_managed_product(args) -> None:
         _lazy_load_model = True
 
     _engine = None
-    _default_model_key = "default"
+    _default_model_key = "default" if initial_profile is not None else None
     _residency_manager = manager
     _auto_unload_idle_seconds = args.auto_unload_idle_seconds
     endpoint_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host

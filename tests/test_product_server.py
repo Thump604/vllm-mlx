@@ -36,7 +36,14 @@ def _catalog_and_artifact(tmp_path):
         "tokenizer.json": "{}",
         "chat_template.jinja": "{{ messages }}",
         "generation_config.json": "{}",
-        "model.safetensors.index.json": "{}",
+        "model-00001-of-00001.safetensors": "weights",
+        "model.safetensors.index.json": json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.weight": "model-00001-of-00001.safetensors"
+                }
+            }
+        ),
     }.items():
         (artifact / name).write_text(value)
     root = Path(__file__).parents[1]
@@ -53,7 +60,12 @@ def _catalog_and_artifact(tmp_path):
         "tokenizer_sha256": _sha(artifact / "tokenizer.json"),
         "chat_template_sha256": _sha(artifact / "chat_template.jinja"),
         "generation_config_sha256": _sha(artifact / "generation_config.json"),
-        "weights_manifest_sha256": _sha(artifact / "model.safetensors.index.json"),
+        "weights_manifest_sha256": hashlib.sha256(
+            (
+                f"{_sha(artifact / 'model-00001-of-00001.safetensors')}"
+                "  model-00001-of-00001.safetensors\n"
+            ).encode()
+        ).hexdigest(),
     }
     profile["subject_digest"] = compute_subject_digest(profile)
     profile["qualification"] = {
@@ -102,17 +114,19 @@ async def test_product_server_configures_routes_without_loading_a_model(
     try:
         assert server._engine is None
         assert server._model_name is None
+        assert server._default_model_key is None
         assert server._product_control_service is not None
-        response = TestClient(server.app).get("/api/v1/control/catalog")
-        assert response.status_code == 200
-        assert response.json()["data"][0]["profile_id"] == "managed-model"
-        status = TestClient(server.app).get("/api/v1/control/status")
-        assert status.status_code == 200
-        assert status.json()["data"]["state"] == "unloaded"
+        with TestClient(server.app) as client:
+            response = client.get("/api/v1/control/catalog")
+            assert response.status_code == 200
+            assert response.json()["data"][0]["profile_id"] == "managed-model"
+            status = client.get("/api/v1/control/status")
+            assert status.status_code == 200
+            assert status.json()["data"]["state"] == "unloaded"
     finally:
-        await server._residency_manager.shutdown()
         server._residency_manager = None
         server._product_control_service = None
+        server._default_model_key = None
         os.environ.pop("VLLM_MLX_LIFECYCLE_STATE_PATH", None)
 
 
@@ -161,6 +175,7 @@ def test_clear_managed_product_profile_restores_pre_profile_defaults(monkeypatch
     monkeypatch.setattr(server, "_managed_product_base_defaults", baseline)
     monkeypatch.setattr(server, "_model_name", "stale-model")
     monkeypatch.setattr(server, "_model_path", "/stale/model")
+    monkeypatch.setattr(server, "_default_model_key", "default")
     monkeypatch.setattr(server, "_default_max_tokens", 999)
     monkeypatch.setattr(server, "_max_request_tokens", 999)
     monkeypatch.setattr(server, "_default_temperature", 1.0)
@@ -176,6 +191,7 @@ def test_clear_managed_product_profile_restores_pre_profile_defaults(monkeypatch
 
     assert server._model_name is None
     assert server._model_path is None
+    assert server._default_model_key is None
     assert server._default_max_tokens == 101
     assert server._max_request_tokens == 202
     assert server._default_temperature == 0.3
@@ -186,6 +202,30 @@ def test_clear_managed_product_profile_restores_pre_profile_defaults(monkeypatch
     assert server._default_repetition_penalty == 1.1
     assert server._default_chat_template_kwargs == {"enable_thinking": False}
     assert server._default_thinking_token_budget == 303
+
+
+def test_qwen_managed_profile_applies_exact_qualified_request_defaults(monkeypatch):
+    root = Path(__file__).parents[1]
+    profile = json.loads(
+        (root / "catalog/profiles/qwen3.6-35b-a3b-8bit-v1.json").read_text()
+    )
+    spec = ModelSpec(
+        "default",
+        "/models/qwen",
+        max_tokens=profile["serving"]["limits"]["max_output_tokens"],
+        force_mllm=True,
+    )
+    monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+    server._apply_managed_product_profile(profile, spec)
+
+    assert server._resolve_temperature(None) == 0.7
+    assert server._resolve_top_p(None) == 0.8
+    assert server._resolve_top_k(None) == 20
+    assert server._resolve_min_p(None) == 0.0
+    assert server._resolve_presence_penalty(None) == 1.5
+    assert server._resolve_repetition_penalty(None) == 1.0
+    assert server._resolve_chat_template_kwargs(None) == {"enable_thinking": False}
 
 
 @pytest.mark.anyio
@@ -205,6 +245,7 @@ async def test_product_server_restores_exact_persisted_profile_configuration(
     try:
         assert server._model_name == "managed-model"
         assert server._model_path == str(artifact)
+        assert server._default_model_key == "default"
         assert server._product_control_service.status()["active_profile"] == {
             "profile_id": "managed-model",
             "profile_revision": 1,

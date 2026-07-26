@@ -103,8 +103,8 @@ evidence for, or part of, the first product workflow.
 | P4.1 | complete | Define the desktop/control client API and compatibility versioning | Sol `high` | P3 |
 | P4.2 | complete | Build catalog, install, activate, chat, coding-client setup, and diagnostics shell | Terra `high` | P4.1 |
 | P4.3 | complete | Add install-to-chat and install-to-code golden workflows | Terra `medium` | P4.2 |
-| P4.4 | in progress | Verify one activatable first-release model and supported Mac hardware profile | Luna `high` | P4.3 |
-| P4.5 | blocked | Independent release-readiness review | Terra `high` | P4.4 |
+| P4.4 | complete | Verify one activatable first-release model and supported Mac hardware profile | Luna `high` | P4.3 |
+| P4.5 | complete | Independent release-readiness review | Terra `high` | P4.4 |
 
 ### P4 Acceptance Gate
 
@@ -116,30 +116,50 @@ evidence for, or part of, the first product workflow.
 
 ### P4.4 Progress
 
-- Portable Qwen 3.6 35B and Laguna S 2.1 structural profiles: complete. Both
-  remain non-activatable until exact profile-bound qualification evidence is
-  recorded; portable catalog facts are not local Runtime qualification.
+- Portable Qwen 3.6 35B and Laguna S 2.1 structural profiles: complete. Qwen is
+  qualified against an exact clean upstream artifact; Laguna remains
+  artifact-only until separate profile-bound evidence is recorded.
 - Recorded 64 GB and 128 GB Apple Silicon hardware-envelope schemas: complete.
-  Model fit remains unknown until measured evidence is bound to a profile.
+  Qwen's 128 GB fit now includes measured peak memory bound to its profile.
 - Product control service, managed runtime adapter, restart validation, and
   focused regression coverage: complete in the integration branch.
-- Golden workflow tests now use the shipped Qwen profile identity with an
-  explicit test-only qualification overlay. They prove workflow behavior, not
-  live model eligibility.
+- Golden workflow tests use the shipped Qwen profile identity. Live evidence now
+  establishes Qwen eligibility independently of those workflow tests.
 - The Qwen qualification package now uses the provider's mode-specific sampling
   tuples and nested `chat_template_kwargs.enable_thinking` request shape. A
   zero-valued pseudo-timeout was removed.
-- Runtime health now reports content hashes for the loaded local artifact's
-  metadata, and qualification normalization rejects served-name matches whose
-  artifact hashes do not match the profile.
-- Remaining P4.4 gate: bind one exact Qwen 3.6 35B artifact, serving profile,
-  measured 128 GB Apple Silicon envelope, and passing install/activate/chat
-  evidence to the catalog subject digest. Then run the catalog-backed
-  install-to-chat and install-to-code workflows without inventing a model
-  identity.
+- Runtime health reports content hashes for the loaded local artifact's
+  metadata. Managed verification now hashes every shard declared by the
+  safetensors index and materializes a canonical `SHA256SUMS` only after the
+  complete artifact matches the profile. Qualification normalization rejects
+  served-name matches whose artifact hashes do not match the profile.
+- The upstream-clean Qwen artifact passed 20/20 direct, coding, forced-tool, and
+  post-tool cases across five repetitions in
+  `run/product-roadmap/qwen35-first-release-final-v6/result.json`. The profile
+  defaults now exactly match that provider-native no-think tuple.
+- The catalog-backed managed workflow in
+  `run/product-roadmap/qwen35-managed-product-v6/` verified every bound shard,
+  activated the profile, returned clean final chat using only profile defaults,
+  survived a persisted-state restart, returned clean final chat again, emitted
+  coding-client configuration, and stopped cleanly.
+- Normalized qualification evidence remains deliberately non-promoting:
+  `promotion_required=true` and `production_ready=false` are the P3.4 safety
+  contract. The profile's `qualified` status is the separate, explicit catalog
+  promotion reviewed against the bound passing evidence; the normalizer does
+  not mutate catalog truth automatically.
+- A stale `mlx-vlm 0.6.4` development lock produced corrupt output from the same
+  clean artifact. The project dependency floor and local ignored development
+  lock now resolve public `mlx-vlm 0.6.7`; `uv lock --check` passes, and the
+  successful managed workflow does not require the local Laguna fork.
+- Fresh managed-product startup previously crashed before installation because
+  it synchronized an unregistered default resident. Empty state now starts
+  idle, and focused lifecycle coverage preserves that contract.
 - Laguna S 2.1 local Runtime evidence remains useful onboarding evidence but
   does not make the portable profile qualified. Long-horizon coding suitability
   remains a product/workload evaluation, not a serving qualification claim.
+- Independent P4.5 review passed after the portable artifact verifier gained
+  full-shard validation, atomic manifest publication, and interrupted-manifest
+  recovery coverage.
 
 ## Deferred Until The First Product Workflow Passes
 
@@ -153,10 +173,8 @@ evidence for, or part of, the first product workflow.
 
 ## Next Execution Step
 
-Complete the P4.4 Qwen 3.6 35B qualification package against the exact catalog
-subject and recorded 128 GB Apple Silicon envelope. The package must bind the
-artifact revision and digest, resolved serving profile, measured hardware, and
-managed install/activate/healthy-chat/coding-setup evidence. Ops must provide an
-isolated Qwen qualification window; Jobs must release or suspend its lease for
-that window. The live run is the remaining source for measured peak memory and
-profile-bound behavior evidence. Resume P4.5 only after that package passes.
+Complete P4.5 as an independent review of the Qwen evidence, managed lifecycle
+fix, dependency floor, and upstream delivery boundaries. Resolve any blocking
+finding without broadening the model-profile PR sequence. After P4.5 passes,
+resume the dependency-ordered upstream topic branches; do not publish the
+integration branch as one pull request.
