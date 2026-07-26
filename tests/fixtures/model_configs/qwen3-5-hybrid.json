@@ -1,0 +1,42 @@
+{
+  "fixture_metadata": {
+    "source_repository": "mlx-community/Qwen3.6-35B-A3B-8bit",
+    "source_revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0",
+    "base_model_repository": "Qwen/Qwen3.6-35B-A3B",
+    "source_config_sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296"
+  },
+  "config": {
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "text_config": {
+      "model_type": "qwen3_5_moe_text",
+      "num_hidden_layers": 40,
+      "num_key_value_heads": 2,
+      "head_dim": 256,
+      "max_position_embeddings": 262144,
+      "full_attention_interval": 4,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 32,
+      "linear_value_head_dim": 128,
+      "num_experts": 256,
+      "num_experts_per_tok": 8,
+      "moe_intermediate_size": 512,
+      "shared_expert_intermediate_size": 512,
+      "mtp_num_hidden_layers": 1,
+      "layer_types": [
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention", "linear_attention", "linear_attention", "full_attention"
+      ]
+    }
+  }
+}

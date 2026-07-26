@@ -56,6 +56,21 @@ def test_fixture_metadata_is_not_part_of_provider_config_extraction():
     assert "fixture_metadata" not in _config("dense-gqa.json")
 
 
+def test_qwen_fixture_metadata_is_not_part_of_provider_config_extraction():
+    qwen = _payload("qwen3-5-hybrid.json")
+
+    assert qwen["fixture_metadata"] == {
+        "source_repository": "mlx-community/Qwen3.6-35B-A3B-8bit",
+        "source_revision": "e06a74e6236a60c8367e1a3214e83d8b61b637b0",
+        "base_model_repository": "Qwen/Qwen3.6-35B-A3B",
+        "source_config_sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296",
+    }
+    assert all(
+        "fixture_metadata" not in fact.pointer
+        for fact in adapt_model_config(_config("qwen3-5-hybrid.json")).provider_facts
+    )
+
+
 def test_dense_gqa_requires_explicit_profile_inputs_and_preserves_provenance():
     config = _config("dense-gqa.json")
     without_profile = adapt_model_config(config)
@@ -111,6 +126,44 @@ def test_dense_adapter_rejects_invalid_head_relationship_and_synthetic_fields():
     assert "kv_cache_element_bytes" not in config
 
 
+def test_qwen_nested_config_requires_exact_declared_full_attention_schedule():
+    result = adapt_model_config(_config("qwen3-5-hybrid.json"))
+
+    assert result.adapter_id == "qwen3_5_hybrid"
+    assert result.status == "ready"
+    assert result.context_limits is not None
+    assert result.context_limits.advertised_context_tokens == 262_144
+    assert result.dense_gqa_kv_input is None
+    assert "linear-attention" in result.predictive_kv_reason
+    assert (
+        _fact(result, "linear_value_head_dim").pointer
+        == "/text_config/linear_value_head_dim"
+    )
+    assert _fact(result, "num_experts_per_tok").value == 8
+    assert _fact(result, "mtp_num_hidden_layers").value == 1
+
+
+def test_qwen_hybrid_rejects_irrelevant_dense_kv_profile():
+    result = adapt_model_config(_config("qwen3-5-hybrid.json"), kv_profile=_profile())
+
+    assert result.status == "unknown"
+    assert any("do not apply" in reason for reason in result.reasons)
+
+
+def test_qwen_schedule_mismatch_fails_unknown():
+    config = _config("qwen3-5-hybrid.json")
+    text = config["text_config"]
+    assert isinstance(text, dict)
+    layer_types = text["layer_types"]
+    assert isinstance(layer_types, list)
+    layer_types[3] = "linear_attention"
+
+    result = adapt_model_config(config)
+
+    assert result.status == "unknown"
+    assert any("full_attention_interval" in reason for reason in result.reasons)
+
+
 def test_unknown_model_type_does_not_use_path_or_name_inference():
     config = _config("dense-gqa.json")
     config["model_type"] = "unknown_dense_gqa"
@@ -132,6 +185,9 @@ def test_unknown_model_type_does_not_use_path_or_name_inference():
         ("dense-gqa.json", ("num_key_value_heads",)),
         ("dense-gqa.json", ("head_dim",)),
         ("dense-gqa.json", ("max_position_embeddings",)),
+        ("qwen3-5-hybrid.json", ("text_config", "linear_num_key_heads")),
+        ("qwen3-5-hybrid.json", ("text_config", "num_experts_per_tok")),
+        ("qwen3-5-hybrid.json", ("text_config", "mtp_num_hidden_layers")),
     ],
 )
 def test_boolean_values_never_count_as_config_numeric_facts(

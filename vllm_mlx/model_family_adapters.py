@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeGuard
 
@@ -66,6 +66,8 @@ class ModelFamilyAdapterResult:
 
 
 _DENSE_GQA_MODEL_TYPES = frozenset({"llama", "mistral", "qwen2"})
+_QWEN3_5_OUTER_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+_QWEN3_5_TEXT_TYPES = frozenset({"qwen3_5_text", "qwen3_5_moe_text"})
 
 
 def adapt_model_config(
@@ -74,6 +76,14 @@ def adapt_model_config(
     """Adapt declared config structure without model-path or name inference."""
     if not isinstance(config, Mapping):
         return _unknown("unknown", "config must be a mapping")
+    qwen = _adapt_qwen3_5_hybrid(config)
+    if qwen is not None:
+        if kv_profile is not None:
+            return _unknown(
+                qwen.adapter_id,
+                "generic dense/GQA KV profile inputs do not apply to Qwen hybrid attention",
+            )
+        return qwen
     dense = _adapt_dense_gqa(config, kv_profile)
     if dense is not None:
         return dense
@@ -188,6 +198,97 @@ def _adapt_dense_gqa(
         kv_input,
         context_provenance + kv_provenance,
         None,
+        (),
+    )
+
+
+def _adapt_qwen3_5_hybrid(
+    config: Mapping[str, object],
+) -> ModelFamilyAdapterResult | None:
+    outer_type = config.get("model_type")
+    if not isinstance(outer_type, str) or outer_type not in _QWEN3_5_OUTER_TYPES:
+        return None
+    text = config.get("text_config")
+    if not isinstance(text, Mapping):
+        return _unknown("qwen3_5_hybrid", "qwen3_5 config requires text_config")
+    text_type = text.get("model_type")
+    if not isinstance(text_type, str) or text_type not in _QWEN3_5_TEXT_TYPES:
+        return _unknown(
+            "qwen3_5_hybrid",
+            "qwen3_5 text_config has an unsupported declared model_type",
+        )
+    names = (
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "head_dim",
+        "max_position_embeddings",
+        "full_attention_interval",
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "mtp_num_hidden_layers",
+    )
+    values, reasons = _positive_fields(text, "/text_config", names)
+    layer_types = text.get("layer_types")
+    if not _is_string_sequence(layer_types):
+        reasons.append("/text_config/layer_types must be a sequence of strings")
+    elif (
+        "num_hidden_layers" in values
+        and len(layer_types) != values["num_hidden_layers"]
+    ):
+        reasons.append(
+            "/text_config/layer_types length must match /text_config/num_hidden_layers"
+        )
+    elif "full_attention_interval" in values:
+        expected = tuple(
+            (
+                "full_attention"
+                if (index + 1) % values["full_attention_interval"] == 0
+                else "linear_attention"
+            )
+            for index in range(len(layer_types))
+        )
+        if tuple(layer_types) != expected:
+            reasons.append(
+                "/text_config/layer_types must match the declared /text_config/full_attention_interval schedule"
+            )
+    if reasons:
+        return _unknown("qwen3_5_hybrid", *reasons)
+    assert _is_string_sequence(layer_types)
+    facts = (
+        ConfigFact("model_type", outer_type, "/model_type"),
+        ConfigFact("text_model_type", text_type, "/text_config/model_type"),
+        *(_config_fact(text, name, "/text_config") for name in names),
+        ConfigFact(
+            "linear_attention_layer_count",
+            sum(item == "linear_attention" for item in layer_types),
+            "/text_config/layer_types",
+            "derived",
+        ),
+        ConfigFact(
+            "full_attention_layer_count",
+            sum(item == "full_attention" for item in layer_types),
+            "/text_config/layer_types",
+            "derived",
+        ),
+    )
+    context, provenance = _context_input(
+        values["max_position_embeddings"], "/text_config/max_position_embeddings", None
+    )
+    return ModelFamilyAdapterResult(
+        "qwen3_5_hybrid",
+        "ready",
+        facts,
+        context,
+        None,
+        provenance,
+        "qwen3_5 hybrid linear-attention state is not modeled by the generic KV estimator",
         (),
     )
 
@@ -313,6 +414,16 @@ def _unknown(adapter_id: str, *reasons: str) -> ModelFamilyAdapterResult:
 def _pointer(prefix: str, name: str) -> str:
     escaped = name.replace("~", "~0").replace("/", "~1")
     return f"{prefix}/{escaped}" if prefix else f"/{escaped}"
+
+
+def _is_sequence(value: object) -> TypeGuard[Sequence[object]]:
+    return isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    )
+
+
+def _is_string_sequence(value: object) -> TypeGuard[Sequence[str]]:
+    return _is_sequence(value) and all(isinstance(item, str) for item in value)
 
 
 def _is_positive_integer(value: object) -> TypeGuard[int]:
