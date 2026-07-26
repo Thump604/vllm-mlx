@@ -71,6 +71,20 @@ def test_qwen_fixture_metadata_is_not_part_of_provider_config_extraction():
     )
 
 
+def test_laguna_fixture_metadata_is_not_part_of_provider_config_extraction():
+    laguna = _payload("laguna-s-2-1.json")
+
+    assert laguna["fixture_metadata"] == {
+        "source_repository": "poolside/Laguna-S-2.1",
+        "source_revision": "a50e85e7e0aae7b0a504d156bd36a616ec9fea38",
+        "local_config_sha256": "8440d3ec23e275aa62bba1371c20cee4a72906fdc33ca37966ba7cd83472847b",
+    }
+    assert all(
+        "fixture_metadata" not in fact.pointer
+        for fact in adapt_model_config(_config("laguna-s-2-1.json")).provider_facts
+    )
+
+
 def test_dense_gqa_requires_explicit_profile_inputs_and_preserves_provenance():
     config = _config("dense-gqa.json")
     without_profile = adapt_model_config(config)
@@ -164,6 +178,57 @@ def test_qwen_schedule_mismatch_fails_unknown():
     assert any("full_attention_interval" in reason for reason in result.reasons)
 
 
+def test_laguna_requires_complete_identity_structure_and_retains_unknown_kv():
+    result = adapt_model_config(_config("laguna-s-2-1.json"))
+
+    assert result.adapter_id == "laguna_s_2_1"
+    assert result.status == "ready"
+    assert result.context_limits is not None
+    assert result.context_limits.advertised_context_tokens == 1_048_576
+    assert result.context_limits.kv_window_tokens == 512
+    assert result.dense_gqa_kv_input is None
+    assert "mixed global/sliding" in result.predictive_kv_reason
+    assert _fact(result, "architecture").pointer == "/architectures/0"
+    assert _fact(result, "shared_expert_intermediate_size").value == 1024
+    assert _fact(result, "mlp_only_layers").value == [0]
+    assert _fact(result, "global_attention_layer_count").value == 12
+    assert _fact(result, "sliding_attention_layer_count").value == 36
+
+
+def test_laguna_rejects_irrelevant_dense_kv_profile():
+    result = adapt_model_config(_config("laguna-s-2-1.json"), kv_profile=_profile())
+
+    assert result.status == "unknown"
+    assert any("do not apply" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("architectures", ["OtherForCausalLM"]),
+        ("layer_types", ["full_attention"] * 48),
+        ("mlp_layer_types", ["sparse"] * 48),
+        ("gating_types", ["per_head"] * 47),
+        ("num_attention_heads_per_layer", [48] * 48),
+        ("mlp_only_layers", []),
+        ("num_key_value_heads", 4),
+        ("head_dim", 256),
+        ("max_position_embeddings", 262_144),
+        ("sliding_window", 1024),
+        ("num_experts_per_tok", 8),
+        ("shared_expert_intermediate_size", 512),
+    ],
+)
+def test_laguna_adversarial_identity_variants_fail_unknown(field: str, value: object):
+    config = _config("laguna-s-2-1.json")
+    config[field] = value
+
+    result = adapt_model_config(config)
+
+    assert result.status == "unknown"
+    assert result.dense_gqa_kv_input is None
+
+
 def test_unknown_model_type_does_not_use_path_or_name_inference():
     config = _config("dense-gqa.json")
     config["model_type"] = "unknown_dense_gqa"
@@ -188,6 +253,9 @@ def test_unknown_model_type_does_not_use_path_or_name_inference():
         ("qwen3-5-hybrid.json", ("text_config", "linear_num_key_heads")),
         ("qwen3-5-hybrid.json", ("text_config", "num_experts_per_tok")),
         ("qwen3-5-hybrid.json", ("text_config", "mtp_num_hidden_layers")),
+        ("laguna-s-2-1.json", ("num_experts",)),
+        ("laguna-s-2-1.json", ("num_experts_per_tok",)),
+        ("laguna-s-2-1.json", ("shared_expert_intermediate_size",)),
     ],
 )
 def test_boolean_values_never_count_as_config_numeric_facts(

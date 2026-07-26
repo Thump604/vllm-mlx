@@ -68,6 +68,15 @@ class ModelFamilyAdapterResult:
 _DENSE_GQA_MODEL_TYPES = frozenset({"llama", "mistral", "qwen2"})
 _QWEN3_5_OUTER_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
 _QWEN3_5_TEXT_TYPES = frozenset({"qwen3_5_text", "qwen3_5_moe_text"})
+_LAGUNA_LAYER_TYPES = (
+    "full_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+) * 12
+_LAGUNA_MLP_TYPES = ("dense",) + ("sparse",) * 47
+_LAGUNA_GATING_TYPES = ("per_head",) * 48
+_LAGUNA_HEADS_PER_LAYER = (48, 72, 72, 72) * 12
 
 
 def adapt_model_config(
@@ -84,6 +93,14 @@ def adapt_model_config(
                 "generic dense/GQA KV profile inputs do not apply to Qwen hybrid attention",
             )
         return qwen
+    laguna = _adapt_laguna(config)
+    if laguna is not None:
+        if kv_profile is not None:
+            return _unknown(
+                laguna.adapter_id,
+                "generic dense/GQA KV profile inputs do not apply to Laguna mixed attention",
+            )
+        return laguna
     dense = _adapt_dense_gqa(config, kv_profile)
     if dense is not None:
         return dense
@@ -293,6 +310,77 @@ def _adapt_qwen3_5_hybrid(
     )
 
 
+def _adapt_laguna(config: Mapping[str, object]) -> ModelFamilyAdapterResult | None:
+    if config.get("model_type") != "laguna":
+        return None
+    reasons: list[str] = []
+    if config.get("architectures") != ["LagunaForCausalLM"]:
+        reasons.append("/architectures must equal ['LagunaForCausalLM']")
+    names = (
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "head_dim",
+        "max_position_embeddings",
+        "sliding_window",
+        "num_experts",
+        "num_experts_per_tok",
+        "shared_expert_intermediate_size",
+    )
+    values, numeric_reasons = _positive_fields(config, "", names)
+    reasons.extend(numeric_reasons)
+    _require_exact_sequence(config, "layer_types", _LAGUNA_LAYER_TYPES, reasons)
+    _require_exact_sequence(config, "mlp_layer_types", _LAGUNA_MLP_TYPES, reasons)
+    _require_exact_sequence(config, "gating_types", _LAGUNA_GATING_TYPES, reasons)
+    _require_exact_sequence(
+        config, "num_attention_heads_per_layer", _LAGUNA_HEADS_PER_LAYER, reasons
+    )
+    if config.get("mlp_only_layers") != [0]:
+        reasons.append("/mlp_only_layers must equal [0]")
+    expected_values = {
+        "num_hidden_layers": 48,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "max_position_embeddings": 1_048_576,
+        "sliding_window": 512,
+        "num_experts": 256,
+        "num_experts_per_tok": 10,
+        "shared_expert_intermediate_size": 1024,
+    }
+    for name, expected in expected_values.items():
+        if values.get(name) != expected:
+            reasons.append(f"/{name} must equal {expected}")
+    if reasons:
+        return _unknown("laguna_s_2_1", *reasons)
+    facts = (
+        ConfigFact("model_type", "laguna", "/model_type"),
+        ConfigFact("architecture", "LagunaForCausalLM", "/architectures/0"),
+        *(_config_fact(config, name) for name in names),
+        _config_fact(config, "layer_types"),
+        _config_fact(config, "mlp_layer_types"),
+        _config_fact(config, "gating_types"),
+        _config_fact(config, "num_attention_heads_per_layer"),
+        _config_fact(config, "mlp_only_layers"),
+        ConfigFact("global_attention_layer_count", 12, "/layer_types", "derived"),
+        ConfigFact("sliding_attention_layer_count", 36, "/layer_types", "derived"),
+    )
+    context, provenance = _context_input(
+        values["max_position_embeddings"],
+        "/max_position_embeddings",
+        None,
+        kv_window_tokens=values["sliding_window"],
+    )
+    return ModelFamilyAdapterResult(
+        "laguna_s_2_1",
+        "ready",
+        facts,
+        context,
+        None,
+        provenance,
+        "Laguna mixed global/sliding attention cache bytes are not modeled by the generic KV estimator",
+        (),
+    )
+
+
 def _context_input(
     advertised: int,
     pointer: str,
@@ -397,6 +485,17 @@ def _positive_fields(
         else:
             values[name] = value
     return values, reasons
+
+
+def _require_exact_sequence(
+    config: Mapping[str, object],
+    name: str,
+    expected: tuple[object, ...],
+    reasons: list[str],
+) -> None:
+    value = config.get(name)
+    if not _is_sequence(value) or tuple(value) != expected:
+        reasons.append(f"/{name} does not match the Laguna S 2.1 declared structure")
 
 
 def _config_fact(
