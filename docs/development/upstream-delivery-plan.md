@@ -333,6 +333,11 @@ live memory qualification.
 
 **Depends on:** MI-3.
 
+**Prepared branch:** `604/dense-gqa-adapter-v1` at `444aebb`, stacked on
+MI-3. It introduces the shared adapter result/provenance contracts, dispatcher,
+dense/GQA adapter, one synthetic fixture, and focused tests only. The stacked
+hardware, fit, and adapter suites pass (`59 passed`).
+
 **Scope:** Adapt declared dense or GQA config structure into the generic
 estimator. Cache dtype, context policy, concurrency, and quantization overhead
 remain explicit caller/profile inputs with provenance.
@@ -349,7 +354,11 @@ configuration.
 
 ### MI-5: Qwen 3.6 hybrid config adapter
 
-**Depends on:** MI-1 and MI-3.
+**Depends on:** MI-1, MI-3, and MI-4.
+
+**Prepared branch:** `604/qwen-hybrid-adapter-v1` at `c075ee9`, stacked on
+MI-4. It adds only the Qwen dispatcher branch, hybrid adapter, pinned fixture,
+and Qwen-focused tests. The stacked suites pass (`66 passed`).
 
 **Scope:** Add a revision-pinned adapter for the declared Qwen 3.6 hybrid
 attention structure. Validate the exact full-attention cadence and expose
@@ -367,7 +376,14 @@ execution, and architecture-specific cache formulas.
 
 ### MI-6: Laguna S 2.1 config adapter
 
-**Depends on:** PR 5, MI-1, and MI-3.
+**Depends on:** PR 5, MI-1, MI-3, and MI-4. It is stacked after MI-5 to avoid
+parallel edits to the shared dispatcher, although Laguna behavior does not
+depend on Qwen behavior.
+
+**Prepared branch:** `604/laguna-config-adapter-v1` at `a380a8f`, stacked on
+MI-5. It adds only the Laguna dispatcher branch, exact-structure adapter,
+pinned fixture, and Laguna-focused tests. The stacked suites pass
+(`84 passed`).
 
 **Scope:** Add a revision-pinned adapter for Laguna S 2.1 structural identity:
 mixed global/sliding attention, per-layer heads, MoE routing, shared expert,
