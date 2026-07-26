@@ -1,6 +1,6 @@
 # ModelProfile Legacy Compatibility Mapping
 
-Status: PR3C qualification import slice
+Status: PR3D explicit finalization slice
 Runtime wiring: none
 
 ## Boundary
@@ -11,7 +11,15 @@ CLI-server, and qualification inputs and returns an incomplete ModelProfile v1 i
 envelope. It does not read files, download artifacts, mutate runtime state,
 start a server, qualify a model, or finalize a profile.
 
-The implementation has six ownership modules:
+`finalize_legacy_model_profile` is the separate explicit completion boundary.
+Its caller supplies a complete candidate profile and both committed schemas.
+The finalizer rejects non-missing import errors, changes to imported facts,
+and removal or mutation of imported provenance records. It delegates profile
+schema, subject-digest, evidence-binding, and cross-field checks to the existing
+ModelProfile validator before returning `complete=true`. It does not infer
+missing facts, run qualification, resolve a profile, or activate a model.
+
+The implementation has seven ownership modules:
 
 - `vllm_mlx/model_profile_compat.py` is the stable public facade. It re-exports
   the three result/input dataclasses and owns the keyword-only dispatcher.
@@ -29,6 +37,8 @@ The implementation has six ownership modules:
 - `vllm_mlx/_model_profile_qualification_compat.py` owns PR3C normalization of
   already-recorded qualification evidence. It does not run a qualification,
   recompute a subject digest, finalize a profile, or mutate runtime state.
+- `vllm_mlx/_model_profile_finalization.py` owns PR3D preservation checks and
+  delegates final schema and semantic validation to the committed validators.
 
 Each input carries a payload, source location, and SHA-256. Output source
 descriptors intentionally omit payloads. The result is an audit record and is
@@ -72,11 +82,12 @@ qualification from model names, parser names, feature flags, or booleans.
 Generic command `status`, `production_ready`, and bare qualification booleans
 are recorded only as deterministic warnings. They never establish qualification
 truth. PR3C preserves a valid `not_qualified`, `failed`, or `blocked` status,
-but it always returns `complete=false`; binding evidence to the final canonical
-subject digest and promoting a complete profile remain PR3D responsibilities.
+but import always returns `complete=false`; binding evidence to the final
+canonical subject digest and promoting a complete profile happen only through
+the explicit PR3D finalization boundary.
 
 The serialized result follows
 `schemas/model-profile-import-result-v1.schema.json` and can be checked with
 the committed `vllm_mlx.model_profile_import` validator APIs. A future slice may
-add other source kinds or explicit completion; neither is part of this module's
-public dispatcher today.
+add other source kinds; neither import nor finalization performs runtime
+resolution or activation.

@@ -76,9 +76,13 @@ class CompatibilityIssue:
         }
 
 
+class ModelProfileFinalizationError(ValueError):
+    """Raised when an incomplete import cannot be finalized safely."""
+
+
 @dataclass(frozen=True)
 class ModelProfileImportResult:
-    """The incomplete v1 import envelope; it never changes runtime state."""
+    """A v1 import envelope; construction never changes runtime state."""
 
     complete: bool
     sources: tuple[LegacySourceInput, ...]

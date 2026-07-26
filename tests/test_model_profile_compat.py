@@ -289,18 +289,23 @@ def test_as_dict_omits_payloads_and_deep_copies_nested_values():
     assert "/unrelated" not in result.issues[0].sources
 
 
-def test_dispatcher_exposes_pr3c_keyword_only_inputs_without_expanding_exports():
-    signature = inspect.signature(import_legacy_model_profile)
+def test_facade_exposes_only_the_bounded_import_and_finalization_api():
+    import_signature = inspect.signature(import_legacy_model_profile)
+    finalize_signature = inspect.signature(
+        model_profile_compat.finalize_legacy_model_profile
+    )
     assert model_profile_compat.__all__ == (
         "LegacySourceInput",
         "CompatibilityIssue",
+        "ModelProfileFinalizationError",
         "ModelProfileImportResult",
+        "finalize_legacy_model_profile",
         "import_legacy_model_profile",
     )
     assert model_profile_compat.LegacySourceInput is (
         _model_profile_compat_types.LegacySourceInput
     )
-    assert list(signature.parameters) == [
+    assert list(import_signature.parameters) == [
         "acquisition",
         "conversion",
         "registration",
@@ -310,7 +315,21 @@ def test_dispatcher_exposes_pr3c_keyword_only_inputs_without_expanding_exports()
     ]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        for parameter in signature.parameters.values()
+        for parameter in import_signature.parameters.values()
+    )
+    assert list(finalize_signature.parameters) == [
+        "imported",
+        "completed_profile",
+        "profile_schema",
+        "import_schema",
+    ]
+    assert (
+        finalize_signature.parameters["profile_schema"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        finalize_signature.parameters["import_schema"].kind
+        is inspect.Parameter.KEYWORD_ONLY
     )
 
 
