@@ -166,6 +166,15 @@ and product UI.
 
 **Depends on:** PR 3B.
 
+**Prepared branch:** `604/model-profile-import-qualification-v1`, stacked on
+the prepared PR 3B branch at `dc9e33e`. Focused profile suites pass
+(`38 passed`); Ruff, Black, focused mypy, touched slop, claim lint, and diff
+checks are clean. Direct review added regression coverage for mixed
+valid/invalid evidence history and strict RFC 3339 timestamps. The external
+Desloppify subjective-review runner exhausted its account quota in all 20
+batches, so no subjective score is claimed for this slice. Do not open PR 3C
+before PR 3B is accepted.
+
 **Scope:** Add qualification-source and evidence normalization without
 promoting weak or unbound booleans into qualification truth.
 
@@ -180,6 +189,14 @@ and product UI.
 
 **Depends on:** PR 3C.
 
+**Prepared branch:** `604/model-profile-import-finalization-v1`, stacked on
+the prepared PR 3C branch at `633217d`. Focused profile suites pass
+(`46 passed`); Ruff, Black, focused mypy, touched slop, claim lint, and diff
+checks are clean. A bounded Desloppify mechanical scan reports objective and
+verified `81.5`; its overall/strict `20.4` values are not decision-grade
+because all subjective dimensions are unassessed after runner quota exhaustion.
+Do not open PR 3D before PR 3C is accepted.
+
 **Scope:** Add the pure finalization path that accepts explicitly supplied
 missing facts, rejects changed imported facts and source errors, revalidates
 the complete profile, and returns `complete=true` only after validation passes.
@@ -187,7 +204,10 @@ the complete profile, and returns `complete=true` only after validation passes.
 **Files:**
 
 - `vllm_mlx/model_profile_compat.py`
+- `vllm_mlx/_model_profile_compat_types.py`
+- `vllm_mlx/_model_profile_finalization.py`
 - `tests/test_model_profile_compat.py`
+- `tests/test_model_profile_finalization_compat.py`
 - `docs/development/model-profile-compatibility-mapping.md`
 
 **Acceptance checks:** Conflict resolution is fail-closed; completed profiles
