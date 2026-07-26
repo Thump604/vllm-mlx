@@ -18,7 +18,7 @@ implemented in P1.3 and P1.4.
 
 ## Documents And State
 
-The product requires four distinct documents:
+The product requires three distinct documents:
 
 | Document | Mutability | Responsibility |
 |---|---|---|
@@ -138,23 +138,21 @@ vocabularies, and passing evidence for `qualified`. P1.4 semantic validation
 must enforce digest equality, set disjointness, feature-policy linkage, context
 and KV relationships, and provenance coverage for optional sections.
 
-P1.4 will implement those semantic checks in a standalone model-profile module
-without importing serving code. That implementation must use RFC 8785
-canonical JSON rather than relying on Python dictionary order or an
-approximate sorted-key encoding. It must also reject inactive feature modes
-that expose request or activation controls and collect deterministic failures
-before raising its validation error.
+`vllm_mlx.model_profile` implements those semantic checks without importing
+serving code. It uses RFC 8785 canonical JSON rather than relying on Python
+dictionary order or an approximate sorted-key encoding. It also rejects
+inactive feature modes that expose request or activation controls and collects
+deterministic failures before raising its validation error.
 
 ## Legacy Import Envelope
 
-P1.3 will define `schemas/model-profile-import-result-v1.schema.json` as the
-only compatibility output allowed to contain an incomplete profile fragment.
-It must record exact source files, stable issue codes, affected pointers,
-severity, and conflicts. `complete=true` will be valid only when `profile`
-validates as a full ModelProfile; otherwise the result remains an import report
-and cannot be activated or qualified. Missing values remain issues; importers
-must not synthesize parser, template, capability, context, or qualification
-facts from model names.
+`schemas/model-profile-import-result-v1.schema.json` is the only compatibility
+output allowed to contain an incomplete profile fragment. It records exact
+source files, stable issue codes, affected pointers, severity, and conflicts.
+`complete=true` is valid only when `profile` validates as a full ModelProfile;
+otherwise the result remains an import report and cannot be activated or
+qualified. Missing values remain issues; importers must not synthesize parser,
+template, capability, context, or qualification facts from model names.
 
 ## Compatibility Mapping Required Before Runtime Wiring
 
