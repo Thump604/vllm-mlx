@@ -110,6 +110,11 @@ activation, automatic qualification promotion, and product UI.
 
 **Depends on:** PR 2.
 
+**Prepared branch:** `604/model-profile-resolution-v1` at `a4b2cd1`,
+stacked on the prepared PR 2 branch. The schema, semantic validation, and
+precedence suites pass together (`30 passed`). Do not open it before PR 2 is
+accepted.
+
 **Scope:** Add a pure resolver that makes precedence executable and auditable:
 profile limits, allowed activation overrides, profile defaults, provider
 defaults, then runtime fallbacks. Immutable identity/template/parser/engine
