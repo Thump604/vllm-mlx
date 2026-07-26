@@ -264,6 +264,10 @@ inspection and estimation logic without accepting the product roadmap.
 
 **Depends on:** PR 1 and PR 2.
 
+**Prepared branch:** `604/model-metadata-inspection-v1` at `3b9b61f`,
+stacked on the prepared PR 2 branch. It contains only `model_workflow.py` and
+its focused tests; all 23 tests pass. Do not open it before PR 2 is accepted.
+
 **Scope:** Extend artifact inspection to tokenizer, chat-template, generation,
 license, immutable revision, and declared-capability metadata. Preserve source
 attribution and return unknown rather than inferring unsupported capabilities.
@@ -301,6 +305,10 @@ serving behavior.
 ### MI-3: Explainable model-fit calculations
 
 **Depends on:** MI-2.
+
+**Prepared branch:** `604/model-fit-estimation-v1` at `8711de7`, stacked on
+the prepared MI-2 branch. The hardware and fit suites pass together
+(`44 passed`). Hold it until MI-2 is accepted.
 
 **Scope:** Add pure calculations for exact artifact residency, dense/GQA KV
 cache, independent context bounds, conversion workspace, and memory margin.
