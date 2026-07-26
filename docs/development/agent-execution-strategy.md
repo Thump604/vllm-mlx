@@ -6,9 +6,16 @@ Use GPT-5.6 Sol for decisions and integration, Terra for bounded engineering,
 and Luna for clear, repeatable work. Delegation should reduce coordinator noise
 and cost without distributing architecture or weakening review.
 
-The official Codex model guidance describes Sol as the detailed flagship, Terra
-as the pragmatic all-rounder, and Luna as the fast model for repeatable work.
-This repository turns that guidance into explicit task and reasoning defaults.
+The allocation policy follows Anthropic's documented model-family tiers:
+fast/high-volume work, balanced complex work, and the most complex long-running
+work. Effort follows Anthropic's documented latency/token-versus-reasoning
+tradeoff. This repository translates those task classes to the available Codex
+Luna, Terra, and Sol models without claiming cross-provider model equivalence.
+
+Source guidance:
+
+- <https://platform.claude.com/docs/en/about-claude/models/overview>
+- <https://platform.claude.com/docs/en/build-with-claude/effort>
 
 ## Roles
 

@@ -16,7 +16,17 @@ packages; they do not create a competing plan.
 
 Use the smallest model and lowest reasoning level that can reliably satisfy the
 work package. Reasoning levels are part of the assignment, not an implicit
-agent choice.
+agent choice. Capability tiers follow Anthropic's documented model-family
+positioning: fast/high-volume work, balanced complex work, and the most complex
+long-running work. Reasoning effort follows Anthropic's documented principle
+that higher effort trades latency and token use for deeper reasoning. The
+Luna/Terra/Sol rows below map those task classes onto the Codex models available
+in this environment; they do not claim that the model families are equivalent.
+
+Sources:
+
+- <https://platform.claude.com/docs/en/about-claude/models/overview>
+- <https://platform.claude.com/docs/en/build-with-claude/effort>
 
 | Role | Model | Reasoning | Use |
 |---|---|---|---|
