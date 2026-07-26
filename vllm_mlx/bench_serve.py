@@ -33,10 +33,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import httpx
-from tabulate import tabulate as _tabulate
+from tabulate import tabulate as _tabulate  # type: ignore[import-untyped]
 
 # ---------------------------------------------------------------------------
 # Prompt set loading
@@ -979,7 +979,7 @@ async def stream_chat_completion(
 
     try:
         if timeout_s and timeout_s > 0:
-            async with asyncio.timeout(timeout_s):
+            async with asyncio.timeout(timeout_s):  # type: ignore[attr-defined]
                 await _consume_stream()
         else:
             await _consume_stream()
@@ -1070,6 +1070,16 @@ def _check_length_bounds(min_chars: Any, max_chars: Any, content: str) -> list[s
     if max_chars is not None and len(content) > int(max_chars):
         issues.append(f"content longer than max_chars={max_chars}")
     return issues
+
+
+def _expects_tool_call(checks: dict) -> bool:
+    """Return whether the case contract explicitly expects tool-call output."""
+    expected_count = checks.get("tool_call_count")
+    return (
+        (expected_count is not None and int(expected_count) > 0)
+        or checks.get("tool_call_names") is not None
+        or checks.get("tool_call_args_required_keys") is not None
+    )
 
 
 def _check_regex_patterns(
@@ -1206,9 +1216,12 @@ def validate_quality_checks(
     tool_calls = tool_calls or []
 
     issues.extend(_check_finish_reason(checks.get("finish_reason"), finish_reason))
-    issues.extend(
-        _check_length_bounds(checks.get("min_chars"), checks.get("max_chars"), content)
-    )
+    if content or not tool_calls or not _expects_tool_call(checks):
+        issues.extend(
+            _check_length_bounds(
+                checks.get("min_chars"), checks.get("max_chars"), content
+            )
+        )
     issues.extend(
         _check_regex_patterns(
             checks.get("required_regex"),
@@ -1400,7 +1413,7 @@ async def _fetch_post_run_status(client: httpx.AsyncClient, base_url: str) -> di
     try:
         resp = await client.get(f"{base_url}/v1/status")
         resp.raise_for_status()
-        return resp.json()
+        return cast(dict[Any, Any], resp.json())
     except Exception:
         return {}
 
@@ -1514,7 +1527,8 @@ def _build_workload_record(
         "ok": quality_ok,
     }
     if include_content:
-        record["quality"]["content"] = content
+        quality = cast(dict[str, Any], record["quality"])
+        quality["content"] = content
     return record
 
 
@@ -1730,7 +1744,7 @@ async def run_bench_serve_workload(
             raise ValueError("could not determine model ID; pass --model")
 
         records = []
-        cache_events = []
+        cache_events: list[dict[str, Any]] = []
         if resolved_cache_policy == "before-run":
             cache_events.append(
                 {
@@ -1871,7 +1885,7 @@ def format_table(results: list[BenchServeResult]) -> str:
                 val = round(val, 1)
             row.append(val)
         rows.append(row)
-    return _tabulate(rows, headers=_TABLE_COLUMNS, tablefmt="simple")
+    return cast(str, _tabulate(rows, headers=_TABLE_COLUMNS, tablefmt="simple"))
 
 
 def format_json(results: list[BenchServeResult]) -> str:
@@ -2130,7 +2144,9 @@ def format_workload_table(payload: dict) -> str:
                 for value in (row[col] for col in _WORKLOAD_TABLE_COLUMNS)
             ]
         )
-    return _tabulate(rows, headers=_WORKLOAD_TABLE_COLUMNS, tablefmt="simple")
+    return cast(
+        str, _tabulate(rows, headers=_WORKLOAD_TABLE_COLUMNS, tablefmt="simple")
+    )
 
 
 def format_workload_json(payload: dict) -> str:
@@ -2206,14 +2222,14 @@ logger = logging.getLogger(__name__)
 async def run_bench_serve(
     url: str = "http://127.0.0.1:8080",
     model: Optional[str] = None,
-    prompt_sets: list[str] = None,
+    prompt_sets: Optional[list[str]] = None,
     prompt_file: Optional[str] = None,
-    concurrencies: list[int] = None,
+    concurrencies: Optional[list[int]] = None,
     max_tokens: int = 256,
     repetitions: int = 3,
     warmup: int = 1,
-    thinking_values: list[Optional[bool]] = None,
-    extra_bodies: list[str] = None,
+    thinking_values: Optional[list[Optional[bool]]] = None,
+    extra_bodies: Optional[list[str]] = None,
     output_path: Optional[str] = None,
     fmt: str = "table",
     do_validate: bool = True,
@@ -2508,7 +2524,7 @@ async def run_bench_serve(
                     vals = [
                         r[key] for r in valid_results if key in r and r[key] is not None
                     ]
-                    return statistics.mean(vals) if vals else 0.0
+                    return float(statistics.mean(vals)) if vals else 0.0
 
                 mean_ttft = _mean("ttft_ms")
                 mean_tpot = _mean("tpot_ms")

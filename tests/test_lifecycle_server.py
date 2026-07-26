@@ -554,6 +554,24 @@ class TestStatusEndpointEngineRace:
             "tokenizer_sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest(),
         }
 
+    def test_health_artifact_identity_prefers_full_weight_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+
+        index = tmp_path / "model.safetensors.index.json"
+        sums = tmp_path / "SHA256SUMS"
+        index.write_bytes(b'{"weight_map":{}}')
+        sums.write_bytes(b"abc  model-00001-of-00001.safetensors\n")
+        monkeypatch.setattr(srv, "_model_path", str(tmp_path))
+
+        identity = srv._health_artifact_identity()
+        assert identity is not None
+        assert (
+            identity["weights_manifest_sha256"]
+            == hashlib.sha256(sums.read_bytes()).hexdigest()
+        )
+
     @pytest.mark.anyio
     async def test_status_endpoint_returns_disabled_mtp_object_when_absent(
         self, monkeypatch

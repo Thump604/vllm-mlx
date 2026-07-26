@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 import shutil
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -24,9 +27,11 @@ _HASH_FILES = {
     "tokenizer_sha256": ("tokenizer.json",),
     "chat_template_sha256": ("chat_template.jinja",),
     "generation_config_sha256": ("generation_config.json",),
-    "weights_manifest_sha256": ("model.safetensors.index.json", "SHA256SUMS"),
+    "weights_manifest_sha256": ("SHA256SUMS", "model.safetensors.index.json"),
 }
 _MLX_VLM_TEXT_MODEL_TYPES = frozenset({"laguna"})
+_WEIGHT_MANIFEST = "SHA256SUMS"
+_WEIGHT_INDEX = "model.safetensors.index.json"
 
 
 def _requires_mlx_vlm(profile: Mapping[str, Any]) -> bool:
@@ -44,6 +49,78 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _relative_weight_path(name: object, *, source: str) -> Path:
+    if not isinstance(name, str):
+        raise ManagedRuntimeError(f"{source} contains an invalid shard path")
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ManagedRuntimeError(f"{source} contains an invalid shard path")
+    return relative
+
+
+def _verified_manifest_entries(
+    root: Path, manifest_path: Path
+) -> list[tuple[str, str]]:
+    entries = []
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        digest, separator, name = line.partition("  ")
+        relative = _relative_weight_path(name, source="weight manifest")
+        if not separator or len(digest) != 64:
+            raise ManagedRuntimeError("weight manifest contains an invalid entry")
+        path = root / relative
+        if not path.is_file() or _sha256(path) != digest:
+            raise ManagedRuntimeError(
+                f"weight shard does not match manifest: {relative}"
+            )
+        entries.append((name, digest))
+    return entries
+
+
+def _indexed_weight_entries(root: Path) -> list[tuple[str, str]]:
+    index_path = root / _WEIGHT_INDEX
+    if not index_path.is_file():
+        raise ManagedRuntimeError("model artifact is missing its weight index")
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        names = sorted(set(index["weight_map"].values()))
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ManagedRuntimeError("weight index is invalid") from exc
+    entries = []
+    for name in names:
+        relative = _relative_weight_path(name, source="weight index")
+        path = root / relative
+        if not path.is_file():
+            raise ManagedRuntimeError(f"weight shard is missing: {relative}")
+        entries.append((str(name), _sha256(path)))
+    return entries
+
+
+def _weight_manifest(root: Path, *, prefer_index: bool = False) -> tuple[str, str]:
+    manifest_path = root / _WEIGHT_MANIFEST
+    entries = (
+        _verified_manifest_entries(root, manifest_path)
+        if manifest_path.is_file() and not prefer_index
+        else _indexed_weight_entries(root)
+    )
+    canonical = "".join(f"{digest}  {name}\n" for name, digest in sorted(entries))
+    return canonical, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _publish_weight_manifest(root: Path, content: str) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        dir=root, prefix=f".{_WEIGHT_MANIFEST}.", suffix=".tmp"
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(root / _WEIGHT_MANIFEST)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def verify_profile_artifact(
     profile: Mapping[str, Any], artifact_path: str | Path
 ) -> dict[str, Any]:
@@ -55,6 +132,15 @@ def verify_profile_artifact(
     for field, candidates in _HASH_FILES.items():
         expected = profile["artifact"]["hashes"].get(field)
         if expected is None:
+            continue
+        if field == "weights_manifest_sha256":
+            _, actual = _weight_manifest(root)
+            if actual != expected:
+                raise ManagedRuntimeError(
+                    "model artifact weights do not match profile "
+                    f"{profile['profile_id']}"
+                )
+            verified[field] = actual
             continue
         path = next(
             (root / name for name in candidates if (root / name).is_file()), None
@@ -181,6 +267,17 @@ class ManagedProductRuntime:
                 is_mllm=_requires_mlx_vlm(profile),
             ),
         )
+        canonical_manifest, actual_manifest_hash = await asyncio.to_thread(
+            _weight_manifest, target, prefer_index=True
+        )
+        expected_manifest_hash = profile["artifact"]["hashes"].get(
+            "weights_manifest_sha256"
+        )
+        if actual_manifest_hash != expected_manifest_hash:
+            raise ManagedRuntimeError(
+                f"model artifact weights do not match profile {profile_id}"
+            )
+        await asyncio.to_thread(_publish_weight_manifest, target, canonical_manifest)
         evidence = await asyncio.to_thread(verify_profile_artifact, profile, target)
         self._installed[profile_id] = target
         return {**evidence, "managed": True, "source": "immutable_repository"}

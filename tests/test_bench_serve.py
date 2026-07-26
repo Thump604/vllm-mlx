@@ -1001,6 +1001,32 @@ class TestQualityChecks:
         assert ok is True
         assert issues == []
 
+    def test_expected_tool_call_ignores_inherited_content_minimum(self):
+        tool_calls = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Chicago"}',
+                },
+            }
+        ]
+
+        ok, issues = validate_quality_checks(
+            "tool_calls",
+            "",
+            {
+                "min_chars": 8,
+                "tool_call_count": 1,
+                "tool_call_names": ["get_weather"],
+            },
+            tool_calls=tool_calls,
+        )
+
+        assert ok is True
+        assert issues == []
+
     def test_required_tool_call_name_must_exist(self):
         ok, issues = validate_quality_checks(
             "tool_calls",

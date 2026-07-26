@@ -51,11 +51,11 @@ def test_profile_identities_and_artifact_hashes_are_immutable_fixtures():
         "e06a74e6236a60c8367e1a3214e83d8b61b637b0"
     )
     assert qwen["artifact"]["hashes"] == {
-        "config_sha256": "0c37843fa49b0faf20d02582b66b6bed236f42db6f2b54bd6f84dffad3a3b365",
+        "config_sha256": "5da49c3a84c5a4a751b720b62b9f8703bdb8a0796b5fc55df3278f8b9d6ce296",
         "tokenizer_sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
         "chat_template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
         "generation_config_sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
-        "weights_manifest_sha256": "09e48724ae52eaf03ecb2b042530dfbbf058c038e857bb8d751747b680ae09ab",
+        "weights_manifest_sha256": "a95c2ee571657a7252a5b1ac63d1302c2e17a928f3a0053d556f6fa0cfe043e0",
     }
     assert laguna["identity"]["resolved_revision"] == (
         "a50e85e7e0aae7b0a504d156bd36a616ec9fea38"

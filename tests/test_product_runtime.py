@@ -46,7 +46,11 @@ def _profile(root: Path, *, converted=False):
         "tokenizer.json": b'{"version":"1"}',
         "chat_template.jinja": b"{{ messages }}",
         "generation_config.json": b'{"temperature":1.0}',
-        "model.safetensors.index.json": b'{"weight_map":{}}',
+        "model-00001-of-00001.safetensors": b"weights",
+        "model.safetensors.index.json": (
+            b'{"weight_map":{"model.layers.0.weight":'
+            b'"model-00001-of-00001.safetensors"}}'
+        ),
     }
     for name, content in files.items():
         (root / name).write_bytes(content)
@@ -58,7 +62,12 @@ def _profile(root: Path, *, converted=False):
         "tokenizer_sha256": _hash(root / "tokenizer.json"),
         "chat_template_sha256": _hash(root / "chat_template.jinja"),
         "generation_config_sha256": _hash(root / "generation_config.json"),
-        "weights_manifest_sha256": _hash(root / "model.safetensors.index.json"),
+        "weights_manifest_sha256": hashlib.sha256(
+            (
+                f"{_hash(root / 'model-00001-of-00001.safetensors')}"
+                "  model-00001-of-00001.safetensors\n"
+            ).encode()
+        ).hexdigest(),
     }
     profile["artifact"]["quantization"]["source"] = (
         "conversion_manifest" if converted else "local_artifact_config"
@@ -75,6 +84,59 @@ def test_artifact_verification_is_content_bound(tmp_path):
     (tmp_path / "config.json").write_text("changed")
     with pytest.raises(ManagedRuntimeError, match="does not match"):
         verify_profile_artifact(profile, tmp_path)
+
+
+def test_artifact_verification_rejects_modified_weight_shard(tmp_path):
+    profile = _profile(tmp_path)
+    verify_profile_artifact(profile, tmp_path)
+
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"changed")
+
+    with pytest.raises(ManagedRuntimeError, match="weights do not match"):
+        verify_profile_artifact(profile, tmp_path)
+
+
+@pytest.mark.anyio
+async def test_managed_acquisition_materializes_verified_weight_manifest(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    profile = _profile(source)
+    (source / "SHA256SUMS").write_text("partial")
+    monkeypatch.setenv(
+        "VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "lifecycle.json")
+    )
+
+    def fake_acquire(_repository, *, options):
+        target = Path(options.target_dir)
+        target.mkdir(parents=True)
+        for path in source.iterdir():
+            (target / path.name).write_bytes(path.read_bytes())
+
+    monkeypatch.setattr(control_runtime, "acquire_model", fake_acquire)
+
+    async def factory(spec):
+        return FakeEngine(spec)
+
+    manager = ResidencyManager(factory)
+    runtime = ManagedProductRuntime(
+        manager,
+        model_root=tmp_path / "managed",
+        endpoint="http://127.0.0.1:8080",
+    )
+
+    installed = await runtime.install(profile)
+    manifest = Path(installed["artifact_path"]) / "SHA256SUMS"
+
+    assert installed["source"] == "immutable_repository"
+    assert manifest.read_text() == (
+        f"{_hash(source / 'model-00001-of-00001.safetensors')}"
+        "  model-00001-of-00001.safetensors\n"
+    )
+    assert list(manifest.parent.glob(".SHA256SUMS.*.tmp")) == []
+    verify_profile_artifact(profile, installed["artifact_path"])
+    await manager.shutdown()
 
 
 def test_profile_to_model_spec_applies_only_declared_overrides(tmp_path):
@@ -125,13 +187,13 @@ async def test_laguna_managed_acquisition_uses_mlx_vlm_download_rules(
 
     def fake_acquire(_repository, *, options):
         observed["is_mllm"] = options.is_mllm
+        target = Path(options.target_dir)
+        target.mkdir(parents=True)
+        for path in tmp_path.iterdir():
+            if path.is_file():
+                (target / path.name).write_bytes(path.read_bytes())
 
     monkeypatch.setattr(control_runtime, "acquire_model", fake_acquire)
-    monkeypatch.setattr(
-        control_runtime,
-        "verify_profile_artifact",
-        lambda _profile, target: {"artifact_path": str(target)},
-    )
     monkeypatch.setenv(
         "VLLM_MLX_LIFECYCLE_STATE_PATH", str(tmp_path / "lifecycle.json")
     )

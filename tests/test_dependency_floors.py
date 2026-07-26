@@ -35,7 +35,7 @@ def _has_minimum(requirement: str, minimum: str) -> bool:
 def test_mlx_vlm_floor_includes_step37_flash_support_and_followups():
     dependencies = _project_dependencies()
 
-    assert _has_minimum(dependencies["mlx-vlm"], "0.6.2")
+    assert _has_minimum(dependencies["mlx-vlm"], "0.6.7")
 
 
 def test_mlx_lm_floor_matches_current_mlx_vlm_runtime_requirement():
