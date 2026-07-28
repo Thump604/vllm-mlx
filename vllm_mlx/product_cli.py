@@ -97,7 +97,7 @@ def product_command(
             print(flush=True)
             return
     elif command == "coding-setup":
-        payload = _coding_setup(
+        payload = build_coding_setup(
             args.client,
             args.model,
             args.endpoint,
@@ -150,7 +150,7 @@ def _parse_overrides(values: list[str]) -> dict[str, Any]:
     return overrides
 
 
-def _coding_setup(
+def build_coding_setup(
     client: str,
     model: str,
     endpoint: str,
