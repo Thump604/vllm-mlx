@@ -795,6 +795,12 @@ routes, profile fixtures, and live model calls.
 
 **Depends on:** PR 6B, PR 7A, PW-2, and PW-3.
 
+**Prepared branch:** `604/managed-product-runtime-v1` at `f1140ba`, composed
+from the prepared product-service and first-release-profile branches. The
+focused catalog, runtime, server, service, and route suites pass (`27 passed`);
+Ruff, Black, and `git diff --check` are clean. The branch deliberately excludes
+the later golden workflow transport test harness.
+
 **Scope:** Bind exact profile hashes to local or managed artifacts and adapt one
 validated profile to the existing single-resident lifecycle manager. Preserve
 the prior model on failed replacement and clear dormant state on removal.
