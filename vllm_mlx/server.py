@@ -4310,6 +4310,30 @@ def _record_structured_stream_content(
         parts.append(content)
 
 
+def _resolve_reasoning_stream_delta(reasoning_parser, output, delta_msg, request):
+    """Return a stream delta, including parser state buffered at a length stop."""
+    if delta_msg is None:
+        if not output.finished:
+            return None
+        content = None
+        reasoning = None
+    else:
+        content = delta_msg.content
+        reasoning = delta_msg.reasoning
+        content, reasoning = _promote_streaming_response_format_delta(
+            content, reasoning, request
+        )
+
+    if output.finished:
+        final_delta = reasoning_parser.finalize_stream()
+        if final_delta is not None:
+            if final_delta.content:
+                content = (content or "") + final_delta.content
+            if final_delta.reasoning:
+                reasoning = (reasoning or "") + final_delta.reasoning
+    return content, reasoning
+
+
 def _validate_structured_stream(
     request: ChatCompletionRequest,
     content_parts: list[str],
@@ -6192,15 +6216,12 @@ async def stream_chat_completion(
                     previous_text, accumulated_text, delta_text
                 )
 
-                if delta_msg is None:
-                    # Skip this chunk (e.g., <think> token itself)
-                    continue
-
-                content = delta_msg.content
-                reasoning = delta_msg.reasoning
-                content, reasoning = _promote_streaming_response_format_delta(
-                    content, reasoning, request
+                resolved_delta = _resolve_reasoning_stream_delta(
+                    reasoning_parser, output, delta_msg, request
                 )
+                if resolved_delta is None:
+                    continue
+                content, reasoning = resolved_delta
 
                 # Some models (e.g. MiniMax) wrap tool calls in <think>
                 # blocks, so reasoning parser captures tool call XML as
