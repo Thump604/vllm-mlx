@@ -640,6 +640,12 @@ HTTP status, model processes, Jobs/Ops, or live state.
 
 **Depends on:** PR 7.
 
+**Prepared branch:** `604/profile-qualification-evidence-v1` at `8b6a1d0`,
+stacked on the recovery/validation workflow branch. The focused workflow suite
+passes (`63 passed`); Ruff, Black, and `git diff --check` are clean. The code
+binds evidence but does not promote a profile automatically; wiring it through
+the final lifecycle activation surface remains dependent on PR 7.
+
 **Scope:** Convert bounded load, generation, parser, memory, and recovery
   results into profile evidence without automatically promoting a model to
   qualified or production-ready.
