@@ -536,22 +536,63 @@ fixture revision or digest drift fails closed.
 **Excluded:** Local `/Volumes` access in CI, model loads, service changes,
 performance claims, and exposure policy.
 
-### PR 6: Acquisition, conversion, and artifact validation integration
+### PR 6A: Targeted resumable acquisition
 
-**Depends on:** PR 3 and PR 5.
+**Depends on:** PR 2 and MI-1.
 
-**Scope:** Have existing workflow commands emit the canonical profile fragment,
-  conversion manifest binding, resumable state, and integrity result.
+**Prepared branch:** `604/model-acquisition-resume-v1` at `08c5ce7`, stacked
+on the prepared metadata-inspection branch. The focused workflow suite passes
+(`33 passed`); Ruff, Black, and `git diff --check` are clean. Do not open it
+until its contract dependencies are accepted.
 
-**Files:** Existing workflow/acquisition modules identified by the current
-  inventory, their focused tests, and the relevant versioned schemas.
+**Scope:** Make targeted Hugging Face acquisition identity-bound, resumable,
+and crash-durable. An immutable revision, operation journal, staging marker,
+atomic manifest publication, retry behavior, and target-path conflict handling
+remain inside this single workflow slice.
 
-**Acceptance checks:** A clean fixture run records exact revision, conversion
-  parameters, artifact digest, tool versions, and checksum results; interrupted
-  work is resumable or terminally actionable.
+**Files:**
 
-**Excluded:** Serving startup, model qualification, catalog curation, desktop
-  UX, and broad refactoring of workflow modules.
+- `vllm_mlx/model_workflow.py`
+- `tests/test_model_workflow.py`
+
+**Acceptance checks:** An interrupted acquisition resumes only when its exact
+identity matches; a partial target cannot be mistaken for a complete artifact;
+the published manifest is durable and bound to the operation identity; unrelated
+target paths fail without modification.
+
+**Excluded:** Conversion, registration, ModelProfile completion, lifecycle
+activation, model loading, qualification, catalog curation, desktop UX, and
+broad workflow refactoring.
+
+### PR 6B: Recoverable conversion and output validation
+
+**Depends on:** PR 6A.
+
+**Scope:** Add identity-bound conversion journaling, cancellation/retry
+handling, output validation, and atomic conversion-manifest publication. Keep
+conversion mechanics separate from acquisition and profile registration.
+
+**Acceptance checks:** A conversion cannot overwrite an unrelated output;
+cancelled and failed conversions retain actionable state; successful output has
+the expected MLX structure and content binding before it is registered.
+
+**Excluded:** Acquisition changes, serving startup, model qualification,
+catalog curation, desktop UX, and lifecycle activation.
+
+### PR 6C: Workflow-to-profile evidence integration
+
+**Depends on:** PR 3D, PR 5, and PR 6B.
+
+**Scope:** Emit profile-bound acquisition and conversion evidence through the
+explicit import/finalization boundary. This is the only workflow slice allowed
+to make a complete profile from the independently validated operation records.
+
+**Acceptance checks:** Exact revision, conversion parameters, artifact digest,
+tool versions, and checksum results retain provenance; incomplete workflow
+facts stay incomplete rather than becoming inferred profile truth.
+
+**Excluded:** Serving startup, automatic qualification promotion, catalog
+curation, desktop UX, and broad workflow refactoring.
 
 ### LC-1: Pure lifecycle state contract
 
