@@ -1950,6 +1950,72 @@ class TestStreamChatCompletion:
         assert payloads[2]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
+    async def test_stream_emits_terminal_speculative_metadata(self, monkeypatch):
+        """Streaming speculative requests expose terminal draft counters."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="done",
+                    new_text="done",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    mtp_drafts=9,
+                    mtp_accepted=7,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(
+            server,
+            "_engine",
+            type("DraftEngine", (), {"_model": type("Draft", (), {"draft_kind": "dflash"})()})(),
+        )
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        metadata_payload = next(
+            payload for payload in payloads if payload["generation_metadata"] is not None
+        )
+        assert metadata_payload["choices"] == []
+        assert metadata_payload["generation_metadata"] == {
+            "no_final_content_watchdog_tokens": None,
+            "no_final_content_watchdog_enforced": False,
+            "speculative_method": "dflash",
+            "speculative_drafts": 9,
+            "speculative_accepted": 7,
+        }
+
+    @pytest.mark.anyio
     async def test_auto_parser_streams_bare_bracket_tool_calls(self, monkeypatch):
         """Bare bracket tool calls should stream as structured tool_calls."""
         from vllm_mlx.engine.base import GenerationOutput
