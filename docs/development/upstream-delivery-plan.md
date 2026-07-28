@@ -249,6 +249,13 @@ client behavior, feature qualification, or resident/default policy.
 
 **Depends on:** PR 1, PR 2, and PR 3D.
 
+**Prepared branch:** `604/laguna-onboarding-fixture-v1` at `5a00380`,
+stacked on the prepared PR 3D branch. The fixture is structural-only: its
+source revision and hashes are asserted locally, the upstream-claim lint and
+diff check pass, and it contains no local artifact path, conversion, serving,
+or qualification claim. Do not open it before PR 1, PR 2, and PR 3D are
+accepted.
+
 **Scope:** Add the Laguna acceptance fixture and immutable artifact metadata as
 test data/documentation. Demonstrate the boundary between structural artifact
 facts and later runtime qualification.
