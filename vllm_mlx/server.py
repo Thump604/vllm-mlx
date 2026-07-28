@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import secrets
 import socket as _socket
@@ -51,8 +52,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
+from typing import Any, cast
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -155,6 +157,11 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
+from .control.service import ProductControlError, ProductControlService
+from .control.routes import (
+    create_control_router as _create_control_router,
+    product_control_error_handler,
+)
 from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .endpoint_model_policies import (
@@ -211,6 +218,7 @@ _lazy_load_model: bool = False
 _residency_manager: ResidencyManager | None = None
 _lifecycle_task: asyncio.Task | None = None
 _lifespan_active: bool = False
+_product_control_service: ProductControlService | None = None
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -1236,6 +1244,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         logger.info(f"Preparing BatchedEngine for residency: {spec.model_name}")
         return BatchedEngine(
             model_name=spec.model_name,
+            trust_remote_code=spec.trust_remote_code,
             scheduler_config=spec.scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
@@ -1249,6 +1258,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
     )
     return SimpleEngine(
         model_name=spec.model_name,
+        trust_remote_code=spec.trust_remote_code,
         force_mllm=spec.force_mllm,
         mtp=spec.mtp,
         prefill_step_size=spec.prefill_step_size,
@@ -1258,6 +1268,9 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         specprefill_backbone_pct=spec.specprefill_backbone_pct,
         specprefill_draft_model=spec.specprefill_draft_model,
         max_kv_size=max_kv_size,
+        mllm_draft_model=spec.mllm_draft_model,
+        mllm_draft_kind=spec.mllm_draft_kind,
+        mllm_draft_block_size=spec.mllm_draft_block_size,
     )
 
 
@@ -1678,6 +1691,34 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     if not secrets.compare_digest(credentials.credentials, _api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
+
+
+async def verify_product_control_api_key(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Authenticate product control without escaping its stable envelope."""
+    try:
+        return await verify_api_key(credentials)
+    except HTTPException as exc:
+        raise ProductControlError("authentication_failed", str(exc.detail)) from exc
+
+
+def _get_product_control_service() -> ProductControlService:
+    if _product_control_service is None:
+        raise ProductControlError(
+            "runtime_unavailable", "managed product control is not configured"
+        )
+    return _product_control_service
+
+
+app.add_exception_handler(
+    ProductControlError,
+    product_control_error_handler,
+)
+app.include_router(
+    _create_control_router(_get_product_control_service),
+    dependencies=[Depends(verify_product_control_api_key)],
+)
 
 
 def get_engine() -> BaseEngine:
@@ -6483,6 +6524,174 @@ def _make_keepalive_http_protocol(idle=10, interval=5, count=3):
 # =============================================================================
 
 
+def _parse_product_artifact_bindings(values: list[str]) -> dict[str, Path]:
+    bindings: dict[str, Path] = {}
+    for value in values:
+        profile_id, separator, raw_path = value.partition("=")
+        if not separator or not profile_id or not raw_path:
+            raise ValueError(
+                "--product-artifact-binding must use PROFILE_ID=/absolute/path"
+            )
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            raise ValueError("product artifact bindings must use absolute paths")
+        if profile_id in bindings:
+            raise ValueError(f"duplicate product artifact binding: {profile_id}")
+        bindings[profile_id] = path.resolve()
+    return bindings
+
+
+def _persisted_product_profile(state_path: Path, catalog) -> dict[str, Any] | None:
+    if not state_path.is_file():
+        return None
+    try:
+        payload = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid product lifecycle state: {state_path}") from exc
+    snapshot = payload.get("snapshot") if isinstance(payload, dict) else None
+    configured = (
+        snapshot.get("configured_profile") if isinstance(snapshot, dict) else None
+    )
+    resolved = snapshot.get("resolved_process") if isinstance(snapshot, dict) else None
+    if configured is None:
+        return None
+    if not isinstance(configured, dict) or not isinstance(resolved, dict):
+        raise RuntimeError("persisted product profile identity is incomplete")
+    try:
+        revision = int(configured["profile_revision"])
+        profile = cast(
+            dict[str, Any], catalog.get(str(configured["profile_id"]), revision)
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "persisted product profile is not present in the catalog"
+        ) from exc
+    if profile["subject_digest"] != resolved.get("config_digest"):
+        raise RuntimeError(
+            "persisted product profile digest does not match the catalog"
+        )
+    return profile
+
+
+def _apply_managed_product_profile(profile: Mapping[str, Any], spec: ModelSpec) -> None:
+    """Apply one profile to the existing server globals before engine loading."""
+    global _model_name, _model_path, _default_max_tokens, _max_request_tokens
+    global _default_temperature, _default_top_p, _default_top_k, _default_min_p
+    global _default_presence_penalty, _default_repetition_penalty
+    global _default_chat_template_kwargs, _default_thinking_token_budget
+    global _reasoning_parser, _reasoning_parser_name
+    global _tool_call_parser, _enable_auto_tool_choice, _tool_parser_instance
+    global _force_mllm_model
+
+    serving = cast(dict[str, Any], profile["serving"])
+    if not isinstance(serving, dict):
+        raise TypeError("managed product serving profile must be an object")
+    sampling = cast(dict[str, Any], serving["sampling"])
+    limits = cast(dict[str, Any], serving["limits"])
+    parsers = cast(dict[str, Any], serving["parsers"])
+    template = cast(dict[str, Any], serving["template"])
+    identity = cast(dict[str, Any], profile["identity"])
+    if not all(
+        isinstance(value, dict)
+        for value in (sampling, limits, parsers, template, identity)
+    ):
+        raise TypeError("managed product profile sections must be objects")
+    defaults = cast(dict[str, Any], sampling["profile_defaults"])
+    if not isinstance(defaults, dict):
+        raise TypeError("managed product sampling defaults must be an object")
+
+    _model_path = spec.model_name
+    _model_name = str(identity["served_model_name"])
+    _default_max_tokens = int(limits["max_output_tokens"])
+    _max_request_tokens = int(limits["max_request_output_tokens"])
+    _default_temperature = defaults.get("temperature")
+    _default_top_p = defaults.get("top_p")
+    _default_top_k = defaults.get("top_k")
+    _default_min_p = defaults.get("min_p")
+    _default_presence_penalty = defaults.get("presence_penalty")
+    _default_repetition_penalty = defaults.get("repetition_penalty")
+    _default_chat_template_kwargs = dict(template.get("default_kwargs", {}))
+    _default_thinking_token_budget = None
+    _force_mllm_model = spec.force_mllm
+
+    reasoning_name = parsers.get("reasoning")
+    _reasoning_parser_name = str(reasoning_name) if reasoning_name else None
+    _reasoning_parser = (
+        get_reasoning_parser(_reasoning_parser_name)()
+        if _reasoning_parser_name is not None
+        else None
+    )
+    tool_name = parsers.get("tool")
+    if tool_name and ToolParserManager.get_tool_parser(str(tool_name)) is None:
+        raise ValueError(f"unknown tool parser in managed profile: {tool_name}")
+    _tool_call_parser = str(tool_name) if tool_name else None
+    _enable_auto_tool_choice = _tool_call_parser is not None
+    _tool_parser_instance = None
+
+
+def _sync_managed_product_runtime() -> None:
+    _sync_engine_from_residency()
+
+
+def _configure_managed_product(args) -> None:
+    """Configure the first-product control plane without a second runtime owner."""
+    global _engine, _model_name, _model_path, _default_model_key
+    global _residency_manager, _auto_unload_idle_seconds, _lazy_load_model
+    global _product_control_service
+
+    from .catalog import load_catalog
+    from .control.runtime import (
+        ManagedProductRuntime,
+        profile_to_model_spec,
+        verify_profile_artifact,
+    )
+
+    state_dir = Path(args.product_state_dir).expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "lifecycle.json"
+    os.environ["VLLM_MLX_LIFECYCLE_STATE_PATH"] = str(state_path)
+    catalog = load_catalog(args.product_catalog)
+    bindings = _parse_product_artifact_bindings(args.product_artifact_binding)
+    model_root = Path(args.product_model_root).expanduser().resolve()
+    manager = ResidencyManager(
+        _engine_factory,
+        on_engine_loaded=_restore_engine_state,
+        on_engine_unloading=_persist_engine_state,
+        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+    )
+    initial_profile = _persisted_product_profile(state_path, catalog)
+    if initial_profile is not None:
+        profile_id = str(initial_profile["profile_id"])
+        artifact = bindings.get(profile_id) or (
+            model_root / str(initial_profile["identity"]["artifact_id"])
+        )
+        verify_profile_artifact(initial_profile, artifact)
+        spec = profile_to_model_spec(initial_profile, artifact)
+        manager.register_model(spec)
+        _apply_managed_product_profile(initial_profile, spec)
+        _lazy_load_model = args.lazy_load_model
+    else:
+        _model_name = None
+        _model_path = None
+        _lazy_load_model = True
+
+    _engine = None
+    _default_model_key = "default"
+    _residency_manager = manager
+    _auto_unload_idle_seconds = args.auto_unload_idle_seconds
+    endpoint_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+    runtime = ManagedProductRuntime(
+        manager,
+        model_root=model_root,
+        endpoint=f"http://{endpoint_host}:{args.port}",
+        artifact_bindings=bindings,
+        initial_profile=initial_profile,
+        apply_profile=_apply_managed_product_profile,
+        sync_runtime=_sync_managed_product_runtime,
+    )
+    _product_control_service = ProductControlService(catalog, manager, runtime)
+
+
 def main():
     """Run the server."""
     parser = create_parser()
@@ -6571,20 +6780,23 @@ def main():
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
-    # Load model before starting server
-    load_model(
-        args.model,
-        use_batching=args.continuous_batching,
-        max_tokens=args.max_tokens,
-        max_request_tokens=args.max_request_tokens,
-        force_mllm=args.mllm,
-        trust_remote_code=args.trust_remote_code,
-        mllm_draft_model=args.mllm_draft_model,
-        mllm_draft_kind=args.mllm_draft_kind,
-        mllm_draft_block_size=args.mllm_draft_block_size,
-        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
-        lazy_load_model=args.lazy_load_model,
-    )
+    if args.product_catalog:
+        _configure_managed_product(args)
+    else:
+        # Load model before starting server
+        load_model(
+            args.model,
+            use_batching=args.continuous_batching,
+            max_tokens=args.max_tokens,
+            max_request_tokens=args.max_request_tokens,
+            force_mllm=args.mllm,
+            trust_remote_code=args.trust_remote_code,
+            mllm_draft_model=args.mllm_draft_model,
+            mllm_draft_kind=args.mllm_draft_kind,
+            mllm_draft_block_size=args.mllm_draft_block_size,
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+            lazy_load_model=args.lazy_load_model,
+        )
 
     # Start server with TCP keepalive for fast dead-client detection.
     # Without this, abrupt client disconnects (power-off, network loss) take
@@ -6711,6 +6923,34 @@ Examples:
         "--lazy-load-model",
         action="store_true",
         help="Register the main model at startup but defer loading until first request",
+    )
+    parser.add_argument(
+        "--product-catalog",
+        type=str,
+        default=None,
+        help="Enable managed product control using this ModelProfile catalog root",
+    )
+    parser.add_argument(
+        "--product-state-dir",
+        type=str,
+        default="~/Library/Application Support/vllm-mlx",
+        help="Durable managed product state directory",
+    )
+    parser.add_argument(
+        "--product-model-root",
+        type=str,
+        default="~/Library/Application Support/vllm-mlx/models",
+        help="Managed product model artifact directory",
+    )
+    parser.add_argument(
+        "--product-artifact-binding",
+        action="append",
+        default=[],
+        metavar="PROFILE_ID=/ABSOLUTE/PATH",
+        help=(
+            "Bind an exact catalog profile to an existing local artifact; may be "
+            "repeated and never transfers deletion ownership"
+        ),
     )
     parser.add_argument(
         "--rate-limit",
