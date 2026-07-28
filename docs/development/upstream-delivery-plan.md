@@ -702,7 +702,7 @@ on PR 7B and PR 8.
 the prepared profile-validation branch because it uses the same canonical JSON
 dependency. The focused control-API suite passes (`16 passed`); Ruff, Black,
 and `git diff --check` are clean. The contract can be reviewed independently,
-but must not be wired to a mutable lifecycle route until PR 7 and PR 8 are
+but must not be wired to a mutable lifecycle route until PR 7B and PR 8 are
 accepted.
 
 **Scope:** Add only the versioned request/response envelope, operation models,
