@@ -589,6 +589,15 @@ catalog curation, desktop UX, and lifecycle activation.
 
 **Depends on:** PR 3D, PR 5, and PR 6B.
 
+**Current local boundary:** The completed Qwen first-release package remains
+preserved on `604/product-agent-strategy`; it is not an upstream candidate as
+one diff. Its current history combines portable workflow/provenance mechanics
+with this machine's artifact hashes, hardware measurement, and explicit catalog
+promotion. Extract the portable mechanism and synthetic regression fixtures
+from that history before opening PR 6C. Keep the machine-specific evidence in
+Runtime run artifacts and local catalog policy; never publish it as a generic
+upstream qualification claim.
+
 **Scope:** Emit profile-bound acquisition and conversion evidence through the
 explicit import/finalization boundary. This is the only workflow slice allowed
 to make a complete profile from the independently validated operation records.
