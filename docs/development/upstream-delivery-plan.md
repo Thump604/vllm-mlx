@@ -624,7 +624,7 @@ configuration changes while live fail with stable actionable errors.
 **Excluded:** Changes to `lifecycle.py`, `model_registry.py`, `server.py`, CLI,
 HTTP status, model processes, Jobs/Ops, or live state.
 
-### PR 7: Lifecycle control API and one-active-model state
+### PR 7A: Lifecycle state persistence and one-active-model control
 
 **Depends on:** PR 4, PR 6, and LC-1.
 
@@ -635,29 +635,49 @@ Black, and `git diff --check` are clean. This branch contains persistence and
 single-model state only. Product HTTP transport and qualification normalization
 remain separate downstream slices.
 
-**Scope:** Expose acquire, validate, activate, stop, status, and recovery
-  operations through the existing lifecycle/registry boundary. Make configured
-  state, process state, and profile state explicit and recoverable.
+**Scope:** Persist configured, resolved, resident, and request-lease state
+through the existing lifecycle boundary. Make one-active-model state, terminal
+reconciliation, cancellation, and recovery explicit without adding product
+operation records or HTTP routes.
 
-**Files:** Existing `lifecycle.py`, `model_registry.py`, API models/routes,
-  focused lifecycle tests, and state schemas identified by the inventory.
+**Files:** `lifecycle.py`, `lifecycle_control.py`, narrow CLI wiring, and
+focused lifecycle-control tests.
 
-**Acceptance checks:** A model can be activated and stopped through one stable
-  interface; stale state is detected; one large active model is enforced by
-  lifecycle state; cancellation and recovery tests pass.
+**Acceptance checks:** Stale state is detected; one large active model is
+enforced by lifecycle state; cancellation and recovery tests pass; no product
+operation record is created implicitly.
 
 **Excluded:** Desktop application, Jobs/Ops integration, new inference engines,
-  arbitrary model auto-configuration, and performance feature matrices.
+arbitrary model auto-configuration, and performance feature matrices.
+
+### PR 7B: Durable lifecycle operation ledger
+
+**Depends on:** PR 6C and PR 7A.
+
+**Scope:** Add durable queued/running/terminal product-operation records,
+idempotency bindings, cancellation state, restart reconciliation, and dormant
+candidate cleanup to the lifecycle state store. This is a lifecycle storage
+slice, not the product service or HTTP API.
+
+**Files:** Narrow additions to `lifecycle.py`, `lifecycle_control.py`, and
+focused lifecycle-control tests.
+
+**Acceptance checks:** An operation replay survives restart; reused idempotency
+keys with a changed request fail; interrupted operations receive a terminal
+runtime-unavailable record; dormant candidates cannot clear a live resident.
+
+**Excluded:** Product service orchestration, catalog reads, HTTP routes,
+server globals, model loads, and client UX.
 
 ### PR 8: Qualification evidence normalization
 
-**Depends on:** PR 7.
+**Depends on:** PR 3D and PR 6C.
 
 **Prepared branch:** `604/profile-qualification-evidence-v1` at `8b6a1d0`,
 stacked on the recovery/validation workflow branch. The focused workflow suite
 passes (`63 passed`); Ruff, Black, and `git diff --check` are clean. The code
 binds evidence but does not promote a profile automatically; wiring it through
-the final lifecycle activation surface remains dependent on PR 7.
+the final lifecycle activation surface remains dependent on PR 7A.
 
 **Scope:** Convert bounded load, generation, parser, memory, and recovery
   results into profile evidence without automatically promoting a model to
@@ -675,7 +695,8 @@ the final lifecycle activation surface remains dependent on PR 7.
 
 ### PW-1: Versioned product control contract
 
-**Depends on:** PR 7 and PR 8.
+**Depends on:** PR 2 for the pure contract. Mutable-route integration depends
+on PR 7B and PR 8.
 
 **Prepared branch:** `604/control-api-contract-v1` at `956779f`, stacked on
 the prepared profile-validation branch because it uses the same canonical JSON
@@ -727,7 +748,7 @@ routes, and model-family serving patches.
 
 ### PW-3: Durable product operations service
 
-**Depends on:** LC-1, PR 7, and PW-1.
+**Depends on:** PR 7B, PW-1, and PW-2.
 
 **Scope:** Add durable install/activate/stop/remove operation records,
 idempotency, cancellation, sanitized failures, and the service protocol over
@@ -745,7 +766,7 @@ routes, profile fixtures, and live model calls.
 
 ### PW-4: Managed artifact and residency adapter
 
-**Depends on:** PR 6, PR 7, PW-2, and PW-3.
+**Depends on:** PR 6B, PR 7A, PW-2, and PW-3.
 
 **Scope:** Bind exact profile hashes to local or managed artifacts and adapt one
 validated profile to the existing single-resident lifecycle manager. Preserve
