@@ -521,6 +521,12 @@ qualification, registration, and exposure.
 
 **Depends on:** MI-2 through MI-6.
 
+**Prepared branch:** `604/model-fit-fixture-validation-v1` at `1246cf6`,
+stacked on the prepared Laguna config-adapter branch. The complete focused
+model-intelligence group passes (`91 passed`); Ruff, Black, and
+`git diff --check` are clean. This is portable fixture validation only and
+does not load a model or access local artifact paths.
+
 **Scope:** Exercise the adapters and estimators together against portable,
 source-attributed fixtures. Use the Laguna handoff to prove that a future
 onboarding workflow can replace manual fact transcription without upgrading
