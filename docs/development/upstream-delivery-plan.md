@@ -795,11 +795,11 @@ routes, profile fixtures, and live model calls.
 
 **Depends on:** PR 6B, PR 7A, PW-2, and PW-3.
 
-**Prepared branch:** `604/managed-product-runtime-v1` at `f1140ba`, composed
-from the prepared product-service and first-release-profile branches. The
-focused catalog, runtime, server, service, and route suites pass (`27 passed`);
-Ruff, Black, and `git diff --check` are clean. The branch deliberately excludes
-the later golden workflow transport test harness.
+**Prepared branch:** `604/managed-product-runtime-adapter-v1` at `8fbf211`,
+composed from the prepared product-service and first-release-profile branches.
+The focused catalog, runtime, service, and route suites pass (`25 passed`);
+Ruff, Black, and `git diff --check` are clean. The adapter deliberately excludes
+server-global wiring and the later golden workflow transport test harness.
 
 **Scope:** Bind exact profile hashes to local or managed artifacts and adapt one
 validated profile to the existing single-resident lifecycle manager. Preserve
@@ -835,6 +835,12 @@ and client setup.
 ### PW-6: Managed product server integration
 
 **Depends on:** PW-2 through PW-5.
+
+**Prepared branch:** `604/product-server-integration-v1` at `ea18df6`, stacked
+on the managed runtime-adapter branch. The focused catalog, runtime, server,
+service, and route suites pass (`27 passed`); Ruff, Black, and
+`git diff --check` are clean. The branch includes the narrow `Any`/`cast`
+imports required by the extracted typed server helpers.
 
 **Scope:** Wire the validated catalog, lifecycle manager, runtime adapter, and
 HTTP service into the existing server behind explicit product-control flags.
