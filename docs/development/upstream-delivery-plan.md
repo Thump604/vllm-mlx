@@ -650,9 +650,30 @@ operation record is created implicitly.
 **Excluded:** Desktop application, Jobs/Ops integration, new inference engines,
 arbitrary model auto-configuration, and performance feature matrices.
 
+### PR 7A.5: Lifecycle profile-identity binding
+
+**Depends on:** PR 2 and PR 7A.
+
+**Prepared branch:** `604/lifecycle-profile-binding-v1` at `f8a6289`, stacked
+on the lifecycle-persistence branch. The focused lifecycle contract/control
+suites pass (`59 passed`); Ruff, Black, and `git diff --check` are clean.
+
+**Scope:** Bind a resolved `ModelSpec` to one immutable ModelProfile subject,
+reject stale profile digests and conflicting spec identity, and preserve that
+identity through lifecycle state. It adds no operation ledger, service, route,
+or model load behavior.
+
+**Excluded:** Profile completion, artifact acquisition, product operations,
+HTTP routes, server globals, and client UX.
+
 ### PR 7B: Durable lifecycle operation ledger
 
-**Depends on:** PR 6C and PR 7A.
+**Depends on:** PR 6C, PR 7A, and PR 7A.5.
+
+**Prepared branch:** `604/lifecycle-operation-ledger-v1` at `90750b9`, stacked
+on the lifecycle profile-binding branch. The focused lifecycle contract,
+control, and CLI suites pass (`77 passed`); Ruff, Black, and
+`git diff --check` are clean.
 
 **Scope:** Add durable queued/running/terminal product-operation records,
 idempotency bindings, cancellation state, restart reconciliation, and dormant
@@ -749,6 +770,12 @@ routes, and model-family serving patches.
 ### PW-3: Durable product operations service
 
 **Depends on:** PR 7B, PW-1, and PW-2.
+
+**Prepared branch:** `604/product-control-service-v1` at `1932b3a`, composed
+from the prepared operation-ledger, control-contract, and catalog branches.
+The focused dependency, lifecycle, catalog, service, and route suites pass
+(`106 passed`); Ruff, Black, and `git diff --check` are clean. The service
+branch does not wire itself into global server state or start a model.
 
 **Scope:** Add durable install/activate/stop/remove operation records,
 idempotency, cancellation, sanitized failures, and the service protocol over
