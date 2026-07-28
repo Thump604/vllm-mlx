@@ -628,6 +628,13 @@ HTTP status, model processes, Jobs/Ops, or live state.
 
 **Depends on:** PR 4, PR 6, and LC-1.
 
+**Prepared branch:** `604/lifecycle-control-persistence-v1` at `5b2ccb0`,
+stacked on the pure lifecycle-contract branch. The focused lifecycle-control
+and CLI suites pass (`28 passed`) on the supported Python 3.12 runtime; Ruff,
+Black, and `git diff --check` are clean. This branch contains persistence and
+single-model state only. Product HTTP transport and qualification normalization
+remain separate downstream slices.
+
 **Scope:** Expose acquire, validate, activate, stop, status, and recovery
   operations through the existing lifecycle/registry boundary. Make configured
   state, process state, and profile state explicit and recoverable.
