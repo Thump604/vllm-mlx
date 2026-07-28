@@ -702,9 +702,14 @@ catalog data, and client UX.
 
 **Prepared branch:** `604/model-profile-catalog-v1` at `1564823`, stacked on
 the prepared profile-validation branch. The focused catalog-loader suite passes
-(`11 passed`); Ruff, Black, and `git diff --check` are clean. This branch is
-the read-only loader only; portable first-release profile documents remain a
-separate data slice after their structural dependencies are accepted.
+(`11 passed`); Ruff, Black, and `git diff --check` are clean. The read-only
+loader is separate from first-release profile data.
+
+**Prepared data branch:** `604/first-release-profile-data-v1` at `00da32a`,
+stacked on the catalog-loader branch. The profile/catalog suites pass
+(`17 passed`); Ruff, Black, and `git diff --check` are clean. It contains
+portable Qwen and Laguna structural profile data and hardware envelopes only;
+it does not load a model or claim portable runtime qualification.
 
 **Scope:** Add the read-only validated catalog loader plus portable Qwen and
 Laguna first-release profile documents. Laguna remains artifact-only until its
