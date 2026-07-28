@@ -883,6 +883,14 @@ catalog fixtures, golden workflows, and a first-party coding-agent engine.
 
 **Depends on:** PW-2, PW-5, PW-6, and PW-7A.
 
+**Prepared local composition:** `604/golden-product-workflows-v1` at
+`0144b0e`, with the narrow command-shell boundary correction `bef59ef`.
+It is composed locally from the prepared server integration and command-shell
+parents so the exact transport path can be tested now. Its focused suite passes
+(`41 passed`) on Python 3.12; Ruff, Black, and `git diff --check` are clean.
+Do not open it as a combined PR: after PW-6 and PW-7A land, rebase it on their
+released common base and open only the workflow delta.
+
 **Scope:** Add golden install-to-chat and install-to-code workflows around the
 stable API and catalog-backed selected profile.
 
