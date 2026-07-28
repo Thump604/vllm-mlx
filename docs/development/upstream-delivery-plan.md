@@ -792,15 +792,37 @@ feature is not configured.
 **Excluded:** New inference routes, model-specific patches, qualification runs,
 Ops/Jobs policy, and desktop UI.
 
-### PW-7: Product command shell and golden workflows
+### PW-7A: Product command shell and control client
 
 **Depends on:** PW-1 and PW-5.
 
-**Scope:** Add the thin control client/CLI and golden install-to-chat and
-install-to-code workflows around the stable API.
+**Prepared branch:** `604/product-command-shell-v1` at `f1865ea`, stacked on
+the versioned control-contract branch. The focused client/CLI suites pass
+(`11 passed`); Ruff, Black, and `git diff --check` are clean. This branch does
+not provide routes or activate a model.
 
-**Files:** `vllm_mlx/control/client.py`, `vllm_mlx/product_cli.py`, CLI entrypoint
-wiring, `tests/product_workflows/**`, and focused client/CLI tests.
+**Scope:** Add the thin versioned control client and command shell around the
+stable API.
+
+**Files:** `vllm_mlx/control_client.py`, `vllm_mlx/product_cli.py`, CLI entrypoint
+wiring, client/CLI tests, and concise CLI reference documentation.
+
+**Acceptance checks:** Client version compatibility, command request shaping,
+idempotency forwarding, and server-error rendering are deterministic without
+raw serving flags or direct lifecycle mutation.
+
+**Excluded:** HTTP route implementation, lifecycle mutation, model loading,
+catalog fixtures, golden workflows, and a first-party coding-agent engine.
+
+### PW-7B: Golden install-to-chat and install-to-code workflows
+
+**Depends on:** PW-2, PW-5, PW-6, and PW-7A.
+
+**Scope:** Add golden install-to-chat and install-to-code workflows around the
+stable API and catalog-backed selected profile.
+
+**Files:** `tests/product_workflows/**` and the narrow workflow helpers needed
+to exercise the already-supported command shell.
 
 **Acceptance checks:** A user can select a curated model, receive an
   explainable profile, activate it, chat, configure a supported coding client,
