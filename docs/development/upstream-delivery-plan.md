@@ -658,6 +658,13 @@ HTTP status, model processes, Jobs/Ops, or live state.
 
 **Depends on:** PR 7 and PR 8.
 
+**Prepared branch:** `604/control-api-contract-v1` at `956779f`, stacked on
+the prepared profile-validation branch because it uses the same canonical JSON
+dependency. The focused control-API suite passes (`16 passed`); Ruff, Black,
+and `git diff --check` are clean. The contract can be reviewed independently,
+but must not be wired to a mutable lifecycle route until PR 7 and PR 8 are
+accepted.
+
 **Scope:** Add only the versioned request/response envelope, operation models,
 and pure validation helpers used by future product clients.
 
