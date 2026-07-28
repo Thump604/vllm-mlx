@@ -574,6 +574,11 @@ broad workflow refactoring.
 
 **Depends on:** PR 6A.
 
+**Prepared branch:** `604/model-conversion-recovery-v1` at `a8c3e9f`,
+stacked on PR 6A. It adds identity-bound conversion journaling, cancellation
+and retry handling, output validation, and atomic conversion-manifest
+publication. Keep it separate from profile completion and serving activation.
+
 **Scope:** Add identity-bound conversion journaling, cancellation/retry
 handling, output validation, and atomic conversion-manifest publication. Keep
 conversion mechanics separate from acquisition and profile registration.
@@ -589,14 +594,21 @@ catalog curation, desktop UX, and lifecycle activation.
 
 **Depends on:** PR 3D, PR 5, and PR 6B.
 
+**Prepared branch:** `604/workflow-profile-evidence-v1` at `0a14ea1`. The
+branch composes the already-prepared PR 3D and PR 6B heads only to run the
+cross-boundary tests locally. Before opening PR 6C, rebase it onto the accepted
+upstream prerequisite base and retain only `0a14ea1` as the review subject.
+The focused workflow/profile suites pass (`72 passed`), plus Ruff, Black, and
+`git diff --check`.
+
 **Current local boundary:** The completed Qwen first-release package remains
 preserved on `604/product-agent-strategy`; it is not an upstream candidate as
 one diff. Its current history combines portable workflow/provenance mechanics
 with this machine's artifact hashes, hardware measurement, and explicit catalog
-promotion. Extract the portable mechanism and synthetic regression fixtures
-from that history before opening PR 6C. Keep the machine-specific evidence in
-Runtime run artifacts and local catalog policy; never publish it as a generic
-upstream qualification claim.
+promotion. PR 6C now extracts the portable manifest-binding mechanism and
+synthetic regression fixtures. Keep the machine-specific evidence in Runtime
+run artifacts and local catalog policy; never publish it as a generic upstream
+qualification claim.
 
 **Scope:** Emit profile-bound acquisition and conversion evidence through the
 explicit import/finalization boundary. This is the only workflow slice allowed
@@ -605,6 +617,19 @@ to make a complete profile from the independently validated operation records.
 **Acceptance checks:** Exact revision, conversion parameters, artifact digest,
 tool versions, and checksum results retain provenance; incomplete workflow
 facts stay incomplete rather than becoming inferred profile truth.
+
+**Files:**
+
+- `vllm_mlx/model_workflow.py`
+- `vllm_mlx/model_profile_workflow.py`
+- `tests/test_model_profile_workflow.py`
+
+**Review boundary:** The adapter reads finalized acquisition, conversion, and
+registration manifests as SHA-256-bound source records; rejects mismatched
+operation links, registration copies, and absent conversion artifact digests;
+and delegates explicit completion to PR 3D's finalizer. It does not start a
+server, alter a registry, create profile facts from missing data, or promote a
+qualification status.
 
 **Excluded:** Serving startup, automatic qualification promotion, catalog
 curation, desktop UX, and broad workflow refactoring.
