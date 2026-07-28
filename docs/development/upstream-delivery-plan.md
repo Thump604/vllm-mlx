@@ -592,7 +592,7 @@ catalog curation, desktop UX, and lifecycle activation.
 
 ### PR 6C: Workflow-to-profile evidence integration
 
-**Depends on:** PR 3D, PR 5, and PR 6B.
+**Depends on:** PR 3D and PR 6B.
 
 **Prepared branch:** `604/workflow-profile-evidence-v1` at `0a14ea1`. The
 branch composes the already-prepared PR 3D and PR 6B heads only to run the
