@@ -594,12 +594,14 @@ catalog curation, desktop UX, and lifecycle activation.
 
 **Depends on:** PR 3D and PR 6B.
 
-**Prepared branch:** `604/workflow-profile-evidence-v1` at `0a14ea1`. The
+**Prepared branch:** `604/workflow-profile-evidence-v1` at `d1fcc0f`. The
 branch composes the already-prepared PR 3D and PR 6B heads only to run the
 cross-boundary tests locally. Before opening PR 6C, rebase it onto the accepted
-upstream prerequisite base and retain only `0a14ea1` as the review subject.
+upstream prerequisite base and retain only `d1fcc0f` as the review subject.
 The focused workflow/profile suites pass (`72 passed`), plus Ruff, Black, and
-`git diff --check`.
+`git diff --check`. The complete composed suite ran `2354 passed, 24 skipped,
+23 deselected`; three cancellation-path failures reproduce unchanged on the
+pre-PR-6C prerequisite base under Python 3.14.
 
 **Current local boundary:** The completed Qwen first-release package remains
 preserved on `604/product-agent-strategy`; it is not an upstream candidate as
