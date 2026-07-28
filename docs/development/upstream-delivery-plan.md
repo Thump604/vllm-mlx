@@ -598,6 +598,11 @@ curation, desktop UX, and broad workflow refactoring.
 
 **Depends on:** PR 4 and MI-7.
 
+**Prepared branch:** `604/lifecycle-contract-v1` at `6dd6a90`, stacked on
+the prepared precedence-resolver branch. The focused lifecycle-contract suite
+passes (`40 passed`); Ruff, Black, and `git diff --check` are clean. Do not
+open it until its profile and model-intelligence dependencies are accepted.
+
 **Scope:** Define immutable configured-profile, resolved-process,
 resident-process, and request-lease state plus legal transitions. Keep the
 contract synchronous and dependency-free so existing single-resident and
