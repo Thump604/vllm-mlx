@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "hardware_profile_id": "apple-silicon-128gb",
+  "hardware_class": "apple-silicon-128gb",
+  "platform": "Darwin/arm64",
+  "unified_memory_bytes": 137438953472,
+  "measurement": {"method": "recorded_fixture", "source": "tests/test_model_fit_fixtures.py", "measured": true},
+  "model_fit": [
+    {"profile_id": "qwen3.6-35b-a3b-8bit", "status": "unknown", "method": "not_measured", "serving_context": null, "max_concurrency": null, "notes": "Portable envelope only; no fit claim."},
+    {"profile_id": "laguna-s-2.1-mlx-q4", "status": "unknown", "method": "not_measured", "serving_context": null, "max_concurrency": null, "notes": "Portable envelope only; live qualification is pending."}
+  ]
+}
