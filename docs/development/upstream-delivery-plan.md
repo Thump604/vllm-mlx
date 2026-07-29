@@ -245,6 +245,40 @@ fail, and runtime fallback fills only genuinely absent optional values.
 **Excluded:** Wiring the resolver into a live route, changing model defaults,
 client behavior, feature qualification, or resident/default policy.
 
+### PR 4A: Profile-owned backend loader compatibility
+
+**Depends on:** PR 1 and PR 2.
+
+**Prepared branch:** `604/mlx-lm-loader-compat`, based on the current product
+integration branch for local validation only. Rebase this narrow delta onto the
+accepted PR 2 base before opening it upstream.
+
+**Scope:** Add immutable, profile-owned backend loader compatibility data and a
+pure load receipt. A profile can declare the backend, loader route, dependency
+constraints, and either a strict weight policy or a precise allowlist of
+artifact-owned unmatched prefixes. The receipt records the requested policy and
+installed backend versions without claiming that a load succeeded or that a
+loader discarded weights.
+
+**Files:**
+
+- `schemas/model-profile-v1.schema.json`
+- `vllm_mlx/model_profile.py`
+- `vllm_mlx/loader_compat.py`
+- `tests/test_loader_compat.py`
+- `docs/development/model-profile-v1.md`
+
+**Acceptance checks:** Backend data changes the profile subject digest; strict
+profiles reject unmatched-prefix allowlists; backend and loader route must
+match; missing loader contracts cannot be resolved; receipts preserve requested
+policy without inventing unmatched keys or a successful load.
+
+**Excluded:** Calling `mlx_lm.load`, changing existing strict-fallback
+behavior, selecting a model by name/config shape, adapting `mlx-vlm`, server
+startup, cache/batch behavior, model qualification, and live serving. A later
+adapter PR may consume this explicit policy only after it can record a
+backend-proven load result.
+
 ### PR 5: Laguna S 2.1 onboarding fixture
 
 **Depends on:** PR 1, PR 2, and PR 3D.

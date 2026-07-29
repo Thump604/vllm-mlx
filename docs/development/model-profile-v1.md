@@ -82,6 +82,25 @@ The serving section records:
 - feature mode and feature-specific settings;
 - activation overrides plus required, allowed, and forbidden request fields.
 
+## Backend Loader Contract
+
+`backend` is optional for profiles imported before this contract. New profiles
+that select a backend loader must make it immutable profile subject data. It
+records the backend implementation, loader route, dependency constraints, and
+weight policy:
+
+- `strict` rejects unmatched weights.
+- `allowlisted_extras` permits only explicit artifact-owned extra prefixes.
+
+The generic Runtime must not infer `strict=False` from a model name or from the
+presence of a VLM-shaped config. A backend adapter may report observed unmatched
+keys in its load receipt only when its underlying loader can prove them. A
+declared allowlist is not proof that any keys were dropped.
+
+The contract is deliberately backend-neutral. It allows `mlx-lm` to remain the
+primary backend while leaving a narrow route for `mlx-vlm` or a later backend
+without leaking their loader internals into profiles, lifecycle, or API routes.
+
 The v1 feature vocabulary is closed: continuous batching, constrained JSON,
 KVQ4, KVQ8, MTP, prefix cache, SpecPrefill, and streaming. New semantics require
 a schema revision; namespaced extensions cannot change resolver behavior.

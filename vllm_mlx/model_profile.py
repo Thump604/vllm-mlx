@@ -14,11 +14,59 @@ from referencing import Registry, Resource
 _SUBJECT_FIELDS = (
     "identity",
     "artifact",
+    "backend",
     "capabilities",
     "serving",
     "hardware_fit",
     "provenance",
 )
+
+_IDENTITY_PROVIDER_FIELDS = (
+    "/identity/provider",
+    "/identity/repository_id",
+    "/identity/requested_revision",
+    "/identity/resolved_revision",
+)
+
+_PROVENANCE_KINDS_BY_PREFIX = (
+    ("/identity/", {"provider_fact", "derived_recommendation", "maintainer_policy"}),
+    ("/artifact/", {"provider_fact", "derived_recommendation"}),
+    ("/backend/", {"provider_fact", "derived_recommendation", "measured_result"}),
+    (
+        "/capabilities/",
+        {"provider_fact", "derived_recommendation", "measured_result"},
+    ),
+    (
+        "/serving/",
+        {"provider_fact", "derived_recommendation", "maintainer_policy"},
+    ),
+)
+
+_FEATURE_MODE_CONTROL_RULES = {
+    "available_per_request": (
+        "request",
+        "request_feature_not_allowed",
+        "per-request feature must name an allowed or required request field",
+    ),
+    "available_on_activation": (
+        "activation",
+        "activation_feature_not_allowed",
+        "activation feature must name an allowed activation override",
+    ),
+}
+
+_INACTIVE_FEATURE_MODES = frozenset({"guarded_off", "deferred", "not_supported"})
+
+_CONTROL_FIELD_RULES = {
+    "request": (
+        "request_feature_not_allowed",
+        "request control field is not allowed by request policy",
+    ),
+    "activation": (
+        "activation_feature_not_allowed",
+        "activation control field is not allowed by activation policy",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -73,6 +121,7 @@ def collect_model_profile_issues(
 
     _check_subject_digest(profile, issues)
     _check_limits(profile, issues)
+    _check_backend(profile, issues)
     _check_request_policy(profile, issues)
     _check_feature_controls(profile, issues)
     _check_qualification(profile, issues)
@@ -228,6 +277,43 @@ def _check_limits(
         )
 
 
+def _check_backend(
+    profile: Mapping[str, Any], issues: list[ModelProfileValidationIssue]
+) -> None:
+    """Validate optional, immutable backend compatibility facts.
+
+    Profiles created before this contract intentionally remain valid.  A profile
+    that opts in must be explicit about whether a text loader may discard
+    unmatched weights; silent fallback is not a compatibility contract.
+    """
+    backend = profile.get("backend")
+    if backend is None:
+        return
+    policy = backend["weight_policy"]
+    allowed_prefixes = policy["allowed_unmatched_weight_prefixes"]
+    if policy["mode"] == "strict" and allowed_prefixes:
+        _issue(
+            issues,
+            "strict_loader_allows_unmatched_weights",
+            "/backend/weight_policy/allowed_unmatched_weight_prefixes",
+            "strict loader policy cannot allow unmatched weight prefixes",
+        )
+    if backend["loader_route"] == "mlx_vlm" and backend["backend_id"] != "mlx-vlm":
+        _issue(
+            issues,
+            "backend_route_mismatch",
+            "/backend",
+            "mlx_vlm loader route requires backend_id mlx-vlm",
+        )
+    if backend["loader_route"] == "mlx_lm" and backend["backend_id"] != "mlx-lm":
+        _issue(
+            issues,
+            "backend_route_mismatch",
+            "/backend",
+            "mlx_lm loader route requires backend_id mlx-lm",
+        )
+
+
 def _check_request_policy(
     profile: Mapping[str, Any], issues: list[ModelProfileValidationIssue]
 ) -> None:
@@ -254,49 +340,43 @@ def _check_feature_controls(
         request_policy["allowed_fields"]
     )
     activation_fields = set(serving["activation_policy"]["owner_override_fields"])
+    fields_by_control = {
+        "request": request_fields,
+        "activation": activation_fields,
+    }
     for name, feature in serving["features"].items():
-        mode = feature["mode"]
-        control = feature["control"]
-        field = feature.get("control_field")
         pointer = f"/serving/features/{name}"
-        if mode == "available_per_request":
-            if control != "request" or field not in request_fields:
-                _issue(
-                    issues,
-                    "request_feature_not_allowed",
-                    pointer,
-                    "per-request feature must name an allowed or required request field",
-                )
-        elif mode == "available_on_activation":
-            if control != "activation" or field not in activation_fields:
-                _issue(
-                    issues,
-                    "activation_feature_not_allowed",
-                    pointer,
-                    "activation feature must name an allowed activation override",
-                )
-        elif mode in {"guarded_off", "deferred", "not_supported"}:
-            if control != "none" or field is not None:
-                _issue(
-                    issues,
-                    "inactive_feature_has_control",
-                    pointer,
-                    "inactive feature modes cannot expose activation or request control",
-                )
-        elif control == "request" and field not in request_fields:
-            _issue(
-                issues,
-                "request_feature_not_allowed",
-                pointer,
-                "request control field is not allowed by request policy",
+        issue = _feature_control_issue(feature, fields_by_control)
+        if issue is not None:
+            _issue(issues, issue[0], pointer, issue[1])
+
+
+def _feature_control_issue(
+    feature: Mapping[str, Any], fields_by_control: Mapping[str, set[str]]
+) -> tuple[str, str] | None:
+    mode = feature["mode"]
+    control = feature["control"]
+    field = feature.get("control_field")
+    mode_rule = _FEATURE_MODE_CONTROL_RULES.get(mode)
+    if mode_rule is not None:
+        expected_control, code, detail = mode_rule
+        if (
+            control != expected_control
+            or field not in fields_by_control[expected_control]
+        ):
+            return code, detail
+        return None
+    if mode in _INACTIVE_FEATURE_MODES:
+        if control != "none" or field is not None:
+            return (
+                "inactive_feature_has_control",
+                "inactive feature modes cannot expose activation or request control",
             )
-        elif control == "activation" and field not in activation_fields:
-            _issue(
-                issues,
-                "activation_feature_not_allowed",
-                pointer,
-                "activation control field is not allowed by activation policy",
-            )
+        return None
+    control_rule = _CONTROL_FIELD_RULES.get(control)
+    if control_rule is not None and field not in fields_by_control[control]:
+        return control_rule
+    return None
 
 
 def _check_qualification(
@@ -330,14 +410,27 @@ def _check_provenance(
     profile: Mapping[str, Any], issues: list[ModelProfileValidationIssue]
 ) -> None:
     records = profile["provenance"]["records"]
-    subject_sections = ("identity", "artifact", "capabilities", "serving")
+    pointers = _provenance_subject_pointers(profile)
+    _check_provenance_records(records, pointers, issues)
+    _check_provenance_coverage(profile, records, pointers, issues)
+    _check_measured_hardware_fit(profile, issues)
+
+
+def _provenance_subject_pointers(profile: Mapping[str, Any]) -> list[str]:
     pointers = [
         pointer
-        for section in subject_sections
+        for section in _provenance_subject_sections(profile)
         for pointer in _leaf_pointers(profile[section], f"/{section}")
     ]
     pointers.extend(_leaf_pointers(profile.get("hardware_fit", []), "/hardware_fit"))
+    return pointers
 
+
+def _check_provenance_records(
+    records: Sequence[Mapping[str, Any]],
+    pointers: Sequence[str],
+    issues: list[ModelProfileValidationIssue],
+) -> None:
     for index, record in enumerate(records):
         for path in record["field_paths"]:
             if not any(_path_covers(path, pointer) for pointer in pointers):
@@ -349,6 +442,13 @@ def _check_provenance(
                 )
         _check_provenance_metadata(record, index, issues)
 
+
+def _check_provenance_coverage(
+    profile: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    pointers: Sequence[str],
+    issues: list[ModelProfileValidationIssue],
+) -> None:
     for pointer in pointers:
         allowed_kinds = _allowed_provenance_kinds(profile, pointer)
         covering = [
@@ -372,6 +472,10 @@ def _check_provenance(
                     f"{record['kind']} cannot establish {pointer}",
                 )
 
+
+def _check_measured_hardware_fit(
+    profile: Mapping[str, Any], issues: list[ModelProfileValidationIssue]
+) -> None:
     for index, fit in enumerate(profile.get("hardware_fit", [])):
         if (
             fit["method"] == "measured"
@@ -383,6 +487,12 @@ def _check_provenance(
                 f"/hardware_fit/{index}/measured_peak_memory_bytes",
                 "measured hardware fit requires a measured peak-memory value",
             )
+
+
+def _provenance_subject_sections(profile: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the immutable profile sections that require provenance."""
+    sections = ("identity", "artifact", "capabilities", "serving")
+    return (*sections, "backend") if "backend" in profile else sections
 
 
 def _leaf_pointers(value: Any, pointer: str) -> list[str]:
@@ -453,31 +563,19 @@ def _check_provenance_metadata(
 
 
 def _allowed_provenance_kinds(profile: Mapping[str, Any], pointer: str) -> set[str]:
-    if pointer.startswith(
-        (
-            "/identity/provider",
-            "/identity/repository_id",
-            "/identity/requested_revision",
-            "/identity/resolved_revision",
-        )
-    ):
+    if pointer.startswith(_IDENTITY_PROVIDER_FIELDS):
         if profile["identity"]["provider"] == "local":
             return {"derived_recommendation", "maintainer_policy"}
         return {"provider_fact"}
-    if pointer.startswith("/identity/"):
-        return {"provider_fact", "derived_recommendation", "maintainer_policy"}
-    if pointer.startswith("/artifact/"):
-        return {"provider_fact", "derived_recommendation"}
-    if pointer.startswith("/capabilities/"):
-        return {"provider_fact", "derived_recommendation", "measured_result"}
     if pointer.startswith("/serving/sampling/provider_defaults"):
         if not profile["serving"]["sampling"]["provider_defaults"]:
             return {"provider_fact", "derived_recommendation", "maintainer_policy"}
         return {"provider_fact"}
-    if pointer.startswith("/serving/"):
-        return {"provider_fact", "derived_recommendation", "maintainer_policy"}
     if pointer.startswith("/hardware_fit/"):
         index = int(pointer.split("/", 3)[2])
         method = profile["hardware_fit"][index]["method"]
         return {"measured_result" if method == "measured" else "derived_recommendation"}
+    for prefix, allowed_kinds in _PROVENANCE_KINDS_BY_PREFIX:
+        if pointer.startswith(prefix):
+            return allowed_kinds
     raise ValueError(f"no provenance policy for {pointer}")

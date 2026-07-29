@@ -25,6 +25,7 @@
     "description": { "type": "string" },
     "identity": { "$ref": "#/$defs/identity" },
     "artifact": { "$ref": "#/$defs/artifact" },
+    "backend": { "$ref": "#/$defs/backend" },
     "capabilities": { "$ref": "#/$defs/capabilities" },
     "serving": { "$ref": "#/$defs/serving" },
     "hardware_fit": {
@@ -119,6 +120,33 @@
             "generation_config_sha256": { "$ref": "#/$defs/sha256" },
             "weights_manifest_sha256": { "$ref": "#/$defs/sha256" }
           }
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend_id", "loader_route", "weight_policy", "dependency_constraints"],
+      "properties": {
+        "backend_id": { "type": "string", "enum": ["mlx-lm", "mlx-vlm"] },
+        "loader_route": { "type": "string", "enum": ["mlx_lm", "mlx_vlm"] },
+        "weight_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "allowed_unmatched_weight_prefixes"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["strict", "allowlisted_extras"] },
+            "allowed_unmatched_weight_prefixes": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/non_empty_string" },
+              "uniqueItems": true
+            }
+          }
+        },
+        "dependency_constraints": {
+          "type": "object",
+          "propertyNames": { "enum": ["mlx", "mlx-lm", "mlx-vlm"] },
+          "additionalProperties": { "$ref": "#/$defs/non_empty_string" }
         }
       }
     },
