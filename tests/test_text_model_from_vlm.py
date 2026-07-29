@@ -3,6 +3,7 @@
 
 import json
 import os
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -38,6 +39,12 @@ def test_build_text_model_none_vlm():
     """Returns None when vlm_model is None."""
     result = build_text_model(None, TEXT_MTP_MODEL)
     assert result is None
+
+
+def test_build_text_model_accepts_engine_mtp_decision():
+    parameter = inspect.signature(build_text_model).parameters["enable_mtp"]
+
+    assert parameter.default is True
 
 
 def test_build_text_model_dispatches_gemma4_text_model(tmp_path, monkeypatch):
