@@ -35,6 +35,7 @@ def _strip_mtp_key_prefix(key: str) -> str | None:
             return key.removeprefix(prefix)
     return None
 
+
 _QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES = (
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
