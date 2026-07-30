@@ -1469,8 +1469,9 @@ class TestSimpleEngineConcurrency:
         mock_mllm.model = MagicMock()
         mock_mllm.get_tokenizer.return_value = tokenizer
 
-        def build_text_model(*_args, **_kwargs):
+        def build_text_model(*_args, **kwargs):
             captured["build_thread"] = threading.get_ident()
+            captured["enable_mtp"] = kwargs["enable_mtp"]
             return text_model
 
         with (
@@ -1494,6 +1495,7 @@ class TestSimpleEngineConcurrency:
                 assert engine._text_tokenizer is tokenizer
                 assert captured["build_thread"] == worker_thread
                 assert captured["build_thread"] != event_loop_thread
+                assert captured["enable_mtp"] is False
             finally:
                 await engine.stop()
 
