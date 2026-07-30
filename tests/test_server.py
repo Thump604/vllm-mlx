@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the OpenAI-compatible API server."""
 
+import asyncio
 import json
 import platform
 import sys
@@ -3824,6 +3825,56 @@ class TestSseDoneTermination:
         assert (
             len(openai_done) == 0
         ), "Must not emit OpenAI [DONE] for Anthropic streams"
+
+
+class TestDisconnectGuard:
+    """Tests for streaming disconnect and producer-progress handling."""
+
+    @pytest.mark.anyio
+    async def test_allows_regular_chunks_beyond_timeout(self):
+        from vllm_mlx.server import _disconnect_guard
+
+        async def chunks():
+            for index in range(12):
+                await asyncio.sleep(0.01)
+                yield f"data: {index}\\n\\n"
+
+        request = SimpleNamespace(_is_disconnected=False, _receive=None)
+        emitted = [
+            chunk
+            async for chunk in _disconnect_guard(
+                chunks(),
+                request,
+                poll_interval=0.005,
+                heartbeat_interval=0.005,
+                timeout=0.03,
+            )
+        ]
+
+        data_chunks = [chunk for chunk in emitted if chunk.startswith("data: ")]
+        assert data_chunks == [f"data: {index}\\n\\n" for index in range(12)]
+
+    @pytest.mark.anyio
+    async def test_stops_generator_output_inactivity(self):
+        from vllm_mlx.server import _disconnect_guard
+
+        async def stalled():
+            await asyncio.sleep(0.05)
+            yield "data: late\\n\\n"
+
+        request = SimpleNamespace(_is_disconnected=False, _receive=None)
+        emitted = [
+            chunk
+            async for chunk in _disconnect_guard(
+                stalled(),
+                request,
+                poll_interval=0.005,
+                heartbeat_interval=0.005,
+                timeout=0.02,
+            )
+        ]
+
+        assert "data: late\\n\\n" not in emitted
 
 
 def pytest_addoption(parser):

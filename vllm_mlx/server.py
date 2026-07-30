@@ -4283,10 +4283,11 @@ async def _disconnect_guard(
     detection — without heartbeats, ``is_disconnected()`` stays False
     during long prefill because no data is written to the socket.
 
-    If *timeout* is set, the stream is forcefully stopped once the
-    elapsed wall-clock time exceeds the given number of seconds.
-    Without this, zombie streaming requests can run indefinitely when
-    ``is_disconnected()`` never fires.
+    If *timeout* is set, it bounds inactivity from the inner generator,
+    not the total stream lifetime. A stream that continues to produce
+    chunks must be allowed to complete even when generation takes longer
+    than the configured interval. Heartbeats force ASGI writes to detect a
+    disconnected client, but do not count as generator progress.
 
     On disconnect, the cancellation propagates to stream_outputs()
     finally-block → abort_request() → abort_prefill().
@@ -4298,11 +4299,11 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    _effective_timeout = timeout or _default_timeout
+    _chunk_timeout = timeout or _default_timeout
 
     logger.info(
         f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s "
-        f"timeout={_effective_timeout:.0f}s"
+        f"chunk_timeout={_chunk_timeout:.0f}s"
     )
 
     async def _wait_disconnect():
@@ -4321,6 +4322,7 @@ async def _disconnect_guard(
 
     chunk_count = 0
     heartbeat_count = 0
+    last_chunk_at = _t0
     disconnect_task: asyncio.Task | None = None
     anext_task: asyncio.Task | None = None
     try:
@@ -4328,10 +4330,11 @@ async def _disconnect_guard(
         disconnect_task = asyncio.create_task(_wait_disconnect())
         anext_task = None
         while True:
-            # Enforce absolute timeout for streaming requests.
-            if _time.monotonic() - _t0 >= _effective_timeout:
+            idle_seconds = _time.monotonic() - last_chunk_at
+            if idle_seconds >= _chunk_timeout:
                 logger.warning(
-                    f"[disconnect_guard] TIMEOUT after {_effective_timeout:.0f}s, "
+                    f"[disconnect_guard] OUTPUT INACTIVITY TIMEOUT after "
+                    f"{idle_seconds:.1f}s without a generator chunk, "
                     f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
                     f"elapsed={_elapsed()}"
                 )
@@ -4349,7 +4352,7 @@ async def _disconnect_guard(
             done, _ = await asyncio.wait(
                 [anext_task, disconnect_task],
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=heartbeat_interval,
+                timeout=min(heartbeat_interval, _chunk_timeout - idle_seconds),
             )
 
             if disconnect_task in done:
@@ -4381,6 +4384,7 @@ async def _disconnect_guard(
                     )
                     break
                 chunk_count += 1
+                last_chunk_at = _time.monotonic()
                 if chunk_count == 1:
                     logger.info(
                         f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
