@@ -1227,6 +1227,177 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert model.forward_widths == [1, 2, 2]
         assert generator.get_mtp_stats()["accepted"] == 2
 
+    def test_sampled_mtp_reject_replays_residual_without_shape_corruption(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        request = SimpleNamespace(
+            uid=42,
+            request_id="reject-sampled",
+            temperature=0.6,
+            top_p=1.0,
+            top_k=1,
+            min_p=0.0,
+        )
+
+        class Batch:
+            uids = [42]
+            requests = [request]
+
+            def __len__(self):
+                return 1
+
+        class TrimmableCache:
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                pass
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("sampled MTP must not take the bypass path")
+
+        class LanguageModel:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del hidden_states, next_token_ids, mtp_cache
+                # Draft is confident in token 1.
+                return mx.array([[[0.0, 5.0, 1.0, -3.0]]])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                if input_tokens.shape[1] == 2:
+                    # Verify pass: target is confident in token 2, not the
+                    # draft's token 1, so the sampled draft is rejected and
+                    # a residual token must be replayed instead.
+                    logits = mx.array(
+                        [[[0.0, -3.0, 5.0, -3.0], [0.0, -3.0, 5.0, -3.0]]]
+                    )
+                    hidden = mx.zeros((1, 2, 2))
+                else:
+                    logits = mx.array([[[0.0, -3.0, 5.0, -3.0]]])
+                    hidden = mx.zeros((1, 1, 2))
+                return logits, hidden
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+        cache = [TrimmableCache()]
+
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[lambda logprobs: mx.argmax(logprobs, axis=-1)],
+        )
+        assert generator.get_mtp_stats()["rejected"] == 1
+
+        # A second decode step must not crash: the skip-state entry populated
+        # by the residual replay above must be rank-2 (batch, vocab), not a
+        # stale rank-3 (batch, seq, vocab) tensor.
+        tokens, _ = generator._step(
+            mx.array([[1]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[lambda logprobs: mx.argmax(logprobs, axis=-1)],
+        )
+        mx.eval(tokens)
+        assert tokens.shape == (1,)
+
+    def test_concurrent_mtp_rejects_whole_batch_on_single_row_mismatch(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        request_a = SimpleNamespace(
+            uid=30, request_id="a", temperature=0.0, top_p=1.0, top_k=0, min_p=0.0
+        )
+        request_b = SimpleNamespace(
+            uid=31, request_id="b", temperature=0.0, top_p=1.0, top_k=0, min_p=0.0
+        )
+
+        class Batch:
+            def __init__(self):
+                self.uids = [30, 31]
+                self.requests = [request_a, request_b]
+
+            def __len__(self):
+                return len(self.uids)
+
+        class TrimmableCache:
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                pass
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("concurrent MTP must not take the bypass path")
+
+        class LanguageModel:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del hidden_states, next_token_ids, mtp_cache
+                return mx.array([[[0.0, 0.0, 4.0, -3.0]], [[0.0, 0.0, 4.0, -3.0]]])
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                seq_len = input_tokens.shape[1]
+                batch_size = input_tokens.shape[0]
+                logits = mx.full((batch_size, seq_len, 4), -3.0)
+                if seq_len == 1:
+                    logits[:, 0, 2] = 4.0
+                else:
+                    # Row 0's draft matches (token 2); row 1's does not
+                    # (token 1), so the whole concurrent batch must fall
+                    # back to a primary-only replay rather than crash.
+                    logits[0, 0, 2] = 4.0
+                    logits[1, 0, 1] = 4.0
+                hidden = mx.zeros((batch_size, seq_len, 2))
+                return logits, hidden
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+        cache = [TrimmableCache()]
+
+        tokens, _ = generator._step(
+            mx.array([[0], [0]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        mx.eval(tokens)
+
+        assert tokens.shape == (2,)
+        assert generator.get_mtp_stats()["rejected"] == 1
+        assert generator.get_mtp_stats()["accepted"] == 0
+
+        # Must not crash on the following step either.
+        tokens, _ = generator._step(
+            mx.array([[1], [1]], dtype=mx.uint32),
+            cache=cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+        mx.eval(tokens)
+        assert tokens.shape == (2,)
+
     def test_install_mtp_mllm_counts_structural_bypasses(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
