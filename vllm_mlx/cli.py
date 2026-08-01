@@ -115,7 +115,14 @@ def serve_command(args):
 
     # Configure server security settings
     server._api_key = args.api_key
-    server._default_timeout = args.timeout
+    if args.disable_timeout:
+        server._default_timeout = None
+        logger.warning(
+            "REQUEST TIMEOUT DISABLED (--disable-timeout); "
+            "client disconnect and explicit cancellation still apply"
+        )
+    else:
+        server._default_timeout = args.timeout
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
@@ -1327,6 +1334,14 @@ Examples:
         type=float,
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--disable-timeout",
+        action="store_true",
+        help=(
+            "Disable request timeout policy while preserving client disconnect "
+            "cancellation."
+        ),
     )
     serve_parser.add_argument(
         "--enable-metrics",
