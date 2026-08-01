@@ -190,7 +190,7 @@ _warm_prompts_path: str | None = None  # Path to JSON of prompts to pre-warm at 
 _default_model_key: str | None = None
 _default_max_tokens: int = 32768
 _max_request_tokens: int = 32768
-_default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+_default_timeout: float | None = 300.0  # Default request timeout; None disables the wall-clock policy
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _default_chat_template_kwargs: dict[str, object] | None = None
@@ -4357,10 +4357,11 @@ async def _disconnect_guard(
     detection — without heartbeats, ``is_disconnected()`` stays False
     during long prefill because no data is written to the socket.
 
-    If *timeout* is set, the stream is forcefully stopped once the
-    elapsed wall-clock time exceeds the given number of seconds.
-    Without this, zombie streaming requests can run indefinitely when
-    ``is_disconnected()`` never fires.
+    If *timeout* is set, it bounds inactivity from the inner generator,
+    not the total stream lifetime. A stream that continues to produce
+    chunks must be allowed to complete even when generation takes longer
+    than the configured interval. Heartbeats force ASGI writes to detect a
+    disconnected client, but do not count as generator progress.
 
     On disconnect, the cancellation propagates to stream_outputs()
     finally-block → abort_request() → abort_prefill().
@@ -4372,11 +4373,14 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    _effective_timeout = timeout or _default_timeout
+    _chunk_timeout = timeout if timeout is not None else _default_timeout
+    timeout_label = (
+        "disabled" if _chunk_timeout is None else f"{_chunk_timeout:.0f}s"
+    )
 
     logger.info(
         f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s "
-        f"timeout={_effective_timeout:.0f}s"
+        f"chunk_timeout={timeout_label}"
     )
 
     async def _wait_disconnect():
@@ -4395,6 +4399,7 @@ async def _disconnect_guard(
 
     chunk_count = 0
     heartbeat_count = 0
+    last_chunk_at = _t0
     disconnect_task: asyncio.Task | None = None
     anext_task: asyncio.Task | None = None
     try:
@@ -4402,10 +4407,11 @@ async def _disconnect_guard(
         disconnect_task = asyncio.create_task(_wait_disconnect())
         anext_task = None
         while True:
-            # Enforce absolute timeout for streaming requests.
-            if _time.monotonic() - _t0 >= _effective_timeout:
+            idle_seconds = _time.monotonic() - last_chunk_at
+            if _chunk_timeout is not None and idle_seconds >= _chunk_timeout:
                 logger.warning(
-                    f"[disconnect_guard] TIMEOUT after {_effective_timeout:.0f}s, "
+                    f"[disconnect_guard] OUTPUT INACTIVITY TIMEOUT after "
+                    f"{idle_seconds:.1f}s without a generator chunk, "
                     f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
                     f"elapsed={_elapsed()}"
                 )
@@ -4423,7 +4429,11 @@ async def _disconnect_guard(
             done, _ = await asyncio.wait(
                 [anext_task, disconnect_task],
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=heartbeat_interval,
+                timeout=(
+                    heartbeat_interval
+                    if _chunk_timeout is None
+                    else min(heartbeat_interval, _chunk_timeout - idle_seconds)
+                ),
             )
 
             if disconnect_task in done:
@@ -4455,6 +4465,7 @@ async def _disconnect_guard(
                     )
                     break
                 chunk_count += 1
+                last_chunk_at = _time.monotonic()
                 if chunk_count == 1:
                     logger.info(
                         f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
@@ -4511,7 +4522,7 @@ async def _disconnect_guard(
 async def _wait_with_disconnect(
     coro,
     raw_request: Request,
-    timeout: float,
+    timeout: float | None,
     poll_interval: float = 0.5,
     timeout_detail_seconds: float | None = None,
     cleanup_result=None,
@@ -4562,7 +4573,7 @@ async def _wait_with_disconnect(
                 status_code=504,
                 detail=(
                     "Request timed out after "
-                    f"{(timeout_detail_seconds or timeout):.1f} seconds"
+                    f"{(timeout_detail_seconds if timeout_detail_seconds is not None else timeout):.1f} seconds"
                 ),
             )
 
@@ -4600,14 +4611,22 @@ async def _wait_with_disconnect(
             task.cancel()
 
 
-def _start_request_budget(timeout: float | None) -> tuple[float, float]:
-    """Return the total timeout and absolute deadline for a request."""
-    total_timeout = timeout or _default_timeout
+def _start_request_budget(
+    timeout: float | None,
+) -> tuple[float | None, float | None]:
+    """Return the request budget; a non-positive budget means no wall-clock cap."""
+    total_timeout = _default_timeout if timeout is None else timeout
+    if total_timeout is None or total_timeout <= 0:
+        return None, None
     return total_timeout, time.monotonic() + total_timeout
 
 
-def _remaining_request_timeout(total_timeout: float, deadline: float) -> float:
+def _remaining_request_timeout(
+    total_timeout: float | None, deadline: float | None
+) -> float | None:
     """Compute remaining request budget or raise the standard timeout error."""
+    if total_timeout is None or deadline is None:
+        return None
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise HTTPException(
@@ -4623,8 +4642,8 @@ _active_request_contexts: dict[int, RequestModelContext] = {}
 async def _acquire_default_engine_for_request(
     raw_request: Request,
     *,
-    total_timeout: float,
-    deadline: float,
+    total_timeout: float | None,
+    deadline: float | None,
     count_activity: bool = True,
     model: str | None = None,
 ) -> BaseEngine | None:
@@ -6540,7 +6559,14 @@ def main():
     global _default_presence_penalty, _default_repetition_penalty
     global _max_audio_upload_bytes, _max_tts_input_chars
     _api_key = args.api_key
-    _default_timeout = args.timeout
+    if args.disable_timeout:
+        _default_timeout = None
+        logger.warning(
+            "REQUEST TIMEOUT DISABLED (--disable-timeout); "
+            "client disconnect and explicit cancellation still apply"
+        )
+    else:
+        _default_timeout = args.timeout
     _metrics_enabled = args.enable_metrics
     _metrics.configure(enabled=args.enable_metrics)
     if args.default_temperature is not None:
@@ -6740,6 +6766,14 @@ Examples:
         type=float,
         default=300.0,
         help="Default request timeout in seconds (default: 300)",
+    )
+    parser.add_argument(
+        "--disable-timeout",
+        action="store_true",
+        help=(
+            "Disable request timeout policy while preserving client disconnect "
+            "cancellation."
+        ),
     )
     parser.add_argument(
         "--enable-metrics",
