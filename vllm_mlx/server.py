@@ -578,8 +578,11 @@ def _resolve_no_final_content_token_limit() -> int | None:
 
 def _generation_metadata(
     thinking_processor: object | None,
+    output: object | None = None,
 ) -> GenerationMetadata | None:
-    if thinking_processor is None:
+    mtp_drafts = getattr(output, "mtp_drafts", 0) or 0
+    mtp_accepted = getattr(output, "mtp_accepted", 0) or 0
+    if thinking_processor is None and not (mtp_drafts or mtp_accepted):
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -588,6 +591,8 @@ def _generation_metadata(
         no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
+        mtp_drafts=mtp_drafts or None,
+        mtp_accepted=mtp_accepted or None,
     )
 
 
@@ -3270,6 +3275,7 @@ def load_model(
     mllm_draft_model: str | None = None,
     mllm_draft_kind: str | None = None,
     mllm_draft_block_size: int | None = None,
+    default_mllm_draft: bool = False,
     warm_prompts_path: str | None = None,
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
@@ -3299,6 +3305,8 @@ def load_model(
         mllm_draft_model: Optional MLLM speculative draft/assistant model path.
         mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp".
         mllm_draft_block_size: Optional speculative block size passed to mlx-vlm.
+        default_mllm_draft: Enable a configured assistant drafter unless a
+            request explicitly opts out.
         auto_unload_idle_seconds: Idle time before auto-unloading the main model.
             When non-zero, the main model is managed through lifecycle
             residency instead of being loaded immediately in this function.
@@ -3321,6 +3329,8 @@ def load_model(
         raise ValueError("Default max tokens cannot exceed max request tokens")
     if mllm_draft_model and not force_mllm:
         raise ValueError("MLLM draft models require force_mllm/--mllm")
+    if default_mllm_draft and not mllm_draft_model:
+        raise ValueError("default_mllm_draft requires an MLLM draft model")
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         raise ValueError("MLLM draft block size must be a positive integer")
     if mllm_draft_model and use_batching:
@@ -3455,6 +3465,7 @@ def load_model(
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            default_mllm_draft=default_mllm_draft,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -5206,7 +5217,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
-            generation_metadata=_generation_metadata(prepared.thinking_processor),
+            generation_metadata=_generation_metadata(
+                prepared.thinking_processor, output
+            ),
         )
     finally:
         if release_on_exit:
@@ -6879,6 +6892,7 @@ def main():
         prefix_trie_cache=args.prefix_trie_cache,
         prefix_trie_cache_size=args.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
+        default_mllm_draft=args.default_mllm_draft,
         auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         lazy_load_model=args.lazy_load_model,
     )
@@ -6983,6 +6997,14 @@ Examples:
         type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
         default=None,
         help="Optional prompt-cache trie memory cap in MB.",
+    )
+    parser.add_argument(
+        "--default-mllm-draft",
+        action="store_true",
+        help=(
+            "Enable a configured MLLM assistant drafter by default. "
+            "Requests may opt out with mllm_draft=false."
+        ),
     )
     parser.add_argument(
         "--mcp-config",
