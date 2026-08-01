@@ -1109,14 +1109,16 @@ def _build_tool_parser(engine: BaseEngine | None):
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return None
 
-    if _tool_parser_instance is not None:
-        if hasattr(_tool_parser_instance, "reset"):
-            _tool_parser_instance.reset()
-        return _tool_parser_instance
-
-    parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-    tokenizer = getattr(engine, "tokenizer", None) if engine is not None else None
-    return parser_cls(tokenizer)
+    parser_cls = (
+        type(_tool_parser_instance)
+        if _tool_parser_instance is not None
+        else ToolParserManager.get_tool_parser(_tool_call_parser)
+    )
+    tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
+    try:
+        return parser_cls(tokenizer)
+    except TypeError:
+        return parser_cls()
 
 
 def _build_reasoning_parser(engine: BaseEngine | None = None):
@@ -1134,6 +1136,33 @@ def _build_reasoning_parser(engine: BaseEngine | None = None):
         return type(_reasoning_parser)(tokenizer)
     except TypeError:
         return type(_reasoning_parser)()
+
+
+def _prepare_streaming_reasoning_parser(
+    engine: BaseEngine,
+    request: ChatCompletionRequest | ResponsesRequest | None,
+    chat_kwargs: dict[str, object],
+    *,
+    allowed: bool = True,
+):
+    """Build isolated reasoning state for one stream when thinking is enabled."""
+    if not allowed or _thinking_disabled(request, chat_kwargs):
+        return None
+    parser = _build_reasoning_parser(engine)
+    if parser is not None:
+        parser.reset_state()
+    return parser
+
+
+def _prepare_openai_stream_reasoning_state(
+    engine: BaseEngine,
+    request: ChatCompletionRequest,
+    chat_kwargs: dict[str, object],
+) -> tuple[object | None, bool]:
+    """Return isolated parser state and the legacy Nemotron marker state."""
+    parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
+    is_thinking_model = "nemotron" in (engine.model_name or "").lower() and not parser
+    return parser, is_thinking_model
 
 
 # Lifecycle startup coordination — an Event lets the lifecycle loop block
@@ -2541,32 +2570,10 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
             sequence += 1
         return events
 
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
-
-    global _tool_parser_instance
-    tool_parser = None
+    reasoning_parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
+    tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = False
-    if _enable_auto_tool_choice and _tool_call_parser:
-        if _tool_parser_instance is None:
-            try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-                tokenizer = None
-                if _engine is not None and hasattr(_engine, "_tokenizer"):
-                    tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(
-                    "Initialized tool call parser for responses streaming: %s",
-                    _tool_call_parser,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to init tool parser for responses streaming: %s", e
-                )
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2583,8 +2590,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         previous_text = raw_accumulated_text
         raw_accumulated_text += delta_text
 
-        if _reasoning_parser and not _thinking_disabled(request, chat_kwargs):
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+        if reasoning_parser:
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, raw_accumulated_text, delta_text
             )
             if delta_msg is None:
@@ -2983,8 +2990,6 @@ def _get_streaming_tool_parser(
     back to the generic auto parser so streaming still matches the generic
     non-streaming tool parsing behavior.
     """
-    global _tool_parser_instance
-
     if request is None:
         return None
     if _tool_choice_disabled(request):
@@ -2993,17 +2998,14 @@ def _get_streaming_tool_parser(
     tokenizer = _get_engine_tokenizer(engine if engine is not None else _engine)
 
     if _enable_auto_tool_choice and _tool_call_parser:
-        if _tool_parser_instance is None:
-            try:
-                _get_or_init_tool_parser(engine)
-            except Exception as e:
-                logger.warning(
-                    "Failed to init tool parser for streaming: %s",
-                    _sanitize_log_text(e, limit=500),
-                )
-                return None
-        _tool_parser_instance.reset()
-        return _tool_parser_instance
+        try:
+            return _build_tool_parser(engine)
+        except Exception as e:
+            logger.warning(
+                "Failed to init tool parser for streaming: %s",
+                _sanitize_log_text(e, limit=500),
+            )
+            return None
 
     if not getattr(request, "tools", None):
         return None
@@ -5715,14 +5717,13 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    use_reasoning = (
-        _reasoning_parser is not None
-        and not chat_kwargs.get("logits_processors")
-        and not _thinking_disabled(openai_request, chat_kwargs)
+    reasoning_parser = _prepare_streaming_reasoning_parser(
+        engine,
+        openai_request,
+        chat_kwargs,
+        allowed=not chat_kwargs.get("logits_processors"),
     )
-
-    if use_reasoning:
-        _reasoning_parser.reset_state()
+    use_reasoning = reasoning_parser is not None
 
     # Block index tracking: with reasoning parser we use index 0 for
     # thinking and index 1 for text; without parser, index 0 for text.
@@ -5807,7 +5808,7 @@ async def _stream_anthropic_messages(
             # Reasoning parser path
             previous_text = accumulated_text
             accumulated_text += filtered
-            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            delta_msg = reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, filtered
             )
 
@@ -6059,16 +6060,12 @@ async def stream_chat_completion(
     )
     yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-    # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
-    # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = (
-        "nemotron" in (engine.model_name or "").lower() and not _reasoning_parser
+    # The template adds <think> to the prompt, so the model output starts
+    # inside the think block when no parser owns a separate reasoning channel.
+    reasoning_parser, is_thinking_model = _prepare_openai_stream_reasoning_state(
+        engine, request, kwargs
     )
     think_prefix_sent = False
-
-    # Reset reasoning parser state for this stream
-    if _reasoning_parser:
-        _reasoning_parser.reset_state()
 
     # Track accumulated text for reasoning parser
     accumulated_text = ""
@@ -6118,14 +6115,10 @@ async def stream_chat_completion(
             # Use reasoning parser if enabled (skip when enable_thinking=False
             # is set either on the request or via the resolved chat template
             # kwargs / server default).
-            if (
-                _reasoning_parser
-                and delta_text
-                and not _thinking_disabled(request, kwargs)
-            ):
+            if reasoning_parser and delta_text:
                 previous_text = accumulated_text
                 accumulated_text += delta_text
-                delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                delta_msg = reasoning_parser.extract_reasoning_streaming(
                     previous_text, accumulated_text, delta_text
                 )
 
