@@ -2697,6 +2697,7 @@ class TestSimpleEngineNaturalStop:
         assert outputs[0].finished
         assert outputs[0].finish_reason == "stop"
 
+
 class TestSimpleEngineClearRuntimeCaches:
     """Operational reset (DELETE /v1/cache) must actually release the
     multi-slot system-prompt KV cache state introduced in the LRU patch —
