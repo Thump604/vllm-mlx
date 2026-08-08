@@ -2046,9 +2046,7 @@ def test_scheduler_step_error_fails_every_request_once():
     scheduler.output_queues = {
         request_id: asyncio.Queue() for request_id in scheduler.requests
     }
-    scheduler.batch_generator = SimpleNamespace(
-        process_pending_removals=MagicMock()
-    )
+    scheduler.batch_generator = SimpleNamespace(process_pending_removals=MagicMock())
 
     def abort(request_id):
         scheduler.requests.pop(request_id, None)
