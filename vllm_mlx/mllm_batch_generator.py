@@ -2036,6 +2036,28 @@ class MLLMBatchGenerator:
         return bool(self.unprocessed_requests or self.active_batch)
 
 
+def _draft_external_mtp_active_batch(
+    draft_model: Any,
+    primary_tokens: mx.array,
+    hidden_states: mx.array,
+    positions: List[int],
+    sampler: Callable,
+) -> mx.array:
+    """Draft one token per row without conflating mixed KV positions."""
+    from mlx_vlm.speculative.mtp import _mtp_draft_block_active
+
+    return _mtp_draft_block_active(
+        draft_model,
+        primary_tokens.tolist(),
+        hidden_states[:, -1:, :],
+        2,
+        sampler,
+        primary_tokens.dtype,
+        positions,
+        greedy_sampling=True,
+    )[:, 0]
+
+
 def install_mtp_mllm(
     batch_gen: "MLLMBatchGenerator",
     language_model: Any,
@@ -2256,15 +2278,18 @@ def install_mtp_mllm(
                 # Sample-and-compare preserves the target distribution here only
                 # because the external draft is a point mass. Changing greedy=True
                 # requires a rejection-sampling verifier that accounts for q(x).
-                draft_tokens = draft_model.draft_block(
+                # Mixed-position batches cannot share one assistant-drafter
+                # decode position. A request that joins an active batch has a
+                # shorter valid KV length than the rows already decoding; the
+                # mlx-vlm helper drafts those rows independently and restores
+                # the batched shared-KV view afterwards.
+                draft_tokens = _draft_external_mtp_active_batch(
+                    draft_model,
                     primary_tokens,
-                    hidden_states[:, -1:, :],
-                    None,
-                    2,
+                    hidden_states,
+                    positions,
                     _draft_sampler,
-                    primary_tokens.dtype,
-                    greedy=True,
-                )[:, 0]
+                )
                 draft_distribution = None
             else:
                 draft_logits = language_model.mtp_forward(

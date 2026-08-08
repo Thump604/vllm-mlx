@@ -1976,3 +1976,96 @@ class TestChunkedPrefillCacheHandling:
         assert orig_next_called == [
             1
         ], f"Short prompt should fall through to _orig_next, got {orig_next_called}"
+
+
+def test_external_mtp_drafts_mixed_position_rows_independently():
+    """A later request must not inherit an active row's decode position."""
+    import inspect
+
+    from vllm_mlx.mllm_batch_generator import (
+        _draft_external_mtp_active_batch,
+        install_mtp_mllm,
+    )
+
+    assert "_draft_external_mtp_active_batch(" in inspect.getsource(install_mtp_mllm)
+
+    class FakeDraftModel:
+        def __init__(self):
+            self._draft_round = 0
+            self._shared_kv = {
+                "sliding_attention": (
+                    mx.zeros((2, 1, 8, 2)),
+                    mx.zeros((2, 1, 8, 2)),
+                )
+            }
+            self.set_calls = []
+            self.draft_batch_sizes = []
+
+        def set_shared_kv(self, shared_kv, **kwargs):
+            self._shared_kv = shared_kv
+            self.set_calls.append(kwargs)
+
+        def draft_block(self, bonus_token, hidden, *args, **kwargs):
+            self.draft_batch_sizes.append(hidden.shape[0])
+            token = int(bonus_token) + 10
+            return mx.array([[token]], dtype=mx.int32)
+
+    draft_model = FakeDraftModel()
+    out = _draft_external_mtp_active_batch(
+        draft_model,
+        mx.array([1, 2], dtype=mx.int32),
+        mx.zeros((2, 1, 4)),
+        [10377, 10327],
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert out.tolist() == [11, 12]
+    assert draft_model.draft_batch_sizes == [1, 1]
+    assert [call["kv_offset"] for call in draft_model.set_calls[:2]] == [10377, 10327]
+    assert draft_model.set_calls[-1]["kv_offset"] == 10377
+
+
+def test_scheduler_step_error_fails_every_request_once():
+    """A poisoned shared batch must not be retried behind SSE heartbeats."""
+    import inspect
+
+    from vllm_mlx.mllm_scheduler import MLLMScheduler
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.requests = {
+        request_id: SimpleNamespace(
+            output_tokens=[1, 2],
+            output_text="partial",
+            num_prompt_tokens=10327,
+            num_output_tokens=2,
+            mtp_drafts=10,
+            mtp_accepted=6,
+        )
+        for request_id in ("older", "joining")
+    }
+    scheduler.output_queues = {
+        request_id: asyncio.Queue() for request_id in scheduler.requests
+    }
+    scheduler.batch_generator = SimpleNamespace(
+        process_pending_removals=MagicMock()
+    )
+
+    def abort(request_id):
+        scheduler.requests.pop(request_id, None)
+        return True
+
+    scheduler.abort_request = MagicMock(side_effect=abort)
+    scheduler._fail_requests_after_step_error(ValueError("negative dimensions"))
+
+    assert scheduler.requests == {}
+    assert scheduler.abort_request.call_count == 2
+    scheduler.batch_generator.process_pending_removals.assert_called_once_with()
+    for queue in scheduler.output_queues.values():
+        output = queue.get_nowait()
+        assert output.finished is True
+        assert output.finish_reason == "error"
+        assert output.output_text == "partial"
+
+    assert "_fail_requests_after_step_error(e)" in inspect.getsource(
+        MLLMScheduler._process_loop
+    )

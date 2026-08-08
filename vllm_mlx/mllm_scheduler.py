@@ -839,6 +839,47 @@ class MLLMScheduler:
 
         return output
 
+    def _fail_requests_after_step_error(self, error: Exception) -> None:
+        """Terminate every request that may share a partially mutated batch.
+
+        A model forward can update earlier cache layers before a later layer
+        raises. Retrying that batch is unsafe and previously produced an
+        infinite exception loop while streaming clients received heartbeats.
+        """
+        request_ids = list(self.requests)
+        logger.error(
+            "Failing %d MLLM requests after an unrecoverable scheduler step: %s",
+            len(request_ids),
+            error,
+        )
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            queue = self.output_queues.get(request_id)
+            if request is not None and queue is not None:
+                try:
+                    queue.put_nowait(
+                        RequestOutput(
+                            request_id=request_id,
+                            output_token_ids=list(request.output_tokens),
+                            output_text=request.output_text,
+                            finished=True,
+                            finish_reason="error",
+                            prompt_tokens=request.num_prompt_tokens,
+                            completion_tokens=request.num_output_tokens,
+                            mtp_drafts=request.mtp_drafts,
+                            mtp_accepted=request.mtp_accepted,
+                        )
+                    )
+                except asyncio.QueueFull:
+                    pass
+            self.abort_request(request_id)
+
+        # abort_request defers batch mutation for thread safety. This handler
+        # runs on the scheduler loop after the failed forward has unwound, so
+        # draining now is both safe and necessary before any later request.
+        if self.batch_generator is not None:
+            self.batch_generator.process_pending_removals()
+
     def get_request(self, request_id: str) -> Optional[MLLMRequest]:
         """Get a request by ID."""
         return self.requests.get(request_id)
@@ -982,6 +1023,7 @@ class MLLMScheduler:
                 raise
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                self._fail_requests_after_step_error(e)
                 await asyncio.sleep(0.1)
 
     async def add_request_async(
