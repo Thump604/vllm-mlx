@@ -39,8 +39,8 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             # Supplying an integration server is an explicit opt-in to the
             # integration suite, including tests that are also marked slow.
-            if "slow" in item.keywords and not (
-                server_url and "integration" in item.keywords
+            if item.get_closest_marker("slow") is not None and not (
+                server_url and item.get_closest_marker("integration") is not None
             ):
                 item.add_marker(skip_slow)
 
@@ -50,7 +50,7 @@ def pytest_collection_modifyitems(config, items):
             reason="Integration tests require --server-url"
         )
         for item in items:
-            if "integration" in item.keywords:
+            if item.get_closest_marker("integration") is not None:
                 item.add_marker(skip_integration)
 
 

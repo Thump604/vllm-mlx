@@ -20,6 +20,9 @@ class _Item:
     def add_marker(self, marker):
         self.markers.append(marker)
 
+    def get_closest_marker(self, name):
+        return name if name in self.keywords else None
+
 
 def test_explicit_server_url_enables_all_integration_tests():
     items = [_Item("integration"), _Item("integration", "slow")]
