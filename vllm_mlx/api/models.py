@@ -372,6 +372,10 @@ class CompletionResponse(BaseModel):
     model: str
     choices: list[CompletionChoice]
     usage: Usage = Field(default_factory=Usage)
+    # Keep /v1/completions terminal diagnostics at parity with
+    # /v1/chat/completions.  It is optional so standard OpenAI-compatible
+    # clients continue to receive the ordinary completion shape unchanged.
+    generation_metadata: GenerationMetadata | None = None
 
 
 # =============================================================================

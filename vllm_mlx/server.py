@@ -615,6 +615,52 @@ def _generation_metadata(
     )
 
 
+def _aggregate_completion_generation_metadata(
+    outputs: list[GenerationOutput],
+) -> GenerationMetadata | None:
+    """Return request-level terminal diagnostics for one or more prompts.
+
+    ``/v1/completions`` accepts a prompt list but has one response-level
+    extension field, unlike its per-choice text.  Counters and timings are
+    additive across independently generated prompts.  A policy/status value
+    is published only when every participating output agrees; reporting the
+    last row's routing decision for a mixed request would be misleading.
+    """
+    metadata = [_generation_metadata(None, output) for output in outputs]
+    if not any(item is not None for item in metadata):
+        return None
+    if len(metadata) == 1:
+        return metadata[0]
+
+    def common(name: str):
+        values = {
+            getattr(item, name) if item is not None else None for item in metadata
+        }
+        return values.pop() if len(values) == 1 else None
+
+    def summed(name: str):
+        values = [
+            getattr(item, name) if item is not None else None for item in metadata
+        ]
+        present = [value for value in values if value is not None]
+        return sum(present) if present else None
+
+    return GenerationMetadata(
+        mtp_drafts=summed("mtp_drafts"),
+        mtp_accepted=summed("mtp_accepted"),
+        specprefill_requested_policy=common("specprefill_requested_policy"),
+        specprefill_effective_policy=common("specprefill_effective_policy"),
+        specprefill_coverage=common("specprefill_coverage"),
+        specprefill_engaged=common("specprefill_engaged"),
+        specprefill_selector_version=common("specprefill_selector_version"),
+        specprefill_fallback_reason=common("specprefill_fallback_reason"),
+        specprefill_total_tokens=summed("specprefill_total_tokens"),
+        specprefill_selected_tokens=summed("specprefill_selected_tokens"),
+        specprefill_scorer_ms=summed("specprefill_scorer_ms"),
+        specprefill_target_prefill_ms=summed("specprefill_target_prefill_ms"),
+    )
+
+
 def _attach_specprefill_request_kwargs(
     request: object,
     kwargs: dict[str, object],
@@ -4868,6 +4914,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         # Non-streaming response with timing and timeout
         start_time = time.perf_counter()
         choices = []
+        terminal_outputs = []
         total_completion_tokens = 0
         total_prompt_tokens = 0
         for i, prompt in enumerate(prompts):
@@ -4916,6 +4963,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                     finish_reason=output.finish_reason,
                 )
             )
+            terminal_outputs.append(output)
             total_completion_tokens += output.completion_tokens
             total_prompt_tokens += (
                 output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
@@ -4939,6 +4987,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+            ),
+            generation_metadata=_aggregate_completion_generation_metadata(
+                terminal_outputs
             ),
         )
     finally:
@@ -6099,6 +6150,11 @@ async def stream_completion(
             }
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
+                terminal_metadata = _generation_metadata(None, output)
+                if terminal_metadata is not None:
+                    data["generation_metadata"] = terminal_metadata.model_dump(
+                        exclude_none=True
+                    )
             yield f"data: {json.dumps(data)}\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
