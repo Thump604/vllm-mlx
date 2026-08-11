@@ -39,6 +39,14 @@ from ..specprefill import (
     SpecPrefillPolicy,
     resolve_specprefill_decision,
 )
+from ..specprefill_profiles import (
+    EMPTY_SPECPREFILL_PROFILE_REGISTRY,
+    SpecPrefillCell,
+    SpecPrefillEngine,
+    SpecPrefillProfileKey,
+    SpecPrefillProfileRegistry,
+    SpecPrefillTuning,
+)
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -122,6 +130,17 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
+def _request_can_compose_mtp(route_mtp: bool, processors: list[Any] | None) -> bool:
+    """Whether this request reaches an MTP decode phase on the text route.
+
+    A permanently active request-local processor disables MTP for the whole
+    request. A retire-capable processor constrains only the thinking phase;
+    its content continuation deliberately resumes native MTP and therefore
+    requires the independently qualified combined profile cell.
+    """
+    return route_mtp and (not processors or _processors_can_retire(processors))
+
+
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
@@ -141,6 +160,8 @@ class _SpecPrefillTelemetry:
     selected_tokens: int | None
     scorer_ms: float | None = None
     target_prefill_ms: float | None = None
+    profile_tuning: SpecPrefillTuning | None = None
+    profile_selector_version: str | None = None
 
     def fallback(self, reason: str) -> None:
         self.decision = SpecPrefillDecision(
@@ -163,7 +184,9 @@ class _SpecPrefillTelemetry:
             "specprefill_coverage": decision.coverage.value,
             "specprefill_engaged": decision.effective_policy
             is SpecPrefillPolicy.SPARSE,
-            "specprefill_selector_version": SPECPREFILL_SELECTOR_VERSION,
+            "specprefill_selector_version": (
+                self.profile_selector_version or SPECPREFILL_SELECTOR_VERSION
+            ),
             "specprefill_fallback_reason": decision.fallback_reason,
             "specprefill_total_tokens": self.total_tokens,
             "specprefill_selected_tokens": self.selected_tokens,
@@ -196,6 +219,10 @@ class SimpleEngine(BaseEngine):
         specprefill_draft_model: str | None = None,
         specprefill_diagnostic_mode: bool = False,
         specprefill_max_tokens: int | None = None,
+        specprefill_profile_registry: SpecPrefillProfileRegistry | None = None,
+        specprefill_sparse_profile_key: SpecPrefillProfileKey | None = None,
+        specprefill_combined_profile_key: SpecPrefillProfileKey | None = None,
+        specprefill_estimated_residency_bytes: int | None = None,
         max_kv_size: int = 0,
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
@@ -223,6 +250,15 @@ class SimpleEngine(BaseEngine):
             specprefill_max_tokens: Optional explicit scorer-admission cap.
                 ``None`` leaves long-context admission to the profile/memory
                 controller rather than imposing a hidden engine ceiling.
+            specprefill_profile_registry: Exact calibrated profiles. ``None``
+                uses an empty fail-closed registry.
+            specprefill_sparse_profile_key: Exact SimpleEngine sparse-only
+                artifact/adapter profile identity.
+            specprefill_combined_profile_key: Exact SimpleEngine
+                SpecPrefill+MTP profile identity.
+            specprefill_estimated_residency_bytes: Estimated resident bytes for
+                this exact request composition. This engine does not estimate
+                or load artifacts.
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
@@ -260,6 +296,43 @@ class SimpleEngine(BaseEngine):
         if specprefill_max_tokens is not None and specprefill_max_tokens <= 0:
             raise ValueError("specprefill_max_tokens must be positive when set")
         self._specprefill_max_tokens = specprefill_max_tokens
+        if specprefill_profile_registry is None:
+            specprefill_profile_registry = EMPTY_SPECPREFILL_PROFILE_REGISTRY
+        if not isinstance(specprefill_profile_registry, SpecPrefillProfileRegistry):
+            raise ValueError(
+                "specprefill_profile_registry must be SpecPrefillProfileRegistry"
+            )
+        for name, key, expected_cell in (
+            (
+                "specprefill_sparse_profile_key",
+                specprefill_sparse_profile_key,
+                SpecPrefillCell.SPARSE_ONLY,
+            ),
+            (
+                "specprefill_combined_profile_key",
+                specprefill_combined_profile_key,
+                SpecPrefillCell.COMBINED_MTP,
+            ),
+        ):
+            if key is not None and not isinstance(key, SpecPrefillProfileKey):
+                raise ValueError(f"{name} must be SpecPrefillProfileKey")
+            if key is not None and key.engine is not SpecPrefillEngine.SIMPLE:
+                raise ValueError(f"{name} must target the SimpleEngine route")
+            if key is not None and key.cell is not expected_cell:
+                raise ValueError(f"{name} must target the {expected_cell.value} cell")
+        if (
+            specprefill_estimated_residency_bytes is not None
+            and specprefill_estimated_residency_bytes < 0
+        ):
+            raise ValueError(
+                "specprefill_estimated_residency_bytes must be non-negative"
+            )
+        self._specprefill_profile_registry = specprefill_profile_registry
+        self._specprefill_sparse_profile_key = specprefill_sparse_profile_key
+        self._specprefill_combined_profile_key = specprefill_combined_profile_key
+        self._specprefill_estimated_residency_bytes = (
+            specprefill_estimated_residency_bytes
+        )
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
@@ -328,6 +401,7 @@ class SimpleEngine(BaseEngine):
         coverage: str | None,
         has_media: bool,
         total_tokens: int | None,
+        combined_mtp: bool = False,
     ) -> _SpecPrefillTelemetry:
         """Resolve request intent before execution, with a safe dense default.
 
@@ -336,6 +410,7 @@ class SimpleEngine(BaseEngine):
         coverage declaration is ``unknown`` and therefore never engages sparse
         prefill in a production engine.
         """
+        explicit_policy = policy is not None
         if policy is None:
             policy = (
                 "sparse" if legacy is True else "dense" if legacy is False else "auto"
@@ -344,13 +419,24 @@ class SimpleEngine(BaseEngine):
             coverage = "unknown"
 
         requested_policy = SpecPrefillPolicy(policy)
+        legacy_sparse_intent = legacy is True and not explicit_policy
+        legacy_profile_managed_intent = (
+            legacy_sparse_intent and not self._specprefill_diagnostic_mode
+        )
+        profile_managed_intent = (
+            requested_policy is SpecPrefillPolicy.AUTO or legacy_profile_managed_intent
+        )
         # ``sparse`` is a diagnostic forcing control. Its diagnostic-only
-        # meaning includes bypassing the calibrated crossover; production
-        # routes still resolve it dense before any scorer work begins.
+        # meaning includes bypassing calibrated profile lookup. Legacy boolean
+        # enablement remains an intent, not a production forcing bypass.
         if (
             self._specprefill_diagnostic_mode
             and requested_policy is SpecPrefillPolicy.SPARSE
         ):
+            threshold_met = True
+        elif profile_managed_intent:
+            # Production and diagnostic auto use the exact profile's calibrated
+            # crossover. Do not impose the old engine-wide threshold here.
             threshold_met = True
         elif total_tokens is None:
             threshold_met = False
@@ -364,14 +450,60 @@ class SimpleEngine(BaseEngine):
             or total_tokens is None
             or total_tokens <= self._specprefill_max_tokens
         )
+        # Legacy ``specprefill=true`` is production sparse intent, not a
+        # production forcing bypass. In a diagnostic profile it retains the
+        # legacy forcing behavior so existing sparse diagnostics do not become
+        # unexpectedly coverage-gated by the new production policy.
+        decision_policy = "auto" if legacy_profile_managed_intent else policy
         decision = resolve_specprefill_decision(
-            policy,
+            decision_policy,
             coverage,
             production=not self._specprefill_diagnostic_mode,
             text_only=not has_media,
             threshold_met=threshold_met,
             admission_allowed=admission_allowed,
         )
+        if legacy_sparse_intent:
+            decision = SpecPrefillDecision(
+                requested_policy=SpecPrefillPolicy.SPARSE,
+                effective_policy=decision.effective_policy,
+                coverage=decision.coverage,
+                fallback_reason=decision.fallback_reason,
+            )
+
+        profile_tuning: SpecPrefillTuning | None = None
+        profile_selector_version: str | None = None
+        requires_profile = decision.effective_policy is SpecPrefillPolicy.SPARSE and (
+            not self._specprefill_diagnostic_mode
+            or requested_policy is SpecPrefillPolicy.AUTO
+        )
+        if requires_profile:
+            profile_key = self._active_specprefill_profile_key(combined_mtp)
+            if profile_key is None:
+                decision = self._specprefill_dense_fallback(
+                    decision, "profile_not_registered"
+                )
+            elif (
+                total_tokens is None
+                or self._specprefill_estimated_residency_bytes is None
+            ):
+                decision = self._specprefill_dense_fallback(
+                    decision, "profile_residency_not_estimated"
+                )
+            else:
+                profile_decision = self._specprefill_profile_registry.resolve(
+                    profile_key,
+                    prompt_tokens=total_tokens,
+                    residency_bytes=self._specprefill_estimated_residency_bytes,
+                    diagnostic=self._specprefill_diagnostic_mode,
+                )
+                if not profile_decision.eligible:
+                    decision = self._specprefill_dense_fallback(
+                        decision, profile_decision.fallback_reason
+                    )
+                else:
+                    profile_tuning = profile_decision.tuning
+                    profile_selector_version = profile_decision.selector_version
         if (
             decision.effective_policy is SpecPrefillPolicy.SPARSE
             and self._draft_model is None
@@ -382,13 +514,42 @@ class SimpleEngine(BaseEngine):
                 coverage=decision.coverage,
                 fallback_reason="specprefill_unavailable",
             )
+            profile_tuning = None
+            profile_selector_version = None
 
         selected_tokens = (
             total_tokens
             if decision.effective_policy is SpecPrefillPolicy.DENSE
             else None
         )
-        return _SpecPrefillTelemetry(decision, total_tokens, selected_tokens)
+        return _SpecPrefillTelemetry(
+            decision,
+            total_tokens,
+            selected_tokens,
+            profile_tuning=profile_tuning,
+            profile_selector_version=profile_selector_version,
+        )
+
+    def _active_specprefill_profile_key(
+        self, combined_mtp: bool
+    ) -> SpecPrefillProfileKey | None:
+        """Return the independently qualified sparse-only or combined cell."""
+        return (
+            self._specprefill_combined_profile_key
+            if combined_mtp
+            else self._specprefill_sparse_profile_key
+        )
+
+    @staticmethod
+    def _specprefill_dense_fallback(
+        decision: SpecPrefillDecision, reason: str | None
+    ) -> SpecPrefillDecision:
+        return SpecPrefillDecision(
+            requested_policy=decision.requested_policy,
+            effective_policy=SpecPrefillPolicy.DENSE,
+            coverage=decision.coverage,
+            fallback_reason=reason,
+        )
 
     def _specprefill_controls(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Remove public prefill controls before forwarding to model APIs."""
@@ -1082,6 +1243,10 @@ class SimpleEngine(BaseEngine):
             coverage=specprefill_controls["coverage"],
             has_media=specprefill_controls["has_media"],
             total_tokens=len(tokens_list),
+            # MLXLanguageModel injects native MTP into its decode call when
+            # configured. Other routes pass their request-effective value
+            # explicitly (for example, an MLLM assistant request).
+            combined_mtp=self._mtp,
         )
 
         # SpecPrefill is independent from MTP. The direct path is used only
@@ -1102,11 +1267,34 @@ class SimpleEngine(BaseEngine):
                 specprefill_keep_pct=(
                     specprefill_controls["keep_pct"]
                     if self._specprefill_diagnostic_mode
-                    else None
+                    else (
+                        telemetry.profile_tuning.keep_pct
+                        if telemetry.profile_tuning is not None
+                        else None
+                    )
                 ),
                 specprefill_backbone_pct=(
                     specprefill_controls["backbone_pct"]
                     if self._specprefill_diagnostic_mode
+                    else (
+                        telemetry.profile_tuning.backbone_pct
+                        if telemetry.profile_tuning is not None
+                        else None
+                    )
+                ),
+                specprefill_chunk_size=(
+                    telemetry.profile_tuning.chunk_size
+                    if telemetry.profile_tuning is not None
+                    else None
+                ),
+                specprefill_halo_chunks=(
+                    telemetry.profile_tuning.halo_chunks
+                    if telemetry.profile_tuning is not None
+                    else None
+                ),
+                specprefill_anchor_chunks=(
+                    telemetry.profile_tuning.anchor_chunks
+                    if telemetry.profile_tuning is not None
                     else None
                 ),
                 **kwargs,
@@ -1466,6 +1654,7 @@ class SimpleEngine(BaseEngine):
                 temperature,
                 top_p,
                 tools=template_tools,
+                combined_mtp=has_mtp and self._mtp,
                 **kwargs,
             ):
                 yield chunk
@@ -1483,6 +1672,7 @@ class SimpleEngine(BaseEngine):
                 coverage=specprefill_controls["coverage"],
                 has_media=request_has_media or specprefill_controls["has_media"],
                 total_tokens=None,
+                combined_mtp=mllm_draft_requested,
             )
 
         def mllm_call_kwargs() -> dict:
@@ -2056,6 +2246,9 @@ class SimpleEngine(BaseEngine):
         telemetry: _SpecPrefillTelemetry | None = None,
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
+        specprefill_chunk_size: int | None = None,
+        specprefill_halo_chunks: int | None = None,
+        specprefill_anchor_chunks: int | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
@@ -2134,10 +2327,24 @@ class SimpleEngine(BaseEngine):
                     if specprefill_backbone_pct is not None
                     else self._specprefill_backbone_pct
                 )
+                effective_chunk_size = specprefill_chunk_size or 32
+                effective_halo_chunks = (
+                    specprefill_halo_chunks
+                    if specprefill_halo_chunks is not None
+                    else 1
+                )
+                effective_anchor_chunks = (
+                    specprefill_anchor_chunks
+                    if specprefill_anchor_chunks is not None
+                    else 1
+                )
                 selected = select_chunks(
                     importance,
                     keep_pct=effective_keep,
                     backbone_pct=effective_backbone,
+                    chunk_size=effective_chunk_size,
+                    halo_chunks=effective_halo_chunks,
+                    anchor_chunks=effective_anchor_chunks,
                 )
                 n_selected = selected.shape[0]
                 telemetry.selected_tokens = int(n_selected)
@@ -2273,6 +2480,7 @@ class SimpleEngine(BaseEngine):
         temperature: float,
         top_p: float,
         tools: list | None = None,
+        combined_mtp: bool = False,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Text-only generation via mlx_lm TextModel.
@@ -2306,6 +2514,9 @@ class SimpleEngine(BaseEngine):
             if self._specprefill_diagnostic_mode
             else None
         )
+        specprefill_chunk_size: int | None = None
+        specprefill_halo_chunks: int | None = None
+        specprefill_anchor_chunks: int | None = None
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
@@ -2358,6 +2569,7 @@ class SimpleEngine(BaseEngine):
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
+        combined_mtp = _request_can_compose_mtp(combined_mtp, all_processors)
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -2496,6 +2708,7 @@ class SimpleEngine(BaseEngine):
             coverage=specprefill_controls["coverage"],
             has_media=specprefill_controls["has_media"],
             total_tokens=(full_token_count if full_tokens_list is not None else None),
+            combined_mtp=combined_mtp,
         )
         requested_policy = telemetry.decision.requested_policy
         should_measure_sparse_prompt = not specprefill_controls["has_media"] and (
@@ -2519,7 +2732,18 @@ class SimpleEngine(BaseEngine):
                 coverage=specprefill_controls["coverage"],
                 has_media=False,
                 total_tokens=full_token_count,
+                combined_mtp=combined_mtp,
             )
+
+        if (
+            not self._specprefill_diagnostic_mode
+            and telemetry.profile_tuning is not None
+        ):
+            specprefill_keep_pct = telemetry.profile_tuning.keep_pct
+            specprefill_backbone_pct = telemetry.profile_tuning.backbone_pct
+            specprefill_chunk_size = telemetry.profile_tuning.chunk_size
+            specprefill_halo_chunks = telemetry.profile_tuning.halo_chunks
+            specprefill_anchor_chunks = telemetry.profile_tuning.anchor_chunks
 
         # Tokens for specprefill: suffix (if system KV) or full prompt
         specprefill_tokens = (
@@ -2788,10 +3012,24 @@ class SimpleEngine(BaseEngine):
                     if specprefill_backbone_pct is not None
                     else self._specprefill_backbone_pct
                 )
+                effective_chunk_size = specprefill_chunk_size or 32
+                effective_halo_chunks = (
+                    specprefill_halo_chunks
+                    if specprefill_halo_chunks is not None
+                    else 1
+                )
+                effective_anchor_chunks = (
+                    specprefill_anchor_chunks
+                    if specprefill_anchor_chunks is not None
+                    else 1
+                )
                 selected = select_chunks(
                     importance,
                     keep_pct=effective_keep,
                     backbone_pct=effective_backbone,
+                    chunk_size=effective_chunk_size,
+                    halo_chunks=effective_halo_chunks,
+                    anchor_chunks=effective_anchor_chunks,
                 )
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
