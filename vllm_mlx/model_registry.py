@@ -1164,6 +1164,16 @@ class ModelManager:
             if entry.specprefill_draft_model is not None
             else self._defaults.specprefill_draft_model
         )
+        if continuous_batching and scheduler_config is not None:
+            scheduler_config.specprefill_enabled = specprefill_enabled
+        if continuous_batching and specprefill_enabled:
+            if scheduler_config is None or not callable(
+                getattr(scheduler_config, "specprefill_prepare", None)
+            ):
+                raise ValueError(
+                    "registry CB SpecPrefill requires an explicit "
+                    "SchedulerConfig.specprefill_prepare builder"
+                )
         stream_interval = (
             entry.stream_interval
             if entry.stream_interval is not None

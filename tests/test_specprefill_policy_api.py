@@ -80,6 +80,20 @@ def test_tuning_percentages_are_bounded(field, value):
         CompletionRequest(model="test-model", prompt="hello", **{field: value})
 
 
+def test_cb_production_rejects_request_tuning_as_http_422():
+    from fastapi import HTTPException
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.server import _validate_cb_specprefill_request_tuning
+
+    engine = BatchedEngine.__new__(BatchedEngine)
+    request = _chat(specprefill_keep_pct=0.5)
+
+    with pytest.raises(HTTPException) as failure:
+        _validate_cb_specprefill_request_tuning(engine, request)
+
+    assert failure.value.status_code == 422
+
+
 def test_policy_and_coverage_values_are_closed_enums():
     with pytest.raises(ValidationError):
         _chat(specprefill_policy="sometimes")
@@ -116,13 +130,23 @@ def test_chat_invocation_forwards_policy_coverage_and_media_state():
     request = _chat(
         specprefill_policy="auto",
         specprefill_coverage="selective",
+        specprefill_control_token_indices=[4, 1],
     )
 
     prepared = _prepare_chat_completion_invocation(engine, request, 16)
 
     assert prepared.chat_kwargs["specprefill_policy"] == "auto"
     assert prepared.chat_kwargs["specprefill_coverage"] == "selective"
+    assert prepared.chat_kwargs["specprefill_control_token_indices"] == [4, 1]
     assert prepared.chat_kwargs["specprefill_has_media"] is False
+
+
+@pytest.mark.parametrize("indices", [[-1], [True]])
+def test_control_token_indices_reject_invalid_public_values(indices):
+    with pytest.raises(ValidationError, match="specprefill_control_token_indices"):
+        _chat(specprefill_control_token_indices=indices)
+    with pytest.raises(ValidationError, match="specprefill_control_token_indices"):
+        _completion(specprefill_control_token_indices=indices)
 
 
 def test_server_metadata_combines_prefill_decode_and_watchdog():

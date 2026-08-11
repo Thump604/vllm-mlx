@@ -523,6 +523,26 @@ def test_media_request_uses_separate_dense_fallback_path():
     request = scheduler.running["media"]
     assert request.specprefill_effective_policy is SpecPrefillPolicy.DENSE
     assert request.specprefill_fallback_reason == "media_request"
+
+
+def test_explicit_media_bit_forces_dense_when_extraction_is_empty():
+    factory = _AdmissionFactory()
+    scheduler = _scheduler(factory)
+    scheduler.add_request(
+        "prompt",
+        request_id="empty-media",
+        images=[],
+        specprefill_policy=SpecPrefillPolicy.AUTO,
+        specprefill_coverage=SpecPrefillCoverage.SELECTIVE,
+        specprefill_has_media=True,
+    )
+
+    scheduler.step()
+
+    request = scheduler.running["empty-media"]
+    assert request.specprefill_effective_policy is SpecPrefillPolicy.DENSE
+    assert request.specprefill_fallback_reason == "media_request"
+    assert factory.sessions == {}
     assert factory.sessions == {}
 
 

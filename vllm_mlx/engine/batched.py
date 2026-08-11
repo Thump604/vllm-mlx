@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -26,10 +27,139 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    suspend_cancellation,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedMLLMSpecPrefillRuntime:
+    """Fail-atomic, already prepared scorer and target-adapter ownership."""
+
+    profile_registry: Any
+    profile_key: Any
+    estimated_residency_bytes: int
+    session_factory: Any
+    cache_capability: Any
+    target_forward_context: Any
+    target_model: Any
+    processor: Any
+    target_artifact_hash: str
+    tokenizer_artifact_hash: str
+    scorer_artifact_hash: str
+    cleanup: Any
+
+    def __post_init__(self) -> None:
+        from ..mllm_scheduler import MLLMSpecPrefillCacheCapability
+        from ..specprefill_profiles import (
+            SpecPrefillCell,
+            SpecPrefillEngine,
+            SpecPrefillProfileKey,
+            SpecPrefillProfileRegistry,
+        )
+
+        if not isinstance(self.profile_registry, SpecPrefillProfileRegistry):
+            raise TypeError("profile_registry must be SpecPrefillProfileRegistry")
+        if not isinstance(self.profile_key, SpecPrefillProfileKey):
+            raise TypeError("profile_key must be SpecPrefillProfileKey")
+        if (
+            self.profile_key.engine is not SpecPrefillEngine.CONTINUOUS_BATCHING
+            or self.profile_key.cell is not SpecPrefillCell.SPARSE_ONLY
+        ):
+            raise ValueError("prepared SpecPrefill profile must be CB sparse-only")
+        if (
+            isinstance(self.estimated_residency_bytes, bool)
+            or not isinstance(self.estimated_residency_bytes, int)
+            or self.estimated_residency_bytes < 0
+        ):
+            raise ValueError("estimated_residency_bytes must be non-negative")
+        if not callable(self.session_factory):
+            raise TypeError("session_factory must be callable")
+        if not isinstance(self.cache_capability, MLLMSpecPrefillCacheCapability):
+            raise TypeError("cache_capability must be MLLMSpecPrefillCacheCapability")
+        if not callable(self.target_forward_context):
+            raise TypeError("target_forward_context must be callable")
+        if not callable(self.cleanup):
+            raise TypeError("cleanup must be callable")
+        if self.cache_capability.adapter_id != self.profile_key.adapter_id:
+            raise ValueError("prepared cache adapter must match the profile key")
+        if self.cache_capability.layout != "qwen3_5_nonrotating_hybrid":
+            raise ValueError("prepared cache capability is not admitted for CB")
+        if not any(
+            profile.key == self.profile_key and profile.production_certified
+            for profile in self.profile_registry.profiles
+        ):
+            raise ValueError("prepared profile is not production-certified")
+        expected_hashes = (
+            self.profile_key.target_artifact_hash,
+            self.profile_key.tokenizer_artifact_hash,
+            self.profile_key.scorer_artifact_hash,
+        )
+        if (
+            self.target_artifact_hash,
+            self.tokenizer_artifact_hash,
+            self.scorer_artifact_hash,
+        ) != expected_hashes:
+            raise ValueError("prepared artifact hashes must match the profile key")
+
+
+_SPECPREFILL_OUTPUT_FIELDS = (
+    "specprefill_requested_policy",
+    "specprefill_effective_policy",
+    "specprefill_coverage",
+    "specprefill_engaged",
+    "specprefill_selector_version",
+    "specprefill_fallback_reason",
+    "specprefill_total_tokens",
+    "specprefill_selected_tokens",
+    "specprefill_scorer_ms",
+    "specprefill_target_prefill_ms",
+)
+
+
+def _feature_output_kwargs(output: Any) -> dict[str, Any]:
+    return {
+        "mtp_drafts": getattr(output, "mtp_drafts", 0),
+        "mtp_accepted": getattr(output, "mtp_accepted", 0),
+        **{name: getattr(output, name, None) for name in _SPECPREFILL_OUTPUT_FIELDS},
+    }
+
+
+def _specprefill_request_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    has_media: bool,
+) -> dict[str, Any]:
+    """Consume the public contract and return only scheduler-owned controls."""
+    legacy = kwargs.pop("specprefill", None)
+    policy = kwargs.pop("specprefill_policy", None)
+    coverage = kwargs.pop("specprefill_coverage", None)
+    control_indices = kwargs.pop("specprefill_control_token_indices", None)
+    keep_pct = kwargs.pop("specprefill_keep_pct", None)
+    backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
+    explicit_media = bool(kwargs.pop("specprefill_has_media", False))
+    if keep_pct is not None or backbone_pct is not None:
+        raise ValueError(
+            "CB production SpecPrefill does not accept request keep/backbone tuning"
+        )
+    if legacy is not None:
+        legacy_policy = "sparse" if legacy else "dense"
+        if policy is not None and policy != legacy_policy:
+            raise ValueError(
+                f"specprefill={legacy!r} conflicts with specprefill_policy={policy!r}"
+            )
+        policy = legacy_policy
+    result: dict[str, Any] = {}
+    if policy is not None:
+        result["specprefill_policy"] = policy
+    if coverage is not None:
+        result["specprefill_coverage"] = coverage
+    if control_indices is not None:
+        result["specprefill_control_token_indices"] = tuple(control_indices)
+    result["specprefill_has_media"] = explicit_media or has_media
+    return result
 
 
 def _resolve_metal_buffer_cache_limit(
@@ -221,6 +351,7 @@ class BatchedEngine(BaseEngine):
         self._engine = None  # AsyncEngineCore for LLM
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
+        self._prepared_specprefill_runtime = None
         self._loaded = False
 
     @property
@@ -271,6 +402,12 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm:
                 await self._start_mllm()
             else:
+                if getattr(
+                    self._scheduler_config, "specprefill_enabled", False
+                ):
+                    raise RuntimeError(
+                        "continuous-batching SpecPrefill requires the MLLM scheduler"
+                    )
                 await self._start_llm()
 
             self._loaded = True
@@ -337,6 +474,19 @@ class BatchedEngine(BaseEngine):
         """Start the MLLM engine with MLLMScheduler (continuous batching)."""
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
+        if (
+            self._mllm_scheduler is not None
+            or self._prepared_specprefill_runtime is not None
+        ):
+            with suspend_cancellation():
+                prior_cleanup_failures = (
+                    await self._cleanup_mllm_runtime_ownership()
+                )
+            if prior_cleanup_failures:
+                raise RuntimeError(
+                    "previous MLLM startup cleanup remains incomplete"
+                ) from prior_cleanup_failures[0]
+
         if self._model is None or self._processor is None:
             self._prepare_mllm_model()
 
@@ -391,35 +541,69 @@ class BatchedEngine(BaseEngine):
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
-        mllm_config = MLLMSchedulerConfig(
-            max_num_seqs=max_num_seqs,
-            prefill_batch_size=prefill_batch_size,
-            completion_batch_size=completion_batch_size,
-            enable_vision_cache=True,
-            vision_cache_size=100,
-            cache_memory_mb=cache_memory_mb,
-            enable_prefix_cache=enable_prefix_cache,
-            use_memory_aware_cache=use_memory_aware_cache,
-            prefix_cache_memory_mb=prefix_cache_memory_mb,
-            enable_mtp=enable_mtp,
-            mtp_num_draft_tokens=mtp_num_draft,
-            kv_cache_quantization=kv_quant,
-            kv_cache_quantization_bits=kv_bits,
-            kv_cache_quantization_group_size=kv_group_size,
-            chunked_prefill_tokens=chunked_prefill_tokens,
-            max_kv_size=max_kv_size,
-            ssd_cache_dir=ssd_cache_dir,
-            ssd_cache_max_gb=ssd_cache_max_gb,
-            **mllm_extra,
-        )
+        prepared_specprefill = self._prepare_mllm_specprefill_runtime()
+        self._prepared_specprefill_runtime = prepared_specprefill
+        specprefill_config = {}
+        if prepared_specprefill is not None:
+            specprefill_config = {
+                "specprefill_enabled": True,
+                "specprefill_profile_registry": (
+                    prepared_specprefill.profile_registry
+                ),
+                "specprefill_profile_key": prepared_specprefill.profile_key,
+                "specprefill_estimated_residency_bytes": (
+                    prepared_specprefill.estimated_residency_bytes
+                ),
+                "specprefill_session_factory": (
+                    prepared_specprefill.session_factory
+                ),
+                "specprefill_target_forward_context": (
+                    prepared_specprefill.target_forward_context
+                ),
+                "specprefill_cache_capability": (
+                    prepared_specprefill.cache_capability
+                ),
+            }
+        try:
+            mllm_config = MLLMSchedulerConfig(
+                max_num_seqs=max_num_seqs,
+                prefill_batch_size=prefill_batch_size,
+                completion_batch_size=completion_batch_size,
+                enable_vision_cache=True,
+                vision_cache_size=100,
+                cache_memory_mb=cache_memory_mb,
+                enable_prefix_cache=enable_prefix_cache,
+                use_memory_aware_cache=use_memory_aware_cache,
+                prefix_cache_memory_mb=prefix_cache_memory_mb,
+                enable_mtp=enable_mtp,
+                mtp_num_draft_tokens=mtp_num_draft,
+                kv_cache_quantization=kv_quant,
+                kv_cache_quantization_bits=kv_bits,
+                kv_cache_quantization_group_size=kv_group_size,
+                chunked_prefill_tokens=chunked_prefill_tokens,
+                max_kv_size=max_kv_size,
+                ssd_cache_dir=ssd_cache_dir,
+                ssd_cache_max_gb=ssd_cache_max_gb,
+                **specprefill_config,
+                **mllm_extra,
+            )
 
-        # Create and start MLLM scheduler
-        self._mllm_scheduler = MLLMScheduler(
-            model=self._model,
-            processor=self._processor,
-            config=mllm_config,
-        )
-        await self._mllm_scheduler.start()
+            # Create and start MLLM scheduler only after scorer/adapter prep.
+            self._mllm_scheduler = MLLMScheduler(
+                model=self._model,
+                processor=self._processor,
+                config=mllm_config,
+            )
+            await self._mllm_scheduler.start()
+        except BaseException:
+            with suspend_cancellation():
+                cleanup_failures = await self._cleanup_mllm_runtime_ownership()
+            for failure in cleanup_failures:
+                logger.error(
+                    "MLLM startup cleanup failed while preserving original error",
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
+            raise
 
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
@@ -427,6 +611,89 @@ class BatchedEngine(BaseEngine):
             f"completion_batch={completion_batch_size}, "
             f"prefill_step_size={mllm_config.prefill_step_size}"
         )
+
+    def _prepare_mllm_specprefill_runtime(
+        self,
+    ) -> PreparedMLLMSpecPrefillRuntime | None:
+        enabled = bool(
+            getattr(self._scheduler_config, "specprefill_enabled", False)
+        )
+        if not enabled:
+            return None
+        if getattr(self._scheduler_config, "enable_mtp", False):
+            raise RuntimeError("CB SpecPrefill and MTP composition is not admitted")
+        if getattr(self._scheduler_config, "max_kv_size", 0) > 0:
+            raise RuntimeError("rotating-cache CB SpecPrefill is not admitted")
+        prepare = getattr(self._scheduler_config, "specprefill_prepare", None)
+        if not callable(prepare):
+            raise RuntimeError(
+                "enabled CB SpecPrefill requires specprefill_prepare"
+            )
+        candidate = prepare(self._model, self._processor)
+        if not isinstance(candidate, PreparedMLLMSpecPrefillRuntime):
+            cleanup = getattr(candidate, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            raise TypeError(
+                "specprefill_prepare must return PreparedMLLMSpecPrefillRuntime"
+            )
+        if candidate.target_model is not self._model:
+            mismatch = ValueError("prepared target model identity mismatch")
+            self._prepared_specprefill_runtime = candidate
+            try:
+                candidate.cleanup()
+            except BaseException as cleanup_failure:
+                logger.error(
+                    "Mismatched prepared target cleanup failed",
+                    exc_info=(
+                        type(cleanup_failure),
+                        cleanup_failure,
+                        cleanup_failure.__traceback__,
+                    ),
+                )
+                raise mismatch from cleanup_failure
+            self._prepared_specprefill_runtime = None
+            raise mismatch
+        if candidate.processor is not self._processor:
+            mismatch = ValueError("prepared processor identity mismatch")
+            self._prepared_specprefill_runtime = candidate
+            try:
+                candidate.cleanup()
+            except BaseException as cleanup_failure:
+                logger.error(
+                    "Mismatched prepared processor cleanup failed",
+                    exc_info=(
+                        type(cleanup_failure),
+                        cleanup_failure,
+                        cleanup_failure.__traceback__,
+                    ),
+                )
+                raise mismatch from cleanup_failure
+            self._prepared_specprefill_runtime = None
+            raise mismatch
+        return candidate
+
+    async def _cleanup_mllm_runtime_ownership(self) -> list[BaseException]:
+        """Attempt every owned cleanup and retain only failed ownership."""
+        failures: list[BaseException] = []
+        scheduler = self._mllm_scheduler
+        if scheduler is not None:
+            try:
+                await scheduler.stop()
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._mllm_scheduler = None
+
+        prepared = self._prepared_specprefill_runtime
+        if prepared is not None:
+            try:
+                prepared.cleanup()
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._prepared_specprefill_runtime = None
+        return failures
 
     def _inject_mtp_mllm(self) -> None:
         """Inject MTP weights into the MLLM model's language_model."""
@@ -580,9 +847,8 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._mllm_scheduler:
-            await self._mllm_scheduler.stop()
-            self._mllm_scheduler = None
+        with suspend_cancellation():
+            cleanup_failures = await self._cleanup_mllm_runtime_ownership()
 
         if self._engine:
             await self._engine.stop()
@@ -595,6 +861,8 @@ class BatchedEngine(BaseEngine):
         self._mllm_instance = None
         self._loaded = False
         logger.info("BatchedEngine stopped")
+        if cleanup_failures:
+            raise cleanup_failures[0]
 
     def _apply_chat_template(
         self,
@@ -761,6 +1029,10 @@ class BatchedEngine(BaseEngine):
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
             # so text-only requests must also be routed here.
+            specprefill_kwargs = _specprefill_request_kwargs(
+                kwargs,
+                has_media=bool(images or videos or audio),
+            )
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -774,6 +1046,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                **specprefill_kwargs,
             )
 
             return GenerationOutput(
@@ -782,8 +1055,7 @@ class BatchedEngine(BaseEngine):
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
-                mtp_drafts=output.mtp_drafts,
-                mtp_accepted=output.mtp_accepted,
+                **_feature_output_kwargs(output),
             )
 
         # Use LLM engine for text-only (non-MLLM models)
@@ -850,6 +1122,10 @@ class BatchedEngine(BaseEngine):
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
+            specprefill_kwargs = _specprefill_request_kwargs(
+                kwargs,
+                has_media=bool(images or videos or audio),
+            )
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
@@ -863,6 +1139,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                **specprefill_kwargs,
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
@@ -873,8 +1150,7 @@ class BatchedEngine(BaseEngine):
                     completion_tokens=output.completion_tokens,
                     finished=output.finished,
                     finish_reason=output.finish_reason,
-                    mtp_drafts=output.mtp_drafts,
-                    mtp_accepted=output.mtp_accepted,
+                    **_feature_output_kwargs(output),
                 )
             return
 

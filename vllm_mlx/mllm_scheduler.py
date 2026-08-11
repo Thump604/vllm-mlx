@@ -245,6 +245,7 @@ class MLLMRequest:
     specprefill_policy: SpecPrefillPolicy = SpecPrefillPolicy.AUTO
     specprefill_coverage: SpecPrefillCoverage = SpecPrefillCoverage.UNKNOWN
     specprefill_control_token_indices: tuple[int, ...] = ()
+    specprefill_has_media: bool = False
     prompt_token_ids: tuple[int, ...] = ()
     specprefill_effective_policy: SpecPrefillPolicy = SpecPrefillPolicy.DENSE
     specprefill_fallback_reason: str | None = None
@@ -571,6 +572,9 @@ class MLLMScheduler:
         control_token_indices = tuple(
             kwargs.pop("specprefill_control_token_indices", ())
         )
+        specprefill_has_media = kwargs.pop("specprefill_has_media", False)
+        if not isinstance(specprefill_has_media, bool):
+            raise TypeError("specprefill_has_media must be bool")
         if any(
             isinstance(index, bool) or not isinstance(index, int) or index < 0
             for index in control_token_indices
@@ -591,6 +595,7 @@ class MLLMScheduler:
             specprefill_control_token_indices=tuple(
                 sorted(set(control_token_indices))
             ),
+            specprefill_has_media=specprefill_has_media,
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -740,7 +745,12 @@ class MLLMScheduler:
     def _cooperative_config_for(
         self, request: MLLMRequest
     ) -> tuple[CooperativeSpecPrefillConfig | None, str | None]:
-        text_only = not (request.images or request.videos or request.audio)
+        text_only = not (
+            request.specprefill_has_media
+            or request.images
+            or request.videos
+            or request.audio
+        )
         decision = resolve_specprefill_decision(
             request.specprefill_policy,
             request.specprefill_coverage,

@@ -40,8 +40,8 @@ The server provides:
 import argparse
 import asyncio
 import copy
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -672,6 +672,7 @@ def _attach_specprefill_request_kwargs(
         "specprefill",
         "specprefill_policy",
         "specprefill_coverage",
+        "specprefill_control_token_indices",
         "specprefill_keep_pct",
         "specprefill_backbone_pct",
     ):
@@ -680,6 +681,52 @@ def _attach_specprefill_request_kwargs(
             kwargs[name] = value
     # Engines use this explicit signal to make text-only support fail safe.
     kwargs["specprefill_has_media"] = bool(has_media)
+
+
+def _configure_batched_specprefill(
+    scheduler_config: object | None,
+    *,
+    enabled: bool,
+) -> object | None:
+    """Copy launch config before applying the public CB enable switch."""
+    configured_enabled = enabled or bool(
+        getattr(scheduler_config, "specprefill_enabled", False)
+    )
+    if not configured_enabled:
+        return scheduler_config
+    if scheduler_config is None:
+        from .scheduler import SchedulerConfig
+
+        configured = SchedulerConfig(specprefill_enabled=True)
+    else:
+        configured = copy.copy(scheduler_config)
+        configured.specprefill_enabled = True
+    if not callable(getattr(configured, "specprefill_prepare", None)):
+        raise ValueError(
+            "continuous-batching SpecPrefill is unavailable without an explicit "
+            "SchedulerConfig.specprefill_prepare builder"
+        )
+    return configured
+
+
+def _validate_cb_specprefill_request_tuning(
+    engine: BaseEngine,
+    request: object,
+) -> None:
+    """Reject diagnostic tuning controls on the certified CB production path."""
+    if not isinstance(engine, BatchedEngine):
+        return
+    if (
+        getattr(request, "specprefill_keep_pct", None) is not None
+        or getattr(request, "specprefill_backbone_pct", None) is not None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "CB production SpecPrefill does not accept request "
+                "keep/backbone tuning"
+            ),
+        )
 
 
 class _ThinkingAwareLogitsProcessor:
@@ -1387,9 +1434,13 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         from .engine.batched import BatchedEngine
 
         logger.info(f"Preparing BatchedEngine for residency: {spec.model_name}")
+        scheduler_config = _configure_batched_specprefill(
+            spec.scheduler_config,
+            enabled=spec.specprefill_enabled,
+        )
         return BatchedEngine(
             model_name=spec.model_name,
-            scheduler_config=spec.scheduler_config,
+            scheduler_config=scheduler_config,
             stream_interval=spec.stream_interval,
             force_mllm=spec.force_mllm,
         )
@@ -3329,7 +3380,8 @@ def load_model(
         trust_remote_code: Allow HuggingFace remote code execution during model/tokenizer loading
         mtp: Enable native MTP speculative decoding (SimpleEngine only)
         prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
-        specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
+        specprefill_enabled: Enable SpecPrefill. Continuous batching also
+            requires a fail-atomic ``scheduler_config.specprefill_prepare``.
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_backbone_pct: Fraction of chunks reserved for evenly spaced coverage
@@ -3366,6 +3418,12 @@ def load_model(
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):
         raise ValueError(
             "MLLM draft models are not supported with lifecycle residency yet"
+        )
+
+    if use_batching:
+        scheduler_config = _configure_batched_specprefill(
+            scheduler_config,
+            enabled=specprefill_enabled,
         )
 
     if _lifespan_active:
@@ -4885,6 +4943,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     )
     if engine is None:
         return Response(status_code=499)
+    _validate_cb_specprefill_request_tuning(engine, request)
     release_on_exit = True
 
     try:
@@ -5083,6 +5142,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
     if engine is None:
         return Response(status_code=499)
+
+    _validate_cb_specprefill_request_tuning(engine, request)
 
     release_on_exit = True
     try:

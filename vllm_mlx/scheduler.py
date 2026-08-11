@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -135,9 +135,19 @@ class SchedulerConfig:
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
+    # Continuous-batching SpecPrefill is prepared atomically by BatchedEngine.
+    # The callback returns an immutable bundle of already prepared scorer and
+    # target-adapter components; no first-request artifact/model load is allowed.
+    specprefill_enabled: bool = False
+    specprefill_prepare: Optional[Callable[[Any, Any], Any]] = None
+
     def __post_init__(self) -> None:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
+        if self.specprefill_prepare is not None and not callable(
+            self.specprefill_prepare
+        ):
+            raise TypeError("specprefill_prepare must be callable or None")
 
 
 @dataclass

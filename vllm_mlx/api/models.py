@@ -14,7 +14,14 @@ import time
 import uuid
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    StrictInt,
+    model_serializer,
+    model_validator,
+)
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -223,6 +230,7 @@ class ChatCompletionRequest(BaseModel):
     # production profile may decline.
     specprefill_policy: SpecPrefillPolicy | None = None
     specprefill_coverage: SpecPrefillCoverage | None = None
+    specprefill_control_token_indices: list[StrictInt] | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     # SpecPrefill: per-request evenly spaced backbone percentage.
@@ -239,6 +247,13 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_specprefill_policy(self):
+        indices = self.specprefill_control_token_indices
+        if indices is not None and any(
+            isinstance(index, bool) or index < 0 for index in indices
+        ):
+            raise ValueError(
+                "specprefill_control_token_indices must be non-negative integers"
+            )
         return _validate_specprefill_policy_compatibility(self)
 
 
@@ -345,6 +360,7 @@ class CompletionRequest(BaseModel):
     specprefill: bool | None = None
     specprefill_policy: SpecPrefillPolicy | None = None
     specprefill_coverage: SpecPrefillCoverage | None = None
+    specprefill_control_token_indices: list[StrictInt] | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     # SpecPrefill: per-request evenly spaced backbone percentage.
@@ -352,6 +368,13 @@ class CompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_specprefill_policy(self):
+        indices = self.specprefill_control_token_indices
+        if indices is not None and any(
+            isinstance(index, bool) or index < 0 for index in indices
+        ):
+            raise ValueError(
+                "specprefill_control_token_indices must be non-negative integers"
+            )
         return _validate_specprefill_policy_compatibility(self)
 
 

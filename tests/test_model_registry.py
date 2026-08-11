@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from vllm_mlx.model_registry import (
     load_registry_config,
     log_memory_budget_report,
 )
+from vllm_mlx.scheduler import SchedulerConfig
 from vllm_mlx.utils.download import DownloadConfig
 
 
@@ -140,6 +142,38 @@ models:
         ),
     ):
         load_registry_config(config_path, _defaults())
+
+
+def test_registry_cb_specprefill_requires_and_propagates_explicit_builder(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 1})
+    enabled_defaults = replace(
+        _defaults(),
+        continuous_batching=True,
+        force_mllm=True,
+        specprefill_enabled=True,
+    )
+    manager = ModelManager(
+        _manager_config(budget_gb=2),
+        registry,
+        enabled_defaults,
+    )
+    entry = registry["alpha"]
+
+    with pytest.raises(ValueError, match="specprefill_prepare"):
+        manager._resolve_model_config(entry, entry.source)
+
+    prepared_config = SchedulerConfig(specprefill_prepare=lambda *_args: None)
+    manager = ModelManager(
+        _manager_config(budget_gb=2),
+        registry,
+        replace(enabled_defaults, scheduler_config=prepared_config),
+    )
+    resolved = manager._resolve_model_config(entry, entry.source)
+
+    assert resolved.specprefill_enabled is True
+    assert resolved.scheduler_config is not prepared_config
+    assert resolved.scheduler_config.specprefill_enabled is True
+    assert callable(resolved.scheduler_config.specprefill_prepare)
 
 
 def test_acquire_shares_single_inflight_load(tmp_path):
