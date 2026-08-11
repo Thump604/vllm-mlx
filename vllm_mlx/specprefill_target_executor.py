@@ -16,7 +16,10 @@ start is the committed KV length before that chunk, not its logical position.
 from __future__ import annotations
 
 import time
+import threading
+import weakref
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Iterable, Sequence
 
 import mlx.core as mx
@@ -33,6 +36,10 @@ from .specprefill_target_hooks import TargetPositionHooks
 
 class SparseTargetPrefillError(SparseCacheStateError):
     """Sparse target execution cannot safely begin or finish."""
+
+
+class SparseTargetPrefillLaneBusy(SparseTargetPrefillError):
+    """Another request owns this target model's bounded execution quantum."""
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,21 @@ class SparseTargetPrefillResult:
     telemetry: SparseTargetPrefillTelemetry
 
 
+class SparseTargetPrefillPhase(str, Enum):
+    ACTIVE = "active"
+    COMPLETE = "complete"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class SparseTargetPrefillProgress:
+    """Non-publishable request-local progress after one target chunk quantum."""
+
+    selected_tokens_processed: int
+    chunk_count: int
+    complete: bool
+
+
 @dataclass(frozen=True)
 class _CacheSnapshot:
     """A shallow MLX-safe cache checkpoint for all-or-nothing request execution."""
@@ -61,6 +83,207 @@ class _CacheSnapshot:
     states: tuple[Any, ...]
     meta_states: tuple[Any | None, ...]
     offsets: tuple[int | None, ...]
+
+
+_TARGET_LANE_LOCK = threading.RLock()
+_TARGET_LANES: dict[int, tuple[weakref.ReferenceType[Any], threading.Lock]] = {}
+
+
+def _target_lane_for(model: Any) -> threading.Lock:
+    """Return the non-reentrant target-forward lane for this exact model object."""
+    model_id = id(model)
+    with _TARGET_LANE_LOCK:
+        entry = _TARGET_LANES.get(model_id)
+        if entry is not None:
+            model_ref, lane = entry
+            if model_ref() is model:
+                return lane
+            if model_ref() is None:
+                _TARGET_LANES.pop(model_id, None)
+            else:
+                raise SparseTargetPrefillError(
+                    "target lane registry identity collision"
+                )
+
+        def _remove(model_ref: weakref.ReferenceType[Any]) -> None:
+            with _TARGET_LANE_LOCK:
+                current = _TARGET_LANES.get(model_id)
+                if current is not None and current[0] is model_ref:
+                    _TARGET_LANES.pop(model_id, None)
+
+        try:
+            model_ref = weakref.ref(model, _remove)
+        except TypeError as exc:
+            raise SparseTargetPrefillError(
+                "target models must support weak references for execution lanes"
+            ) from exc
+        lane = threading.Lock()
+        _TARGET_LANES[model_id] = (model_ref, lane)
+        return lane
+
+
+class SparseTargetPrefillSession:
+    """One request's bounded sparse target prefill state machine.
+
+    Static class dispatch remains installed on target RoPE objects.  This
+    session never leaves a request position context or a target model lane
+    active when ``step`` returns, so a scheduler can interleave compatible
+    request caches one chunk at a time without globally serializing the full
+    sparse prefill.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        selected_tokens: mx.array | Sequence[int] | Sequence[Sequence[int]],
+        cache: Sequence[Any],
+        sparse_state: SparseCacheState,
+        adapter: TargetPositionAdapter,
+        *,
+        step_size: int = 2048,
+        cancel_check: Callable[[], None] | None = None,
+    ):
+        _validate_execution_inputs(cache, sparse_state, adapter, step_size)
+        self._token_rows = _normalize_selected_tokens(selected_tokens, sparse_state)
+        self.model = model
+        self.cache = cache
+        self.sparse_state = sparse_state
+        self.adapter = adapter
+        self._step_size = step_size
+        self._cancel_check = cancel_check
+        self._physical_entries = _physical_cache_entries(cache)
+        _require_fresh_physical_cache(self._physical_entries, sparse_state.row_count)
+        self._snapshot = _snapshot_cache(cache)
+        self._hooks = TargetPositionHooks.for_model(model, adapter)
+        self._lane = _target_lane_for(model)
+        self._processed = 0
+        self._starts: list[tuple[int, ...]] = []
+        self._logits: mx.array | None = None
+        self._result: SparseTargetPrefillResult | None = None
+        self._target_prefill_seconds = 0.0
+        self._phase = SparseTargetPrefillPhase.ACTIVE
+
+    @property
+    def phase(self) -> SparseTargetPrefillPhase:
+        """Read-only lifecycle state; only executor transitions may change it."""
+        return self._phase
+
+    @property
+    def complete(self) -> bool:
+        return self.phase is SparseTargetPrefillPhase.COMPLETE
+
+    @property
+    def closed(self) -> bool:
+        return self.phase is SparseTargetPrefillPhase.CLOSED
+
+    @property
+    def result(self) -> SparseTargetPrefillResult:
+        """Return terminal metadata only after every chunk has committed."""
+        if self._result is None:
+            raise SparseTargetPrefillError(
+                "sparse target prefill has no publishable result before completion"
+            )
+        return self._result
+
+    def step(self) -> SparseTargetPrefillProgress:
+        """Run one target chunk quantum, then release hook context and lane."""
+        if self.closed:
+            raise SparseTargetPrefillError("sparse target prefill session is closed")
+        if self.complete:
+            return self._progress()
+        if not self._lane.acquire(blocking=False):
+            raise SparseTargetPrefillLaneBusy(
+                "sparse target prefill target lane is busy"
+            )
+        try:
+            self._check_cancelled()
+            chunk_size = min(self._step_size, self._total - self._processed)
+            physical_start = _physical_cache_lengths(
+                self._physical_entries, self.sparse_state.row_count
+            )
+            expected_start = (self._processed,) * self.sparse_state.row_count
+            if physical_start != expected_start:
+                raise SparseTargetPrefillError(
+                    "target cache physical length disagrees with committed sparse "
+                    "target chunk boundary"
+                )
+            self._starts.append(physical_start)
+            plan = _chunk_plan(
+                self.adapter,
+                self.sparse_state,
+                self._processed,
+                chunk_size,
+                physical_start,
+            )
+            forward_started_at = time.perf_counter()
+            with self._hooks.session_for_plan(plan):
+                self._logits = self.model(
+                    self._token_rows[:, self._processed : self._processed + chunk_size],
+                    cache=self.cache,
+                )
+                _eval_forward(self._logits, self.cache)
+            self._target_prefill_seconds += time.perf_counter() - forward_started_at
+            self._processed += chunk_size
+            actual_end = _physical_cache_lengths(
+                self._physical_entries, self.sparse_state.row_count
+            )
+            expected_end = (self._processed,) * self.sparse_state.row_count
+            if actual_end != expected_end:
+                raise SparseTargetPrefillError(
+                    "target cache did not advance by the bounded sparse target chunk"
+                )
+            if self._processed == self._total:
+                self._publish_result()
+            return self._progress()
+        except BaseException:
+            self.cancel()
+            raise
+        finally:
+            self._lane.release()
+
+    def run_to_completion(self) -> SparseTargetPrefillResult:
+        """Compatibility facade for the former monolithic executor."""
+        while not self.complete:
+            self.step()
+        return self.result
+
+    def cancel(self) -> None:
+        """Restore the entry cache snapshot and discard this request's state."""
+        if self.closed or self.complete:
+            return
+        _restore_cache(self.cache, self._snapshot)
+        self._logits = None
+        self._phase = SparseTargetPrefillPhase.CLOSED
+
+    @property
+    def _total(self) -> int:
+        return self._token_rows.shape[1]
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_check is not None:
+            self._cancel_check()
+
+    def _publish_result(self) -> None:
+        if self._logits is None:  # pragma: no cover - step always sets logits.
+            raise SparseTargetPrefillError("sparse target prefill produced no logits")
+        self._result = SparseTargetPrefillResult(
+            logits=self._logits,
+            cache_state=self.sparse_state.clone(),
+            telemetry=SparseTargetPrefillTelemetry(
+                selected_tokens=self._total,
+                target_prefill_ms=self._target_prefill_seconds * 1000.0,
+                chunk_count=len(self._starts),
+                physical_cache_starts=tuple(self._starts),
+            ),
+        )
+        self._phase = SparseTargetPrefillPhase.COMPLETE
+
+    def _progress(self) -> SparseTargetPrefillProgress:
+        return SparseTargetPrefillProgress(
+            selected_tokens_processed=self._processed,
+            chunk_count=len(self._starts),
+            complete=self.complete,
+        )
 
 
 def execute_sparse_target_prefill(
@@ -85,66 +308,15 @@ def execute_sparse_target_prefill(
     disagreement the entry cache checkpoint is restored before the exception
     is raised.  The immutable ``sparse_state`` is returned only on success.
     """
-    _validate_execution_inputs(cache, sparse_state, adapter, step_size)
-    token_rows = _normalize_selected_tokens(selected_tokens, sparse_state)
-    physical_entries = _physical_cache_entries(cache)
-    _require_fresh_physical_cache(physical_entries, sparse_state.row_count)
-    snapshot = _snapshot_cache(cache)
-    hooks = TargetPositionHooks.for_model(model, adapter)
-    starts: list[tuple[int, ...]] = []
-    logits: mx.array | None = None
-    started_at = time.perf_counter()
-    processed = 0
-    total = token_rows.shape[1]
-
-    try:
-        while processed < total:
-            if cancel_check is not None:
-                cancel_check()
-            chunk_size = min(step_size, total - processed)
-            physical_start = _physical_cache_lengths(
-                physical_entries, sparse_state.row_count
-            )
-            expected_start = (processed,) * sparse_state.row_count
-            if physical_start != expected_start:
-                raise SparseTargetPrefillError(
-                    "target cache physical length disagrees with committed sparse "
-                    "target chunk boundary"
-                )
-            starts.append(physical_start)
-            plan = _chunk_plan(
-                adapter, sparse_state, processed, chunk_size, physical_start
-            )
-            with hooks.session_for_plan(plan):
-                logits = model(
-                    token_rows[:, processed : processed + chunk_size], cache=cache
-                )
-                _eval_forward(logits, cache)
-            processed += chunk_size
-            actual_end = _physical_cache_lengths(
-                physical_entries, sparse_state.row_count
-            )
-            expected_end = (processed,) * sparse_state.row_count
-            if actual_end != expected_end:
-                raise SparseTargetPrefillError(
-                    "target cache did not advance by the bounded sparse target chunk"
-                )
-        if logits is None:  # validation makes this unreachable; keep fail-closed.
-            raise SparseTargetPrefillError("sparse target prefill produced no logits")
-    except BaseException:
-        _restore_cache(cache, snapshot)
-        raise
-
-    return SparseTargetPrefillResult(
-        logits=logits,
-        cache_state=sparse_state.clone(),
-        telemetry=SparseTargetPrefillTelemetry(
-            selected_tokens=total,
-            target_prefill_ms=(time.perf_counter() - started_at) * 1000.0,
-            chunk_count=len(starts),
-            physical_cache_starts=tuple(starts),
-        ),
-    )
+    return SparseTargetPrefillSession(
+        model,
+        selected_tokens,
+        cache,
+        sparse_state,
+        adapter,
+        step_size=step_size,
+        cancel_check=cancel_check,
+    ).run_to_completion()
 
 
 def _chunk_plan(
@@ -199,6 +371,10 @@ def _normalize_selected_tokens(
     if tokens.ndim != 2:
         raise SparseTargetPrefillError(
             "selected target tokens must have shape (batch, selected_tokens)"
+        )
+    if tokens.shape[1] == 0:
+        raise SparseTargetPrefillError(
+            "sparse target prefill requires at least one selected token"
         )
     expected = (sparse_state.row_count, sparse_state.rows[0].physical_valid_length)
     if tokens.shape != expected:
