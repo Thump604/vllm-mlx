@@ -72,7 +72,15 @@ def _install_fake_upstream_mtp(monkeypatch, calls):
                 "kwargs": kwargs,
             }
         )
-        yield SimpleNamespace(text="x", token=1, finish_reason="stop")
+        yield SimpleNamespace(
+            text="x",
+            token=1,
+            logprobs="target-logprobs",
+            mtp_drafts=3,
+            mtp_accepted=2,
+            mtp_bypass_reason=None,
+            finish_reason="stop",
+        )
 
     monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
     monkeypatch.setattr(
@@ -445,6 +453,7 @@ def test_pure_llm_selected_forwards_exact_native_mtp_kwargs(monkeypatch):
         0.7, 0.9, 20, 0.05, 11
     )
     assert "num_draft_tokens" not in calls[0]["kwargs"]
+    assert "sampler" not in calls[0]["kwargs"]
 
 
 def test_pure_llm_default_off_and_false_do_not_forward_native_kwargs(monkeypatch):
@@ -457,6 +466,7 @@ def test_pure_llm_default_off_and_false_do_not_forward_native_kwargs(monkeypatch
 
     assert [call["mtp"] for call in calls] == [unset, unset]
     assert [call["mtp_sampling_config"] for call in calls] == [unset, unset]
+    assert all("sampler" in call["kwargs"] for call in calls)
 
 
 @pytest.mark.anyio
@@ -500,9 +510,153 @@ async def test_mllm_text_selected_forwards_exact_native_mtp_kwargs(monkeypatch):
     ]
 
     assert outputs[-1].text == "x"
+    assert outputs[-1].logprobs == "target-logprobs"
+    assert (outputs[-1].mtp_drafts, outputs[-1].mtp_accepted) == (3, 2)
     assert calls[0]["mtp"] is True
     assert isinstance(calls[0]["mtp_sampling_config"], _FakeUpstreamSampling)
     assert "num_draft_tokens" not in calls[0]["kwargs"]
+    assert "sampler" not in calls[0]["kwargs"]
+
+
+def test_pure_llm_copies_native_target_logprobs_and_cumulative_telemetry(
+    monkeypatch,
+):
+    import mlx_lm
+
+    closed = []
+    target_logprobs = object()
+
+    def fake_stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        *,
+        mtp=False,
+        mtp_sampling_config=None,
+        **kwargs,
+    ):
+        del model, tokenizer, prompt, mtp, mtp_sampling_config, kwargs
+        try:
+            yield SimpleNamespace(
+                text="x",
+                token=3,
+                logprobs=target_logprobs,
+                mtp_drafts=2,
+                mtp_accepted=1,
+                mtp_bypass_reason=None,
+                finish_reason="length",
+            )
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+    config = NativeMTPRequestConfig(_sampling(seed=11), num_draft_tokens=1)
+
+    outputs = list(
+        _fake_language_model().stream_generate(
+            "hi", max_tokens=1, native_mtp_request=config
+        )
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].logprobs is target_logprobs
+    assert (outputs[0].mtp_drafts, outputs[0].mtp_accepted) == (2, 1)
+    assert outputs[0].finish_reason == "length"
+    assert closed == [True]
+
+
+def test_pure_llm_early_stop_deterministically_closes_upstream(monkeypatch):
+    import mlx_lm
+
+    closed = []
+
+    def fake_stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        *,
+        mtp=False,
+        mtp_sampling_config=None,
+        **kwargs,
+    ):
+        del model, tokenizer, prompt, mtp, mtp_sampling_config, kwargs
+        try:
+            yield SimpleNamespace(text="STOP", token=3, finish_reason=None)
+            yield SimpleNamespace(text="unreachable", token=4, finish_reason=None)
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+    config = NativeMTPRequestConfig(_sampling(seed=11), num_draft_tokens=1)
+
+    outputs = list(
+        _fake_language_model().stream_generate(
+            "hi",
+            max_tokens=8,
+            stop=["STOP"],
+            native_mtp_request=config,
+        )
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].finish_reason == "stop"
+    assert closed == [True]
+
+
+def test_pure_llm_iteration_error_is_not_masked_by_close_error(monkeypatch):
+    import mlx_lm
+
+    class FailingStream:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("primary iteration failure")
+
+        def close(self):
+            raise ValueError("secondary close failure")
+
+    def fake_stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        *,
+        mtp=False,
+        mtp_sampling_config=None,
+        **kwargs,
+    ):
+        del model, tokenizer, prompt, mtp, mtp_sampling_config, kwargs
+        return FailingStream()
+
+    monkeypatch.setattr(mlx_lm, "stream_generate", fake_stream_generate)
+    config = NativeMTPRequestConfig(_sampling(seed=11), num_draft_tokens=1)
+
+    with pytest.raises(RuntimeError, match="primary iteration failure"):
+        list(
+            _fake_language_model().stream_generate(
+                "hi", max_tokens=2, native_mtp_request=config
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_tracker_primary_error_survives_aclose_error_and_cleans_state():
+    class FailingAsyncStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("primary async iteration failure")
+
+        async def aclose(self):
+            raise ValueError("secondary async close failure")
+
+    engine = SimpleEngine("synthetic")
+    with pytest.raises(RuntimeError, match="primary async iteration failure"):
+        async for _ in engine._track_request_stream(FailingAsyncStream()):
+            pass
+    assert engine._active_requests == {}
+    assert engine._num_running == 0
 
 
 @pytest.mark.anyio

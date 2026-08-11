@@ -9,7 +9,24 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from vllm_mlx.native_mtp_request import NativeMTPRequestConfig, NativeMTPSampling
+
 pytestmark = pytest.mark.anyio
+
+
+def _native_mtp_request(*, temperature=0.7, top_p=0.9):
+    return NativeMTPRequestConfig(
+        NativeMTPSampling(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=0,
+            min_p=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+            seed=17,
+        ),
+        num_draft_tokens=4,
+    )
 
 
 class _SparseTestDetokenizer:
@@ -2045,9 +2062,21 @@ class TestSimpleEngineConcurrency:
 
             return _sample
 
-        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+        def fake_stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            *,
+            mtp=False,
+            mtp_sampling_config=None,
+            **kwargs,
+        ):
             captured["prompt"] = prompt
-            captured["kwargs"] = kwargs
+            captured["kwargs"] = {
+                "mtp": mtp,
+                "mtp_sampling_config": mtp_sampling_config,
+                **kwargs,
+            }
             yield SimpleNamespace(token=18, text="B", finish_reason="stop")
 
         tokenizer = MagicMock()
@@ -2088,7 +2117,7 @@ class TestSimpleEngineConcurrency:
                 "mlx_lm.sample_utils.make_logits_processors",
                 return_value=[],
             ),
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.stream_generate", new=fake_stream_generate),
             patch("vllm_mlx.specprefill.score_tokens") as score_tokens,
             patch.object(engine, "_prepare_sparse_target_prefill") as prepare_sparse,
         ):
@@ -2102,6 +2131,9 @@ class TestSimpleEngineConcurrency:
                     specprefill_policy="sparse",
                     specprefill_backbone_pct=0.25,
                     combined_mtp=True,
+                    _native_mtp_request_config=_native_mtp_request(
+                        temperature=0.6, top_p=0.95
+                    ),
                 )
             ]
 
@@ -2113,8 +2145,10 @@ class TestSimpleEngineConcurrency:
             "min_p": 0.0,
         }
         assert captured["prompt"] == "<|im_start|>user\nhello"
-        assert "mtp" not in captured["kwargs"]
-        assert captured["kwargs"]["num_draft_tokens"] == 4
+        assert captured["kwargs"]["mtp"] is True
+        assert "mtp_sampling_config" in captured["kwargs"]
+        assert "num_draft_tokens" not in captured["kwargs"]
+        assert "sampler" not in captured["kwargs"]
         assert captured["kwargs"]["max_tokens"] == 4
         assert outputs[-1].specprefill_effective_policy == "dense"
         assert (
@@ -2352,8 +2386,18 @@ class TestSimpleEngineConcurrency:
 
         captured_kwargs = {}
 
-        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
-            captured_kwargs.update(kwargs)
+        def fake_stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            *,
+            mtp=False,
+            mtp_sampling_config=None,
+            **kwargs,
+        ):
+            captured_kwargs.update(
+                mtp=mtp, mtp_sampling_config=mtp_sampling_config, **kwargs
+            )
             yield SimpleNamespace(text="Hello", finish_reason="stop")
 
         tokenizer = MagicMock()
@@ -2372,7 +2416,7 @@ class TestSimpleEngineConcurrency:
         engine._text_model.mtp = MagicMock()
         engine._text_tokenizer = tokenizer
 
-        with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+        with patch("mlx_lm.stream_generate", new=fake_stream_generate):
             outputs = [
                 chunk
                 async for chunk in engine._stream_generate_text(
@@ -2381,12 +2425,15 @@ class TestSimpleEngineConcurrency:
                     temperature=0.7,
                     top_p=0.9,
                     combined_mtp=True,
+                    _native_mtp_request_config=_native_mtp_request(),
                 )
             ]
 
         assert outputs[-1].text == "Hello"
-        assert "mtp" not in captured_kwargs
-        assert captured_kwargs["num_draft_tokens"] == 4
+        assert captured_kwargs["mtp"] is True
+        assert "mtp_sampling_config" in captured_kwargs
+        assert "num_draft_tokens" not in captured_kwargs
+        assert "sampler" not in captured_kwargs
 
     @pytest.mark.anyio
     async def test_stream_generate_text_reenables_mtp_after_retired_processor_when_enabled(
@@ -2407,9 +2454,23 @@ class TestSimpleEngineConcurrency:
                 return logits
 
         processor = RetiringProcessor()
+        unset = object()
 
-        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
-            calls.append({"prompt": prompt, **kwargs})
+        def fake_stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            *,
+            mtp=unset,
+            mtp_sampling_config=unset,
+            **kwargs,
+        ):
+            call = {"prompt": prompt, **kwargs}
+            if mtp is not unset:
+                call["mtp"] = mtp
+            if mtp_sampling_config is not unset:
+                call["mtp_sampling_config"] = mtp_sampling_config
+            calls.append(call)
             if len(calls) == 1:
                 processor.is_retired = True
                 yield SimpleNamespace(token=11, text="Hello", finish_reason=None)
@@ -2439,7 +2500,7 @@ class TestSimpleEngineConcurrency:
                 "os.environ",
                 {"VLLM_MLX_ENABLE_THINKING_RETIREMENT_RESUME": "1"},
             ),
-            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch("mlx_lm.stream_generate", new=fake_stream_generate),
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
             patch("mlx_lm.models.cache.trim_prompt_cache"),
         ):
@@ -2451,6 +2512,7 @@ class TestSimpleEngineConcurrency:
                     temperature=0.7,
                     top_p=0.9,
                     logits_processors=[processor],
+                    _native_mtp_request_config=_native_mtp_request(),
                 )
             ]
 
@@ -2458,8 +2520,10 @@ class TestSimpleEngineConcurrency:
         assert len(calls) == 2
         assert "mtp" not in calls[0]
         assert calls[0]["logits_processors"][0] is processor
-        assert "mtp" not in calls[1]
-        assert calls[1]["num_draft_tokens"] == 4
+        assert calls[1]["mtp"] is True
+        assert "mtp_sampling_config" in calls[1]
+        assert "num_draft_tokens" not in calls[1]
+        assert "sampler" not in calls[1]
         assert "prompt_cache" in calls[1]
         assert "logits_processors" not in calls[1]
 

@@ -37,6 +37,10 @@ class StreamingOutput:
     finished: bool = False
     finish_reason: str | None = None
     prompt_tokens: int = 0
+    logprobs: "mx.array | None" = None
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+    mtp_bypass_reason: str | None = None
 
 
 class MLXLanguageModel:
@@ -317,47 +321,83 @@ class MLXLanguageModel:
         if model_forward_context is not None:
             mtp_kwargs["model_forward_context"] = model_forward_context
 
-        for token_count, response in enumerate(
-            stream_generate(
-                self.model,
-                self.tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                logits_processors=all_processors,
-                **mtp_kwargs,
-            ),
-            start=1,
-        ):
-            # response.text is the new token text (not accumulated)
-            new_text = response.text
+        generation_kwargs = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "logits_processors": all_processors,
+            **mtp_kwargs,
+        }
+        if native_mtp_request is None:
+            # Native MTP owns its complete request-local sampling policy.
+            # Passing the ordinary opaque sampler makes stochastic replay
+            # impossible and is rejected by the upstream transaction core.
+            generation_kwargs["sampler"] = sampler
 
-            # Check for stop sequences against a bounded tail rather than
-            # accumulating the full response (which is O(n^2) over the loop).
-            should_stop = False
-            if max_stop_len > 0:
-                combined = accumulated_tail + new_text
-                for stop_seq in stop_list:
-                    if stop_seq in combined:
-                        should_stop = True
-                        break
-                accumulated_tail = combined[-max_stop_len:]
+        generation = stream_generate(
+            self.model,
+            self.tokenizer,
+            **generation_kwargs,
+        )
+        primary_error: BaseException | None = None
+        try:
+            for token_count, response in enumerate(generation, start=1):
+                # response.text is the new token text (not accumulated)
+                new_text = response.text
 
-            finished = should_stop or token_count >= max_tokens
-            finish_reason = None
-            if finished:
-                finish_reason = "stop" if should_stop else "length"
+                # Check for stop sequences against a bounded tail rather than
+                # accumulating the full response (which is O(n^2) over the loop).
+                should_stop = False
+                if max_stop_len > 0:
+                    combined = accumulated_tail + new_text
+                    for stop_seq in stop_list:
+                        if stop_seq in combined:
+                            should_stop = True
+                            break
+                    accumulated_tail = combined[-max_stop_len:]
 
-            yield StreamingOutput(
-                text=new_text,
-                token=response.token if hasattr(response, "token") else 0,
-                finished=finished,
-                finish_reason=finish_reason,
-                prompt_tokens=num_prompt_tokens,
-            )
+                backend_finish_reason = getattr(response, "finish_reason", None)
+                finished = (
+                    should_stop
+                    or token_count >= max_tokens
+                    or backend_finish_reason is not None
+                )
+                finish_reason = backend_finish_reason
+                if should_stop:
+                    finish_reason = "stop"
+                elif finish_reason is None and finished:
+                    finish_reason = "length"
 
-            if finished:
-                break
+                yield StreamingOutput(
+                    text=new_text,
+                    token=response.token if hasattr(response, "token") else 0,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    prompt_tokens=num_prompt_tokens,
+                    logprobs=getattr(response, "logprobs", None),
+                    mtp_drafts=getattr(response, "mtp_drafts", 0),
+                    mtp_accepted=getattr(response, "mtp_accepted", 0),
+                    mtp_bypass_reason=getattr(
+                        response, "mtp_bypass_reason", None
+                    ),
+                )
+
+                if finished:
+                    break
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            close = getattr(generation, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.warning(
+                        "Failed to close mlx-lm stream after generation error",
+                        exc_info=True,
+                    )
 
     def chat(
         self,

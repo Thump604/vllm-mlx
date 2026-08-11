@@ -267,6 +267,25 @@ class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
 
+async def _aclose_async_iterator(
+    iterator: AsyncIterator[Any], primary_error: BaseException | None
+) -> None:
+    """Close a nested async iterator without masking its primary failure."""
+
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except BaseException:
+        if primary_error is None:
+            raise
+        logger.warning(
+            "Failed to close nested generation stream after primary error",
+            exc_info=True,
+        )
+
+
 @dataclass
 class _SpecPrefillTelemetry:
     """Mutable, request-local SpecPrefill evidence shared by one stream.
@@ -1438,6 +1457,7 @@ class SimpleEngine(BaseEngine):
             mtp_drafts=last_output.mtp_drafts,
             mtp_accepted=last_output.mtp_accepted,
             mtp_bypass_reason=last_output.mtp_bypass_reason,
+            logprobs=last_output.logprobs,
             specprefill_requested_policy=last_output.specprefill_requested_policy,
             specprefill_effective_policy=last_output.specprefill_effective_policy,
             specprefill_coverage=last_output.specprefill_coverage,
@@ -1481,8 +1501,15 @@ class SimpleEngine(BaseEngine):
         consumed inside this method, so there is no value to preserve.
         """
         if _in_tracker.get():
-            async for output in source_gen:
-                yield output
+            primary_error: BaseException | None = None
+            try:
+                async for output in source_gen:
+                    yield output
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                await _aclose_async_iterator(source_gen, primary_error)
             return
         _in_tracker.set(True)
         request_id = str(uuid.uuid4())
@@ -1506,6 +1533,7 @@ class SimpleEngine(BaseEngine):
         }
         self._active_requests[request_id] = entry
         self._num_running += 1
+        primary_error: BaseException | None = None
         try:
             async for output in source_gen:
                 now = time.time()
@@ -1526,16 +1554,22 @@ class SimpleEngine(BaseEngine):
                     gen_elapsed = max(1e-3, (now - start) - ttft_s)
                     entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
                 yield output
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self._active_requests.pop(request_id, None)
-            self._num_running = max(0, self._num_running - 1)
-            if last_c > 0:
-                duration = time.time() - start
-                self._total_requests_processed += 1
-                self._total_prompt_tokens += last_p
-                self._total_completion_tokens += last_c
-                self._recent_completions.append((last_c, duration))
-            _in_tracker.set(False)
+            try:
+                await _aclose_async_iterator(source_gen, primary_error)
+            finally:
+                self._active_requests.pop(request_id, None)
+                self._num_running = max(0, self._num_running - 1)
+                if last_c > 0:
+                    duration = time.time() - start
+                    self._total_requests_processed += 1
+                    self._total_prompt_tokens += last_p
+                    self._total_completion_tokens += last_c
+                    self._recent_completions.append((last_c, duration))
+                _in_tracker.set(False)
 
     async def stream_generate(
         self,
@@ -1547,7 +1581,7 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Public stream-generate wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked = self._track_request_stream(
             self._stream_generate_impl(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1557,8 +1591,16 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        primary_error: BaseException | None = None
+        try:
+            async for output in tracked:
+                yield output
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            await _aclose_async_iterator(tracked, primary_error)
 
     async def _stream_generate_impl(
         self,
@@ -1703,7 +1745,7 @@ class SimpleEngine(BaseEngine):
                     native_mtp_kwargs["native_mtp_request"] = native_mtp_config
                 elif native_mtp_disabled:
                     native_mtp_kwargs["native_mtp_disabled"] = True
-                for chunk in self._model.stream_generate(
+                generation = self._model.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -1711,49 +1753,73 @@ class SimpleEngine(BaseEngine):
                     stop=stop,
                     **native_mtp_kwargs,
                     **kwargs,
-                ):
-                    prompt_tokens = (
-                        chunk.prompt_tokens
-                        if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
-                        else prompt_tokens
-                    )
-                    completion_tokens += 1
-                    if request_id in self._active_requests:
-                        self._active_requests[request_id].update(
-                            {
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "elapsed_s": round(time.time() - started_at, 1),
-                            }
+                )
+                primary_error: BaseException | None = None
+                try:
+                    for chunk in generation:
+                        prompt_tokens = (
+                            chunk.prompt_tokens
+                            if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens
+                            else prompt_tokens
                         )
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    accumulated_text += new_text
-
-                    finished = (
-                        getattr(chunk, "finished", False)
-                        or completion_tokens >= max_tokens
-                    )
-                    finish_reason = None
-                    if finished:
-                        finish_reason = getattr(chunk, "finish_reason", None)
-                        if finish_reason is None:
-                            finish_reason = (
-                                "length" if completion_tokens >= max_tokens else "stop"
+                        completion_tokens += 1
+                        if request_id in self._active_requests:
+                            self._active_requests[request_id].update(
+                                {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "elapsed_s": round(time.time() - started_at, 1),
+                                }
                             )
+                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                        accumulated_text += new_text
 
-                    yield GenerationOutput(
-                        text=accumulated_text,
-                        new_text=new_text,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        mtp_bypass_reason=mtp_bypass_reason,
-                        **telemetry.as_output_kwargs(),
-                    )
+                        finished = (
+                            getattr(chunk, "finished", False)
+                            or completion_tokens >= max_tokens
+                        )
+                        finish_reason = None
+                        if finished:
+                            finish_reason = getattr(chunk, "finish_reason", None)
+                            if finish_reason is None:
+                                finish_reason = (
+                                    "length" if completion_tokens >= max_tokens else "stop"
+                                )
 
-                    if finished:
-                        break
+                        yield GenerationOutput(
+                            text=accumulated_text,
+                            new_text=new_text,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            mtp_bypass_reason=(
+                                mtp_bypass_reason
+                                or getattr(chunk, "mtp_bypass_reason", None)
+                            ),
+                            logprobs=getattr(chunk, "logprobs", None),
+                            **telemetry.as_output_kwargs(),
+                        )
+
+                        if finished:
+                            break
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+                finally:
+                    close = getattr(generation, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except BaseException:
+                            if primary_error is None:
+                                raise
+                            logger.warning(
+                                "Failed to close model stream after generation error",
+                                exc_info=True,
+                            )
 
                 if not finished:
                     if prompt_tokens == 0:
@@ -1974,7 +2040,7 @@ class SimpleEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Public stream-chat wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked = self._track_request_stream(
             self._stream_chat_impl(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -1986,8 +2052,16 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        primary_error: BaseException | None = None
+        try:
+            async for output in tracked:
+                yield output
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            await _aclose_async_iterator(tracked, primary_error)
 
     async def _stream_chat_impl(
         self,
@@ -2054,7 +2128,7 @@ class SimpleEngine(BaseEngine):
                 kwargs["_native_mtp_disabled"] = True
             elif mtp_bypass_reason is not None:
                 kwargs["_native_mtp_bypass_reason"] = mtp_bypass_reason
-            async for chunk in self._stream_generate_text(
+            text_stream = self._stream_generate_text(
                 messages,
                 max_tokens,
                 temperature,
@@ -2062,8 +2136,16 @@ class SimpleEngine(BaseEngine):
                 tools=template_tools,
                 combined_mtp=use_native_mtp,
                 **kwargs,
-            ):
-                yield chunk
+            )
+            primary_error: BaseException | None = None
+            try:
+                async for chunk in text_stream:
+                    yield chunk
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                await _aclose_async_iterator(text_stream, primary_error)
             return
 
         # Direct MLLM execution (including media) does not implement sparse
@@ -3371,7 +3453,6 @@ class SimpleEngine(BaseEngine):
         ) -> None:
             resume_kwargs = dict(
                 max_tokens=remaining_tokens,
-                sampler=sampler,
                 prefill_step_size=self._prefill_step_size,
                 prompt_cache=prompt_cache,
             )
@@ -3380,6 +3461,8 @@ class SimpleEngine(BaseEngine):
                 # a fresh MTP cache so stale speculative state cannot survive the
                 # processor-to-content handoff.
                 resume_kwargs.update(native_mtp_config.mlx_lm_call_kwargs())
+            else:
+                resume_kwargs["sampler"] = sampler
             for resp in mlx_stream_generate(
                 model,
                 self._text_tokenizer,
@@ -3496,9 +3579,13 @@ class SimpleEngine(BaseEngine):
 
             gen_kwargs = dict(
                 max_tokens=max_tokens,
-                sampler=sampler,
                 prefill_step_size=self._prefill_step_size,
             )
+            if not use_mtp:
+                # Native MTP samples from its immutable request config.  The
+                # ordinary sampler is opaque to transactional replay and must
+                # remain absent from the selected native call.
+                gen_kwargs["sampler"] = sampler
             if all_processors:
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
@@ -3554,16 +3641,34 @@ class SimpleEngine(BaseEngine):
                         max_tokens - token_count,
                     )
             else:
-                for resp in mlx_stream_generate(
+                generation = mlx_stream_generate(
                     model,
                     self._text_tokenizer,
                     prompt=prompt_to_send,
                     **gen_kwargs,
-                ):
-                    if abort_event.is_set():
-                        logger.info("Text route: abort requested; stopping decode")
-                        break
-                    _emit_response(resp)
+                )
+                primary_error: BaseException | None = None
+                try:
+                    for resp in generation:
+                        if abort_event.is_set():
+                            logger.info("Text route: abort requested; stopping decode")
+                            break
+                        _emit_response(resp)
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+                finally:
+                    close = getattr(generation, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except BaseException:
+                            if primary_error is None:
+                                raise
+                            logger.warning(
+                                "Failed to close mlx-lm text stream after error",
+                                exc_info=True,
+                            )
 
         def _run_specprefill(model, bc, use_mtp):
             """Run sparse-only target prefill and retain its forward context."""
@@ -3758,6 +3863,10 @@ class SimpleEngine(BaseEngine):
         accumulated_text = ""
         token_count = 0
         finished = False
+        mtp_drafts = 0
+        mtp_accepted = 0
+        backend_mtp_bypass_reason = None
+        last_logprobs = None
         try:
             while True:
                 kind, payload = await response_queue.get()
@@ -3774,6 +3883,14 @@ class SimpleEngine(BaseEngine):
                 resp = payload
 
                 token_count += 1
+                # mlx-lm reports cumulative native counters on every response.
+                # Assign rather than sum so Simple does not double-count them.
+                mtp_drafts = getattr(resp, "mtp_drafts", mtp_drafts)
+                mtp_accepted = getattr(resp, "mtp_accepted", mtp_accepted)
+                backend_mtp_bypass_reason = getattr(
+                    resp, "mtp_bypass_reason", backend_mtp_bypass_reason
+                )
+                last_logprobs = getattr(resp, "logprobs", None)
                 new_text = resp.text if hasattr(resp, "text") else str(resp)
                 accumulated_text += new_text
 
@@ -3798,7 +3915,12 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=finish_reason,
-                    mtp_bypass_reason=mtp_bypass_reason,
+                    mtp_drafts=mtp_drafts,
+                    mtp_accepted=mtp_accepted,
+                    mtp_bypass_reason=(
+                        mtp_bypass_reason or backend_mtp_bypass_reason
+                    ),
+                    logprobs=last_logprobs,
                     **telemetry.as_output_kwargs(),
                 )
 
@@ -3815,7 +3937,10 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
-                mtp_bypass_reason=mtp_bypass_reason,
+                mtp_drafts=mtp_drafts,
+                mtp_accepted=mtp_accepted,
+                mtp_bypass_reason=(mtp_bypass_reason or backend_mtp_bypass_reason),
+                logprobs=last_logprobs,
                 **telemetry.as_output_kwargs(),
             )
 

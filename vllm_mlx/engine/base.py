@@ -34,6 +34,10 @@ class GenerationOutput:
     mtp_drafts: int = 0
     mtp_accepted: int = 0
     mtp_bypass_reason: str | None = None
+    # Request-local target distribution for the most recently emitted token.
+    # Native MTP must report target logprobs even when the token came from its
+    # draft head.  ``None`` preserves every existing engine/caller shape.
+    logprobs: Any | None = None
     # SpecPrefill is independent of decode speculation.  Keep its terminal
     # state separate so composing MTP cannot erase sparse-prefill evidence.
     specprefill_requested_policy: str | None = None
