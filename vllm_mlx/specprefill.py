@@ -38,12 +38,190 @@ Design notes:
 Reference: arxiv.org/abs/2502.02789 (SpecPrefill: Speculative Prefilling)
 """
 
+import hashlib
 import math
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable
 
 import mlx.core as mx
 
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
+
+SPECPREFILL_SELECTOR_VERSION = "hybrid-chunk-v1"
+
+
+class SpecPrefillPolicy(str, Enum):
+    """Requested or effective prefill policy for one text request."""
+
+    AUTO = "auto"
+    SPARSE = "sparse"
+    DENSE = "dense"
+
+
+class SpecPrefillCoverage(str, Enum):
+    """Whether a workload can tolerate omitted prompt context."""
+
+    SELECTIVE = "selective"
+    EXHAUSTIVE = "exhaustive"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SelectionPlan:
+    """Deterministic sparse-token selection for one prompt.
+
+    Indices and chunk IDs are immutable host values so the plan may safely be
+    retained in request telemetry or used as a cache fingerprint. Execution
+    converts ``selected_indices`` to an MLX array at the boundary.
+    """
+
+    prompt_length: int
+    chunk_size: int
+    keep_pct: float
+    selected_chunks: tuple[int, ...]
+    selected_indices: tuple[int, ...]
+    selector_version: str = SPECPREFILL_SELECTOR_VERSION
+    importance_chunks: tuple[int, ...] = ()
+    backbone_chunks: tuple[int, ...] = ()
+    anchor_chunks: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.prompt_length <= 0:
+            raise ValueError("prompt_length must be positive")
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if not 0 < self.keep_pct <= 1:
+            raise ValueError("keep_pct must be in (0, 1]")
+        if tuple(sorted(set(self.selected_chunks))) != self.selected_chunks:
+            raise ValueError("selected_chunks must be sorted and unique")
+        if tuple(sorted(set(self.selected_indices))) != self.selected_indices:
+            raise ValueError("selected_indices must be sorted and unique")
+        if not self.selected_indices:
+            raise ValueError("SelectionPlan must retain at least one token")
+        if (
+            self.selected_indices[0] < 0
+            or self.selected_indices[-1] >= self.prompt_length
+        ):
+            raise ValueError("selected_indices are outside the prompt")
+
+        expected = tuple(
+            token
+            for chunk in self.selected_chunks
+            for token in range(
+                chunk * self.chunk_size,
+                min((chunk + 1) * self.chunk_size, self.prompt_length),
+            )
+        )
+        if expected != self.selected_indices:
+            raise ValueError("selected_indices must contain complete selected chunks")
+
+    @property
+    def selected_token_count(self) -> int:
+        return len(self.selected_indices)
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable semantic identity for exact sparse-cache reuse."""
+        fields = (
+            self.selector_version,
+            str(self.prompt_length),
+            str(self.chunk_size),
+            self.keep_pct.hex(),
+            ",".join(map(str, self.selected_chunks)),
+            ",".join(map(str, self.importance_chunks)),
+            ",".join(map(str, self.backbone_chunks)),
+            ",".join(map(str, self.anchor_chunks)),
+        )
+        return hashlib.sha256("|".join(fields).encode("ascii")).hexdigest()
+
+    def as_mx_indices(self) -> mx.array:
+        """Return executor-ready indices without changing the immutable plan."""
+        return mx.array(self.selected_indices, dtype=mx.int32)
+
+
+@dataclass(frozen=True)
+class SpecPrefillDecision:
+    """A request-local admission decision, independent from engine execution."""
+
+    requested_policy: SpecPrefillPolicy
+    effective_policy: SpecPrefillPolicy
+    coverage: SpecPrefillCoverage
+    fallback_reason: str | None = None
+    selection_plan: SelectionPlan | None = None
+
+    def __post_init__(self) -> None:
+        if self.effective_policy is SpecPrefillPolicy.AUTO:
+            raise ValueError("effective_policy must resolve auto to sparse or dense")
+        if self.effective_policy is SpecPrefillPolicy.SPARSE and self.fallback_reason:
+            raise ValueError("a sparse decision cannot have a fallback reason")
+        if self.effective_policy is SpecPrefillPolicy.DENSE and self.selection_plan:
+            raise ValueError("a dense decision cannot expose a sparse selection plan")
+
+
+@dataclass(frozen=True)
+class SpecPrefillArchitectureAdapter:
+    """Explicit model-family contract for scoring and cache ownership."""
+
+    name: str
+    model_types: tuple[str, ...]
+    query_extractor: Callable[..., mx.array]
+    cache_map_builder: Callable[[Any], dict[int, int]]
+
+
+def resolve_specprefill_decision(
+    policy: SpecPrefillPolicy | str,
+    coverage: SpecPrefillCoverage | str,
+    *,
+    production: bool,
+    text_only: bool = True,
+    threshold_met: bool = True,
+    admission_allowed: bool = True,
+) -> SpecPrefillDecision:
+    """Resolve a conservative pre-execution policy decision.
+
+    Production may only engage sparse prefill for declared selective text
+    workloads that have passed both value and residency admission. Explicit
+    sparse forcing remains available for diagnostic use only.
+    """
+    requested = SpecPrefillPolicy(policy)
+    declared_coverage = SpecPrefillCoverage(coverage)
+    if requested is SpecPrefillPolicy.DENSE:
+        return SpecPrefillDecision(
+            requested, SpecPrefillPolicy.DENSE, declared_coverage
+        )
+    if not text_only:
+        return SpecPrefillDecision(
+            requested, SpecPrefillPolicy.DENSE, declared_coverage, "media_request"
+        )
+    if (
+        declared_coverage is not SpecPrefillCoverage.SELECTIVE
+        and requested is not SpecPrefillPolicy.SPARSE
+    ):
+        return SpecPrefillDecision(
+            requested,
+            SpecPrefillPolicy.DENSE,
+            declared_coverage,
+            "coverage_not_selective",
+        )
+    if production and requested is SpecPrefillPolicy.SPARSE:
+        return SpecPrefillDecision(
+            requested,
+            SpecPrefillPolicy.DENSE,
+            declared_coverage,
+            "sparse_forcing_diagnostic_only",
+        )
+    if not threshold_met:
+        return SpecPrefillDecision(
+            requested, SpecPrefillPolicy.DENSE, declared_coverage, "below_threshold"
+        )
+    if not admission_allowed:
+        return SpecPrefillDecision(
+            requested, SpecPrefillPolicy.DENSE, declared_coverage, "admission_denied"
+        )
+    return SpecPrefillDecision(requested, SpecPrefillPolicy.SPARSE, declared_coverage)
+
 
 # ===========================================================================
 # Step 1: Token importance scoring (draft model)
@@ -64,16 +242,16 @@ class _AttentionCapture:
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor or _qwen35_extract_queries
 
-    def __call__(self, x, mask=None, cache=None):
-        queries = self._query_extractor(self._original, x, cache)
+    def __call__(self, x, mask=None, cache=None, **kwargs):
+        queries = self._query_extractor(self._original, x, cache=cache, **kwargs)
         self._query_buffer[self._buf_idx].append(queries)
-        return self._original(x, mask=mask, cache=cache)
+        return self._original(x, mask=mask, cache=cache, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
 
 
-def _qwen35_extract_queries(attn, x, cache=None):
+def _qwen35_extract_queries(attn, x, cache=None, **_kwargs):
     """Extract post-RoPE queries from Qwen3.5 attention (gate split + q_norm).
 
     Qwen3.5 q_proj output is 2x wider: [queries, gate]. We split, normalize,
@@ -92,7 +270,28 @@ def _qwen35_extract_queries(attn, x, cache=None):
     return queries
 
 
-def _llama_extract_queries(attn, x, cache=None):
+def _qwen_extract_queries(attn, x, cache=None, **_kwargs):
+    """Extract normalized RoPE queries from dense Qwen attention.
+
+    Qwen 3's projection is not gated, unlike the Qwen3.5 hybrid family, but
+    it retains Q/K normalization. Treating it as a generic Llama block drops
+    that normalization and changes the scoring distribution.
+    """
+    B, L, _ = x.shape
+    n_heads = getattr(attn, "n_heads", getattr(attn, "num_attention_heads", None))
+    if n_heads is None:
+        raise ValueError("Cannot determine Qwen attention head count")
+    queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
+    q_norm = getattr(attn, "q_norm", None)
+    if q_norm is not None:
+        queries = q_norm(queries)
+    queries = queries.transpose(0, 2, 1, 3)
+    if cache is not None:
+        return attn.rope(queries, offset=cache.offset)
+    return attn.rope(queries)
+
+
+def _llama_extract_queries(attn, x, cache=None, **_kwargs):
     """Extract post-RoPE queries from standard transformer attention.
 
     Standard architecture: q_proj → reshape → RoPE. No gate, no q_norm.
@@ -113,7 +312,28 @@ def _llama_extract_queries(attn, x, cache=None):
     return queries
 
 
-def _nemotron_h_extract_queries(attn, x, cache=None):
+def _gemma4_extract_queries(attn, x, cache=None, offset=None, **_kwargs):
+    """Extract Gemma 4 normalized partial-RoPE queries.
+
+    KV-shared Gemma layers receive their logical offset explicitly from their
+    owner layer. The capture wrapper must preserve that argument rather than
+    substituting a fresh cache-local position.
+    """
+    B, L, _ = x.shape
+    n_heads = getattr(attn, "n_heads", getattr(attn, "num_attention_heads", None))
+    if n_heads is None:
+        raise ValueError("Cannot determine Gemma 4 attention head count")
+    queries = attn.q_proj(x).reshape(B, L, n_heads, -1)
+    q_norm = getattr(attn, "q_norm", None)
+    if q_norm is not None:
+        queries = q_norm(queries)
+    queries = queries.transpose(0, 2, 1, 3)
+    if offset is None:
+        offset = cache.offset if cache is not None else 0
+    return attn.rope(queries, offset=offset)
+
+
+def _nemotron_h_extract_queries(attn, x, cache=None, **_kwargs):
     """Extract queries from Nemotron-H attention (no RoPE, no gate, no q_norm).
 
     Nemotron-H attention layers have NO positional encoding — RoPE is absent.
@@ -325,23 +545,11 @@ def score_tokens(
         attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
     )
 
-    # Auto-detect query extractor from model_type (explicit registry, not
-    # attribute sniffing -- avoids silent misclassification on new models).
+    # Resolve known model families through an explicit adapter registry. The
+    # generic fallback remains only for legacy callers that pass a custom
+    # extractor; unknown model types must not silently acquire a scoring path.
     if query_extractor is None:
-        model_type = getattr(getattr(model, "config", None), "model_type", "")
-        _EXTRACTOR_REGISTRY = {
-            "qwen3_5": _qwen35_extract_queries,
-            "qwen3_5_moe": _qwen35_extract_queries,
-            "qwen3_vl": _qwen35_extract_queries,
-            "qwen3_vl_moe": _qwen35_extract_queries,
-            "nemotron_h": _nemotron_h_extract_queries,
-        }
-        query_extractor = _EXTRACTOR_REGISTRY.get(model_type)
-        if query_extractor is None:
-            if _get_rope(attn_obj) is not None:
-                query_extractor = _llama_extract_queries
-            else:
-                query_extractor = _nemotron_h_extract_queries
+        query_extractor = resolve_specprefill_adapter(model).query_extractor
 
     # Phase 1: Prefill
     cache = make_prompt_cache(model)
@@ -375,7 +583,7 @@ def score_tokens(
     # Phase 3: Compute importance
     # Map layer indices to cache indices (identity for standard models,
     # compacted for Nemotron-H where only M/* layers have cache entries)
-    layer_to_cache = _build_layer_to_cache_map(model)
+    layer_to_cache = resolve_specprefill_adapter(model).cache_map_builder(model)
     attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
     if cancel_check is not None:
         cancel_check()
@@ -396,75 +604,169 @@ def score_tokens(
     return importance
 
 
-def select_chunks(importance, keep_pct=0.3, chunk_size=32, backbone_pct=0.0):
-    """Select top-k% token chunks by average importance.
-
-    Args:
-        importance: (M,) per-token importance scores
-        keep_pct: fraction of chunks to keep (default 0.3)
-        chunk_size: tokens per chunk (default 32)
-        backbone_pct: fraction of chunks reserved for evenly-spaced coverage
-
-    Returns:
-        sorted mx.array of kept token indices
-    """
-    M = importance.shape[0]
-    if keep_pct >= 1.0:
-        return mx.arange(M)
-
-    n_chunks = math.ceil(M / chunk_size)
-    target_tokens = max(1, math.ceil(M * keep_pct))
-    keep_n = max(1, math.ceil(n_chunks * keep_pct))
-    backbone_n = max(0, math.ceil(n_chunks * backbone_pct)) if backbone_pct > 0 else 0
-    top_n = max(0, keep_n - backbone_n)
-
-    chunk_scores = []
-    for i in range(n_chunks):
-        start = i * chunk_size
-        end = min(start + chunk_size, M)
-        chunk_scores.append(mx.mean(importance[start:end]).item())
-
-    selected_chunks = set(
-        sorted(range(n_chunks), key=lambda i: chunk_scores[i], reverse=True)[:top_n]
+def _chunk_scores(importance, chunk_size: int) -> tuple[int, list[float]]:
+    """Compute all chunk means in one MLX expression and validate them."""
+    if len(importance.shape) != 1:
+        raise ValueError("importance must be a one-dimensional tensor")
+    prompt_length = int(importance.shape[0])
+    if prompt_length <= 0:
+        raise ValueError("importance must not be empty")
+    n_chunks = math.ceil(prompt_length / chunk_size)
+    padded_length = n_chunks * chunk_size
+    padded = (
+        mx.pad(importance, [(0, padded_length - prompt_length)])
+        if padded_length != prompt_length
+        else importance
     )
-    if backbone_n > 0:
-        if backbone_n >= n_chunks:
-            selected_chunks.update(range(n_chunks))
-        else:
-            for i in range(backbone_n):
-                selected_chunks.add(round(i * (n_chunks - 1) / max(1, backbone_n - 1)))
+    sums = mx.sum(padded.reshape(n_chunks, chunk_size), axis=1)
+    lengths = mx.minimum(
+        mx.full((n_chunks,), chunk_size),
+        prompt_length - mx.arange(n_chunks) * chunk_size,
+    )
+    scores = [float(score) for score in (sums / lengths).tolist()]
+    if not all(math.isfinite(score) for score in scores):
+        raise ValueError("importance must contain only finite values")
+    return prompt_length, scores
 
-    def _selected_token_count(chunks):
-        total = 0
-        for chunk_idx in chunks:
-            start = chunk_idx * chunk_size
-            end = min(start + chunk_size, M)
-            total += end - start
-        return total
 
-    if (
-        len(selected_chunks) < keep_n
-        or _selected_token_count(selected_chunks) < target_tokens
-    ):
-        for chunk_idx in sorted(
-            range(n_chunks), key=lambda i: chunk_scores[i], reverse=True
+def _stratified_chunks(n_chunks: int, count: int) -> tuple[int, ...]:
+    """Select stable center-of-stratum representatives across a prompt."""
+    if count <= 0:
+        return ()
+    if count >= n_chunks:
+        return tuple(range(n_chunks))
+    selected = {
+        min(n_chunks - 1, int((index + 0.5) * n_chunks / count))
+        for index in range(count)
+    }
+    for candidate in range(n_chunks):
+        if len(selected) >= count:
+            break
+        selected.add(candidate)
+    return tuple(sorted(selected))
+
+
+def _anchor_chunk_ids(n_chunks: int, count: int) -> tuple[int, ...]:
+    if count <= 0:
+        return ()
+    count = min(count, n_chunks)
+    anchors = set(range(count))
+    anchors.update(range(max(0, n_chunks - count), n_chunks))
+    return tuple(sorted(anchors))
+
+
+def build_selection_plan(
+    importance,
+    keep_pct: float = 0.3,
+    chunk_size: int = 32,
+    backbone_pct: float = 0.0,
+    *,
+    halo_chunks: int = 1,
+    anchor_chunks: int = 1,
+) -> SelectionPlan:
+    """Build a deterministic, versioned hybrid sparse-prefill plan.
+
+    Fixed anchors preserve prompt framing, a stratified backbone prevents
+    score collapse into one region, and an importance-ranked halo keeps local
+    context around a selected chunk. All chunk means are calculated on device
+    before one O(chunks) host ranking operation.
+    """
+    if not 0 < keep_pct <= 1:
+        raise ValueError("keep_pct must be in (0, 1]")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if not 0 <= backbone_pct <= 1:
+        raise ValueError("backbone_pct must be in [0, 1]")
+    if halo_chunks < 0 or anchor_chunks < 0:
+        raise ValueError("halo_chunks and anchor_chunks must be non-negative")
+
+    prompt_length, scores = _chunk_scores(importance, chunk_size)
+    n_chunks = len(scores)
+    ranked = tuple(sorted(range(n_chunks), key=lambda chunk: (-scores[chunk], chunk)))
+    desired_chunks = max(1, math.ceil(n_chunks * keep_pct))
+    desired_tokens = max(1, math.ceil(prompt_length * keep_pct))
+    anchors = _anchor_chunk_ids(n_chunks, anchor_chunks)
+    backbone = _stratified_chunks(n_chunks, math.ceil(n_chunks * backbone_pct))
+    selected = set(anchors)
+    selected.update(backbone)
+    # Anchors are a quality floor, not a substitute for importance-ranked
+    # evidence. They may exceed the retention budget on very short prompts.
+    importance_budget = max(1, desired_chunks - len(backbone))
+    chunk_budget = min(n_chunks, desired_chunks + len(anchors))
+    importance_seeds: list[int] = []
+
+    def selected_token_count() -> int:
+        return sum(
+            min(chunk_size, prompt_length - chunk * chunk_size) for chunk in selected
+        )
+
+    for seed in ranked:
+        if (
+            len(importance_seeds) >= importance_budget
+            and selected_token_count() >= desired_tokens
         ):
-            selected_chunks.add(chunk_idx)
-            if (
-                len(selected_chunks) >= keep_n
-                and _selected_token_count(selected_chunks) >= target_tokens
+            break
+        importance_seeds.append(seed)
+        candidates = [seed]
+        for distance in range(1, halo_chunks + 1):
+            candidates.extend((seed - distance, seed + distance))
+        for candidate in candidates:
+            if not 0 <= candidate < n_chunks or (
+                len(selected) >= chunk_budget and candidate not in selected
             ):
-                break
+                continue
+            selected.add(candidate)
 
-    top_chunks = sorted(selected_chunks)
+    # A partial last chunk can meet a chunk budget without meeting the token
+    # retention target; fill deterministically until both are satisfied.
+    for candidate in ranked:
+        if len(selected) >= chunk_budget and selected_token_count() >= desired_tokens:
+            break
+        if (
+            selected_token_count() < desired_tokens
+            or len(selected) < chunk_budget
+            or candidate in selected
+        ):
+            selected.add(candidate)
 
-    indices = []
-    for ci in top_chunks:
-        start = ci * chunk_size
-        end = min(start + chunk_size, M)
-        indices.extend(range(start, end))
+    selected_chunks = tuple(sorted(selected))
+    selected_indices = tuple(
+        token
+        for chunk in selected_chunks
+        for token in range(
+            chunk * chunk_size, min((chunk + 1) * chunk_size, prompt_length)
+        )
+    )
+    return SelectionPlan(
+        prompt_length=prompt_length,
+        chunk_size=chunk_size,
+        keep_pct=keep_pct,
+        selected_chunks=selected_chunks,
+        selected_indices=selected_indices,
+        importance_chunks=tuple(importance_seeds),
+        backbone_chunks=backbone,
+        anchor_chunks=anchors,
+    )
 
-    return mx.array(indices)
+
+def select_chunks(
+    importance,
+    keep_pct=0.3,
+    chunk_size=32,
+    backbone_pct=0.0,
+    *,
+    halo_chunks=1,
+    anchor_chunks=1,
+):
+    """Return executor-ready indices from :func:`build_selection_plan`."""
+    return build_selection_plan(
+        importance,
+        keep_pct=keep_pct,
+        chunk_size=chunk_size,
+        backbone_pct=backbone_pct,
+        halo_chunks=halo_chunks,
+        anchor_chunks=anchor_chunks,
+    ).as_mx_indices()
 
 
 # ===========================================================================
@@ -663,31 +965,153 @@ def _set_attn_module(layer, module):
         layer.mixer = module
 
 
+def _get_model_type(model) -> str:
+    """Return a model type from supported mlx-lm/mlx-vlm wrapper layouts."""
+    if isinstance(model, str):
+        return model
+    candidates = (
+        getattr(model, "config", None),
+        getattr(model, "args", None),
+        getattr(getattr(model, "model", None), "config", None),
+        getattr(getattr(model, "model", None), "args", None),
+    )
+    for candidate in candidates:
+        model_type = getattr(candidate, "model_type", None)
+        if model_type:
+            return str(model_type)
+    return ""
+
+
+def _standard_layer_to_cache_map(model) -> dict[int, int]:
+    """Map standard decoder layers to one cache entry each."""
+    return {index: index for index in range(len(model.layers))}
+
+
+def _gemma4_shared_kv_cache_map(model) -> dict[int, int]:
+    """Map Gemma 4 layers to their physical KV-owning cache entries.
+
+    Gemma's prompt-cache factory materializes one entry per unique KV owner,
+    not one entry per decoder layer. ``previous_kvs`` contains decoder-layer
+    owners, so map first-seen owners to their compact cache-list indices.
+    """
+    inner_model = getattr(model, "model", None)
+    previous_kvs = getattr(model, "previous_kvs", None)
+    if previous_kvs is None and inner_model is not None:
+        previous_kvs = getattr(inner_model, "previous_kvs", None)
+    if previous_kvs is None:
+        raise ValueError("Gemma 4 model is missing previous_kvs cache ownership")
+    if len(previous_kvs) != len(model.layers):
+        raise ValueError("Gemma 4 previous_kvs must cover every decoder layer")
+    owner_to_cache: dict[int, int] = {}
+    mapping: dict[int, int] = {}
+    for layer_idx, owner_idx in enumerate(previous_kvs):
+        if not isinstance(owner_idx, int) or not 0 <= owner_idx < len(model.layers):
+            raise ValueError(
+                f"Invalid Gemma 4 KV owner {owner_idx!r} for layer {layer_idx}"
+            )
+        if owner_idx > layer_idx:
+            raise ValueError(
+                f"Gemma 4 KV owner {owner_idx} must precede layer {layer_idx}"
+            )
+        if owner_idx not in owner_to_cache:
+            owner_to_cache[owner_idx] = len(owner_to_cache)
+        mapping[layer_idx] = owner_to_cache[owner_idx]
+    return mapping
+
+
+def _hybrid_layer_to_cache_map(model) -> dict[int, int]:
+    """Map Qwen3.5/3.6's mixed linear/attention stack to cache slots."""
+    return _standard_layer_to_cache_map(model)
+
+
+def _nemotron_h_layer_to_cache_map(model) -> dict[int, int]:
+    """Map only stateful Nemotron-H blocks into its compact cache list."""
+    layer_to_cache: dict[int, int] = {}
+    cache_idx = 0
+    for layer_idx, layer in enumerate(model.layers):
+        if getattr(layer, "block_type", None) in ("M", "*"):
+            layer_to_cache[layer_idx] = cache_idx
+            cache_idx += 1
+    return layer_to_cache
+
+
+STANDARD_QWEN_ADAPTER = SpecPrefillArchitectureAdapter(
+    name="qwen-dense",
+    model_types=("qwen2", "qwen2_moe", "qwen3", "qwen3_moe"),
+    query_extractor=_qwen_extract_queries,
+    cache_map_builder=_standard_layer_to_cache_map,
+)
+QWEN_HYBRID_ADAPTER = SpecPrefillArchitectureAdapter(
+    name="qwen3.5-3.6-hybrid-moe",
+    model_types=(
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    ),
+    query_extractor=_qwen35_extract_queries,
+    cache_map_builder=_hybrid_layer_to_cache_map,
+)
+GEMMA4_ADAPTER = SpecPrefillArchitectureAdapter(
+    name="gemma4-shared-kv",
+    model_types=("gemma4", "gemma4_text"),
+    query_extractor=_gemma4_extract_queries,
+    cache_map_builder=_gemma4_shared_kv_cache_map,
+)
+NEMOTRON_H_ADAPTER = SpecPrefillArchitectureAdapter(
+    name="nemotron-h",
+    model_types=("nemotron_h",),
+    query_extractor=_nemotron_h_extract_queries,
+    cache_map_builder=_nemotron_h_layer_to_cache_map,
+)
+_ADAPTERS: tuple[SpecPrefillArchitectureAdapter, ...] = (
+    STANDARD_QWEN_ADAPTER,
+    QWEN_HYBRID_ADAPTER,
+    GEMMA4_ADAPTER,
+    NEMOTRON_H_ADAPTER,
+)
+ARCHITECTURE_ADAPTERS: dict[str, SpecPrefillArchitectureAdapter] = {
+    model_type: adapter for adapter in _ADAPTERS for model_type in adapter.model_types
+}
+
+
+def resolve_specprefill_adapter(model: Any) -> SpecPrefillArchitectureAdapter:
+    """Return the explicit scoring/cache contract for a supported model type."""
+    model_type = _get_model_type(model)
+    adapter = ARCHITECTURE_ADAPTERS.get(model_type)
+    if adapter is None:
+        supported = ", ".join(sorted(ARCHITECTURE_ADAPTERS))
+        raise ValueError(
+            f"Unsupported SpecPrefill model_type {model_type!r}; supported: {supported}"
+        )
+    return adapter
+
+
 def _build_layer_to_cache_map(model):
     """Build mapping from model layer index to cache index.
 
-    Standard models (Qwen3.5, Llama, GPT-OSS): one cache entry per layer,
-    so the mapping is identity (layer_idx → layer_idx).
+    Standard models have one cache entry per layer. Gemma 4 shared-KV layers
+    map to compact cache entries keyed by their physical owner. This
+    compatibility helper intentionally keeps support for existing direct
+    callers; new scoring uses the architecture adapter registry above.
 
     Nemotron-H: only M (Mamba2) and * (attention) layers have cache entries.
     MLP (-) and MoE (E) layers get no cache. The mapping is compacted.
 
     Returns dict {layer_idx: cache_idx}.
     """
+    if (
+        getattr(model, "previous_kvs", None) is not None
+        or getattr(getattr(model, "model", None), "previous_kvs", None) is not None
+    ):
+        return _gemma4_shared_kv_cache_map(model)
+
     has_block_type = any(hasattr(layer, "block_type") for layer in model.layers)
     if not has_block_type:
-        # Standard model: identity mapping
-        return {i: i for i in range(len(model.layers))}
-
-    # Nemotron-H style: count cache entries for M/* layers
-    layer_to_cache = {}
-    cache_idx = 0
-    for layer_idx, layer in enumerate(model.layers):
-        bt = getattr(layer, "block_type", None)
-        if bt in ("M", "*"):
-            layer_to_cache[layer_idx] = cache_idx
-            cache_idx += 1
-    return layer_to_cache
+        return _standard_layer_to_cache_map(model)
+    return _nemotron_h_layer_to_cache_map(model)
 
 
 # ---------------------------------------------------------------------------
