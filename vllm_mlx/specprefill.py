@@ -51,7 +51,6 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
-from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
 SPECPREFILL_SELECTOR_VERSION = "hybrid-chunk-v1"
@@ -71,6 +70,10 @@ class SpecPrefillCoverage(str, Enum):
     SELECTIVE = "selective"
     EXHAUSTIVE = "exhaustive"
     UNKNOWN = "unknown"
+
+
+class SpecPrefillScorerLaneBusy(RuntimeError):
+    """Another bounded request currently owns the scorer lane."""
 
 
 @dataclass(frozen=True)
@@ -604,6 +607,7 @@ class SpecPrefillScorer:
         self._model_ref = weakref.ref(model)
         self.adapter = resolve_specprefill_adapter(model)
         self._session_lock = threading.Lock()
+        self._quantum_lock = threading.Lock()
         self._active_session = None
         self._session_context = threading.local()
 
@@ -718,6 +722,21 @@ class SpecPrefillScorer:
                 pass
             self._session_lock.release()
 
+    @contextmanager
+    def scoring_quantum(self):
+        """Lease the scorer lane for one bounded request-local session step.
+
+        Capture itself still takes the shorter ``capture_session`` lock.  This
+        companion lock covers cache/query importance work too, then releases
+        before another request's next quantum can run.
+        """
+        if not self._quantum_lock.acquire(blocking=False):
+            raise SpecPrefillScorerLaneBusy("SpecPrefill scorer lane is busy")
+        try:
+            yield
+        finally:
+            self._quantum_lock.release()
+
     def score_tokens(
         self,
         tokens,
@@ -728,58 +747,25 @@ class SpecPrefillScorer:
         prefill_step_size=2048,
         query_extractor=None,
         cancel_check=None,
+        sampling_seed=None,
     ):
-        """Score one prompt with all lazy capture work inside its session."""
-        model = self.model
-        if isinstance(tokens, mx.array):
-            tokens = tokens.tolist()
-        n_prompt = len(tokens)
+        """Score through bounded request-local session quanta for compatibility."""
+        # Local import keeps the session implementation free to reuse this
+        # install-once scorer without a module-import cycle.
+        from .specprefill_scorer_session import SpecPrefillScorerSession
 
-        cache = None
-        logits = None
-        try:
-            with self.capture_session(
-                query_extractor=query_extractor, capture_enabled=False
-            ) as session:
-                cache = make_prompt_cache(model)
-                logits = _prefill_draft(
-                    model,
-                    tokens,
-                    cache,
-                    step_size=prefill_step_size,
-                    cancel_check=cancel_check,
-                )
-                session.capture_enabled = True
-                _lookahead_decode(
-                    model,
-                    logits,
-                    cache,
-                    n_lookahead,
-                    temp=temp,
-                    top_p=top_p,
-                    cancel_check=cancel_check,
-                )
-
-                layer_to_cache = self.adapter.cache_map_builder(model)
-                attn_caches = [
-                    cache[layer_to_cache[index]]
-                    for index in self.attention_layer_indices
-                ]
-                if cancel_check is not None:
-                    cancel_check()
-                importance = _compute_importance(
-                    session.query_buffer,
-                    attn_caches,
-                    n_prompt,
-                    pool_kernel=pool_kernel if pool_kernel > 0 else None,
-                )
-                # MLX execution is lazy. Realize both captured queries and the
-                # final scores while this request still owns the scorer lane.
-                mx.eval(session.query_buffer, importance)
-            return importance
-        finally:
-            del cache, logits
-            mx.clear_cache()
+        return SpecPrefillScorerSession(
+            self,
+            tokens,
+            n_lookahead=n_lookahead,
+            pool_kernel=pool_kernel,
+            temp=temp,
+            top_p=top_p,
+            prefill_step_size=prefill_step_size,
+            query_extractor=query_extractor,
+            cancel_check=cancel_check,
+            sampling_seed=sampling_seed,
+        ).run_to_completion()
 
 
 _SCORER_REGISTRY: dict[int, tuple[weakref.ReferenceType[Any], SpecPrefillScorer]] = {}
@@ -970,6 +956,7 @@ def score_tokens(
     prefill_step_size=2048,
     query_extractor=None,
     cancel_check=None,
+    sampling_seed=None,
 ):
     """Score token importance using attention-based analysis on a draft model.
 
@@ -1005,6 +992,7 @@ def score_tokens(
         prefill_step_size=prefill_step_size,
         query_extractor=query_extractor,
         cancel_check=cancel_check,
+        sampling_seed=sampling_seed,
     )
 
 

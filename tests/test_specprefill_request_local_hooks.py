@@ -261,89 +261,40 @@ def test_session_exception_clears_state_without_uninstalling_wrapper():
         assert scorer.capture_active
 
 
-def test_public_score_tokens_realizes_lazy_work_before_session_release(monkeypatch):
+def test_public_score_tokens_delegates_to_bounded_request_local_session(monkeypatch):
     model = ScorerModel()
     scorer = SpecPrefillScorer.for_model(model)
     attention = model.layers[0].self_attn
-    cache = [SimpleNamespace(keys=mx.ones((1, 1, 2, 1)))]
-    eval_session_states = []
-    real_eval = specprefill.mx.eval
+    import vllm_mlx.specprefill_scorer_session as scorer_sessions
 
-    monkeypatch.setattr(specprefill, "make_prompt_cache", lambda _model: cache)
+    observed = {}
 
-    def prefill(*_args, **_kwargs):
-        assert scorer.capture_active
-        attention(mx.ones((1, 1, 1)), cache=cache[0])
-        return mx.zeros((1, 1, 4))
+    class BoundedSession:
+        def __init__(self, session_scorer, tokens, **kwargs):
+            observed.update(scorer=session_scorer, tokens=tokens, kwargs=kwargs)
 
-    monkeypatch.setattr(specprefill, "_prefill_draft", prefill)
+        def run_to_completion(self):
+            assert not scorer.capture_active
+            return mx.array([0.25, 0.75])
 
-    def lookahead(_model, _logits, _cache, _steps, **_kwargs):
-        attention(mx.ones((1, 1, 1)), cache=cache[0], offset=2)
-        return [1]
-
-    def compute_importance(query_buffer, *_args, **_kwargs):
-        assert scorer.capture_active
-        assert len(query_buffer[0]) == 1
-        return mx.array([0.25, 0.75])
-
-    def recording_eval(*values):
-        eval_session_states.append(scorer.capture_active)
-        return real_eval(*values)
-
-    monkeypatch.setattr(specprefill, "_lookahead_decode", lookahead)
-    monkeypatch.setattr(specprefill, "_compute_importance", compute_importance)
-    monkeypatch.setattr(specprefill.mx, "eval", recording_eval)
+    monkeypatch.setattr(scorer_sessions, "SpecPrefillScorerSession", BoundedSession)
 
     importance = specprefill.score_tokens(
         model,
         [1, 2],
+        n_lookahead=3,
+        pool_kernel=7,
         query_extractor=passthrough_extractor,
     )
 
     assert importance.tolist() == [0.25, 0.75]
-    assert eval_session_states == [True]
+    assert observed["scorer"] is scorer
+    assert observed["tokens"] == [1, 2]
+    assert observed["kwargs"]["n_lookahead"] == 3
+    assert observed["kwargs"]["pool_kernel"] == 7
+    assert observed["kwargs"]["query_extractor"] is passthrough_extractor
     assert not scorer.capture_active
     assert model.layers[0].self_attn is attention
-
-
-def test_score_tokens_rejects_overlap_before_second_prefill(monkeypatch):
-    model = ScorerModel()
-    SpecPrefillScorer.for_model(model)
-    entered_prefill = threading.Event()
-    release_prefill = threading.Event()
-    first_errors = []
-    prefill_calls = 0
-
-    monkeypatch.setattr(specprefill, "make_prompt_cache", lambda _model: [])
-
-    def blocking_prefill(*_args, **_kwargs):
-        nonlocal prefill_calls
-        prefill_calls += 1
-        entered_prefill.set()
-        release_prefill.wait(timeout=5)
-        raise ValueError("stop first scorer")
-
-    monkeypatch.setattr(specprefill, "_prefill_draft", blocking_prefill)
-
-    def run_first_score():
-        try:
-            specprefill.score_tokens(model, [1, 2])
-        except Exception as exc:  # noqa: BLE001 - asserted below
-            first_errors.append(exc)
-
-    thread = threading.Thread(target=run_first_score)
-    thread.start()
-    assert entered_prefill.wait(timeout=5)
-    with pytest.raises(RuntimeError, match="already has an active session"):
-        specprefill.score_tokens(model, [3, 4])
-    release_prefill.set()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert prefill_calls == 1
-    assert len(first_errors) == 1
-    assert str(first_errors[0]) == "stop first scorer"
 
 
 def test_partial_dispatch_installation_rolls_back(monkeypatch):
