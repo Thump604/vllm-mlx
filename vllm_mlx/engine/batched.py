@@ -50,6 +50,7 @@ class PreparedMLLMSpecPrefillRuntime:
     tokenizer_artifact_hash: str
     scorer_artifact_hash: str
     cleanup: Any
+    gemma_batch_config: Any = None
     diagnostic: bool = False
     advertisable: bool = True
 
@@ -87,7 +88,53 @@ class PreparedMLLMSpecPrefillRuntime:
             raise TypeError("cleanup must be callable")
         if self.cache_capability.adapter_id != self.profile_key.adapter_id:
             raise ValueError("prepared cache adapter must match the profile key")
-        if self.cache_capability.layout != "qwen3_5_nonrotating_hybrid":
+        gemma_layouts = {
+            "gemma4-e2b",
+            "gemma4-31b",
+            "gemma4-26b-a4b",
+        }
+        if self.cache_capability.layout == "qwen3_5_nonrotating_hybrid":
+            if self.gemma_batch_config is not None:
+                raise ValueError("Qwen prepared runtime cannot carry Gemma config")
+        elif self.cache_capability.layout in gemma_layouts:
+            from ..mllm_batch_generator import GemmaSparseBatchConfig
+
+            if not isinstance(self.gemma_batch_config, GemmaSparseBatchConfig):
+                raise TypeError(
+                    "Gemma prepared runtime requires GemmaSparseBatchConfig"
+                )
+            if (
+                not self.diagnostic
+                or self.advertisable
+                or self.cache_capability.backend != "mlx_vlm"
+                or not self.cache_capability.rotating
+                or not self.cache_capability.homogeneous_rows_only
+            ):
+                raise ValueError(
+                    "Gemma CB SpecPrefill is diagnostic mlx-vlm homogeneous only"
+                )
+            attestation = self.gemma_batch_config.attestation
+            if (
+                attestation.target_model is not self.target_model
+                or attestation.processor is not self.processor
+                or attestation.artifact.artifact_id != self.cache_capability.layout
+            ):
+                raise ValueError(
+                    "Gemma batch config does not match prepared runtime identity"
+                )
+            execution = self.gemma_batch_config.execution_config
+            if (
+                execution.target_id
+                != f"{self.profile_key.target_artifact_id}@sha256:{self.target_artifact_hash}"
+                or execution.tokenizer_id
+                != f"tokenizer@sha256:{self.tokenizer_artifact_hash}"
+                or execution.scorer_id
+                != f"{self.profile_key.scorer_artifact_id}@sha256:{self.scorer_artifact_hash}"
+            ):
+                raise ValueError(
+                    "Gemma execution identity does not match prepared artifacts"
+                )
+        else:
             raise ValueError("prepared cache capability is not admitted for CB")
         matching_profiles = tuple(
             profile
@@ -586,10 +633,21 @@ class BatchedEngine(BaseEngine):
                 "specprefill_cache_capability": (
                     prepared_specprefill.cache_capability
                 ),
+                "specprefill_gemma_batch_config": (
+                    prepared_specprefill.gemma_batch_config
+                ),
                 "specprefill_diagnostic": prepared_specprefill.diagnostic,
                 "specprefill_advertisable": prepared_specprefill.advertisable,
             }
         try:
+            if (
+                prepared_specprefill is not None
+                and prepared_specprefill.gemma_batch_config is not None
+                and enable_prefix_cache
+            ):
+                raise RuntimeError(
+                    "diagnostic Gemma CB SpecPrefill cannot compose with prefix cache"
+                )
             mllm_config = MLLMSchedulerConfig(
                 max_num_seqs=max_num_seqs,
                 prefill_batch_size=prefill_batch_size,

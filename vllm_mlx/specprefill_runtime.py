@@ -16,10 +16,23 @@ from .cooperative_specprefill import (
     CooperativeSpecPrefillSession,
 )
 from .engine.batched import PreparedMLLMSpecPrefillRuntime
-from .mllm_batch_generator import MLLMTargetForwardPhase
+from .mllm_batch_generator import (
+    GemmaSparseBatchConfig,
+    MLLMTargetForwardPhase,
+    prepare_gemma_sparse_target,
+)
 from .mllm_scheduler import MLLMSpecPrefillAdmission, MLLMSpecPrefillCacheCapability
 from .specprefill import SpecPrefillScorer
-from .specprefill_cache import SparseCacheState, SparsePolicyTuning
+from .specprefill_cache import (
+    SparseCacheExecutionConfig,
+    SparseCacheState,
+    SparsePolicyTuning,
+)
+from .specprefill_gemma_cache import (
+    GEMMA4_ARTIFACTS,
+    GemmaArtifactSpec,
+    validate_aligned_scalar_cache,
+)
 from .specprefill_positions import (
     TargetPositionFamily,
     decode_plan,
@@ -32,6 +45,7 @@ from .specprefill_profiles import (
     SpecPrefillTuning,
 )
 from .specprefill_scorer_session import SpecPrefillScorerSession
+from .specprefill_selection import SPECPREFILL_SELECTOR_VERSION
 from .specprefill_target_executor import SparseTargetPrefillSession
 from .specprefill_target_hooks import TargetPositionHooks
 
@@ -84,6 +98,11 @@ TargetIdentityAttestor = Callable[[Any, Any], TargetProcessorAttestation]
 @dataclass(frozen=True)
 class _QwenCacheTopology:
     entries: tuple[tuple[type[Any], int], ...]
+
+
+@dataclass(frozen=True)
+class _GemmaCacheTopology:
+    entries: tuple[tuple[type[Any], int | None, int | None], ...]
 
 
 def build_qwen_cb_specprefill_prepare(
@@ -235,6 +254,175 @@ def build_qwen_cb_specprefill_prepare(
     return prepare
 
 
+def build_gemma_cb_specprefill_prepare(
+    *,
+    scorer_artifact_path: str,
+    scorer_artifact_hash: str,
+    target_artifact_path: str,
+    target_artifact_hash: str,
+    tokenizer_artifact_hash: str,
+    gemma_artifact: GemmaArtifactSpec,
+    profile_registry: SpecPrefillProfileRegistry,
+    profile_key: SpecPrefillProfileKey,
+    calibrated_tuning: SpecPrefillTuning,
+    estimated_residency_bytes: int,
+    target_identity_attestor: TargetIdentityAttestor,
+    scorer_loader: ScorerLoader | None = None,
+    target_cache_factory: TargetCacheFactory | None = None,
+    scorer_prefill_step_size: int = 2048,
+    target_prefill_step_size: int = 2048,
+) -> Callable[[Any, Any], PreparedMLLMSpecPrefillRuntime]:
+    """Prepare diagnostic-only Gemma CB SpecPrefill ownership eagerly.
+
+    This is deliberately not a production or discovery capability. The exact
+    target bytes, live object/topology, mlx-vlm scalar cache backend, scorer,
+    hooks, and request cache factory are all proven before startup publishes a
+    scheduler.
+    """
+    _validate_builder_inputs(
+        scorer_artifact_path=scorer_artifact_path,
+        scorer_artifact_hash=scorer_artifact_hash,
+        target_artifact_hash=target_artifact_hash,
+        tokenizer_artifact_hash=tokenizer_artifact_hash,
+        profile_registry=profile_registry,
+        profile_key=profile_key,
+        calibrated_tuning=calibrated_tuning,
+        estimated_residency_bytes=estimated_residency_bytes,
+        diagnostic=True,
+        scorer_prefill_step_size=scorer_prefill_step_size,
+        target_prefill_step_size=target_prefill_step_size,
+    )
+    if GEMMA4_ARTIFACTS.get(gemma_artifact.artifact_id) != gemma_artifact:
+        raise ValueError("gemma_artifact must be a certified Gemma artifact")
+    if profile_key.target_artifact_id != gemma_artifact.artifact_id:
+        raise ValueError("Gemma artifact must match the diagnostic profile key")
+    loader = scorer_loader or _default_scorer_loader
+    cache_factory = target_cache_factory or _default_target_cache_factory
+    if not callable(loader):
+        raise TypeError("scorer_loader must be callable")
+    if not callable(target_identity_attestor):
+        raise TypeError("target_identity_attestor must be callable")
+    if not callable(cache_factory):
+        raise TypeError("target_cache_factory must be callable")
+    sparse_tuning = SparsePolicyTuning(
+        keep_pct=calibrated_tuning.keep_pct,
+        backbone_pct=calibrated_tuning.backbone_pct,
+        halo_chunks=calibrated_tuning.halo_chunks,
+        anchor_chunks=calibrated_tuning.anchor_chunks,
+        chunk_size=calibrated_tuning.chunk_size,
+    )
+
+    def prepare(target_model: Any, processor: Any) -> PreparedMLLMSpecPrefillRuntime:
+        loaded: LoadedSpecPrefillScorer | None = None
+        owner: _GemmaCBRuntimeOwner | None = None
+        try:
+            actual_scorer_hash = sha256_artifact_path(scorer_artifact_path)
+            if actual_scorer_hash != scorer_artifact_hash:
+                raise ValueError("scorer artifact bytes do not match expected hash")
+            identity = target_identity_attestor(target_model, processor)
+            prepared_target = prepare_gemma_sparse_target(
+                target_model=target_model,
+                processor=processor,
+                target_artifact_path=target_artifact_path,
+                artifact=gemma_artifact,
+                target_identity_attestation=identity,
+            )
+            if identity.tokenizer_artifact_hash != tokenizer_artifact_hash:
+                raise ValueError("tokenizer attestation does not match profile")
+            if prepared_target.target_artifact_hash != target_artifact_hash:
+                raise ValueError("target attestation does not match profile")
+            loaded = loader(scorer_artifact_path, scorer_artifact_hash)
+            if not isinstance(loaded, LoadedSpecPrefillScorer):
+                raise TypeError("scorer_loader must return LoadedSpecPrefillScorer")
+            if sha256_artifact_path(scorer_artifact_path) != actual_scorer_hash:
+                raise ValueError("scorer artifact changed while it was being loaded")
+            scorer = SpecPrefillScorer.for_model(loaded.model)
+            adapter = resolve_target_position_adapter(target_model)
+            expected_family = (
+                TargetPositionFamily.GEMMA4_A4B
+                if gemma_artifact.artifact_id == "gemma4-26b-a4b"
+                else TargetPositionFamily.GEMMA4_DENSE
+            )
+            if adapter.family is not expected_family:
+                raise SpecPrefillRuntimePreparationError(
+                    "Gemma adapter does not match the certified artifact"
+                )
+            text_model = prepared_target.text_model
+            hooks = TargetPositionHooks.for_model(text_model, adapter)
+            probe_cache = tuple(cache_factory(text_model))
+            prepared_target.validate_cache(probe_cache)
+            validate_aligned_scalar_cache(probe_cache, logical_position=0)
+            topology = _gemma_cache_topology(probe_cache)
+            del probe_cache
+            owner = _GemmaCBRuntimeOwner(
+                prepared_target=prepared_target,
+                scorer=scorer,
+                loaded_scorer=loaded,
+                adapter=adapter,
+                hooks=hooks,
+                cache_factory=cache_factory,
+                cache_topology=topology,
+                sparse_tuning=sparse_tuning,
+                target_id=prepared_target.canonical_target_id,
+                tokenizer_id=f"tokenizer@sha256:{tokenizer_artifact_hash}",
+                scorer_id=(
+                    f"{profile_key.scorer_artifact_id}@sha256:{scorer_artifact_hash}"
+                ),
+                scorer_prefill_step_size=scorer_prefill_step_size,
+                target_prefill_step_size=target_prefill_step_size,
+            )
+            execution_config = SparseCacheExecutionConfig(
+                target_id=owner.target_id,
+                tokenizer_id=owner.tokenizer_id,
+                scorer_id=owner.scorer_id,
+                selector_version=SPECPREFILL_SELECTOR_VERSION,
+                tuning=sparse_tuning,
+            )
+            gemma_batch_config = GemmaSparseBatchConfig(
+                prepared_target,
+                execution_config,
+            )
+            return PreparedMLLMSpecPrefillRuntime(
+                profile_registry=profile_registry,
+                profile_key=profile_key,
+                estimated_residency_bytes=estimated_residency_bytes,
+                session_factory=owner.session_factory,
+                cache_capability=MLLMSpecPrefillCacheCapability(
+                    adapter_id=adapter.adapter_id,
+                    layout=gemma_artifact.artifact_id,
+                    backend="mlx_vlm",
+                    rotating=True,
+                    homogeneous_rows_only=True,
+                ),
+                target_forward_context=owner.target_forward_context,
+                target_model=target_model,
+                processor=processor,
+                target_artifact_hash=target_artifact_hash,
+                tokenizer_artifact_hash=tokenizer_artifact_hash,
+                scorer_artifact_hash=scorer_artifact_hash,
+                cleanup=owner.close,
+                gemma_batch_config=gemma_batch_config,
+                diagnostic=True,
+                advertisable=False,
+            )
+        except BaseException as failure:
+            try:
+                if owner is not None:
+                    owner.close()
+                elif loaded is not None:
+                    loaded.cleanup()
+            except BaseException as cleanup_failure:
+                failure.add_note(
+                    "SpecPrefill preparation cleanup failed: "
+                    f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                )
+                retained = owner.close if owner is not None else loaded.cleanup
+                setattr(failure, "specprefill_retained_cleanup", retained)
+            raise
+
+    return prepare
+
+
 class _QwenCBRuntimeOwner:
     """Mutable lifetime owner captured by immutable prepared-runtime callables."""
 
@@ -347,6 +535,148 @@ class _QwenCBRuntimeOwner:
         self.loaded_scorer = None
         self.hooks = None
         self.target_model = None
+
+    def _require_open(self) -> None:
+        if self.closed:
+            raise SpecPrefillRuntimePreparationError("prepared runtime is closed")
+
+
+class _GemmaCBRuntimeOwner:
+    """Lifetime owner for one exact diagnostic Gemma CB target."""
+
+    def __init__(
+        self,
+        *,
+        prepared_target: Any,
+        scorer: SpecPrefillScorer,
+        loaded_scorer: LoadedSpecPrefillScorer,
+        adapter: Any,
+        hooks: TargetPositionHooks,
+        cache_factory: TargetCacheFactory,
+        cache_topology: _GemmaCacheTopology,
+        sparse_tuning: SparsePolicyTuning,
+        target_id: str,
+        tokenizer_id: str,
+        scorer_id: str,
+        scorer_prefill_step_size: int,
+        target_prefill_step_size: int,
+    ) -> None:
+        self.prepared_target = prepared_target
+        self.target_model = prepared_target.text_model
+        self.scorer = scorer
+        self.loaded_scorer = loaded_scorer
+        self.adapter = adapter
+        self.hooks = hooks
+        self.cache_factory = cache_factory
+        self.cache_topology = cache_topology
+        self.sparse_tuning = sparse_tuning
+        self.target_id = target_id
+        self.tokenizer_id = tokenizer_id
+        self.scorer_id = scorer_id
+        self.scorer_prefill_step_size = scorer_prefill_step_size
+        self.target_prefill_step_size = target_prefill_step_size
+        self.closed = False
+
+    def session_factory(
+        self,
+        request: Any,
+        tokens: tuple[int, ...],
+        config: CooperativeSpecPrefillConfig,
+    ) -> MLLMSpecPrefillAdmission:
+        self._require_open()
+        expected_tail = self.prepared_target.artifact.sliding_window
+        actual_tail = (
+            None
+            if config.rotating_tail_requirement is None
+            else config.rotating_tail_requirement.window_tokens
+        )
+        if (
+            config.tuning != self.sparse_tuning
+            or config.target_id != self.target_id
+            or config.tokenizer_id != self.tokenizer_id
+            or config.scorer_id != self.scorer_id
+            or actual_tail != expected_tail
+        ):
+            raise SpecPrefillRuntimePreparationError(
+                "request artifacts/tuning/tail do not match prepared Gemma profile"
+            )
+        scorer_session = SpecPrefillScorerSession(
+            self.scorer,
+            tokens,
+            prefill_step_size=self.scorer_prefill_step_size,
+        )
+
+        def target_factory(selected_tokens, sparse_state):
+            self._require_open()
+            return SparseTargetPrefillSession(
+                self.target_model,
+                selected_tokens,
+                self._fresh_target_cache(),
+                sparse_state,
+                self.adapter,
+                step_size=self.target_prefill_step_size,
+            )
+
+        return MLLMSpecPrefillAdmission(
+            CooperativeSpecPrefillSession(
+                request.request_id,
+                tokens,
+                scorer_session,
+                target_factory,
+                config,
+            )
+        )
+
+    def target_forward_context(self, forward: Any):
+        self._require_open()
+        if forward.phase is not MLLMTargetForwardPhase.DECODE:
+            raise SpecPrefillRuntimePreparationError(
+                "prepared target context supports decode only"
+            )
+        rows = tuple(forward.sparse_row_states)
+        if not rows or all(row is None for row in rows):
+            return nullcontext()
+        if any(row is None for row in rows):
+            raise SpecPrefillRuntimePreparationError(
+                "sparse and dense rows cannot share target forward context"
+            )
+        logical_positions = {
+            row.next_logical_position for row in rows if row is not None
+        }
+        physical_lengths = {
+            row.physical_valid_length for row in rows if row is not None
+        }
+        if len(logical_positions) != 1 or len(physical_lengths) != 1:
+            raise SpecPrefillRuntimePreparationError(
+                "Gemma target context requires homogeneous sparse rows"
+            )
+        state = SparseCacheState(tuple(row.clone() for row in rows if row is not None))
+        return self.hooks.session_for_plan(decode_plan(self.adapter, state))
+
+    def _fresh_target_cache(self) -> Sequence[Any]:
+        cache = self.cache_factory(self.target_model)
+        if not isinstance(cache, Sequence):
+            raise SpecPrefillRuntimePreparationError(
+                "Gemma cache factory must return an ordered cache sequence"
+            )
+        self.prepared_target.validate_cache(cache)
+        validate_aligned_scalar_cache(cache, logical_position=0)
+        if _gemma_cache_topology(cache) != self.cache_topology:
+            raise SpecPrefillRuntimePreparationError(
+                "request Gemma cache topology differs from prepared probe"
+            )
+        return cache
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.loaded_scorer.cleanup()
+        self.closed = True
+        self.scorer = None
+        self.loaded_scorer = None
+        self.hooks = None
+        self.target_model = None
+        self.prepared_target = None
 
     def _require_open(self) -> None:
         if self.closed:
@@ -500,3 +830,20 @@ def _qwen_cache_topology(
             "Qwen CB cache has no physical attention cache owners"
         )
     return _QwenCacheTopology(tuple(entries))
+
+
+def _gemma_cache_topology(cache: Sequence[Any]) -> _GemmaCacheTopology:
+    if not cache or len({id(entry) for entry in cache}) != len(cache):
+        raise SpecPrefillRuntimePreparationError(
+            "Gemma probe cache owners must be non-empty and unaliased"
+        )
+    return _GemmaCacheTopology(
+        tuple(
+            (
+                type(entry),
+                getattr(entry, "max_size", None),
+                getattr(entry, "keep", None),
+            )
+            for entry in cache
+        )
+    )

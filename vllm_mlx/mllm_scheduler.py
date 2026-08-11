@@ -34,6 +34,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tupl
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .mllm_batch_generator import (
+    GemmaSparseBatchConfig,
     MLLMBatchGenerator,
     MLLMBatchRequest,
     MLLMBatchResponse,
@@ -55,6 +56,7 @@ from .specprefill import (
     resolve_specprefill_decision,
 )
 from .specprefill_cache import SparsePolicyTuning
+from .specprefill_selection import RotatingTailRequirement
 from .specprefill_profiles import (
     EMPTY_SPECPREFILL_PROFILE_REGISTRY,
     SpecPrefillCell,
@@ -125,6 +127,7 @@ class MLLMSchedulerConfig:
     specprefill_session_factory: Callable[..., "MLLMSpecPrefillAdmission"] | None = None
     specprefill_target_forward_context: Callable[..., Any] | None = None
     specprefill_cache_capability: "MLLMSpecPrefillCacheCapability" | None = None
+    specprefill_gemma_batch_config: GemmaSparseBatchConfig | None = None
     specprefill_diagnostic: bool = False
     specprefill_advertisable: bool = False
 
@@ -157,6 +160,38 @@ class MLLMSchedulerConfig:
             raise TypeError(
                 "specprefill_cache_capability must be MLLMSpecPrefillCacheCapability"
             )
+        gemma_config = self.specprefill_gemma_batch_config
+        if gemma_config is not None and not isinstance(
+            gemma_config, GemmaSparseBatchConfig
+        ):
+            raise TypeError(
+                "specprefill_gemma_batch_config must be GemmaSparseBatchConfig"
+            )
+        if gemma_config is not None and (
+            not self.specprefill_diagnostic or self.specprefill_advertisable
+        ):
+            raise ValueError(
+                "Gemma CB SpecPrefill is diagnostic and nonadvertisable only"
+            )
+        if gemma_config is not None and self.enable_mtp:
+            raise ValueError("Gemma CB SpecPrefill cannot compose with MTP")
+        if gemma_config is not None and self.enable_prefix_cache:
+            raise ValueError("Gemma CB SpecPrefill cannot compose with prefix cache")
+        if gemma_config is not None and self.max_kv_size > 0:
+            raise ValueError(
+                "Gemma CB SpecPrefill uses model-owned rotating cache geometry"
+            )
+        if gemma_config is not None and (
+            capability is None
+            or capability.layout
+            != gemma_config.attestation.artifact.artifact_id
+            or capability.backend != "mlx_vlm"
+            or not capability.rotating
+            or not capability.homogeneous_rows_only
+        ):
+            raise ValueError(
+                "Gemma CB SpecPrefill requires exact rotating mlx-vlm capability"
+            )
         if key is not None and capability is not None and (
             capability.adapter_id != key.adapter_id
         ):
@@ -187,6 +222,9 @@ class MLLMSpecPrefillCacheCapability:
 
     adapter_id: str
     layout: str
+    backend: str = "mlx_lm"
+    rotating: bool = False
+    homogeneous_rows_only: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.adapter_id, str) or not self.adapter_id.strip():
@@ -196,8 +234,17 @@ class MLLMSpecPrefillCacheCapability:
             "gemma4_dense",
             "gemma4_a4b",
             "mixed_rotating",
+            "gemma4-e2b",
+            "gemma4-31b",
+            "gemma4-26b-a4b",
         }:
             raise ValueError("unknown SpecPrefill cache capability layout")
+        if self.backend not in {"mlx_lm", "mlx_vlm"}:
+            raise ValueError("unknown SpecPrefill cache capability backend")
+        if not isinstance(self.rotating, bool):
+            raise TypeError("SpecPrefill rotating capability must be bool")
+        if not isinstance(self.homogeneous_rows_only, bool):
+            raise TypeError("SpecPrefill homogeneous_rows_only must be bool")
 
 
 @dataclass(frozen=True)
@@ -476,6 +523,14 @@ class MLLMScheduler:
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
                 target_forward_context=self.config.specprefill_target_forward_context,
+                expected_sparse_execution_config=(
+                    self.config.specprefill_gemma_batch_config.execution_config
+                    if self.config.specprefill_gemma_batch_config is not None
+                    else None
+                ),
+                expected_gemma_sparse_config=(
+                    self.config.specprefill_gemma_batch_config
+                ),
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -793,10 +848,25 @@ class MLLMScheduler:
             return None, "residency_estimate_unavailable"
         if capability is None:
             return None, "cache_capability_unavailable"
-        if (
-            capability.adapter_id != key.adapter_id
-            or capability.layout != "qwen3_5_nonrotating_hybrid"
-        ):
+        gemma_config = self.config.specprefill_gemma_batch_config
+        qwen_capability = (
+            capability.adapter_id == key.adapter_id
+            and capability.layout == "qwen3_5_nonrotating_hybrid"
+            and capability.backend == "mlx_lm"
+            and not capability.rotating
+            and gemma_config is None
+        )
+        gemma_capability = (
+            gemma_config is not None
+            and capability.adapter_id == key.adapter_id
+            and capability.layout == gemma_config.attestation.artifact.artifact_id
+            and capability.backend == "mlx_vlm"
+            and capability.rotating
+            and capability.homogeneous_rows_only
+            and gemma_config.execution_config.target_id
+            == f"{key.target_artifact_id}@sha256:{key.target_artifact_hash}"
+        )
+        if not (qwen_capability or gemma_capability):
             return None, "cache_capability_unsupported"
         if self.config.specprefill_session_factory is None:
             return None, "cooperative_session_factory_unavailable"
@@ -830,6 +900,13 @@ class MLLMScheduler:
                     chunk_size=tuning.chunk_size,
                 ),
                 control_token_indices=request.specprefill_control_token_indices,
+                rotating_tail_requirement=(
+                    RotatingTailRequirement(
+                        gemma_config.attestation.artifact.sliding_window
+                    )
+                    if gemma_capability
+                    else None
+                ),
             ),
             None,
         )
