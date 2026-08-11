@@ -6,21 +6,29 @@ from types import SimpleNamespace
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from vllm_mlx.specprefill import (
     ARCHITECTURE_ADAPTERS,
+    GEMMA4_ADAPTER,
+    QWEN_HYBRID_ADAPTER,
     SPECPREFILL_SELECTOR_VERSION,
+    Gemma4Variant,
     SpecPrefillCoverage,
     SpecPrefillPolicy,
     _AttentionCapture,
     _build_layer_to_cache_map,
     _gemma4_extract_queries,
     _qwen_extract_queries,
+    _qwen35_extract_queries,
     build_selection_plan,
+    resolve_gemma4_layout,
     resolve_specprefill_adapter,
     resolve_specprefill_decision,
     select_chunks,
+    validate_specprefill_cache_topology,
 )
+from vllm_mlx.specprefill_scorer_session import SpecPrefillScorerSession
 
 
 def test_production_policy_requires_declared_selective_coverage():
@@ -93,6 +101,148 @@ def test_gemma_shared_kv_mapping_compacts_to_unique_owner_caches():
     assert _build_layer_to_cache_map(sparse_model) == {0: 0, 1: 0, 2: 1, 3: 0, 4: 1}
 
 
+def test_gemma_outer_language_model_resolver_keeps_decoder_and_cache_owners():
+    decoder = SimpleNamespace(
+        layers=[
+            SimpleNamespace(layer_type="full_attention"),
+            SimpleNamespace(layer_type="sliding_attention"),
+            SimpleNamespace(layer_type="full_attention"),
+            SimpleNamespace(layer_type="sliding_attention"),
+        ],
+        previous_kvs=(0, 1, 0, 1),
+        config=SimpleNamespace(num_experts=None),
+    )
+    language_model = SimpleNamespace(
+        model=decoder,
+        make_cache=lambda: [KVCache(), RotatingKVCache(16)],
+    )
+    outer = SimpleNamespace(
+        config=SimpleNamespace(model_type="gemma4"), language_model=language_model
+    )
+
+    layout = resolve_gemma4_layout(outer)
+    mapping = GEMMA4_ADAPTER.cache_map_builder(outer)
+
+    assert layout.decoder_model is decoder
+    assert layout.cache_model is language_model
+    assert layout.variant is Gemma4Variant.DENSE
+    assert mapping == {0: 0, 1: 1, 2: 0, 3: 1}
+    cache = language_model.make_cache()
+    validate_specprefill_cache_topology(GEMMA4_ADAPTER, outer, cache, mapping)
+    assert type(cache[mapping[0]]) is KVCache
+    assert type(cache[mapping[1]]) is RotatingKVCache
+    with pytest.raises(ValueError, match="full_attention owner 0 requires KVCache"):
+        validate_specprefill_cache_topology(
+            GEMMA4_ADAPTER,
+            outer,
+            [RotatingKVCache(16), KVCache()],
+            mapping,
+        )
+
+
+def test_gemma_outer_wrapper_scorer_session_uses_language_owner_compact_cache():
+    class Attention:
+        n_heads = 1
+
+        def __call__(self, x, mask=None, cache=None):
+            del mask, cache
+            return x
+
+    class Outer:
+        def __init__(self):
+            decoder = SimpleNamespace(
+                layers=[
+                    SimpleNamespace(self_attn=Attention(), layer_type="full_attention")
+                ],
+                previous_kvs=(0,),
+                config=SimpleNamespace(num_experts=None),
+            )
+            self.config = SimpleNamespace(model_type="gemma4")
+            self.language_model = SimpleNamespace(
+                model=decoder, make_cache=lambda: [KVCache()]
+            )
+
+    outer = Outer()
+    from vllm_mlx.specprefill import SpecPrefillScorer
+
+    scorer = SpecPrefillScorer.for_model(outer)
+    session = SpecPrefillScorerSession(scorer, [1], n_lookahead=1)
+
+    assert scorer.decoder_model is outer.language_model.model
+    assert scorer.cache_model is outer.language_model
+    assert len(session.cache) == 1
+
+
+def test_gemma_a4b_zero_shared_kv_is_identity_topology_not_shared_owner_guessing():
+    decoder = SimpleNamespace(
+        layers=[
+            SimpleNamespace(layer_type="full_attention"),
+            SimpleNamespace(layer_type="sliding_attention"),
+            SimpleNamespace(layer_type="full_attention"),
+        ],
+        previous_kvs=(0, 1, 2),
+        config=SimpleNamespace(num_experts=128),
+    )
+    wrapper = SimpleNamespace(
+        config=SimpleNamespace(model_type="gemma4"),
+        model=decoder,
+        make_cache=lambda: [KVCache(), RotatingKVCache(16), KVCache()],
+    )
+
+    layout = resolve_gemma4_layout(wrapper)
+    mapping = GEMMA4_ADAPTER.cache_map_builder(wrapper)
+
+    assert layout.variant is Gemma4Variant.A4B
+    assert mapping == {0: 0, 1: 1, 2: 2}
+    validate_specprefill_cache_topology(
+        GEMMA4_ADAPTER, wrapper, wrapper.make_cache(), mapping
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous_kvs", "message"),
+    [((0, 3), "Invalid Gemma 4 KV owner"), ((1, 0), "must precede")],
+)
+def test_gemma_owner_topology_fails_closed_before_cache_use(previous_kvs, message):
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="gemma4"),
+        layers=[object(), object()],
+        previous_kvs=previous_kvs,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        resolve_gemma4_layout(model)
+
+
+def test_cache_topology_rejects_wrong_cache_length_and_out_of_bounds_mapping():
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="gemma4"),
+        layers=[object(), object()],
+        previous_kvs=(0, 0),
+    )
+    mapping = {0: 0, 1: 0}
+    with pytest.raises(ValueError, match="has 2 entries; expected 1"):
+        validate_specprefill_cache_topology(
+            GEMMA4_ADAPTER, model, [object(), object()], mapping
+        )
+    with pytest.raises(ValueError, match="out of bounds"):
+        validate_specprefill_cache_topology(GEMMA4_ADAPTER, model, [object()], {0: 1})
+
+
+def test_qwen_hybrid_requires_one_cache_entry_per_decoder_layer():
+    model = SimpleNamespace(layers=[object(), object(), object()])
+    mapping = QWEN_HYBRID_ADAPTER.cache_map_builder(model)
+
+    assert mapping == {0: 0, 1: 1, 2: 2}
+    validate_specprefill_cache_topology(
+        QWEN_HYBRID_ADAPTER, model, [object()] * 3, mapping
+    )
+    with pytest.raises(ValueError, match="has 2 entries; expected 3"):
+        validate_specprefill_cache_topology(
+            QWEN_HYBRID_ADAPTER, model, [object(), object()], mapping
+        )
+
+
 def test_capture_preserves_shared_kv_offset_arguments():
     recorded = []
 
@@ -140,6 +290,33 @@ def test_explicit_qwen_and_gemma_extractors_apply_normalization_and_offset():
         actual = extractor(Attention(), x, cache=cache)
         mx.eval(actual)
         assert actual.tolist() == expected.tolist()
+
+
+def test_qwen_hybrid_extractor_keeps_gated_projection_and_q_norm_contract():
+    class Norm:
+        def __call__(self, x):
+            return x * 3
+
+    class Rope:
+        def __call__(self, x, offset=0):
+            return x + offset
+
+    class Attention:
+        num_attention_heads = 2
+        q_norm = Norm()
+        rope = Rope()
+
+        def q_proj(self, x):
+            B, L, _ = x.shape
+            queries = x.reshape(B, L, 2, 4)
+            gates = queries + 100
+            return mx.concatenate((queries, gates), axis=-1).reshape(B, L, -1)
+
+    x = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8)
+    actual = _qwen35_extract_queries(Attention(), x, cache=SimpleNamespace(offset=7))
+    expected = x.reshape(1, 2, 2, 4).transpose(0, 2, 1, 3) * 3 + 7
+    mx.eval(actual, expected)
+    assert actual.tolist() == expected.tolist()
 
 
 def test_hybrid_selector_retains_importance_halo_anchors_and_backbone():

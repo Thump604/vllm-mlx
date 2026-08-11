@@ -39,7 +39,6 @@ Reference: arxiv.org/abs/2502.02789 (SpecPrefill: Speculative Prefilling)
 """
 
 import functools
-import hashlib
 import inspect
 import math
 import threading
@@ -47,13 +46,20 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import mlx.core as mx
 
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_sampler
 
-SPECPREFILL_SELECTOR_VERSION = "hybrid-chunk-v1"
+from vllm_mlx.specprefill_selection import (
+    SPECPREFILL_SELECTOR_VERSION,  # noqa: F401 - re-exported public identity
+    RotatingTailRequirement,
+    SelectionPlan,
+    SelectionPolicy,
+    build_selection_plan_from_chunk_scores,
+)
 
 
 class SpecPrefillPolicy(str, Enum):
@@ -74,79 +80,6 @@ class SpecPrefillCoverage(str, Enum):
 
 class SpecPrefillScorerLaneBusy(RuntimeError):
     """Another bounded request currently owns the scorer lane."""
-
-
-@dataclass(frozen=True)
-class SelectionPlan:
-    """Deterministic sparse-token selection for one prompt.
-
-    Indices and chunk IDs are immutable host values so the plan may safely be
-    retained in request telemetry or used as a cache fingerprint. Execution
-    converts ``selected_indices`` to an MLX array at the boundary.
-    """
-
-    prompt_length: int
-    chunk_size: int
-    keep_pct: float
-    selected_chunks: tuple[int, ...]
-    selected_indices: tuple[int, ...]
-    selector_version: str = SPECPREFILL_SELECTOR_VERSION
-    importance_chunks: tuple[int, ...] = ()
-    backbone_chunks: tuple[int, ...] = ()
-    anchor_chunks: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.prompt_length <= 0:
-            raise ValueError("prompt_length must be positive")
-        if self.chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        if not 0 < self.keep_pct <= 1:
-            raise ValueError("keep_pct must be in (0, 1]")
-        if tuple(sorted(set(self.selected_chunks))) != self.selected_chunks:
-            raise ValueError("selected_chunks must be sorted and unique")
-        if tuple(sorted(set(self.selected_indices))) != self.selected_indices:
-            raise ValueError("selected_indices must be sorted and unique")
-        if not self.selected_indices:
-            raise ValueError("SelectionPlan must retain at least one token")
-        if (
-            self.selected_indices[0] < 0
-            or self.selected_indices[-1] >= self.prompt_length
-        ):
-            raise ValueError("selected_indices are outside the prompt")
-
-        expected = tuple(
-            token
-            for chunk in self.selected_chunks
-            for token in range(
-                chunk * self.chunk_size,
-                min((chunk + 1) * self.chunk_size, self.prompt_length),
-            )
-        )
-        if expected != self.selected_indices:
-            raise ValueError("selected_indices must contain complete selected chunks")
-
-    @property
-    def selected_token_count(self) -> int:
-        return len(self.selected_indices)
-
-    @property
-    def fingerprint(self) -> str:
-        """Stable semantic identity for exact sparse-cache reuse."""
-        fields = (
-            self.selector_version,
-            str(self.prompt_length),
-            str(self.chunk_size),
-            self.keep_pct.hex(),
-            ",".join(map(str, self.selected_chunks)),
-            ",".join(map(str, self.importance_chunks)),
-            ",".join(map(str, self.backbone_chunks)),
-            ",".join(map(str, self.anchor_chunks)),
-        )
-        return hashlib.sha256("|".join(fields).encode("ascii")).hexdigest()
-
-    def as_mx_indices(self) -> mx.array:
-        """Return executor-ready indices without changing the immutable plan."""
-        return mx.array(self.selected_indices, dtype=mx.int32)
 
 
 @dataclass(frozen=True)
@@ -176,6 +109,29 @@ class SpecPrefillArchitectureAdapter:
     model_types: tuple[str, ...]
     query_extractor: Callable[..., mx.array]
     cache_map_builder: Callable[[Any], dict[int, int]]
+
+
+class Gemma4Variant(str, Enum):
+    """Gemma 4 text topology classes supported by the scorer."""
+
+    DENSE = "dense"
+    A4B = "a4b"
+
+
+@dataclass(frozen=True)
+class Gemma4Layout:
+    """Known Gemma wrapper resolution, never an arbitrary attribute walk.
+
+    ``execution_model`` is the object the caller forwards through.  The scorer
+    installs captures on ``decoder_model`` and asks ``cache_model`` to make the
+    compact owner cache.  These are distinct for the Gemma VLM outer wrapper.
+    """
+
+    execution_model: Any
+    decoder_model: Any
+    cache_model: Any
+    previous_kvs: tuple[int, ...]
+    variant: Gemma4Variant
 
 
 def resolve_specprefill_decision(
@@ -606,12 +562,13 @@ class SpecPrefillScorer:
     def __init__(self, model):
         self._model_ref = weakref.ref(model)
         self.adapter = resolve_specprefill_adapter(model)
+        self._decoder_model = _scorer_decoder_model(model, self.adapter)
         self._session_lock = threading.Lock()
         self._quantum_lock = threading.Lock()
         self._active_session = None
         self._session_context = threading.local()
 
-        attention_layers = _find_attention_layers(model)
+        attention_layers = _find_attention_layers(self._decoder_model)
         if not attention_layers:
             raise ValueError("SpecPrefill scorer model has no attention layers")
         attentions = [
@@ -651,11 +608,19 @@ class SpecPrefillScorer:
         return model
 
     @property
+    def decoder_model(self):
+        return self._decoder_model
+
+    @property
+    def cache_model(self):
+        return _scorer_cache_model(self.model, self.adapter)
+
+    @property
     def capture_active(self) -> bool:
         return self._active_session is not None
 
     def _verify_installed(self):
-        model = self.model
+        model = self.decoder_model
         for buffer_index, (layer_idx, attention) in enumerate(
             self._installed_attentions
         ):
@@ -1021,32 +986,6 @@ def _chunk_scores(importance, chunk_size: int) -> tuple[int, list[float]]:
     return prompt_length, scores
 
 
-def _stratified_chunks(n_chunks: int, count: int) -> tuple[int, ...]:
-    """Select stable center-of-stratum representatives across a prompt."""
-    if count <= 0:
-        return ()
-    if count >= n_chunks:
-        return tuple(range(n_chunks))
-    selected = {
-        min(n_chunks - 1, int((index + 0.5) * n_chunks / count))
-        for index in range(count)
-    }
-    for candidate in range(n_chunks):
-        if len(selected) >= count:
-            break
-        selected.add(candidate)
-    return tuple(sorted(selected))
-
-
-def _anchor_chunk_ids(n_chunks: int, count: int) -> tuple[int, ...]:
-    if count <= 0:
-        return ()
-    count = min(count, n_chunks)
-    anchors = set(range(count))
-    anchors.update(range(max(0, n_chunks - count), n_chunks))
-    return tuple(sorted(anchors))
-
-
 def build_selection_plan(
     importance,
     keep_pct: float = 0.3,
@@ -1055,6 +994,8 @@ def build_selection_plan(
     *,
     halo_chunks: int = 1,
     anchor_chunks: int = 1,
+    control_token_indices: tuple[int, ...] = (),
+    rotating_tail_requirement: RotatingTailRequirement | None = None,
 ) -> SelectionPlan:
     """Build a deterministic, versioned hybrid sparse-prefill plan.
 
@@ -1063,81 +1004,20 @@ def build_selection_plan(
     context around a selected chunk. All chunk means are calculated on device
     before one O(chunks) host ranking operation.
     """
-    if not 0 < keep_pct <= 1:
-        raise ValueError("keep_pct must be in (0, 1]")
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive")
-    if not 0 <= backbone_pct <= 1:
-        raise ValueError("backbone_pct must be in [0, 1]")
-    if halo_chunks < 0 or anchor_chunks < 0:
-        raise ValueError("halo_chunks and anchor_chunks must be non-negative")
-
     prompt_length, scores = _chunk_scores(importance, chunk_size)
-    n_chunks = len(scores)
-    ranked = tuple(sorted(range(n_chunks), key=lambda chunk: (-scores[chunk], chunk)))
-    desired_chunks = max(1, math.ceil(n_chunks * keep_pct))
-    desired_tokens = max(1, math.ceil(prompt_length * keep_pct))
-    anchors = _anchor_chunk_ids(n_chunks, anchor_chunks)
-    backbone = _stratified_chunks(n_chunks, math.ceil(n_chunks * backbone_pct))
-    selected = set(anchors)
-    selected.update(backbone)
-    # Anchors are a quality floor, not a substitute for importance-ranked
-    # evidence. They may exceed the retention budget on very short prompts.
-    importance_budget = max(1, desired_chunks - len(backbone))
-    chunk_budget = min(n_chunks, desired_chunks + len(anchors))
-    importance_seeds: list[int] = []
-
-    def selected_token_count() -> int:
-        return sum(
-            min(chunk_size, prompt_length - chunk * chunk_size) for chunk in selected
-        )
-
-    for seed in ranked:
-        if (
-            len(importance_seeds) >= importance_budget
-            and selected_token_count() >= desired_tokens
-        ):
-            break
-        importance_seeds.append(seed)
-        candidates = [seed]
-        for distance in range(1, halo_chunks + 1):
-            candidates.extend((seed - distance, seed + distance))
-        for candidate in candidates:
-            if not 0 <= candidate < n_chunks or (
-                len(selected) >= chunk_budget and candidate not in selected
-            ):
-                continue
-            selected.add(candidate)
-
-    # A partial last chunk can meet a chunk budget without meeting the token
-    # retention target; fill deterministically until both are satisfied.
-    for candidate in ranked:
-        if len(selected) >= chunk_budget and selected_token_count() >= desired_tokens:
-            break
-        if (
-            selected_token_count() < desired_tokens
-            or len(selected) < chunk_budget
-            or candidate in selected
-        ):
-            selected.add(candidate)
-
-    selected_chunks = tuple(sorted(selected))
-    selected_indices = tuple(
-        token
-        for chunk in selected_chunks
-        for token in range(
-            chunk * chunk_size, min((chunk + 1) * chunk_size, prompt_length)
-        )
-    )
-    return SelectionPlan(
-        prompt_length=prompt_length,
-        chunk_size=chunk_size,
+    policy = SelectionPolicy(
         keep_pct=keep_pct,
-        selected_chunks=selected_chunks,
-        selected_indices=selected_indices,
-        importance_chunks=tuple(importance_seeds),
-        backbone_chunks=backbone,
-        anchor_chunks=anchors,
+        backbone_pct=backbone_pct,
+        halo_chunks=halo_chunks,
+        anchor_chunks=anchor_chunks,
+        chunk_size=chunk_size,
+    )
+    return build_selection_plan_from_chunk_scores(
+        prompt_length=prompt_length,
+        chunk_scores=scores,
+        policy=policy,
+        control_token_indices=control_token_indices,
+        rotating_tail_requirement=rotating_tail_requirement,
     )
 
 
@@ -1149,16 +1029,21 @@ def select_chunks(
     *,
     halo_chunks=1,
     anchor_chunks=1,
+    control_token_indices=(),
+    rotating_tail_requirement=None,
 ):
     """Return executor-ready indices from :func:`build_selection_plan`."""
-    return build_selection_plan(
+    plan = build_selection_plan(
         importance,
         keep_pct=keep_pct,
         chunk_size=chunk_size,
         backbone_pct=backbone_pct,
         halo_chunks=halo_chunks,
         anchor_chunks=anchor_chunks,
-    ).as_mx_indices()
+        control_token_indices=control_token_indices,
+        rotating_tail_requirement=rotating_tail_requirement,
+    )
+    return mx.array(plan.selected_indices, dtype=mx.int32)
 
 
 # ===========================================================================
@@ -1374,6 +1259,106 @@ def _get_model_type(model) -> str:
     return ""
 
 
+def _has_gemma4_decoder_contract(candidate: Any) -> bool:
+    """Identify a Gemma text decoder without accepting arbitrary wrappers."""
+    return (
+        candidate is not None
+        and hasattr(candidate, "layers")
+        and getattr(candidate, "previous_kvs", None) is not None
+    )
+
+
+def _gemma4_variant(decoder_model: Any) -> Gemma4Variant:
+    """Classify installed Gemma dense and A4B text contracts explicitly."""
+    config = getattr(decoder_model, "config", None)
+    if config is None or not hasattr(config, "num_experts"):
+        config = getattr(getattr(decoder_model, "model", None), "config", None)
+    experts = getattr(config, "num_experts", None)
+    if isinstance(experts, bool) or not isinstance(experts, int) or experts <= 0:
+        return Gemma4Variant.DENSE
+    return Gemma4Variant.A4B
+
+
+def resolve_gemma4_layout(model: Any) -> Gemma4Layout:
+    """Resolve only observed mlx-lm/mlx-vlm Gemma text ownership layouts.
+
+    Supported paths are the direct text decoder, the mlx-lm text wrapper's
+    ``.model``, the extracted text wrapper's ``.model.previous_kvs``, and the
+    mlx-vlm outer wrapper's ``.language_model.model``. Any other shape is
+    rejected rather than guessed: cache ownership is a correctness contract,
+    not a convenience traversal.
+    """
+    decoder_model = None
+    cache_model = None
+    previous_kvs = None
+    if _has_gemma4_decoder_contract(model):
+        decoder_model = model
+        cache_model = model
+        previous_kvs = model.previous_kvs
+    elif _has_gemma4_decoder_contract(getattr(model, "model", None)):
+        decoder_model = model.model
+        cache_model = model
+        previous_kvs = model.model.previous_kvs
+    elif (
+        hasattr(model, "layers")
+        and getattr(getattr(model, "model", None), "previous_kvs", None) is not None
+    ):
+        # mlx-vlm's extracted text route can expose decoder layers on the
+        # wrapper while retaining shared-KV ownership on ``.model``.
+        decoder_model = model
+        cache_model = model
+        previous_kvs = model.model.previous_kvs
+    else:
+        language_model = getattr(model, "language_model", None)
+        language_decoder = getattr(language_model, "model", None)
+        if _has_gemma4_decoder_contract(language_decoder):
+            decoder_model = language_decoder
+            cache_model = language_model
+            previous_kvs = language_decoder.previous_kvs
+    if decoder_model is None or cache_model is None or previous_kvs is None:
+        raise ValueError(
+            "Unsupported Gemma 4 wrapper; expected direct decoder, .model, "
+            "or .language_model.model cache ownership"
+        )
+
+    layers = tuple(decoder_model.layers)
+    previous_kvs = tuple(previous_kvs)
+    if not layers or len(previous_kvs) != len(layers):
+        raise ValueError("Gemma 4 previous_kvs must cover every decoder layer")
+    for layer_idx, owner_idx in enumerate(previous_kvs):
+        if isinstance(owner_idx, bool) or not isinstance(owner_idx, int):
+            raise ValueError("Gemma 4 previous_kvs entries must be integers")
+        if not 0 <= owner_idx < len(layers):
+            raise ValueError(
+                f"Invalid Gemma 4 KV owner {owner_idx!r} for layer {layer_idx}"
+            )
+        if owner_idx > layer_idx:
+            raise ValueError(
+                f"Gemma 4 KV owner {owner_idx} must precede layer {layer_idx}"
+            )
+    return Gemma4Layout(
+        execution_model=model,
+        decoder_model=decoder_model,
+        cache_model=cache_model,
+        previous_kvs=previous_kvs,
+        variant=_gemma4_variant(decoder_model),
+    )
+
+
+def _scorer_decoder_model(model: Any, adapter: SpecPrefillArchitectureAdapter) -> Any:
+    """Return the child that owns decoder attention instances for capture."""
+    if adapter is GEMMA4_ADAPTER:
+        return resolve_gemma4_layout(model).decoder_model
+    return model
+
+
+def _scorer_cache_model(model: Any, adapter: SpecPrefillArchitectureAdapter) -> Any:
+    """Return the model responsible for constructing the forward's KV cache."""
+    if adapter is GEMMA4_ADAPTER:
+        return resolve_gemma4_layout(model).cache_model
+    return model
+
+
 def _standard_layer_to_cache_map(model) -> dict[int, int]:
     """Map standard decoder layers to one cache entry each."""
     return {index: index for index in range(len(model.layers))}
@@ -1386,25 +1371,11 @@ def _gemma4_shared_kv_cache_map(model) -> dict[int, int]:
     not one entry per decoder layer. ``previous_kvs`` contains decoder-layer
     owners, so map first-seen owners to their compact cache-list indices.
     """
-    inner_model = getattr(model, "model", None)
-    previous_kvs = getattr(model, "previous_kvs", None)
-    if previous_kvs is None and inner_model is not None:
-        previous_kvs = getattr(inner_model, "previous_kvs", None)
-    if previous_kvs is None:
-        raise ValueError("Gemma 4 model is missing previous_kvs cache ownership")
-    if len(previous_kvs) != len(model.layers):
-        raise ValueError("Gemma 4 previous_kvs must cover every decoder layer")
+    layout = resolve_gemma4_layout(model)
+    previous_kvs = layout.previous_kvs
     owner_to_cache: dict[int, int] = {}
     mapping: dict[int, int] = {}
     for layer_idx, owner_idx in enumerate(previous_kvs):
-        if not isinstance(owner_idx, int) or not 0 <= owner_idx < len(model.layers):
-            raise ValueError(
-                f"Invalid Gemma 4 KV owner {owner_idx!r} for layer {layer_idx}"
-            )
-        if owner_idx > layer_idx:
-            raise ValueError(
-                f"Gemma 4 KV owner {owner_idx} must precede layer {layer_idx}"
-            )
         if owner_idx not in owner_to_cache:
             owner_to_cache[owner_idx] = len(owner_to_cache)
         mapping[layer_idx] = owner_to_cache[owner_idx]
@@ -1414,6 +1385,85 @@ def _gemma4_shared_kv_cache_map(model) -> dict[int, int]:
 def _hybrid_layer_to_cache_map(model) -> dict[int, int]:
     """Map Qwen3.5/3.6's mixed linear/attention stack to cache slots."""
     return _standard_layer_to_cache_map(model)
+
+
+def validate_specprefill_cache_topology(
+    adapter: SpecPrefillArchitectureAdapter,
+    model: Any,
+    cache: Sequence[Any],
+    layer_to_cache: dict[int, int],
+    *,
+    attention_layer_indices: Sequence[int] = (),
+) -> None:
+    """Fail closed if a real prompt cache disagrees with its adapter topology."""
+    if adapter is GEMMA4_ADAPTER:
+        layout = resolve_gemma4_layout(model)
+        layers = tuple(layout.decoder_model.layers)
+        layer_count = len(layers)
+        expected_cache_count = len(set(layout.previous_kvs))
+    elif adapter is QWEN_HYBRID_ADAPTER:
+        layer_count = len(model.layers)
+        expected_cache_count = layer_count
+    else:
+        return
+
+    if len(cache) != expected_cache_count:
+        raise ValueError(
+            f"{adapter.name} prompt cache has {len(cache)} entries; expected "
+            f"{expected_cache_count} from its decoder topology"
+        )
+    expected_layers = (
+        tuple(attention_layer_indices)
+        if attention_layer_indices
+        else tuple(range(layer_count))
+    )
+    for layer_idx in expected_layers:
+        cache_idx = layer_to_cache.get(layer_idx)
+        if cache_idx is None:
+            raise ValueError(
+                f"{adapter.name} cache map has no entry for decoder layer {layer_idx}"
+            )
+        if isinstance(cache_idx, bool) or not isinstance(cache_idx, int):
+            raise ValueError(f"{adapter.name} cache index must be a host integer")
+        if not 0 <= cache_idx < len(cache):
+            raise ValueError(
+                f"{adapter.name} cache index {cache_idx} is out of bounds for "
+                f"decoder layer {layer_idx}"
+            )
+
+    if adapter is not GEMMA4_ADAPTER:
+        return
+
+    owner_to_cache: dict[int, int] = {}
+    for layer_idx, owner_idx in enumerate(layout.previous_kvs):
+        expected_cache_idx = owner_to_cache.setdefault(owner_idx, len(owner_to_cache))
+        actual_cache_idx = layer_to_cache.get(layer_idx)
+        if actual_cache_idx != expected_cache_idx:
+            raise ValueError(
+                "gemma4-shared-kv cache map disagrees with compact KV owner "
+                f"{owner_idx} for decoder layer {layer_idx}"
+            )
+        layer_type = getattr(layers[layer_idx], "layer_type", None)
+        owner_type = getattr(layers[owner_idx], "layer_type", None)
+        if layer_type not in ("full_attention", "sliding_attention"):
+            raise ValueError(
+                f"Gemma 4 decoder layer {layer_idx} has unknown layer_type "
+                f"{layer_type!r}"
+            )
+        if layer_type != owner_type:
+            raise ValueError(
+                "Gemma 4 shared-KV follower layer_type disagrees with its "
+                f"owner: layer {layer_idx} is {layer_type!r}, owner {owner_idx} "
+                f"is {owner_type!r}"
+            )
+        cache_entry = cache[expected_cache_idx]
+        expected_type = KVCache if layer_type == "full_attention" else RotatingKVCache
+        if type(cache_entry) is not expected_type:
+            raise ValueError(
+                f"Gemma 4 {layer_type} owner {owner_idx} requires "
+                f"{expected_type.__name__} at compact cache index "
+                f"{expected_cache_idx}, got {type(cache_entry).__name__}"
+            )
 
 
 def _nemotron_h_layer_to_cache_map(model) -> dict[int, int]:
@@ -1495,8 +1545,13 @@ def _build_layer_to_cache_map(model):
     Returns dict {layer_idx: cache_idx}.
     """
     if (
-        getattr(model, "previous_kvs", None) is not None
-        or getattr(getattr(model, "model", None), "previous_kvs", None) is not None
+        _get_model_type(model) in GEMMA4_ADAPTER.model_types
+        or _has_gemma4_decoder_contract(model)
+        or _has_gemma4_decoder_contract(getattr(model, "model", None))
+        or (
+            hasattr(model, "layers")
+            and getattr(getattr(model, "model", None), "previous_kvs", None) is not None
+        )
     ):
         return _gemma4_shared_kv_cache_map(model)
 

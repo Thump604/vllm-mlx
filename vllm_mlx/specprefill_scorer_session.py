@@ -26,7 +26,12 @@ import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import apply_top_p
 
-from .specprefill import SpecPrefillScorer, SpecPrefillScorerLaneBusy, _avg_pool1d
+from .specprefill import (
+    SpecPrefillScorer,
+    SpecPrefillScorerLaneBusy,
+    _avg_pool1d,
+    validate_specprefill_cache_topology,
+)
 
 _MX_ARRAY_TYPE = type(mx.array([0]))
 
@@ -100,8 +105,15 @@ class SpecPrefillScorerSession:
             raise ValueError("prefill_step_size must be a positive integer")
 
         self.scorer = scorer
-        self.cache = make_prompt_cache(scorer.model)
+        self.cache = make_prompt_cache(scorer.cache_model)
         self._layer_to_cache = scorer.adapter.cache_map_builder(scorer.model)
+        validate_specprefill_cache_topology(
+            scorer.adapter,
+            scorer.model,
+            self.cache,
+            self._layer_to_cache,
+            attention_layer_indices=scorer.attention_layer_indices,
+        )
         try:
             for layer_index in scorer.attention_layer_indices:
                 self._layer_to_cache[layer_index]
