@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .specprefill_cache import SparseCacheState, SparseCacheStateError
 
@@ -79,6 +79,11 @@ class TargetPositionAdapter:
     uses_q_norm: bool
     cache_layout: str
     position_id_planes: int = 1
+
+    @property
+    def adapter_id(self) -> str:
+        """Stable profile/cache identity for this exact transport contract."""
+        return self.family.value
 
     def __post_init__(self) -> None:
         if not self.model_types:
@@ -192,6 +197,69 @@ def target_position_adapter(
         raise TargetPositionError(
             f"unsupported target position family {family!r}; supported: {supported}"
         ) from exc
+
+
+def resolve_target_position_adapter(model: Any) -> TargetPositionAdapter:
+    """Resolve a target adapter from a bounded, public model layout.
+
+    This deliberately accepts only the layouts exported by mlx-lm text models
+    and their known VLM wrappers.  It never walks arbitrary attributes: an
+    unrecognised wrapper is not evidence that it preserves the target's
+    position/cache contract and is therefore rejected before sparse work.
+    """
+    outer_config = getattr(model, "config", None) or getattr(model, "args", None)
+    inner = getattr(model, "language_model", None)
+    # mlx-lm Qwen3.5 text ``Model`` also owns ``language_model``.  Only the
+    # concrete mlx-vlm outer topology has a vision tower; treating every text
+    # wrapper as VLM would select M-RoPE IDs for ordinary text attention.
+    is_vlm = inner is not None and getattr(model, "vision_tower", None) is not None
+    target = inner if is_vlm else model
+    config = (
+        getattr(target, "config", None)
+        or getattr(target, "args", None)
+        or _config_value(outer_config, "text_config")
+        or outer_config
+    )
+    model_type = _model_type(config)
+    if model_type in QWEN_DENSE_TARGET.model_types:
+        if is_vlm:
+            raise TargetPositionError(
+                "Qwen3 dense targets do not have a supported VLM layout"
+            )
+        return QWEN_DENSE_TARGET
+    if model_type in QWEN35_TEXT_HYBRID_TARGET.model_types:
+        if not is_vlm:
+            return QWEN35_TEXT_HYBRID_TARGET
+        return (
+            QWEN35_VLM_MOE_TARGET
+            if model_type == "qwen3_5_moe"
+            else QWEN35_VLM_HYBRID_TARGET
+        )
+    if model_type in GEMMA4_DENSE_TARGET.model_types:
+        if _positive_int(_config_value(config, "num_experts")):
+            return GEMMA4_A4B_TARGET
+        return GEMMA4_DENSE_TARGET
+    raise TargetPositionError(
+        "unsupported target model layout for SpecPrefill logical positions: "
+        f"model_type={model_type!r}"
+    )
+
+
+def _config_value(config: Any, name: str) -> Any:
+    if config is None:
+        return None
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _model_type(config: Any) -> str | None:
+    value = _config_value(config, "model_type")
+    return value.lower() if isinstance(value, str) else None
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 @dataclass(frozen=True)

@@ -7,8 +7,10 @@ performance when serving a single user at a time.
 """
 
 import asyncio
+import copy
 import contextvars
 import hashlib
+import inspect
 import logging
 import os
 import threading
@@ -37,8 +39,23 @@ from ..specprefill import (
     SPECPREFILL_SELECTOR_VERSION,
     SpecPrefillDecision,
     SpecPrefillPolicy,
+    build_selection_plan,
     resolve_specprefill_decision,
 )
+from ..specprefill_cache import (
+    SparseCacheIdentity,
+    SparseCacheState,
+    SparsePolicyTuning,
+)
+from ..specprefill_generation_context import SparseGenerationForwardContext
+from ..specprefill_positions import (
+    TargetPositionAdapter,
+    TargetPositionError,
+    resolve_target_position_adapter,
+)
+from ..specprefill_selection import RotatingTailRequirement, SelectionPlan
+from ..specprefill_target_executor import execute_sparse_target_prefill
+from ..specprefill_target_hooks import TargetPositionHooks
 from ..specprefill_profiles import (
     EMPTY_SPECPREFILL_PROFILE_REGISTRY,
     SpecPrefillCell,
@@ -110,6 +127,82 @@ def _sample_with_processors(
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     tok = sampler(logprobs)
     return tok, logprobs
+
+
+def _new_sparse_detokenizer(tokenizer: Any) -> Any:
+    """Create a request-local mlx-lm-compatible incremental detokenizer."""
+    detokenizer = getattr(tokenizer, "detokenizer", None)
+    for name in ("reset", "add_token", "finalize"):
+        if not callable(getattr(detokenizer, name, None)):
+            raise TargetPositionError(
+                "tokenizer lacks the incremental detokenizer required by sparse decode"
+            )
+    detokenizer.reset()
+    # Access once during admission so a malformed implementation fails before
+    # scorer/RNG state advances.
+    if not isinstance(getattr(detokenizer, "last_segment", None), str):
+        raise TargetPositionError("incremental detokenizer last_segment must be text")
+    return detokenizer
+
+
+def _build_text_tokenizer(processor: Any) -> Any:
+    """Build the mlx-lm tokenizer contract from an mlx-vlm processor.
+
+    mlx-vlm installs the artifact-aware streaming detokenizer on the processor,
+    while ``processor.tokenizer`` is the raw Hugging Face tokenizer.  Dense and
+    sparse text-model generation must receive the same mlx-lm ``TokenizerWrapper``
+    so each request gets an isolated detokenizer with identical token semantics.
+    """
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    raw_tokenizer = getattr(processor, "tokenizer", None)
+    template = getattr(processor, "detokenizer", None)
+    if raw_tokenizer is None or template is None:
+        raise TargetPositionError(
+            "MLLM text routing requires processor.tokenizer and processor.detokenizer"
+        )
+    for name in ("reset", "add_token", "finalize"):
+        if not callable(getattr(template, name, None)):
+            raise TargetPositionError(
+                "MLLM processor detokenizer does not implement streaming semantics"
+            )
+
+    def _detokenizer_factory(_tokenizer):
+        detokenizer = copy.copy(template)
+        detokenizer.reset()
+        return detokenizer
+
+    eos_ids = getattr(processor, "eos_token_ids", None)
+    if eos_ids is None:
+        eos_ids = getattr(raw_tokenizer, "eos_token_ids", None)
+    if eos_ids is None:
+        eos_ids = getattr(raw_tokenizer, "eos_token_id", None)
+    if isinstance(eos_ids, int):
+        eos_ids = (eos_ids,)
+    return TokenizerWrapper(
+        raw_tokenizer,
+        detokenizer_class=_detokenizer_factory,
+        eos_token_ids=eos_ids,
+    )
+
+
+def _detokenize_sparse_token(
+    detokenizer: Any,
+    token: int,
+    eos_ids: frozenset[int],
+    *,
+    terminal: bool,
+) -> tuple[str, bool]:
+    """Detokenize one sampled token while suppressing EOS token text."""
+    is_eos = token in eos_ids
+    if not is_eos:
+        detokenizer.add_token(token)
+    if terminal or is_eos:
+        detokenizer.finalize()
+    segment = detokenizer.last_segment
+    if not isinstance(segment, str):
+        raise TargetPositionError("incremental detokenizer emitted non-text output")
+    return segment, is_eos
 
 
 def _processors_can_retire(processors: list[Any] | None) -> bool:
@@ -541,6 +634,193 @@ class SimpleEngine(BaseEngine):
         )
 
     @staticmethod
+    def _callable_supports_forward_context(callable_obj: Any) -> bool:
+        """Require an explicit mlx-lm continuation seam, never ``**kwargs``.
+
+        Sparse target cache state has different logical and physical lengths.
+        Forwarding it through an unverified compatibility ``**kwargs`` path
+        risks silently dropping the request-local position context.
+        """
+        try:
+            parameters = inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return False
+        return "model_forward_context" in parameters
+
+    def _supports_sparse_continuation(self, continuation: Any) -> bool:
+        """Check every continuation boundary that must retain sparse state."""
+        try:
+            from mlx_lm import stream_generate as mlx_stream_generate
+        except ImportError:
+            return False
+        return self._callable_supports_forward_context(
+            continuation
+        ) and self._callable_supports_forward_context(mlx_stream_generate)
+
+    @staticmethod
+    def _control_token_indices(tokenizer: Any, tokens: list[int]) -> tuple[int, ...]:
+        """Return only tokenizer-declared control-token positions."""
+        candidates: set[int] = set()
+        special = getattr(tokenizer, "all_special_ids", ())
+        if isinstance(special, (list, tuple, set)):
+            candidates.update(
+                value
+                for value in special
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            value = getattr(tokenizer, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                candidates.add(value)
+        return tuple(index for index, token in enumerate(tokens) if token in candidates)
+
+    @staticmethod
+    def _eos_token_ids(tokenizer: Any) -> frozenset[int]:
+        """Normalize single- and multi-EOS tokenizer contracts safely."""
+        values = getattr(tokenizer, "eos_token_ids", None)
+        if not isinstance(values, (list, tuple, set)):
+            values = (getattr(tokenizer, "eos_token_id", None),)
+        return frozenset(
+            value
+            for value in values
+            if isinstance(value, int) and not isinstance(value, bool)
+        )
+
+    @staticmethod
+    def _rotating_tail_requirement(cache: list[Any]) -> RotatingTailRequirement | None:
+        """Preserve the declared tail of every rotating target cache layer."""
+        maxima: list[int] = []
+        for entry in cache:
+            if type(entry).__name__ != "RotatingKVCache":
+                continue
+            maximum = getattr(entry, "max_size", None)
+            if (
+                not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+                or maximum <= 0
+            ):
+                raise TargetPositionError("rotating cache lacks a positive max_size")
+            maxima.append(maximum)
+        return RotatingTailRequirement(max(maxima)) if maxima else None
+
+    def _admit_sparse_target(
+        self, target_model: Any
+    ) -> tuple[SpecPrefillProfileKey, TargetPositionAdapter]:
+        """Resolve artifact/adapter/hook compatibility before scorer work."""
+        profile_key = self._active_specprefill_profile_key(combined_mtp=False)
+        if profile_key is None:
+            raise TargetPositionError("exact sparse cache identity is unavailable")
+        adapter = resolve_target_position_adapter(target_model)
+        if profile_key.adapter_id != adapter.adapter_id:
+            raise TargetPositionError(
+                "qualified profile adapter does not match the target position adapter"
+            )
+        # Installation is topology-preserving and immutable.  Doing it here
+        # guarantees executor admission before scorer/RNG state can advance.
+        TargetPositionHooks.for_model(target_model, adapter)
+        return profile_key, adapter
+
+    def _prepare_sparse_target_prefill(
+        self,
+        *,
+        target_model: Any,
+        tokenizer: Any,
+        tokens: list[int],
+        importance: Any,
+        cache: list[Any],
+        telemetry: _SpecPrefillTelemetry,
+        keep_pct: float,
+        backbone_pct: float,
+        chunk_size: int,
+        halo_chunks: int,
+        anchor_chunks: int,
+        profile_key: SpecPrefillProfileKey,
+        adapter: TargetPositionAdapter,
+        cancel_check: Any | None = None,
+    ) -> tuple[Any, SparseGenerationForwardContext, SelectionPlan]:
+        """Build exact sparse state and run a fresh target prefill atomically.
+
+        This is intentionally the only SimpleEngine entry point to the new
+        executor.  It rejects missing artifact identity and any non-fresh
+        target cache before a sparse token can be emitted.
+        """
+        if not tokens:
+            raise TargetPositionError("SpecPrefill requires a non-empty prompt")
+        if profile_key.adapter_id != adapter.adapter_id:
+            raise TargetPositionError("sparse profile/adapter admission changed")
+        tuning = SparsePolicyTuning(
+            keep_pct=keep_pct,
+            backbone_pct=backbone_pct,
+            halo_chunks=halo_chunks,
+            anchor_chunks=anchor_chunks,
+            chunk_size=chunk_size,
+        )
+        plan = build_selection_plan(
+            importance,
+            keep_pct=keep_pct,
+            backbone_pct=backbone_pct,
+            chunk_size=chunk_size,
+            halo_chunks=halo_chunks,
+            anchor_chunks=anchor_chunks,
+            control_token_indices=tuple(
+                sorted(
+                    set(self._control_token_indices(tokenizer, tokens))
+                    | {0, len(tokens) - 1}
+                )
+            ),
+            rotating_tail_requirement=self._rotating_tail_requirement(cache),
+        )
+        if (
+            plan.selected_indices[0] != 0
+            or plan.selected_indices[-1] != len(tokens) - 1
+        ):
+            raise TargetPositionError(
+                "selection plan must retain the first and final prompt tokens"
+            )
+        if (
+            telemetry.profile_selector_version is not None
+            and telemetry.profile_selector_version != plan.selector_version
+        ):
+            raise TargetPositionError(
+                "calibrated selector version does not match the executed selection plan"
+            )
+        identity = SparseCacheIdentity.from_tokens(
+            target_id=(
+                f"{profile_key.target_artifact_id}@{profile_key.target_artifact_hash}"
+                f"#adapter={adapter.adapter_id}"
+            ),
+            tokenizer_id=f"sha256:{profile_key.tokenizer_artifact_hash}",
+            scorer_id=f"{profile_key.scorer_artifact_id}@{profile_key.scorer_artifact_hash}",
+            selector_version=plan.selector_version,
+            tuning=tuning,
+            tokens=tokens,
+            selection_fingerprint=plan.fingerprint,
+        )
+        sparse_state = SparseCacheState.from_selection(
+            identity,
+            (plan.selected_indices,),
+            (len(tokens),),
+        )
+        result = execute_sparse_target_prefill(
+            target_model,
+            [tokens[index] for index in plan.selected_indices],
+            cache,
+            sparse_state,
+            adapter,
+            step_size=self._prefill_step_size,
+            cancel_check=cancel_check,
+        )
+        telemetry.selected_tokens = result.telemetry.selected_tokens
+        telemetry.target_prefill_ms = result.telemetry.target_prefill_ms
+        return (
+            result,
+            SparseGenerationForwardContext(
+                target_model, cache, result.cache_state, adapter
+            ),
+            plan,
+        )
+
+    @staticmethod
     def _specprefill_dense_fallback(
         decision: SpecPrefillDecision, reason: str | None
     ) -> SpecPrefillDecision:
@@ -832,7 +1112,9 @@ class SimpleEngine(BaseEngine):
                     )
 
                     if self._text_model is not None:
-                        self._text_tokenizer = self._model.get_tokenizer()
+                        self._text_tokenizer = _build_text_tokenizer(
+                            self._model.processor
+                        )
                         self._supports_system_kv_cache = (
                             self._probe_system_kv_cache_support(
                                 self._text_model,
@@ -845,6 +1127,9 @@ class SimpleEngine(BaseEngine):
                             self._text_tokenizer.eos_token = "<|im_end|>"
                             self._text_tokenizer.eos_token_id = (
                                 self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                            )
+                            self._text_tokenizer.eos_token_ids = (
+                                self._text_tokenizer.eos_token_id,
                             )
 
                         # Probe the derived TextModel's prompt cache for snapshot-safety
@@ -1252,6 +1537,21 @@ class SimpleEngine(BaseEngine):
         # SpecPrefill is independent from MTP. The direct path is used only
         # for non-MLLM requests; the MLLM text route resolves the same contract
         # in _stream_generate_text.
+        if (
+            not self._is_mllm
+            and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
+            and max_tokens <= 0
+        ):
+            telemetry.fallback("sparse_no_completion_requested")
+        if (
+            not self._is_mllm
+            and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
+            and self._mtp
+        ):
+            # Sparse-only is independently qualified first. Native/external
+            # MTP composition cannot borrow this cache/position state yet.
+            telemetry.fallback("mtp_composition_not_implemented")
+
         if (
             not self._is_mllm
             and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
@@ -2251,7 +2551,7 @@ class SimpleEngine(BaseEngine):
         specprefill_anchor_chunks: int | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
-        """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
+        """Sparse-only path using request-local target position transport.
 
         Scores token importance with the draft model, sparse-prefills the target
         model, then generates autoregressively. Falls back to normal generation
@@ -2282,6 +2582,7 @@ class SimpleEngine(BaseEngine):
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         sparse_output_committed = False
+        sparse_decode_transaction_started = False
 
         def _emit_response(resp: Any) -> None:
             if not cancel_requested.is_set():
@@ -2306,7 +2607,7 @@ class SimpleEngine(BaseEngine):
             except _SpecPrefillCancelled:
                 raise
             except Exception as e:
-                if sparse_output_committed:
+                if sparse_output_committed or sparse_decode_transaction_started:
                     raise
                 logger.error("SpecPrefill failed, falling back to normal path: %s", e)
                 telemetry.fallback("sparse_execution_failed")
@@ -2314,6 +2615,7 @@ class SimpleEngine(BaseEngine):
 
         def _run_specprefill():
             """Score tokens, sparse prefill, generate autoregressively."""
+            nonlocal sparse_decode_transaction_started
             import time
             from types import SimpleNamespace
 
@@ -2321,151 +2623,172 @@ class SimpleEngine(BaseEngine):
             from mlx_lm.models.cache import make_prompt_cache
             from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
-            from ..specprefill import (
-                cleanup_rope,
-                score_tokens,
-                select_chunks,
-                sparse_prefill,
+            from ..specprefill import score_tokens
+
+            if not self._supports_sparse_continuation(self._model.stream_generate):
+                raise TargetPositionError(
+                    "mlx-lm does not expose model_forward_context continuation"
+                )
+
+            profile_key, adapter = self._admit_sparse_target(model)
+            detokenizer = _new_sparse_detokenizer(tokenizer)
+            top_k = kwargs.get("top_k", 0)
+            min_p = kwargs.get("min_p", 0.0)
+            presence_penalty = kwargs.get("presence_penalty", 0.0)
+            repetition_penalty = kwargs.get("repetition_penalty", 1.0)
+            sampler = make_sampler(
+                temp=temperature, top_p=top_p, top_k=top_k, min_p=min_p
+            )
+            penalty_processors = make_logits_processors(
+                repetition_penalty=(
+                    repetition_penalty if repetition_penalty != 1.0 else None
+                ),
+                presence_penalty=(
+                    presence_penalty if presence_penalty != 0.0 else None
+                ),
+            )
+            all_processors = (kwargs.get("logits_processors") or []) + (
+                penalty_processors or []
+            )
+            seeded_processors = _seed_logits_processors(
+                mx.array(tokens, dtype=mx.uint32), all_processors
             )
 
             cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
 
+            # Phase 1: Score with draft model
+            t0 = time.monotonic()
+            importance = score_tokens(
+                self._draft_model,
+                tokens,
+                prefill_step_size=self._prefill_step_size,
+                cancel_check=_cancel_check,
+            )
+            t_score = time.monotonic() - t0
+            telemetry.scorer_ms = t_score * 1000
+
+            # Phase 2/3: semantic selection and request-local target prefill.
+            _cancel_check()
+            effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+            effective_backbone = (
+                specprefill_backbone_pct
+                if specprefill_backbone_pct is not None
+                else self._specprefill_backbone_pct
+            )
+            effective_chunk_size = specprefill_chunk_size or 32
+            effective_halo_chunks = (
+                specprefill_halo_chunks if specprefill_halo_chunks is not None else 1
+            )
+            effective_anchor_chunks = (
+                specprefill_anchor_chunks
+                if specprefill_anchor_chunks is not None
+                else 1
+            )
+            result, forward_context, plan = self._prepare_sparse_target_prefill(
+                target_model=model,
+                tokenizer=tokenizer,
+                tokens=tokens,
+                importance=importance,
+                cache=cache,
+                telemetry=telemetry,
+                keep_pct=effective_keep,
+                backbone_pct=effective_backbone,
+                chunk_size=effective_chunk_size,
+                halo_chunks=effective_halo_chunks,
+                anchor_chunks=effective_anchor_chunks,
+                profile_key=profile_key,
+                adapter=adapter,
+                cancel_check=_cancel_check,
+            )
+            logits = result.logits
+            n_selected = len(plan.selected_indices)
+            t_prefill = (telemetry.target_prefill_ms or 0.0) / 1000.0
+
+            logger.info(
+                "SpecPrefill: scored %d tokens in %.1fs, sparse prefill %d/%d "
+                "(keep=%.0f%%) in %.1fs",
+                n_tokens,
+                t_score,
+                n_selected,
+                n_tokens,
+                n_selected / n_tokens * 100,
+                t_prefill,
+            )
+
+            # Sample the seed under the complete prompt history, then retain
+            # request-local sparse positions for every continuation forward.
+            _cancel_check()
             try:
-                # Phase 1: Score with draft model
-                t0 = time.monotonic()
-                importance = score_tokens(
-                    self._draft_model,
-                    tokens,
-                    prefill_step_size=self._prefill_step_size,
-                    cancel_check=_cancel_check,
-                )
-                t_score = time.monotonic() - t0
-                telemetry.scorer_ms = t_score * 1000
-
-                # Phase 2: Select important chunks
-                _cancel_check()
-                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                effective_backbone = (
-                    specprefill_backbone_pct
-                    if specprefill_backbone_pct is not None
-                    else self._specprefill_backbone_pct
-                )
-                effective_chunk_size = specprefill_chunk_size or 32
-                effective_halo_chunks = (
-                    specprefill_halo_chunks
-                    if specprefill_halo_chunks is not None
-                    else 1
-                )
-                effective_anchor_chunks = (
-                    specprefill_anchor_chunks
-                    if specprefill_anchor_chunks is not None
-                    else 1
-                )
-                selected = select_chunks(
-                    importance,
-                    keep_pct=effective_keep,
-                    backbone_pct=effective_backbone,
-                    chunk_size=effective_chunk_size,
-                    halo_chunks=effective_halo_chunks,
-                    anchor_chunks=effective_anchor_chunks,
-                )
-                n_selected = selected.shape[0]
-                telemetry.selected_tokens = int(n_selected)
-
-                # Phase 3: Sparse prefill on target model
-                t0 = time.monotonic()
-                logits = sparse_prefill(
-                    model,
-                    tokens,
-                    selected,
-                    cache,
-                    step_size=self._prefill_step_size,
-                    cancel_check=_cancel_check,
-                )
-                t_prefill = time.monotonic() - t0
-                telemetry.target_prefill_ms = t_prefill * 1000
-
-                logger.info(
-                    "SpecPrefill: scored %d tokens in %.1fs, "
-                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
-                    n_tokens,
-                    t_score,
-                    n_selected,
-                    n_tokens,
-                    n_selected / n_tokens * 100,
-                    t_prefill,
-                )
-
-                # Phase 4: Sample from the same sampler/processors as dense
-                # generation. The seed sees the complete prompt token history,
-                # then the standard wrapper owns continuation sampling.
-                top_k = kwargs.get("top_k", 0)
-                min_p = kwargs.get("min_p", 0.0)
-                presence_penalty = kwargs.get("presence_penalty", 0.0)
-                repetition_penalty = kwargs.get("repetition_penalty", 1.0)
-                sampler = make_sampler(
-                    temp=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    min_p=min_p,
-                )
-                penalty_processors = make_logits_processors(
-                    repetition_penalty=(
-                        repetition_penalty if repetition_penalty != 1.0 else None
-                    ),
-                    presence_penalty=(
-                        presence_penalty if presence_penalty != 0.0 else None
-                    ),
-                )
-                all_processors = (kwargs.get("logits_processors") or []) + (
-                    penalty_processors or []
-                )
-                seeded_processors = _seed_logits_processors(
-                    mx.array(tokens, dtype=mx.uint32), all_processors
-                )
-                _cancel_check()
+                # Scoring, selection, and fresh-cache target prefill are an
+                # isolated pre-output transaction: failures above this line
+                # may discard the request-local cache and restart dense.  RNG
+                # and logits-processor state become observable as soon as the
+                # first sample begins, so replay is forbidden from here on.
+                sparse_decode_transaction_started = True
                 first_token, _ = _sample_with_processors(
-                    None,
-                    logits[:, -1, :].squeeze(0),
-                    sampler,
-                    seeded_processors,
+                    None, logits[:, -1, :].squeeze(0), sampler, seeded_processors
                 )
                 mx.eval(first_token)
                 first_token_id = first_token.item()
-                first_text = tokenizer.decode([first_token_id])
-                eos_id = tokenizer.eos_token_id
-
-                _emit_sparse_response(
-                    SimpleNamespace(
-                        text=first_text,
-                        finish_reason="stop" if first_token_id == eos_id else None,
-                    )
+                eos_ids = self._eos_token_ids(tokenizer)
+                first_text, first_is_eos = _detokenize_sparse_token(
+                    detokenizer,
+                    first_token_id,
+                    eos_ids,
+                    terminal=max_tokens == 1,
                 )
-
-                if first_token_id != eos_id:
-                    # The wrapper normally builds penalty processors and gives
-                    # user processors only the continuation token sequence.
-                    # Reuse the seeded processors instead so both seed and
-                    # continuation observe the full prompt history, and avoid
-                    # applying the request penalties twice.
-                    continuation_kwargs = dict(kwargs)
-                    continuation_kwargs["logits_processors"] = seeded_processors
-                    continuation_kwargs["presence_penalty"] = 0.0
-                    continuation_kwargs["repetition_penalty"] = 1.0
+            except BaseException:
+                forward_context.finish()
+                raise
+            _emit_sparse_response(
+                SimpleNamespace(
+                    text=first_text,
+                    finish_reason="stop" if first_is_eos else None,
+                )
+            )
+            if not first_is_eos and max_tokens > 1:
+                continuation_kwargs = dict(kwargs)
+                continuation_kwargs["logits_processors"] = seeded_processors
+                continuation_kwargs["presence_penalty"] = 0.0
+                continuation_kwargs["repetition_penalty"] = 1.0
+                continuation_kwargs["model_forward_context"] = forward_context
+                try:
                     for chunk in self._model.stream_generate(
                         prompt=mx.array([first_token_id]),
                         max_tokens=max_tokens - 1,
                         temperature=temperature,
                         top_p=top_p,
-                        stop=stop,
+                        stop=None,
                         prompt_cache=cache,
                         **continuation_kwargs,
                     ):
                         _cancel_check()
-                        _emit_sparse_response(chunk)
-
-            finally:
-                cleanup_rope(model)
+                        token_id = getattr(chunk, "token", None)
+                        if not isinstance(token_id, int) or isinstance(token_id, bool):
+                            raise TargetPositionError(
+                                "sparse continuation must expose integer token IDs"
+                            )
+                        terminal = bool(getattr(chunk, "finished", False))
+                        text, is_eos = _detokenize_sparse_token(
+                            detokenizer,
+                            token_id,
+                            eos_ids,
+                            terminal=terminal,
+                        )
+                        _emit_sparse_response(
+                            SimpleNamespace(
+                                text=text,
+                                finish_reason=(
+                                    "stop"
+                                    if is_eos
+                                    else getattr(chunk, "finish_reason", None)
+                                ),
+                            )
+                        )
+                finally:
+                    forward_context.finish()
+            else:
+                forward_context.finish()
 
         def _run_normal():
             """Fallback: normal generation without specprefill."""
@@ -2505,6 +2828,8 @@ class SimpleEngine(BaseEngine):
                 if kind == "done":
                     break
                 if kind == "error":
+                    if finished and isinstance(payload, _SpecPrefillCancelled):
+                        break
                     raise payload
                 if finished:
                     # The terminal token was already yielded. Drain until the
@@ -2528,6 +2853,8 @@ class SimpleEngine(BaseEngine):
                     finish_reason = "length"
                 elif finish_reason is not None:
                     finished = True
+                if finished:
+                    _request_cancel()
 
                 yield GenerationOutput(
                     text=accumulated_text,
@@ -2651,7 +2978,12 @@ class SimpleEngine(BaseEngine):
         )
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
         custom_logits_active = bool(all_processors)
-        combined_mtp = _request_can_compose_mtp(combined_mtp, all_processors)
+        combined_mtp = (
+            _request_can_compose_mtp(combined_mtp, all_processors)
+            and self._text_model is not None
+            and getattr(self._text_model, "mtp", None) is not None
+        )
+        sparse_no_completion_requested = max_tokens == 0
         max_tokens = max_tokens or 4096
 
         # --- System prompt KV caching ---
@@ -2836,10 +3168,31 @@ class SimpleEngine(BaseEngine):
         use_specprefill = (
             telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
         )
+        # Sparse target execution starts with an empty target cache.  A saved
+        # system prefix has a different physical/logical topology, and MTP
+        # cache pairing is intentionally qualified separately.
+        if use_specprefill and sparse_no_completion_requested:
+            telemetry.fallback("sparse_no_completion_requested")
+            use_specprefill = False
+        elif use_specprefill and combined_mtp:
+            telemetry.fallback("mtp_composition_not_implemented")
+            use_specprefill = False
+        elif use_specprefill and (backbone_cache is not None or system_token_count):
+            telemetry.fallback("sparse_prefix_cache_not_supported")
+            use_specprefill = False
+        elif use_specprefill and not self._supports_sparse_continuation(
+            mlx_stream_generate
+        ):
+            telemetry.fallback("sparse_forward_context_unavailable")
+            use_specprefill = False
+        elif use_specprefill and _processors_can_retire(all_processors):
+            telemetry.fallback("sparse_processor_retirement_unsupported")
+            use_specprefill = False
 
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         sparse_output_committed = False
+        sparse_decode_transaction_started = False
 
         def _emit_response(resp: Any) -> None:
             if abort_event.is_set():
@@ -2902,20 +3255,20 @@ class SimpleEngine(BaseEngine):
 
         # Run all Metal ops in a single serialized thread.
         def _run_all():
-            nonlocal backbone_cache, prompt_to_send
+            nonlocal backbone_cache, prompt_to_send, use_specprefill
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
             use_mtp = (
-                self._mtp
-                and not custom_logits_active
-                and hasattr(model, "mtp")
-                and model.mtp is not None
+                combined_mtp and not custom_logits_active and model.mtp is not None
             )
             if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )
+            if use_specprefill and use_mtp:
+                telemetry.fallback("mtp_composition_not_implemented")
+                use_specprefill = False
 
             # Cache MISS with valid prefix: prefill system tokens and snapshot
             if (
@@ -2980,7 +3333,11 @@ class SimpleEngine(BaseEngine):
                     _run_specprefill(model, backbone_cache, use_mtp)
                     return
                 except Exception as e:
-                    if sparse_output_committed or abort_event.is_set():
+                    if (
+                        sparse_output_committed
+                        or sparse_decode_transaction_started
+                        or abort_event.is_set()
+                    ):
                         raise
                     logger.error(
                         "SpecPrefill failed, falling back to normal MTP path: %s",
@@ -3069,170 +3426,141 @@ class SimpleEngine(BaseEngine):
                     _emit_response(resp)
 
         def _run_specprefill(model, bc, use_mtp):
-            """Score tokens, sparse prefill, then continue on the standard decode path."""
+            """Run sparse-only target prefill and retain its forward context."""
+            nonlocal sparse_decode_transaction_started
             from types import SimpleNamespace
 
             from mlx_lm import stream_generate as mlx_stream_generate
             from mlx_lm.models.cache import make_prompt_cache
 
-            from ..specprefill import (
-                cleanup_rope,
-                score_tokens,
-                select_chunks,
-                sparse_prefill,
+            from ..specprefill import score_tokens
+
+            if bc is not None or use_mtp:
+                raise TargetPositionError(
+                    "sparse-only target prefill requires fresh cache"
+                )
+            profile_key, adapter = self._admit_sparse_target(model)
+            detokenizer = _new_sparse_detokenizer(self._text_tokenizer)
+            seed_tokens = (
+                mx.array(full_tokens_list, dtype=mx.uint32)
+                if full_tokens_list is not None
+                else None
+            )
+            seeded_processors = _seed_logits_processors(seed_tokens, all_processors)
+            cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            import time
+
+            def _cancel_check() -> None:
+                if abort_event.is_set():
+                    raise _SpecPrefillCancelled()
+
+            t0 = time.monotonic()
+            importance = score_tokens(
+                self._draft_model,
+                specprefill_tokens,
+                prefill_step_size=self._prefill_step_size,
+                cancel_check=_cancel_check,
+            )
+            t_score = time.monotonic() - t0
+            telemetry.scorer_ms = t_score * 1000
+            effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+            effective_backbone = (
+                specprefill_backbone_pct
+                if specprefill_backbone_pct is not None
+                else self._specprefill_backbone_pct
+            )
+            effective_chunk_size = specprefill_chunk_size or 32
+            effective_halo_chunks = (
+                specprefill_halo_chunks if specprefill_halo_chunks is not None else 1
+            )
+            effective_anchor_chunks = (
+                specprefill_anchor_chunks
+                if specprefill_anchor_chunks is not None
+                else 1
+            )
+            result, forward_context, plan = self._prepare_sparse_target_prefill(
+                target_model=model,
+                tokenizer=self._text_tokenizer,
+                tokens=specprefill_tokens,
+                importance=importance,
+                cache=cache,
+                telemetry=telemetry,
+                keep_pct=effective_keep,
+                backbone_pct=effective_backbone,
+                chunk_size=effective_chunk_size,
+                halo_chunks=effective_halo_chunks,
+                anchor_chunks=effective_anchor_chunks,
+                profile_key=profile_key,
+                adapter=adapter,
+                cancel_check=_cancel_check,
+            )
+            logits = result.logits
+            n_selected = len(plan.selected_indices)
+            n_total = len(specprefill_tokens)
+            t_prefill = (telemetry.target_prefill_ms or 0.0) / 1000.0
+
+            logger.info(
+                "SpecPrefill: scored %d tokens in %.1fs, sparse prefill %d/%d "
+                "(keep=%.0f%%) in %.1fs",
+                n_total,
+                t_score,
+                n_selected,
+                n_total,
+                n_selected / n_total * 100,
+                t_prefill,
             )
 
-            # Create backbone cache if not already from system KV
-            if bc is None:
-                bc = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
-
+            # Phase 4: Sample the first token from the prefilled logits, then
+            # continue through mlx_lm with the request-local forward context.
+            eos_ids = self._eos_token_ids(self._text_tokenizer)
             try:
-                # Phase 1: Score with draft model
-                import time
-
-                t0 = time.monotonic()
-                importance = score_tokens(
-                    self._draft_model,
-                    specprefill_tokens,
-                    prefill_step_size=self._prefill_step_size,
-                )
-                t_score = time.monotonic() - t0
-                telemetry.scorer_ms = t_score * 1000
-
-                # Phase 2: Select important chunks
-                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                effective_backbone = (
-                    specprefill_backbone_pct
-                    if specprefill_backbone_pct is not None
-                    else self._specprefill_backbone_pct
-                )
-                effective_chunk_size = specprefill_chunk_size or 32
-                effective_halo_chunks = (
-                    specprefill_halo_chunks
-                    if specprefill_halo_chunks is not None
-                    else 1
-                )
-                effective_anchor_chunks = (
-                    specprefill_anchor_chunks
-                    if specprefill_anchor_chunks is not None
-                    else 1
-                )
-                selected = select_chunks(
-                    importance,
-                    keep_pct=effective_keep,
-                    backbone_pct=effective_backbone,
-                    chunk_size=effective_chunk_size,
-                    halo_chunks=effective_halo_chunks,
-                    anchor_chunks=effective_anchor_chunks,
-                )
-                n_selected = selected.shape[0]
-                n_total = len(specprefill_tokens)
-                telemetry.selected_tokens = specprefill_offset + int(n_selected)
-
-                # Phase 3: Sparse prefill on target model
-                t0 = time.monotonic()
-                logits = sparse_prefill(
-                    model,
-                    specprefill_tokens,
-                    selected,
-                    bc,
-                    step_size=self._prefill_step_size,
-                    position_offset=specprefill_offset,
-                )
-                t_prefill = time.monotonic() - t0
-                telemetry.target_prefill_ms = t_prefill * 1000
-
-                logger.info(
-                    "SpecPrefill: scored %d tokens in %.1fs, "
-                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
-                    "(offset=%d, effective_keep=%.2f)",
-                    n_total,
-                    t_score,
-                    n_selected,
-                    n_total,
-                    n_selected / n_total * 100,
-                    t_prefill,
-                    specprefill_offset,
-                    effective_keep,
-                )
-
-                # Phase 4: Sample the first token from the prefilled logits, then
-                # continue through mlx_lm's normal decode path so MTP and request-
-                # local logits processors remain active after sparse prefill.
-                eos_id = self._text_tokenizer.eos_token_id
-                seed_tokens = (
-                    mx.array(full_tokens_list, dtype=mx.uint32)
-                    if full_tokens_list is not None
-                    else None
-                )
-                seeded_processors = _seed_logits_processors(seed_tokens, all_processors)
+                # Sampling is the exact no-replay boundary.  Everything above
+                # uses request-local scorer/target state and can be discarded
+                # for a dense retry; sampler/processor state cannot.
+                sparse_decode_transaction_started = True
                 y, _ = _sample_with_processors(
-                    None,
-                    logits[:, -1, :].squeeze(0),
-                    sampler,
-                    seeded_processors,
+                    None, logits[:, -1, :].squeeze(0), sampler, seeded_processors
                 )
                 mx.eval(y)
-
-                generated_ids = []
-                prev_decoded = ""
-
                 tok_id = y.item()
-                generated_ids.append(tok_id)
-
-                decoded = self._text_tokenizer.decode(generated_ids)
-                new_text = decoded[len(prev_decoded) :]
-                prev_decoded = decoded
-
-                is_eos = tok_id == eos_id
-                _emit_sparse_response(
-                    SimpleNamespace(
-                        text=new_text,
-                        finish_reason="stop" if is_eos else None,
-                    )
+                new_text, is_eos = _detokenize_sparse_token(
+                    detokenizer,
+                    tok_id,
+                    eos_ids,
+                    terminal=max_tokens == 1,
                 )
-
-                if abort_event.is_set():
-                    logger.info(
-                        "SpecPrefill text route: abort requested after seed token"
-                    )
-                    return
-
-                if is_eos or max_tokens <= 1:
-                    return
-
-                prompt_cache = bc
-                if use_mtp and hasattr(model, "make_mtp_cache"):
-                    prompt_cache = bc + model.make_mtp_cache()
-
-                continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
-                token_count = 1
-                if _processors_retired(all_processors) and token_count < max_tokens:
-                    logger.info(
-                        "SpecPrefill text route: request-local processor retired after seed token; "
-                        "resuming content phase with MTP=%s",
-                        hasattr(model, "make_mtp_cache") and model.mtp is not None,
-                    )
-                    _resume_after_processor_retirement(
-                        model,
-                        bc,
-                        continuation_prompt,
-                        max_tokens - token_count,
-                        emit_response=_emit_sparse_response,
-                    )
-                    return
-
-                last_resp = None
-                retired = False
-                continuation_kwargs = dict(
-                    max_tokens=max_tokens - token_count,
-                    sampler=sampler,
-                    prefill_step_size=self._prefill_step_size,
-                    logits_processors=seeded_processors,
-                    prompt_cache=prompt_cache,
+            except BaseException:
+                forward_context.finish()
+                raise
+            _emit_sparse_response(
+                SimpleNamespace(
+                    text=new_text,
+                    finish_reason=(
+                        "stop" if is_eos else "length" if max_tokens <= 1 else None
+                    ),
                 )
-                if use_mtp:
-                    continuation_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+            )
+
+            if abort_event.is_set():
+                logger.info("SpecPrefill text route: abort requested after seed token")
+                forward_context.finish()
+                return
+
+            if is_eos or max_tokens <= 1:
+                forward_context.finish()
+                return
+
+            continuation_prompt = mx.array([tok_id], dtype=mx.uint32)
+            token_count = 1
+            continuation_kwargs = dict(
+                max_tokens=max_tokens - token_count,
+                sampler=sampler,
+                prefill_step_size=self._prefill_step_size,
+                logits_processors=seeded_processors,
+                prompt_cache=cache,
+                model_forward_context=forward_context,
+            )
+            try:
                 for resp in mlx_stream_generate(
                     model,
                     self._text_tokenizer,
@@ -3244,31 +3572,32 @@ class SimpleEngine(BaseEngine):
                             "SpecPrefill text route: abort requested; stopping decode"
                         )
                         break
-                    _emit_sparse_response(resp)
-                    token_count += 1
-                    last_resp = resp
-                    retired = _processors_retired(all_processors)
-                    if retired:
-                        logger.info(
-                            "SpecPrefill text route: request-local processor retired after %d tokens; "
-                            "resuming content phase with MTP=%s",
-                            token_count,
-                            hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                    response_token = getattr(resp, "token", None)
+                    if not isinstance(response_token, int) or isinstance(
+                        response_token, bool
+                    ):
+                        raise TargetPositionError(
+                            "sparse continuation must expose integer token IDs"
                         )
-                        break
-
-                if retired and token_count < max_tokens and last_resp is not None:
-                    seed = _seed_from_last_response(bc, last_resp)
-                    _resume_after_processor_retirement(
-                        model,
-                        bc,
-                        seed,
-                        max_tokens - token_count,
-                        emit_response=_emit_sparse_response,
+                    terminal = getattr(resp, "finish_reason", None) is not None
+                    text, response_is_eos = _detokenize_sparse_token(
+                        detokenizer,
+                        response_token,
+                        eos_ids,
+                        terminal=terminal,
                     )
-
+                    _emit_sparse_response(
+                        SimpleNamespace(
+                            text=text,
+                            finish_reason=(
+                                "stop"
+                                if response_is_eos
+                                else getattr(resp, "finish_reason", None)
+                            ),
+                        )
+                    )
             finally:
-                cleanup_rope(model)
+                forward_context.finish()
 
         async def _produce_responses() -> None:
             try:
@@ -3295,6 +3624,8 @@ class SimpleEngine(BaseEngine):
                 if kind == "done":
                     break
                 if kind == "error":
+                    if finished and isinstance(payload, _SpecPrefillCancelled):
+                        break
                     raise payload
                 if finished:
                     # Drain producer completion after a terminal sparse token
@@ -3317,6 +3648,8 @@ class SimpleEngine(BaseEngine):
                     finish_reason = "stop"
                 elif finish_reason is not None:
                     finished = True
+                if finished:
+                    abort_event.set()
 
                 yield GenerationOutput(
                     text=accumulated_text,

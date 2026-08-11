@@ -20,10 +20,64 @@ from vllm_mlx.specprefill_positions import (
     decode_plan,
     gemma_previous_kv_cache_map,
     mtp_decode_plan,
+    resolve_target_position_adapter,
     sparse_prefill_plan,
     target_position_adapter,
     verify_plan,
 )
+
+
+class _Config:
+    def __init__(self, model_type, **kwargs):
+        self.model_type = model_type
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+
+class _Model:
+    def __init__(self, config=None, *, args=None, language_model=None, vision=False):
+        self.config = config
+        self.args = args
+        self.language_model = language_model
+        if vision:
+            self.vision_tower = object()
+
+
+def test_known_target_resolver_is_config_and_wrapper_bounded():
+    assert (
+        resolve_target_position_adapter(_Model(_Config("qwen3"))) is QWEN_DENSE_TARGET
+    )
+    assert (
+        resolve_target_position_adapter(_Model(_Config("qwen3_5_moe")))
+        is QWEN35_TEXT_HYBRID_TARGET
+    )
+    assert (
+        resolve_target_position_adapter(
+            _Model(
+                _Config("qwen3_5"),
+                language_model=_Model(_Config("qwen3_5")),
+                vision=True,
+            )
+        )
+        is QWEN35_VLM_HYBRID_TARGET
+    )
+    # This matches clean mlx-lm qwen3_5.Model: ``args`` plus a
+    # ``language_model`` text wrapper, with no vision tower.
+    assert (
+        resolve_target_position_adapter(
+            _Model(
+                args=_Config("qwen3_5"),
+                language_model=_Model(_Config("qwen3_5")),
+            )
+        )
+        is QWEN35_TEXT_HYBRID_TARGET
+    )
+    assert (
+        resolve_target_position_adapter(_Model(_Config("gemma4", num_experts=16)))
+        is GEMMA4_A4B_TARGET
+    )
+    with pytest.raises(TargetPositionError, match="unsupported target model layout"):
+        resolve_target_position_adapter(_Model(_Config("unknown")))
 
 
 def _identity(tokens: tuple[int, ...], fingerprint: str = "a" * 64):

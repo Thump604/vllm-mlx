@@ -12,6 +12,26 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
+class _SparseTestDetokenizer:
+    def __init__(self):
+        self.segment = ""
+
+    def reset(self):
+        self.segment = ""
+
+    def add_token(self, token):
+        self.segment = {17: "A", 18: "B"}.get(token, "")
+
+    def finalize(self):
+        return None
+
+    @property
+    def last_segment(self):
+        segment = self.segment
+        self.segment = ""
+        return segment
+
+
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
@@ -1462,10 +1482,18 @@ class TestSimpleEngineConcurrency:
         text_model.mtp = None
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.return_value = 42
+        tokenizer.get_vocab.return_value = {}
+        tokenizer.chat_template = None
+        detokenizer = MagicMock()
+        detokenizer.last_segment = ""
 
         mock_mllm = MagicMock()
         mock_mllm.model = MagicMock()
-        mock_mllm.get_tokenizer.return_value = tokenizer
+        mock_mllm.processor = SimpleNamespace(
+            tokenizer=tokenizer,
+            detokenizer=detokenizer,
+            eos_token_ids=(42,),
+        )
 
         with (
             patch(
@@ -1481,7 +1509,8 @@ class TestSimpleEngineConcurrency:
             await engine.start()
 
         assert engine._text_model is text_model
-        assert engine._text_tokenizer is tokenizer
+        assert engine._text_tokenizer._tokenizer is tokenizer
+        assert engine._text_tokenizer.eos_token_ids == {42}
 
     @pytest.mark.anyio
     async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
@@ -2000,8 +2029,8 @@ class TestSimpleEngineConcurrency:
         assert seen["tokens"] == [10, 11, 12, 13]
 
     @pytest.mark.anyio
-    async def test_specprefill_success_preserves_mtp_path(self):
-        """Successful sparse prefill should continue through the normal MTP path."""
+    async def test_specprefill_intent_with_effective_mtp_falls_back_dense(self):
+        """Unqualified SpecPrefill+MTP must retain the independently safe MTP path."""
         from types import SimpleNamespace
 
         from vllm_mlx.engine.simple import SimpleEngine
@@ -2017,13 +2046,9 @@ class TestSimpleEngineConcurrency:
             return _sample
 
         def fake_stream_generate(model, tokenizer, prompt, **kwargs):
-            captured["prompt"] = prompt.tolist()
+            captured["prompt"] = prompt
             captured["kwargs"] = kwargs
-            yield SimpleNamespace(text="B", finish_reason="stop")
-
-        def fake_select_chunks(_importance, **kwargs):
-            captured["select_chunks_kwargs"] = kwargs
-            return mx.array([0, 1, 2], dtype=mx.int32)
+            yield SimpleNamespace(token=18, text="B", finish_reason="stop")
 
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
@@ -2064,19 +2089,8 @@ class TestSimpleEngineConcurrency:
                 return_value=[],
             ),
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
-            patch(
-                "vllm_mlx.specprefill.score_tokens",
-                return_value=mx.array([1.0, 0.9, 0.8], dtype=mx.float32),
-            ),
-            patch(
-                "vllm_mlx.specprefill.select_chunks",
-                side_effect=fake_select_chunks,
-            ),
-            patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 3, 32), dtype=mx.float32),
-            ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch("vllm_mlx.specprefill.score_tokens") as score_tokens,
+            patch.object(engine, "_prepare_sparse_target_prefill") as prepare_sparse,
         ):
             outputs = [
                 chunk
@@ -2087,23 +2101,27 @@ class TestSimpleEngineConcurrency:
                     top_p=0.95,
                     specprefill_policy="sparse",
                     specprefill_backbone_pct=0.25,
+                    combined_mtp=True,
                 )
             ]
 
-        assert [chunk.new_text for chunk in outputs] == ["A", "B"]
+        assert [chunk.new_text for chunk in outputs] == ["B"]
         assert captured["sampler_kwargs"] == {
             "temp": 0.6,
             "top_p": 0.95,
             "top_k": 0,
             "min_p": 0.0,
         }
-        assert captured["prompt"] == [17]
+        assert captured["prompt"] == "<|im_start|>user\nhello"
         assert "mtp" not in captured["kwargs"]
         assert captured["kwargs"]["num_draft_tokens"] == 4
-        assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
-        assert captured["kwargs"]["max_tokens"] == 3
-        assert captured["kwargs"]["logits_processors"] is None
-        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
+        assert captured["kwargs"]["max_tokens"] == 4
+        assert outputs[-1].specprefill_effective_policy == "dense"
+        assert (
+            outputs[-1].specprefill_fallback_reason == "mtp_composition_not_implemented"
+        )
+        score_tokens.assert_not_called()
+        prepare_sparse.assert_not_called()
 
     @pytest.mark.anyio
     async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
@@ -2362,6 +2380,7 @@ class TestSimpleEngineConcurrency:
                     max_tokens=16,
                     temperature=0.7,
                     top_p=0.9,
+                    combined_mtp=True,
                 )
             ]
 
@@ -2445,7 +2464,7 @@ class TestSimpleEngineConcurrency:
         assert "logits_processors" not in calls[1]
 
     @pytest.mark.anyio
-    async def test_stream_generate_text_specprefill_reenables_mtp_after_retirement(
+    async def test_specprefill_with_active_retiring_processor_falls_dense_without_mtp(
         self,
     ):
         """SpecPrefill retirement-to-MTP continuation is explicit opt-in."""
@@ -2501,15 +2520,8 @@ class TestSimpleEngineConcurrency:
             ),
             patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
-            patch(
-                "vllm_mlx.specprefill.score_tokens", return_value=mx.array([0.1, 0.2])
-            ),
-            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0, 1])),
-            patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 1, 32)),
-            ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch("vllm_mlx.specprefill.score_tokens") as score_tokens,
+            patch.object(engine, "_prepare_sparse_target_prefill") as prepare_sparse,
             patch(
                 "vllm_mlx.engine.simple._sample_with_processors",
                 side_effect=fake_sample,
@@ -2527,12 +2539,15 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert outputs[-1].text == "Hello world"
+        assert outputs[-1].text == " world"
+        assert outputs[-1].specprefill_effective_policy == "dense"
         assert len(calls) == 1
         assert "mtp" not in calls[0]
-        assert calls[0]["num_draft_tokens"] == 4
+        assert "num_draft_tokens" not in calls[0]
         assert "prompt_cache" in calls[0]
-        assert "logits_processors" not in calls[0]
+        assert calls[0]["logits_processors"][0] is processor
+        score_tokens.assert_not_called()
+        prepare_sparse.assert_not_called()
 
     @pytest.mark.anyio
     async def test_text_specprefill_does_not_restart_dense_after_seed_failure(self):
@@ -2563,6 +2578,10 @@ class TestSimpleEngineConcurrency:
         engine._text_model = MagicMock()
         engine._text_model.mtp = None
         engine._text_tokenizer = tokenizer
+        forward_context = MagicMock()
+        forward_context.finish = MagicMock()
+        sparse_result = SimpleNamespace(logits=mx.zeros((1, 1, 8)))
+        sparse_plan = SimpleNamespace(selected_indices=(0,))
 
         with (
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
@@ -2573,12 +2592,25 @@ class TestSimpleEngineConcurrency:
             patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
             patch("mlx_lm.stream_generate", side_effect=failing_continuation),
             patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
-            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
             patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 1, 8)),
+                "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                return_value=SimpleNamespace(
+                    add_token=lambda _token: None,
+                    finalize=lambda: None,
+                    last_segment="A",
+                ),
             ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch.object(engine, "_supports_sparse_continuation", return_value=True),
+            patch.object(
+                engine,
+                "_admit_sparse_target",
+                return_value=(SimpleNamespace(adapter_id="qwen_dense"), MagicMock()),
+            ),
+            patch.object(
+                engine,
+                "_prepare_sparse_target_prefill",
+                return_value=(sparse_result, forward_context, sparse_plan),
+            ),
         ):
             stream = engine._stream_generate_text(
                 messages=[{"role": "user", "content": "hello"}],
@@ -2593,6 +2625,7 @@ class TestSimpleEngineConcurrency:
                 await anext(stream)
 
         assert calls == ["continuation"]
+        forward_context.finish.assert_called_once()
 
     @pytest.mark.anyio
     async def test_cancellation_does_not_release_lock_before_worker_finishes(
@@ -2726,7 +2759,9 @@ class TestSimpleEngineConcurrency:
             continuation_started.set()
             release_continuation.wait(timeout=1)
             worker_finished.set()
-            yield SimpleNamespace(text="B", finish_reason="stop")
+            yield SimpleNamespace(
+                token=18, text="ignored", finished=True, finish_reason="stop"
+            )
 
         engine = SimpleEngine("test-model")
         engine._loaded = True
@@ -2737,18 +2772,31 @@ class TestSimpleEngineConcurrency:
             decode=lambda ids: "A", eos_token_id=99
         )
         engine._model.stream_generate.side_effect = continuation
+        forward_context = MagicMock()
+        forward_context.finish = MagicMock()
+        sparse_result = SimpleNamespace(logits=mx.zeros((1, 1, 8)))
+        sparse_plan = SimpleNamespace(selected_indices=(0,))
 
         with (
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
             patch("mlx_lm.sample_utils.make_sampler", side_effect=sampler_factory),
             patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
             patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
-            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
             patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 1, 8)),
+                "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                return_value=_SparseTestDetokenizer(),
             ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch.object(engine, "_supports_sparse_continuation", return_value=True),
+            patch.object(
+                engine,
+                "_admit_sparse_target",
+                return_value=(SimpleNamespace(adapter_id="qwen_dense"), MagicMock()),
+            ),
+            patch.object(
+                engine,
+                "_prepare_sparse_target_prefill",
+                return_value=(sparse_result, forward_context, sparse_plan),
+            ),
         ):
             stream = engine._stream_generate_specprefill(
                 "prompt",
@@ -2797,13 +2845,20 @@ class TestSimpleEngineConcurrency:
             [SimpleNamespace(text="dense", finish_reason="stop")]
         )
 
+        scorer = MagicMock(side_effect=RuntimeError("before seed"))
         with (
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch("vllm_mlx.specprefill.score_tokens", scorer),
             patch(
-                "vllm_mlx.specprefill.score_tokens",
-                side_effect=RuntimeError("before seed"),
+                "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                return_value=_SparseTestDetokenizer(),
             ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch.object(engine, "_supports_sparse_continuation", return_value=True),
+            patch.object(
+                engine,
+                "_admit_sparse_target",
+                return_value=(SimpleNamespace(adapter_id="qwen_dense"), MagicMock()),
+            ),
         ):
             outputs = [
                 output
@@ -2814,6 +2869,7 @@ class TestSimpleEngineConcurrency:
 
         assert [output.new_text for output in outputs] == ["dense"]
         assert outputs[-1].specprefill_fallback_reason == "sparse_execution_failed"
+        scorer.assert_called_once()
         assert engine._model.stream_generate.call_count == 1
 
     @pytest.mark.anyio
@@ -2830,6 +2886,10 @@ class TestSimpleEngineConcurrency:
             decode=lambda _ids: "A", eos_token_id=99
         )
         engine._model.stream_generate.side_effect = RuntimeError("after seed")
+        forward_context = MagicMock()
+        forward_context.finish = MagicMock()
+        sparse_result = SimpleNamespace(logits=mx.zeros((1, 1, 8)))
+        sparse_plan = SimpleNamespace(selected_indices=(0,))
 
         with (
             patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
@@ -2839,12 +2899,21 @@ class TestSimpleEngineConcurrency:
             ),
             patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
             patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
-            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
             patch(
-                "vllm_mlx.specprefill.sparse_prefill",
-                return_value=mx.zeros((1, 1, 8)),
+                "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                return_value=_SparseTestDetokenizer(),
             ),
-            patch("vllm_mlx.specprefill.cleanup_rope"),
+            patch.object(engine, "_supports_sparse_continuation", return_value=True),
+            patch.object(
+                engine,
+                "_admit_sparse_target",
+                return_value=(SimpleNamespace(adapter_id="qwen_dense"), MagicMock()),
+            ),
+            patch.object(
+                engine,
+                "_prepare_sparse_target_prefill",
+                return_value=(sparse_result, forward_context, sparse_plan),
+            ),
         ):
             stream = engine._stream_generate_specprefill(
                 "prompt", [1], max_tokens=2, temperature=0.0, top_p=1.0
@@ -2855,6 +2924,7 @@ class TestSimpleEngineConcurrency:
                 await anext(stream)
 
         assert engine._model.stream_generate.call_count == 1
+        forward_context.finish.assert_called_once()
 
     @pytest.mark.anyio
     async def test_text_mtp_path_does_not_prelock_serialized_runner(self):
@@ -2900,13 +2970,17 @@ class TestSimpleEngineConcurrency:
             captured["score"] = cancel_check
             return mx.array([0.5], dtype=mx.float32)
 
+        forward_context = MagicMock()
+        forward_context.finish = MagicMock()
+
         def fake_sparse_prefill(*args, cancel_check=None, **kwargs):
             captured["prefill"] = cancel_check
-            return mx.zeros((1, 1, 8), dtype=mx.float32)
-
-        def fake_select_chunks(_importance, **kwargs):
-            captured["select_chunks_kwargs"] = kwargs
-            return mx.array([0], dtype=mx.int32)
+            captured["prepare_kwargs"] = kwargs
+            return (
+                SimpleNamespace(logits=mx.zeros((1, 1, 8), dtype=mx.float32)),
+                forward_context,
+                SimpleNamespace(selected_indices=(0,)),
+            )
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
@@ -2916,32 +2990,43 @@ class TestSimpleEngineConcurrency:
             engine._model.model = MagicMock()
             engine._model.tokenizer = MagicMock()
             engine._model.tokenizer.decode = MagicMock(return_value="A")
-            engine._model.tokenizer.eos_token_id = 0
+            engine._model.tokenizer.eos_token_id = 99
 
             outputs = []
             with (
                 patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
                 patch(
                     "mlx_lm.sample_utils.make_sampler",
-                    return_value=lambda logits: mx.array([0], dtype=mx.int32),
+                    return_value=lambda logits: mx.array([17], dtype=mx.int32),
                 ),
                 patch(
                     "vllm_mlx.specprefill.score_tokens", side_effect=fake_score_tokens
                 ),
                 patch(
-                    "vllm_mlx.specprefill.select_chunks",
-                    side_effect=fake_select_chunks,
+                    "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                    return_value=_SparseTestDetokenizer(),
                 ),
-                patch(
-                    "vllm_mlx.specprefill.sparse_prefill",
+                patch.object(
+                    engine, "_supports_sparse_continuation", return_value=True
+                ),
+                patch.object(
+                    engine,
+                    "_admit_sparse_target",
+                    return_value=(
+                        SimpleNamespace(adapter_id="qwen_dense"),
+                        MagicMock(),
+                    ),
+                ),
+                patch.object(
+                    engine,
+                    "_prepare_sparse_target_prefill",
                     side_effect=fake_sparse_prefill,
                 ),
-                patch("vllm_mlx.specprefill.cleanup_rope"),
             ):
                 async for chunk in engine._stream_generate_specprefill(
                     prompt="hello",
                     tokens=[1, 2, 3, 4],
-                    max_tokens=4,
+                    max_tokens=1,
                     temperature=0.7,
                     top_p=0.9,
                     specprefill_backbone_pct=0.25,
@@ -2951,7 +3036,7 @@ class TestSimpleEngineConcurrency:
         assert outputs == ["A"]
         assert callable(captured["score"])
         assert captured["score"] is captured["prefill"]
-        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
+        assert captured["prepare_kwargs"]["backbone_pct"] == 0.25
 
     @pytest.mark.anyio
     async def test_cancelling_specprefill_request_stops_during_scoring(self):
@@ -2999,7 +3084,21 @@ class TestSimpleEngineConcurrency:
                     "vllm_mlx.specprefill.score_tokens",
                     side_effect=fake_score_tokens,
                 ),
-                patch("vllm_mlx.specprefill.cleanup_rope"),
+                patch(
+                    "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                    return_value=_SparseTestDetokenizer(),
+                ),
+                patch.object(
+                    engine, "_supports_sparse_continuation", return_value=True
+                ),
+                patch.object(
+                    engine,
+                    "_admit_sparse_target",
+                    return_value=(
+                        SimpleNamespace(adapter_id="qwen_dense"),
+                        MagicMock(),
+                    ),
+                ),
             ):
                 task = asyncio.create_task(consume())
                 assert await asyncio.to_thread(score_started.wait, 1.0)
@@ -3057,14 +3156,25 @@ class TestSimpleEngineConcurrency:
                     return_value=mx.array([0.5], dtype=mx.float32),
                 ),
                 patch(
-                    "vllm_mlx.specprefill.select_chunks",
-                    return_value=mx.array([0], dtype=mx.int32),
+                    "vllm_mlx.engine.simple._new_sparse_detokenizer",
+                    return_value=_SparseTestDetokenizer(),
                 ),
-                patch(
-                    "vllm_mlx.specprefill.sparse_prefill",
+                patch.object(
+                    engine, "_supports_sparse_continuation", return_value=True
+                ),
+                patch.object(
+                    engine,
+                    "_admit_sparse_target",
+                    return_value=(
+                        SimpleNamespace(adapter_id="qwen_dense"),
+                        MagicMock(),
+                    ),
+                ),
+                patch.object(
+                    engine,
+                    "_prepare_sparse_target_prefill",
                     side_effect=fake_sparse_prefill,
                 ),
-                patch("vllm_mlx.specprefill.cleanup_rope"),
             ):
                 task = asyncio.create_task(consume())
                 assert await asyncio.to_thread(prefill_started.wait, 1.0)

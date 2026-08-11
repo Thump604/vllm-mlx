@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("mlx.core")
+import mlx.core as mx
 
 from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.engine.simple import SimpleEngine, _request_can_compose_mtp
@@ -21,6 +22,7 @@ from vllm_mlx.specprefill_profiles import (
     SpecPrefillQualificationEvidence,
     SpecPrefillTuning,
 )
+from vllm_mlx.specprefill_positions import QWEN_DENSE_TARGET
 
 
 def _hash(letter: str) -> str:
@@ -34,7 +36,7 @@ def _profile_key(*, cell: SpecPrefillCell) -> SpecPrefillProfileKey:
         tokenizer_artifact_hash=_hash("b"),
         scorer_artifact_id="test-scorer@bf16",
         scorer_artifact_hash=_hash("c"),
-        adapter_id="test-dense-adapter",
+        adapter_id="qwen_dense",
         engine=SpecPrefillEngine.SIMPLE,
         cell=cell,
     )
@@ -459,14 +461,19 @@ async def test_production_profile_forwards_every_calibrated_selector_control(
 
 
 @pytest.mark.anyio
-async def test_direct_native_mtp_route_uses_the_combined_profile_cell(monkeypatch):
+async def test_direct_native_mtp_routes_dense_until_composition_is_qualified(
+    monkeypatch,
+):
     engine = _engine(mtp=True, registered=True)
     engine._loaded = True
     engine._model = SimpleNamespace(
         tokenizer=SimpleNamespace(
             bos_token=None,
             encode=lambda *_args, **_kwargs: list(range(8)),
-        )
+        ),
+        stream_generate=lambda **_kwargs: iter(
+            [SimpleNamespace(text="dense", finish_reason="stop")]
+        ),
     )
     received: dict[str, object] = {}
 
@@ -485,12 +492,80 @@ async def test_direct_native_mtp_route_uses_the_combined_profile_cell(monkeypatc
         )
     ]
 
-    assert outputs[-1].text == "ok"
-    assert received == {"selector_version": "test-combined-selector-v1"}
+    assert outputs[-1].text == "dense"
+    assert received == {}
+    assert outputs[-1].specprefill_effective_policy == "dense"
+    assert outputs[-1].specprefill_fallback_reason == "mtp_composition_not_implemented"
+
+
+def test_sparse_eos_accepts_tokenizer_multi_id_contract():
+    tokenizer = SimpleNamespace(eos_token_id=1, eos_token_ids=(1, 7))
+    assert SimpleEngine._eos_token_ids(tokenizer) == frozenset((1, 7))
+
+
+def test_sparse_cache_identity_rejects_selector_version_drift():
+    engine = _engine(registered=True)
+    telemetry = engine._resolve_specprefill_telemetry(
+        legacy=None,
+        policy="auto",
+        coverage="selective",
+        has_media=False,
+        total_tokens=8,
+    )
+    target = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
+    with pytest.raises(ValueError, match="selector version"):
+        engine._prepare_sparse_target_prefill(
+            target_model=target,
+            tokenizer=SimpleNamespace(all_special_ids=()),
+            tokens=list(range(8)),
+            importance=mx.ones((8,)),
+            cache=[],
+            telemetry=telemetry,
+            keep_pct=0.55,
+            backbone_pct=0.1,
+            chunk_size=32,
+            halo_chunks=1,
+            anchor_chunks=1,
+            profile_key=engine._active_specprefill_profile_key(False),
+            adapter=QWEN_DENSE_TARGET,
+        )
 
 
 @pytest.mark.anyio
-async def test_sparse_failure_restarts_dense_and_reports_fallback(monkeypatch):
+async def test_zero_max_tokens_never_enters_sparse_seed_path(monkeypatch):
+    engine = _engine(diagnostic=True)
+    engine._loaded = True
+    engine._model = SimpleNamespace(
+        tokenizer=SimpleNamespace(
+            bos_token=None,
+            encode=lambda *_args, **_kwargs: list(range(8)),
+        ),
+        stream_generate=lambda **_kwargs: iter(()),
+    )
+    entered_sparse = False
+
+    async def fake_sparse_stream(*_args, **_kwargs):
+        nonlocal entered_sparse
+        entered_sparse = True
+        yield GenerationOutput(text="unexpected")
+
+    monkeypatch.setattr(engine, "_stream_generate_specprefill", fake_sparse_stream)
+    outputs = [
+        output
+        async for output in engine._stream_generate_impl(
+            "prompt",
+            max_tokens=0,
+            specprefill_policy="sparse",
+            specprefill_coverage="selective",
+        )
+    ]
+    assert entered_sparse is False
+    assert outputs[-1].specprefill_effective_policy == "dense"
+    assert outputs[-1].specprefill_fallback_reason == "sparse_no_completion_requested"
+
+
+@pytest.mark.anyio
+async def test_target_prefill_failure_before_sampling_restarts_dense(monkeypatch):
     engine = _engine(diagnostic=True)
     engine._loaded = True
     engine._model = SimpleNamespace(
@@ -513,12 +588,16 @@ async def test_sparse_failure_restarts_dense_and_reports_fallback(monkeypatch):
 
     monkeypatch.setattr("mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [])
     monkeypatch.setattr("vllm_mlx.specprefill.score_tokens", lambda *_a, **_k: object())
+    monkeypatch.setattr(engine, "_supports_sparse_continuation", lambda *_a: True)
     monkeypatch.setattr(
-        "vllm_mlx.specprefill.select_chunks",
-        lambda *_a, **_k: SimpleNamespace(shape=(4,)),
+        engine,
+        "_admit_sparse_target",
+        lambda *_a: (SimpleNamespace(adapter_id="qwen_dense"), QWEN_DENSE_TARGET),
     )
-    monkeypatch.setattr("vllm_mlx.specprefill.sparse_prefill", fail_sparse_prefill)
-    monkeypatch.setattr("vllm_mlx.specprefill.cleanup_rope", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "vllm_mlx.engine.simple._new_sparse_detokenizer", lambda *_a: object()
+    )
+    monkeypatch.setattr(engine, "_prepare_sparse_target_prefill", fail_sparse_prefill)
     outputs = [
         output
         async for output in engine._stream_generate_specprefill(
@@ -531,15 +610,10 @@ async def test_sparse_failure_restarts_dense_and_reports_fallback(monkeypatch):
         )
     ]
 
-    assert outputs[-1].text == "dense"
-    assert outputs[-1].specprefill_requested_policy == "sparse"
-    assert outputs[-1].specprefill_effective_policy == "dense"
-    assert outputs[-1].specprefill_engaged is False
-    assert outputs[-1].specprefill_fallback_reason == "sparse_execution_failed"
-    assert outputs[-1].specprefill_total_tokens == 8
-    assert outputs[-1].specprefill_selected_tokens == 8
-    assert outputs[-1].specprefill_scorer_ms is not None
-    assert outputs[-1].specprefill_target_prefill_ms is None
+    assert telemetry.scorer_ms is not None
+    assert outputs[-1].new_text == "dense"
+    assert telemetry.decision.effective_policy.value == "dense"
+    assert telemetry.decision.fallback_reason == "sparse_execution_failed"
 
 
 def test_sparse_fallback_retains_completed_phase_timing():
