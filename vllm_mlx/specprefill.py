@@ -38,6 +38,7 @@ Design notes:
 Reference: arxiv.org/abs/2502.02789 (SpecPrefill: Speculative Prefilling)
 """
 
+import functools
 import hashlib
 import inspect
 import math
@@ -233,13 +234,12 @@ def resolve_specprefill_decision(
 
 
 class _AttentionCapture:
-    """Install-once attention wrapper with immutable delegation.
+    """Standalone compatibility wrapper for direct capture tests.
 
-    Normal model calls are delegated without touching scorer state. During a
-    request-local scorer session, the owning :class:`SpecPrefillScorer`
-    supplies the capture buffer and extractor. The legacy buffer arguments are
-    retained for callers that construct a standalone wrapper directly; model
-    installation always uses the scorer-owned path.
+    This helper is never installed on a scorer model. Replacing an MLX child
+    module with a plain proxy removes its parameter subtree from
+    :class:`mlx.nn.Module`. :class:`SpecPrefillScorer` instead installs a
+    class-level dispatcher while retaining the exact attention instances.
     """
 
     def __init__(
@@ -248,41 +248,23 @@ class _AttentionCapture:
         buf_idx,
         query_buffer=None,
         query_extractor=None,
-        *,
-        scorer=None,
     ):
         if isinstance(original, _AttentionCapture):
             raise RuntimeError("SpecPrefill attention wrappers cannot be nested")
-        if scorer is not None and (
-            query_buffer is not None or query_extractor is not None
-        ):
-            raise ValueError("scorer-owned wrappers cannot use legacy capture state")
         self._original = original
         self._buf_idx = buf_idx
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor or _qwen35_extract_queries
-        self._scorer_ref = weakref.ref(scorer) if scorer is not None else None
         self._call_plan = _build_capture_call_plan(original)
 
     def __call__(self, *args, **kwargs):
-        if self._scorer_ref is None:
-            query_buffer = self._query_buffer
-            query_extractor = self._query_extractor
-        else:
-            scorer = self._scorer_ref()
-            if scorer is None:
-                raise RuntimeError("Detached SpecPrefill capture wrapper")
-            session = scorer._capture_session_for_wrapper()
-            if session is None:
-                return self._original(*args, **kwargs)
-            query_buffer = session.query_buffer
-            query_extractor = session.query_extractor
-
         x, cache, capture_kwargs = _capture_call_arguments(
             self._call_plan, args, kwargs
         )
-        queries = query_extractor(self._original, x, cache=cache, **capture_kwargs)
-        query_buffer[self._buf_idx].append(queries)
+        queries = self._query_extractor(
+            self._original, x, cache=cache, **capture_kwargs
+        )
+        self._query_buffer[self._buf_idx].append(queries)
         return self._original(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -295,6 +277,154 @@ class _CaptureCallPlan:
     input_position: int | None
     cache_position: int | None
     positional_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _InstalledAttentionCapture:
+    """Immutable dispatch metadata for one original attention instance."""
+
+    scorer_ref: weakref.ReferenceType["SpecPrefillScorer"]
+    buffer_index: int
+    call_plan: _CaptureCallPlan
+
+
+@dataclass(frozen=True)
+class _AttentionClassDispatch:
+    """Original and stable dispatch callables installed for one Python class."""
+
+    original_call: Callable[..., Any]
+    dispatch_call: Callable[..., Any]
+    call_plan: _CaptureCallPlan
+
+
+_ATTENTION_DISPATCH_LOCK = threading.RLock()
+_ATTENTION_DISPATCHED_CLASSES: dict[type, _AttentionClassDispatch] = {}
+_ATTENTION_CAPTURES: dict[
+    int, tuple[weakref.ReferenceType[Any], _InstalledAttentionCapture]
+] = {}
+
+
+def _attention_capture_for(instance: Any) -> _InstalledAttentionCapture | None:
+    """Return identity-matched state without requiring a hashable nn.Module."""
+    object_id = id(instance)
+    entry = _ATTENTION_CAPTURES.get(object_id)
+    if entry is None:
+        return None
+    instance_ref, installed = entry
+    registered = instance_ref()
+    if registered is instance:
+        return installed
+    if registered is None and _ATTENTION_CAPTURES.get(object_id) is entry:
+        _ATTENTION_CAPTURES.pop(object_id, None)
+        return None
+    raise RuntimeError("SpecPrefill attention registry identity collision")
+
+
+def _attention_registry_ref(instance: Any) -> weakref.ReferenceType[Any]:
+    """Build a weak identity key whose callback cannot delete a reused ID."""
+    object_id = id(instance)
+
+    def _remove(instance_ref):
+        with _ATTENTION_DISPATCH_LOCK:
+            entry = _ATTENTION_CAPTURES.get(object_id)
+            if entry is not None and entry[0] is instance_ref:
+                _ATTENTION_CAPTURES.pop(object_id, None)
+
+    try:
+        return weakref.ref(instance, _remove)
+    except TypeError as exc:
+        raise RuntimeError(
+            "SpecPrefill attention instances must support weak references"
+        ) from exc
+
+
+def _install_attention_capture(
+    attention: Any, scorer: "SpecPrefillScorer", buffer_index: int
+) -> None:
+    """Register one attention instance without changing model topology.
+
+    Python resolves ``instance(...)`` through ``type(instance).__call__``.
+    Installing one stable dispatcher on that class lets us select capture
+    behaviour through a weak per-instance registry while leaving the model's
+    original child module, parameters, and state dictionary untouched.
+    """
+    attention_type = type(attention)
+    with _ATTENTION_DISPATCH_LOCK:
+        class_dispatch = _ATTENTION_DISPATCHED_CLASSES.get(attention_type)
+        if class_dispatch is None:
+            resolved_call = attention_type.__call__
+            inherited_dispatch = next(
+                (
+                    installed_dispatch
+                    for installed_dispatch in _ATTENTION_DISPATCHED_CLASSES.values()
+                    if installed_dispatch.dispatch_call is resolved_call
+                ),
+                None,
+            )
+            if inherited_dispatch is None:
+                original_call = resolved_call
+                call_plan = _build_capture_call_plan(attention)
+            else:
+                # A subclass can inherit a base class dispatcher. Flatten it to
+                # the original callable so capture is performed exactly once.
+                original_call = inherited_dispatch.original_call
+                call_plan = inherited_dispatch.call_plan
+
+            @functools.wraps(original_call)
+            def _dispatch(instance, *args, **kwargs):
+                with _ATTENTION_DISPATCH_LOCK:
+                    installed = _attention_capture_for(instance)
+                if installed is None:
+                    return original_call(instance, *args, **kwargs)
+                owner = installed.scorer_ref()
+                if owner is None:
+                    with _ATTENTION_DISPATCH_LOCK:
+                        entry = _ATTENTION_CAPTURES.get(id(instance))
+                        if entry is not None and entry[0]() is instance:
+                            _ATTENTION_CAPTURES.pop(id(instance), None)
+                    return original_call(instance, *args, **kwargs)
+                session = owner._capture_session_for_attention()
+                if session is not None:
+                    x, cache, capture_kwargs = _capture_call_arguments(
+                        installed.call_plan, args, kwargs
+                    )
+                    queries = session.query_extractor(
+                        instance, x, cache=cache, **capture_kwargs
+                    )
+                    session.query_buffer[installed.buffer_index].append(queries)
+                return original_call(instance, *args, **kwargs)
+
+            try:
+                attention_type.__call__ = _dispatch
+            except (AttributeError, TypeError) as exc:
+                raise RuntimeError(
+                    "Cannot install a stable SpecPrefill dispatcher for "
+                    f"attention class {attention_type}"
+                ) from exc
+            class_dispatch = _AttentionClassDispatch(
+                original_call, _dispatch, call_plan
+            )
+            _ATTENTION_DISPATCHED_CLASSES[attention_type] = class_dispatch
+        elif attention_type.__call__ is not class_dispatch.dispatch_call:
+            raise RuntimeError("SpecPrefill attention class dispatcher was modified")
+        else:
+            call_plan = class_dispatch.call_plan
+
+        existing = _attention_capture_for(attention)
+        if existing is not None and existing.scorer_ref() is not scorer:
+            raise RuntimeError("SpecPrefill attention instance is already registered")
+        _ATTENTION_CAPTURES[id(attention)] = (
+            _attention_registry_ref(attention),
+            _InstalledAttentionCapture(weakref.ref(scorer), buffer_index, call_plan),
+        )
+
+
+def _uninstall_attention_capture(attention: Any, scorer: "SpecPrefillScorer") -> None:
+    """Rollback a failed multi-layer registration without touching the model."""
+    with _ATTENTION_DISPATCH_LOCK:
+        installed = _attention_capture_for(attention)
+        if installed is not None and installed.scorer_ref() is scorer:
+            _ATTENTION_CAPTURES.pop(id(attention), None)
 
 
 def _build_capture_call_plan(original):
@@ -463,10 +593,11 @@ class _ScorerCaptureSession:
 class SpecPrefillScorer:
     """Install-once, serialized scorer for one draft model.
 
-    Attention wrappers are a stable part of the scorer model after
-    construction. Only the capture session is request-local and mutable. The
-    initial implementation deliberately rejects overlapping work instead of
-    allowing requests to share capture buffers.
+    Attention instances remain the exact MLX child modules loaded with the
+    model. Their Python classes receive one stable dispatcher, while immutable
+    weak registry entries associate only this scorer's attention instances
+    with request-local capture state. The initial implementation deliberately
+    rejects overlapping work instead of allowing requests to share buffers.
     """
 
     def __init__(self, model):
@@ -479,42 +610,32 @@ class SpecPrefillScorer:
         attention_layers = _find_attention_layers(model)
         if not attention_layers:
             raise ValueError("SpecPrefill scorer model has no attention layers")
-        originals = [_get_attn_module(layer) for _, layer in attention_layers]
-        if any(isinstance(original, _AttentionCapture) for original in originals):
-            raise RuntimeError("SpecPrefill attention wrappers are already installed")
-
-        wrappers = [
-            (layer_idx, layer, _AttentionCapture(original, buf_idx, scorer=self))
-            for buf_idx, ((layer_idx, layer), original) in enumerate(
-                zip(attention_layers, originals)
-            )
+        attentions = [
+            (layer_idx, _get_attn_module(layer))
+            for layer_idx, layer in attention_layers
         ]
-        installed = []
+        installed: list[Any] = []
         try:
-            for (layer_idx, layer, wrapper), original in zip(wrappers, originals):
-                _set_attn_module(layer, wrapper)
-                installed.append((layer, original))
+            for buffer_index, (_layer_idx, attention) in enumerate(attentions):
+                _install_attention_capture(attention, self, buffer_index)
+                installed.append(attention)
         except Exception:
-            for layer, original in installed:
-                _set_attn_module(layer, original)
+            for attention in reversed(installed):
+                _uninstall_attention_capture(attention, self)
             raise
-        wrappers = [(layer_idx, wrapper) for layer_idx, _, wrapper in wrappers]
-        self.attention_layer_indices = tuple(layer_idx for layer_idx, _ in wrappers)
-        self._wrappers = tuple(wrappers)
+        self.attention_layer_indices = tuple(
+            layer_idx for layer_idx, _attention in attentions
+        )
+        self._installed_attentions = tuple(attentions)
 
     @classmethod
     def for_model(cls, model):
-        """Return the sole scorer for ``model``, installing wrappers once."""
+        """Return the sole scorer for ``model``, installing dispatch once."""
         with _SCORER_REGISTRY_LOCK:
-            try:
-                scorer = _SCORER_REGISTRY.get(model)
-            except TypeError as exc:
-                raise RuntimeError(
-                    "SpecPrefill scorer models must support weak references"
-                ) from exc
+            scorer = _scorer_for_model(model)
             if scorer is None:
                 scorer = cls(model)
-                _SCORER_REGISTRY[model] = scorer
+                _register_scorer_model(model, scorer)
             scorer._verify_installed()
             return scorer
 
@@ -531,11 +652,31 @@ class SpecPrefillScorer:
 
     def _verify_installed(self):
         model = self.model
-        for layer_idx, wrapper in self._wrappers:
-            if _get_attn_module(model.layers[layer_idx]) is not wrapper:
-                raise RuntimeError("SpecPrefill scorer wrapper topology was modified")
+        for buffer_index, (layer_idx, attention) in enumerate(
+            self._installed_attentions
+        ):
+            if _get_attn_module(model.layers[layer_idx]) is not attention:
+                raise RuntimeError("SpecPrefill scorer attention topology was modified")
+            with _ATTENTION_DISPATCH_LOCK:
+                installed = _attention_capture_for(attention)
+                class_dispatch = _ATTENTION_DISPATCHED_CLASSES.get(type(attention))
+            if (
+                installed is None
+                or installed.scorer_ref() is not self
+                or installed.buffer_index != buffer_index
+            ):
+                raise RuntimeError(
+                    "SpecPrefill scorer attention registration was modified"
+                )
+            if (
+                class_dispatch is None
+                or type(attention).__call__ is not class_dispatch.dispatch_call
+            ):
+                raise RuntimeError(
+                    "SpecPrefill scorer attention class dispatcher was modified"
+                )
 
-    def _capture_session_for_wrapper(self):
+    def _capture_session_for_attention(self):
         session = self._active_session
         if session is None:
             return None
@@ -594,22 +735,6 @@ class SpecPrefillScorer:
             tokens = tokens.tolist()
         n_prompt = len(tokens)
 
-        first_attention = self._wrappers[0][1]._original
-        n_attn_heads = getattr(
-            first_attention,
-            "num_attention_heads",
-            getattr(
-                first_attention,
-                "n_heads",
-                getattr(first_attention, "num_heads", None),
-            ),
-        )
-        n_kv_heads = getattr(
-            first_attention,
-            "num_key_value_heads",
-            getattr(first_attention, "n_kv_heads", None),
-        )
-
         cache = None
         logits = None
         try:
@@ -646,8 +771,6 @@ class SpecPrefillScorer:
                     session.query_buffer,
                     attn_caches,
                     n_prompt,
-                    n_attn_heads,
-                    n_kv_heads,
                     pool_kernel=pool_kernel if pool_kernel > 0 else None,
                 )
                 # MLX execution is lazy. Realize both captured queries and the
@@ -659,8 +782,44 @@ class SpecPrefillScorer:
             mx.clear_cache()
 
 
-_SCORER_REGISTRY = weakref.WeakKeyDictionary()
-_SCORER_REGISTRY_LOCK = threading.Lock()
+_SCORER_REGISTRY: dict[int, tuple[weakref.ReferenceType[Any], SpecPrefillScorer]] = {}
+_SCORER_REGISTRY_LOCK = threading.RLock()
+
+
+def _scorer_for_model(model: Any) -> SpecPrefillScorer | None:
+    object_id = id(model)
+    entry = _SCORER_REGISTRY.get(object_id)
+    if entry is None:
+        return None
+    model_ref, scorer = entry
+    registered = model_ref()
+    if registered is model:
+        return scorer
+    if registered is None and _SCORER_REGISTRY.get(object_id) is entry:
+        _SCORER_REGISTRY.pop(object_id, None)
+        return None
+    raise RuntimeError("SpecPrefill scorer registry identity collision")
+
+
+def _register_scorer_model(model: Any, scorer: SpecPrefillScorer) -> None:
+    object_id = id(model)
+
+    def _remove(model_ref):
+        with _SCORER_REGISTRY_LOCK:
+            entry = _SCORER_REGISTRY.get(object_id)
+            if entry is not None and entry[0] is model_ref:
+                _SCORER_REGISTRY.pop(object_id, None)
+
+    try:
+        model_ref = weakref.ref(model, _remove)
+    except TypeError as exc:
+        raise RuntimeError(
+            "SpecPrefill scorer models must support weak references"
+        ) from exc
+    existing = _scorer_for_model(model)
+    if existing is not None and existing is not scorer:
+        raise RuntimeError("SpecPrefill scorer model is already registered")
+    _SCORER_REGISTRY[object_id] = (model_ref, scorer)
 
 
 def _prefill_draft(model, tokens, cache, step_size=2048, cancel_check=None):
@@ -732,7 +891,12 @@ def _avg_pool1d(x, kernel_size):
 
 
 def _compute_importance(
-    query_buffer, attn_caches, n_prompt, n_attn_heads, n_kv_heads, pool_kernel=13
+    query_buffer,
+    attn_caches,
+    n_prompt,
+    n_attn_heads=None,
+    n_kv_heads=None,
+    pool_kernel=13,
 ):
     """Compute per-token importance from captured queries and cached keys.
 
@@ -744,7 +908,11 @@ def _compute_importance(
 
     Returns: (n_prompt,) importance scores.
     """
-    heads_per_group = n_attn_heads // n_kv_heads
+    # ``n_attn_heads`` and ``n_kv_heads`` remain accepted for compatibility
+    # with older private callers, but heterogeneous models cannot use one
+    # model-global pair. Derive the grouping from each realized query/cache
+    # shape instead (Gemma 4 alternates sliding and global KV widths).
+    del n_attn_heads, n_kv_heads
     all_scores = []
 
     for layer_i, captures in enumerate(query_buffer):
@@ -759,6 +927,19 @@ def _compute_importance(
             continue
         head_dim = prompt_keys.shape[-1]
         q_stack = mx.concatenate(captures, axis=2)
+        query_heads = int(q_stack.shape[1])
+        key_heads = int(prompt_keys.shape[1])
+        if query_heads <= 0 or key_heads <= 0 or query_heads % key_heads:
+            raise RuntimeError(
+                "SpecPrefill attention heads must have an integral per-layer "
+                f"query/KV grouping (queries={query_heads}, keys={key_heads})"
+            )
+        if int(q_stack.shape[-1]) != int(head_dim):
+            raise RuntimeError(
+                "SpecPrefill captured query and cache key dimensions differ "
+                f"({q_stack.shape[-1]} != {head_dim})"
+            )
+        heads_per_group = query_heads // key_heads
         if heads_per_group > 1:
             expanded_keys = mx.repeat(prompt_keys, heads_per_group, axis=1)
         else:
