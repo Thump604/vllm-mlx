@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
@@ -165,6 +165,25 @@ class StreamOptions(BaseModel):
     include_usage: bool = False  # Include usage stats in final chunk
 
 
+SpecPrefillPolicy = Literal["auto", "sparse", "dense"]
+SpecPrefillCoverage = Literal["selective", "exhaustive", "unknown"]
+
+
+def _validate_specprefill_policy_compatibility(model):
+    """Reject ambiguous combinations of legacy and policy controls."""
+    legacy = model.specprefill
+    policy = model.specprefill_policy
+    if legacy is None or policy is None:
+        return model
+
+    legacy_policy = "sparse" if legacy else "dense"
+    if policy != legacy_policy:
+        raise ValueError(
+            f"specprefill={legacy!r} conflicts with " f"specprefill_policy={policy!r}"
+        )
+    return model
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -199,10 +218,15 @@ class ChatCompletionRequest(BaseModel):
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
+    # Request-safe policy. ``auto`` still requires declared selective coverage
+    # and server-side eligibility; ``sparse`` is an expert intent which a
+    # production profile may decline.
+    specprefill_policy: SpecPrefillPolicy | None = None
+    specprefill_coverage: SpecPrefillCoverage | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
-    specprefill_keep_pct: float | None = None
+    specprefill_keep_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     # SpecPrefill: per-request evenly spaced backbone percentage.
-    specprefill_backbone_pct: float | None = None
+    specprefill_backbone_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
     # MLLM assistant-drafter path: opt in to using a configured drafter.
@@ -212,6 +236,10 @@ class ChatCompletionRequest(BaseModel):
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_specprefill_policy(self):
+        return _validate_specprefill_policy_compatibility(self)
 
 
 class AssistantMessage(BaseModel):
@@ -265,6 +293,18 @@ class GenerationMetadata(BaseModel):
 
     no_final_content_watchdog_tokens: int | None = None
     no_final_content_watchdog_enforced: bool = False
+    mtp_drafts: int | None = None
+    mtp_accepted: int | None = None
+    specprefill_requested_policy: SpecPrefillPolicy | None = None
+    specprefill_effective_policy: SpecPrefillPolicy | None = None
+    specprefill_coverage: SpecPrefillCoverage | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_selector_version: str | None = None
+    specprefill_fallback_reason: str | None = None
+    specprefill_total_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
+    specprefill_scorer_ms: float | None = None
+    specprefill_target_prefill_ms: float | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -303,10 +343,16 @@ class CompletionRequest(BaseModel):
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
+    specprefill_policy: SpecPrefillPolicy | None = None
+    specprefill_coverage: SpecPrefillCoverage | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
-    specprefill_keep_pct: float | None = None
+    specprefill_keep_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     # SpecPrefill: per-request evenly spaced backbone percentage.
-    specprefill_backbone_pct: float | None = None
+    specprefill_backbone_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_specprefill_policy(self):
+        return _validate_specprefill_policy_compatibility(self)
 
 
 class CompletionChoice(BaseModel):
@@ -573,3 +619,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None

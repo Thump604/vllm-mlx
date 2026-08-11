@@ -216,6 +216,19 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-local sparse-prefill diagnostics.  These fields are deliberately
+    # independent of MTP counters because the two features occupy different
+    # generation phases and may engage separately.
+    specprefill_requested_policy: Optional[str] = None
+    specprefill_effective_policy: Optional[str] = None
+    specprefill_coverage: Optional[str] = None
+    specprefill_engaged: Optional[bool] = None
+    specprefill_selector_version: Optional[str] = None
+    specprefill_fallback_reason: Optional[str] = None
+    specprefill_total_tokens: Optional[int] = None
+    specprefill_selected_tokens: Optional[int] = None
+    specprefill_scorer_ms: Optional[float] = None
+    specprefill_target_prefill_ms: Optional[float] = None
 
     @property
     def usage(self) -> Dict[str, int]:

@@ -27,14 +27,24 @@ class GenerationOutput:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     finish_reason: str | None = "stop"
-    mtp_drafts: int = 0
-    mtp_accepted: int = 0
     # For streaming
     new_text: str = ""
     finished: bool = True
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # SpecPrefill is independent of decode speculation.  Keep its terminal
+    # state separate so composing MTP cannot erase sparse-prefill evidence.
+    specprefill_requested_policy: str | None = None
+    specprefill_effective_policy: str | None = None
+    specprefill_coverage: str | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_selector_version: str | None = None
+    specprefill_fallback_reason: str | None = None
+    specprefill_total_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
+    specprefill_scorer_ms: float | None = None
+    specprefill_target_prefill_ms: float | None = None
 
 
 class EngineBusy(RuntimeError):

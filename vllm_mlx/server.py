@@ -570,8 +570,39 @@ def _resolve_no_final_content_token_limit() -> int | None:
 
 def _generation_metadata(
     thinking_processor: object | None,
+    output: GenerationOutput | None = None,
 ) -> GenerationMetadata | None:
-    if thinking_processor is None:
+    feature_fields = {
+        "mtp_drafts": getattr(output, "mtp_drafts", None),
+        "mtp_accepted": getattr(output, "mtp_accepted", None),
+        "specprefill_requested_policy": getattr(
+            output, "specprefill_requested_policy", None
+        ),
+        "specprefill_effective_policy": getattr(
+            output, "specprefill_effective_policy", None
+        ),
+        "specprefill_coverage": getattr(output, "specprefill_coverage", None),
+        "specprefill_engaged": getattr(output, "specprefill_engaged", None),
+        "specprefill_selector_version": getattr(
+            output, "specprefill_selector_version", None
+        ),
+        "specprefill_fallback_reason": getattr(
+            output, "specprefill_fallback_reason", None
+        ),
+        "specprefill_total_tokens": getattr(output, "specprefill_total_tokens", None),
+        "specprefill_selected_tokens": getattr(
+            output, "specprefill_selected_tokens", None
+        ),
+        "specprefill_scorer_ms": getattr(output, "specprefill_scorer_ms", None),
+        "specprefill_target_prefill_ms": getattr(
+            output, "specprefill_target_prefill_ms", None
+        ),
+    }
+    has_feature_metadata = (
+        any(value is not None and value != 0 for value in feature_fields.values())
+        or feature_fields["specprefill_engaged"] is False
+    )
+    if thinking_processor is None and not has_feature_metadata:
         return None
     return GenerationMetadata(
         no_final_content_watchdog_tokens=getattr(
@@ -580,7 +611,29 @@ def _generation_metadata(
         no_final_content_watchdog_enforced=bool(
             getattr(thinking_processor, "watchdog_was_enforced", False)
         ),
+        **feature_fields,
     )
+
+
+def _attach_specprefill_request_kwargs(
+    request: object,
+    kwargs: dict[str, object],
+    *,
+    has_media: bool = False,
+) -> None:
+    """Forward the public policy contract without making a route decision."""
+    for name in (
+        "specprefill",
+        "specprefill_policy",
+        "specprefill_coverage",
+        "specprefill_keep_pct",
+        "specprefill_backbone_pct",
+    ):
+        value = getattr(request, name, None)
+        if value is not None:
+            kwargs[name] = value
+    # Engines use this explicit signal to make text-only support fail safe.
+    kwargs["specprefill_has_media"] = bool(has_media)
 
 
 class _ThinkingAwareLogitsProcessor:
@@ -784,13 +837,7 @@ def _prepare_chat_completion_invocation(
         if video_max_frames:
             chat_kwargs["video_max_frames"] = video_max_frames
 
-    if request.specprefill is not None:
-        chat_kwargs["specprefill"] = request.specprefill
-    if request.specprefill_keep_pct is not None:
-        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
-    if specprefill_backbone_pct is not None:
-        chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+    _attach_specprefill_request_kwargs(request, chat_kwargs, has_media=has_media)
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
         request.chat_template_kwargs
     )
@@ -4837,15 +4884,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
             )
-            if request.specprefill is not None:
-                generate_kwargs["specprefill"] = request.specprefill
-            if request.specprefill_keep_pct is not None:
-                generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-            specprefill_backbone_pct = getattr(
-                request, "specprefill_backbone_pct", None
-            )
-            if specprefill_backbone_pct is not None:
-                generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+            _attach_specprefill_request_kwargs(request, generate_kwargs)
             try:
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
@@ -5015,6 +5054,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                             prepared.messages,
                             request,
                             metrics_tracker=tracker,
+                            thinking_processor=prepared.thinking_processor,
                             **prepared.chat_kwargs,
                         ),
                         "data: [DONE]\n\n",
@@ -5105,7 +5145,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 completion_tokens=output.completion_tokens,
                 total_tokens=output.prompt_tokens + output.completion_tokens,
             ),
-            generation_metadata=_generation_metadata(prepared.thinking_processor),
+            generation_metadata=_generation_metadata(
+                prepared.thinking_processor,
+                output,
+            ),
         )
     finally:
         if release_on_exit:
@@ -6023,13 +6066,7 @@ async def stream_completion(
     generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
         repetition_penalty
     )
-    if request.specprefill is not None:
-        generate_kwargs["specprefill"] = request.specprefill
-    if request.specprefill_keep_pct is not None:
-        generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-    specprefill_backbone_pct = getattr(request, "specprefill_backbone_pct", None)
-    if specprefill_backbone_pct is not None:
-        generate_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
+    _attach_specprefill_request_kwargs(request, generate_kwargs)
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
@@ -6087,6 +6124,7 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     metrics_tracker=None,
+    thinking_processor: object | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
@@ -6143,6 +6181,11 @@ async def stream_chat_completion(
     try:
         # Stream content
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            terminal_metadata = (
+                _generation_metadata(thinking_processor, output)
+                if output.finished
+                else None
+            )
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text
@@ -6252,6 +6295,7 @@ async def stream_chat_completion(
                                     )
                                 ],
                                 usage=get_usage(output) if output.finished else None,
+                                generation_metadata=terminal_metadata,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -6287,6 +6331,7 @@ async def stream_chat_completion(
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
+                    generation_metadata=terminal_metadata,
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
             else:
@@ -6357,6 +6402,7 @@ async def stream_chat_completion(
                                     )
                                 ],
                                 usage=get_usage(output) if output.finished else None,
+                                generation_metadata=terminal_metadata,
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -6391,6 +6437,7 @@ async def stream_chat_completion(
                         )
                     ],
                     usage=get_usage(output) if output.finished else None,
+                    generation_metadata=terminal_metadata,
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
@@ -6487,6 +6534,11 @@ async def stream_chat_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                ),
+                generation_metadata=(
+                    _generation_metadata(thinking_processor, last_output)
+                    if last_output is not None
+                    else None
                 ),
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
