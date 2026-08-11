@@ -21,14 +21,22 @@ import math
 import os
 import threading
 import time
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
 from .multimodal_processor import MultimodalProcessor
+from .specprefill_cache import (
+    SparseCacheExecutionConfig,
+    SparseCacheIdentity,
+    SparseCacheRowState,
+    SparseCacheState,
+)
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -157,6 +165,225 @@ class PrefillAbortedError(Exception):
         super().__init__(f"Prefill aborted for request {request_id}")
 
 
+class SparseBatchError(RuntimeError):
+    """A prepared sparse row cannot safely enter or advance a decode batch."""
+
+
+class SparseBatchCompatibilityError(SparseBatchError):
+    """Sparse rows do not share one immutable execution configuration."""
+
+
+class MLLMTargetForwardPhase(str, Enum):
+    """Target call phases supported by the request-local CB seam."""
+
+    DECODE = "decode"
+
+
+@dataclass(frozen=True)
+class MLLMTargetForward:
+    """One ordinary target decode graph-construction boundary."""
+
+    input_tokens: mx.array
+    cache: Sequence[Any]
+    phase: MLLMTargetForwardPhase
+    sparse_row_states: tuple[SparseCacheRowState | None, ...]
+
+
+TargetForwardContext = Callable[[MLLMTargetForward], AbstractContextManager[Any]]
+
+
+@dataclass(frozen=True)
+class _BatchKVDecodeCheckpoint:
+    """Reference-only checkpoint for mlx-lm's non-rotating BatchKVCache."""
+
+    entry: Any
+    keys: Any
+    values: Any
+    offset: Any
+    left_padding: Any
+    idx: int
+    right_padding: Any
+
+    def restore(self) -> None:
+        self.entry.keys = self.keys
+        self.entry.values = self.values
+        self.entry.offset = self.offset
+        self.entry.left_padding = self.left_padding
+        self.entry._idx = self.idx
+        self.entry._right_padding = self.right_padding
+
+
+@dataclass(frozen=True)
+class _ArraysDecodeCheckpoint:
+    """Reference-only checkpoint for mlx-lm's recurrent ArraysCache."""
+
+    entry: Any
+    cache: tuple[Any, ...]
+    left_padding: Any
+    lengths: Any
+
+    def restore(self) -> None:
+        self.entry.cache = list(self.cache)
+        self.entry.left_padding = self.left_padding
+        self.entry.lengths = self.lengths
+
+
+@dataclass(frozen=True)
+class _SupportedSparseCacheCheckpoint:
+    """Atomic sparse-cache checkpoint over an explicit mlx-lm allowlist.
+
+    The checkpoint retains MLX array references only. It never copies or
+    realizes KV/state tensors. Rotating caches are intentionally excluded:
+    rotation can overwrite live KV slots and cannot be rolled back from
+    metadata alone.
+    """
+
+    kv_entries: tuple[_BatchKVDecodeCheckpoint, ...]
+    array_entries: tuple[_ArraysDecodeCheckpoint, ...]
+
+    @classmethod
+    def capture(
+        cls,
+        cache: Sequence[Any],
+        row_states: Sequence[SparseCacheRowState | None],
+    ) -> "_SupportedSparseCacheCheckpoint":
+        from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+        if not row_states or any(row is None for row in row_states):
+            raise SparseBatchCompatibilityError(
+                "sparse target calls cannot share a batch with dense rows"
+            )
+
+        kv_entries: list[_BatchKVDecodeCheckpoint] = []
+        array_entries: list[_ArraysDecodeCheckpoint] = []
+        row_count = len(row_states)
+        for entry in cache:
+            if type(entry) is BatchKVCache:
+                if (
+                    entry.keys is None
+                    or entry.values is None
+                    or getattr(entry, "_right_padding", None) is not None
+                ):
+                    raise SparseBatchError(
+                        "sparse BatchKVCache must be populated and outside an update"
+                    )
+                if (
+                    entry.offset.ndim != 1
+                    or entry.left_padding.ndim != 1
+                    or entry.offset.shape[0] != row_count
+                    or entry.left_padding.shape[0] != row_count
+                ):
+                    raise SparseBatchCompatibilityError(
+                        "sparse BatchKVCache metadata must match batch row count"
+                    )
+                kv_entries.append(
+                    _BatchKVDecodeCheckpoint(
+                        entry=entry,
+                        keys=entry.keys,
+                        values=entry.values,
+                        offset=entry.offset,
+                        left_padding=entry.left_padding,
+                        idx=entry._idx,
+                        right_padding=entry._right_padding,
+                    )
+                )
+            elif type(entry) is ArraysCache:
+                if entry.batch_size != row_count:
+                    raise SparseBatchCompatibilityError(
+                        "sparse ArraysCache metadata must match batch row count"
+                    )
+                array_entries.append(
+                    _ArraysDecodeCheckpoint(
+                        entry=entry,
+                        cache=tuple(entry.cache),
+                        left_padding=entry.left_padding,
+                        lengths=entry.lengths,
+                    )
+                )
+            else:
+                raise SparseBatchError(
+                    "sparse decode supports only non-rotating BatchKVCache and "
+                    "ArraysCache entries"
+                )
+        if not kv_entries:
+            raise SparseBatchError(
+                "sparse decode requires a BatchKVCache occupancy source"
+            )
+        return cls(tuple(kv_entries), tuple(array_entries))
+
+    def restore(self) -> None:
+        # Restore every entry even if an individual assignment unexpectedly
+        # fails, then surface one fail-closed error to the scheduler.
+        failures: list[BaseException] = []
+        for checkpoint in (*self.kv_entries, *self.array_entries):
+            try:
+                checkpoint.restore()
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise SparseBatchError("sparse cache rollback failed") from failures[0]
+
+    def one_token_advance_predicate(
+        self,
+        row_states: Sequence[SparseCacheRowState | None],
+    ) -> tuple[mx.array, int]:
+        """Build one aggregated device predicate and examined-scalar count."""
+        expected = [row.physical_valid_length for row in row_states if row is not None]
+        predicates: list[mx.array] = []
+        examined_scalars = 0
+        for checkpoint in self.kv_entries:
+            expected_offsets = mx.array(expected, dtype=checkpoint.offset.dtype)
+            zero_padding = mx.zeros_like(checkpoint.left_padding)
+            predicates.extend(
+                (
+                    mx.all(checkpoint.offset == expected_offsets),
+                    mx.all(checkpoint.entry.offset == expected_offsets + 1),
+                    mx.all(checkpoint.left_padding == zero_padding),
+                    mx.all(checkpoint.entry.left_padding == zero_padding),
+                    mx.array(checkpoint.entry._idx == checkpoint.idx + 1),
+                )
+            )
+            examined_scalars += 4 * len(expected) + 1
+        return mx.all(mx.stack(predicates)), examined_scalars
+
+
+def _sparse_execution_config(
+    row_states: Sequence[SparseCacheRowState | None],
+) -> SparseCacheExecutionConfig | None:
+    configs = {row.identity.execution_config for row in row_states if row is not None}
+    if len(configs) > 1:
+        raise SparseBatchCompatibilityError(
+            "sparse decode rows require one exact execution configuration"
+        )
+    return next(iter(configs), None)
+
+
+def _decode_processor_contexts(
+    requests: Sequence["MLLMBatchRequest"], current_tokens: Sequence[int]
+) -> list[list[int]]:
+    """Exact processor history through the current token for every row."""
+    if len(requests) != len(current_tokens):
+        raise ValueError("processor context rows must stay aligned")
+    return [
+        list(request.output_tokens) + [int(token)]
+        for request, token in zip(requests, current_tokens, strict=True)
+    ]
+
+
+def _apply_first_token_processors(
+    logits: mx.array,
+    full_prompt_tokens: mx.array | Sequence[int],
+    processors: Optional[Sequence[Callable]],
+) -> mx.array:
+    """Apply every first-token processor to the exact full prompt."""
+    if not processors:
+        return logits
+    prompt_tokens = mx.array(full_prompt_tokens, dtype=mx.uint32).reshape(-1)
+    for processor in processors:
+        logits = processor(prompt_tokens, logits)
+    return logits
+
+
 def _cache_eval_tensors(cache: List[Any]) -> List[Any]:
     """Return realized tensors that break lazy cache graphs between chunks."""
     tensors: List[Any] = []
@@ -275,9 +502,69 @@ class MLLMBatch:
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
+    sparse_row_states: tuple[SparseCacheRowState | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        row_count = len(self.uids)
+        if self.y.ndim != 1 or self.y.shape[0] != row_count:
+            raise ValueError("MLLMBatch y must be a row-aligned token vector")
+        aligned_lengths = (
+            len(self.request_ids),
+            len(self.logprobs),
+            len(self.max_tokens),
+            len(self.num_tokens),
+            len(self.requests),
+        )
+        if any(length != row_count for length in aligned_lengths):
+            raise ValueError("MLLMBatch row metadata must have equal lengths")
+        if (
+            self.logits_processors is not None
+            and len(self.logits_processors) != row_count
+        ):
+            raise ValueError("MLLMBatch logits processors must stay row-aligned")
+        if self.samplers is not None and len(self.samplers) != row_count:
+            raise ValueError("MLLMBatch samplers must stay row-aligned")
+        if not self.sparse_row_states:
+            self.sparse_row_states = (None,) * row_count
+        elif len(self.sparse_row_states) != row_count:
+            raise ValueError("MLLMBatch sparse row state must stay row-aligned")
+        _sparse_execution_config(self.sparse_row_states)
+        if self.has_sparse_rows:
+            if any(row is None for row in self.sparse_row_states):
+                raise SparseBatchCompatibilityError(
+                    "sparse and dense rows cannot share an MLLMBatch"
+                )
+            if (
+                len(
+                    {
+                        row.physical_valid_length
+                        for row in self.sparse_row_states
+                        if row is not None
+                    }
+                )
+                != 1
+            ):
+                raise SparseBatchCompatibilityError(
+                    "sparse MLLMBatch rows require equal physical occupancy"
+                )
 
     def __len__(self) -> int:
         return len(self.uids)
+
+    @property
+    def has_sparse_rows(self) -> bool:
+        return any(row is not None for row in self.sparse_row_states)
+
+    @property
+    def sparse_execution_config(self) -> SparseCacheExecutionConfig | None:
+        return _sparse_execution_config(self.sparse_row_states)
+
+    def commit_sparse_decode(self, count: int = 1) -> None:
+        """Replace sparse row metadata after a realized target boundary."""
+        self.sparse_row_states = tuple(
+            None if row is None else row.append_decode(count)
+            for row in self.sparse_row_states
+        )
 
     def filter(self, keep_idx: List[int]) -> None:
         """
@@ -286,24 +573,62 @@ class MLLMBatch:
         Args:
             keep_idx: Indices of requests to keep
         """
-        self.uids = [self.uids[k] for k in keep_idx]
-        self.request_ids = [self.request_ids[k] for k in keep_idx]
-        self.logprobs = [self.logprobs[k] for k in keep_idx]
-        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
-        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        self.requests = [self.requests[k] for k in keep_idx]
-        if self.logits_processors is not None:
-            self.logits_processors = [self.logits_processors[k] for k in keep_idx]
-        if self.samplers is not None:
-            self.samplers = [self.samplers[k] for k in keep_idx]
-
+        if len(set(keep_idx)) != len(keep_idx) or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= len(self)
+            for index in keep_idx
+        ):
+            raise ValueError(
+                "MLLMBatch filter indices must be unique in-range integers"
+            )
         keep_idx_array = mx.array(keep_idx, mx.int32)
-        self.y = self.y[keep_idx_array]
+        next_y = self.y[keep_idx_array]
+        next_uids = [self.uids[k] for k in keep_idx]
+        next_request_ids = [self.request_ids[k] for k in keep_idx]
+        next_logprobs = [self.logprobs[k] for k in keep_idx]
+        next_max_tokens = [self.max_tokens[k] for k in keep_idx]
+        next_num_tokens = [self.num_tokens[k] for k in keep_idx]
+        next_requests = [self.requests[k] for k in keep_idx]
+        next_processors = (
+            None
+            if self.logits_processors is None
+            else [self.logits_processors[k] for k in keep_idx]
+        )
+        next_samplers = (
+            None if self.samplers is None else [self.samplers[k] for k in keep_idx]
+        )
+        next_sparse_rows = tuple(self.sparse_row_states[k] for k in keep_idx)
 
-        # Filter cache entries
-        for c in self.cache:
-            if hasattr(c, "filter"):
-                c.filter(keep_idx_array)
+        checkpoint = (
+            _SupportedSparseCacheCheckpoint.capture(self.cache, self.sparse_row_states)
+            if self.has_sparse_rows
+            else None
+        )
+        try:
+            for cache_entry in self.cache:
+                if hasattr(cache_entry, "filter"):
+                    cache_entry.filter(keep_idx_array)
+                elif self.has_sparse_rows:
+                    raise SparseBatchError(
+                        "sparse decode cache entries must support atomic filtering"
+                    )
+        except Exception:
+            if checkpoint is not None:
+                checkpoint.restore()
+            raise
+
+        self.uids = next_uids
+        self.request_ids = next_request_ids
+        self.y = next_y
+        self.logprobs = next_logprobs
+        self.max_tokens = next_max_tokens
+        self.num_tokens = next_num_tokens
+        self.requests = next_requests
+        self.logits_processors = next_processors
+        self.samplers = next_samplers
+        self.sparse_row_states = next_sparse_rows
 
     def extend(self, other: "MLLMBatch") -> None:
         """
@@ -312,43 +637,96 @@ class MLLMBatch:
         Args:
             other: Batch to merge into this one
         """
-        self.uids.extend(other.uids)
-        self.request_ids.extend(other.request_ids)
-        self.y = mx.concatenate([self.y, other.y])
-        self.logprobs.extend(other.logprobs)
-        self.num_tokens.extend(other.num_tokens)
-        self.max_tokens.extend(other.max_tokens)
-        self.requests.extend(other.requests)
+        if self.has_sparse_rows != other.has_sparse_rows:
+            raise SparseBatchCompatibilityError(
+                "sparse and dense rows cannot share a target decode batch"
+            )
+        _sparse_execution_config(self.sparse_row_states + other.sparse_row_states)
+        if (
+            self.has_sparse_rows
+            and len(
+                {
+                    row.physical_valid_length
+                    for row in self.sparse_row_states + other.sparse_row_states
+                    if row is not None
+                }
+            )
+            != 1
+        ):
+            raise SparseBatchCompatibilityError(
+                "sparse target decode rows require equal physical occupancy"
+            )
+        if len(self.cache) != len(other.cache):
+            raise SparseBatchCompatibilityError(
+                "decode batches require identical cache layer topology"
+            )
+
+        self_len = len(self)
+        next_uids = self.uids + other.uids
+        next_request_ids = self.request_ids + other.request_ids
+        next_y = mx.concatenate([self.y, other.y])
+        next_logprobs = self.logprobs + other.logprobs
+        next_num_tokens = self.num_tokens + other.num_tokens
+        next_max_tokens = self.max_tokens + other.max_tokens
+        next_requests = self.requests + other.requests
+        next_sparse_rows = self.sparse_row_states + other.sparse_row_states
 
         # Extend logits_processors
         if self.logits_processors is not None or other.logits_processors is not None:
-            # At this point self.uids already includes other.uids from extend above
-            self_len = len(self.uids) - len(other.uids)
             self_lp = self.logits_processors or [None] * self_len
             other_lp = other.logits_processors or [None] * len(other.uids)
-            self.logits_processors = list(self_lp) + list(other_lp)
+            next_processors = list(self_lp) + list(other_lp)
+        else:
+            next_processors = None
 
         # Extend samplers
         if self.samplers is not None or other.samplers is not None:
-            self_len = len(self.uids) - len(other.uids)
             self_s = self.samplers or [None] * self_len
             other_s = other.samplers or [None] * len(other.uids)
-            self.samplers = list(self_s) + list(other_s)
+            next_samplers = list(self_s) + list(other_s)
+        else:
+            next_samplers = None
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5. Some
         # cache integrations, such as quantized SDPA caches, expose state only
         # through empty()/extend() and do not publish .keys.
-        for c, o in zip(self.cache, other.cache):
-            if c is not None and o is not None and hasattr(c, "extend"):
-                try:
+        checkpoint = (
+            _SupportedSparseCacheCheckpoint.capture(self.cache, self.sparse_row_states)
+            if self.has_sparse_rows
+            else None
+        )
+        try:
+            for c, o in zip(self.cache, other.cache, strict=True):
+                if c is not None and o is not None and hasattr(c, "extend"):
                     has_kv = hasattr(c, "keys") and c.keys is not None
                     has_arrays = hasattr(c, "cache")
                     has_extendable_state = hasattr(c, "empty") and not c.empty()
                     if has_kv or has_arrays or has_extendable_state:
                         c.extend(o)
-                except Exception as e:
-                    logger.warning(f"Failed to extend cache: {e}")
+                elif (c is None) != (o is None) or (
+                    (self.has_sparse_rows or other.has_sparse_rows)
+                    and c is not None
+                    and not hasattr(c, "extend")
+                ):
+                    raise SparseBatchError(
+                        "sparse decode cache entries must support atomic extension"
+                    )
+        except Exception:
+            if checkpoint is not None:
+                checkpoint.restore()
+            raise
+
+        self.uids = next_uids
+        self.request_ids = next_request_ids
+        self.y = next_y
+        self.logprobs = next_logprobs
+        self.num_tokens = next_num_tokens
+        self.max_tokens = next_max_tokens
+        self.requests = next_requests
+        self.logits_processors = next_processors
+        self.samplers = next_samplers
+        self.sparse_row_states = next_sparse_rows
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
@@ -490,6 +868,8 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        target_forward_context: Optional[TargetForwardContext] = None,
+        expected_sparse_execution_config: SparseCacheExecutionConfig | None = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -508,11 +888,29 @@ class MLLMBatchGenerator:
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            target_forward_context: Request-local context factory for target decode
+            expected_sparse_execution_config: Scheduler-selected exact sparse
+                profile/artifact identity admitted by this generator
         """
         self.model = model
         self.processor = processor
         self.mm_processor = mm_processor
         self.max_kv_size = max_kv_size
+        if target_forward_context is not None and not callable(target_forward_context):
+            raise TypeError("target_forward_context must be callable or None")
+        self._target_forward_context = target_forward_context
+        if expected_sparse_execution_config is not None and not isinstance(
+            expected_sparse_execution_config, SparseCacheExecutionConfig
+        ):
+            raise TypeError(
+                "expected_sparse_execution_config must be SparseCacheExecutionConfig"
+            )
+        self._expected_sparse_execution_config = expected_sparse_execution_config
+        # One aggregated predicate scalar is read at each realized sparse
+        # boundary. Telemetry separately counts the device metadata scalars
+        # examined by that predicate; no KV/state tensor is copied.
+        self._sparse_checkpoint_scalar_reads = 0
+        self._sparse_checkpoint_host_scalar_reads = 0
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
@@ -838,6 +1236,292 @@ class MLLMBatchGenerator:
 
         logger.debug(f"Inserted {len(requests)} requests, UIDs: {uids}")
         return uids
+
+    def set_target_forward_context(self, context_factory: TargetForwardContext) -> None:
+        """Install the per-forward target context before sparse adoption."""
+        if not callable(context_factory):
+            raise TypeError("target forward context factory must be callable")
+        if self.active_batch is not None and self.active_batch.has_sparse_rows:
+            raise SparseBatchError(
+                "cannot replace target forward context with sparse rows active"
+            )
+        self._target_forward_context = context_factory
+
+    def set_expected_sparse_execution_config(
+        self, config: SparseCacheExecutionConfig
+    ) -> None:
+        """Bind scheduler-selected sparse profile/artifact identity."""
+        if not isinstance(config, SparseCacheExecutionConfig):
+            raise TypeError("config must be SparseCacheExecutionConfig")
+        if self.active_batch is not None and self.active_batch.has_sparse_rows:
+            raise SparseBatchError(
+                "cannot replace sparse execution identity with sparse rows active"
+            )
+        self._expected_sparse_execution_config = config
+
+    def adopt_prefilled_sparse_row(
+        self,
+        request: MLLMBatchRequest,
+        cache: Sequence[Any],
+        first_logits: mx.array,
+        sparse_state: SparseCacheState,
+    ) -> int:
+        """Atomically adopt one exact, fresh sparse-prefilled text row.
+
+        The method never enters the ordinary unprocessed/prefix-cache path and
+        never emits a response.  The first sampled token becomes ``batch.y``
+        only after cache conversion and active-batch compatibility succeed.
+        """
+        if self._target_forward_context is None:
+            raise SparseBatchError(
+                "sparse decode requires a request-local target forward context"
+            )
+        if request.max_tokens <= 0:
+            raise SparseBatchError(
+                "sparse requests require max_tokens greater than zero"
+            )
+        if request.images or request.videos or request.audio:
+            raise SparseBatchError("prepared sparse adoption is text-only")
+        if request.request_id in self._aborted_request_ids:
+            raise PrefillAbortedError(request.request_id)
+        if (
+            not isinstance(sparse_state, SparseCacheState)
+            or sparse_state.row_count != 1
+        ):
+            raise SparseBatchError("prepared sparse adoption requires exactly one row")
+        row_state = sparse_state.rows[0]
+        if not isinstance(row_state, SparseCacheRowState):
+            raise SparseBatchError("prepared sparse adoption requires sparse row state")
+        if self._expected_sparse_execution_config is None:
+            raise SparseBatchError(
+                "sparse adoption requires a generator-selected execution identity"
+            )
+        if (
+            row_state.identity.execution_config
+            != self._expected_sparse_execution_config
+        ):
+            raise SparseBatchCompatibilityError(
+                "prepared sparse identity does not match the generator-selected profile"
+            )
+        if request.input_ids is None:
+            raise SparseBatchError(
+                "prepared sparse adoption requires the exact full prompt token IDs"
+            )
+        full_tokens = tuple(request.input_ids.reshape(-1).tolist())
+        if (
+            SparseCacheIdentity.hash_tokens(full_tokens)
+            != row_state.identity.full_token_hash
+        ):
+            raise SparseBatchError(
+                "prepared sparse identity does not match the request token sequence"
+            )
+        if row_state.next_logical_position != len(full_tokens):
+            raise SparseBatchError(
+                "prepared sparse logical cursor must equal the full prompt length"
+            )
+        self._validate_prepared_sparse_cache(cache, row_state)
+
+        if self.active_batch is not None and not self.active_batch.has_sparse_rows:
+            raise SparseBatchCompatibilityError(
+                "sparse and dense rows cannot share a target decode batch"
+            )
+
+        active_uids = (
+            set(self.active_batch.uids) if self.active_batch is not None else set()
+        )
+        queued_uids = {queued.uid for queued in self.unprocessed_requests}
+        queued_request_ids = {queued.request_id for queued in self.unprocessed_requests}
+        active_request_ids = (
+            set(self.active_batch.request_ids)
+            if self.active_batch is not None
+            else set()
+        )
+        if (
+            request.request_id in active_request_ids
+            or request.request_id in queued_request_ids
+        ):
+            raise SparseBatchError("request is already owned by the batch generator")
+
+        candidate_uid = request.uid
+        if candidate_uid < 0:
+            candidate_uid = self.uid_counter
+        if candidate_uid in active_uids or candidate_uid in queued_uids:
+            raise SparseBatchError("prepared sparse request UID is already active")
+
+        # Complete every fallible cache operation before consuming a custom
+        # processor or stochastic sampler. A successful active-cache extend is
+        # held as an unpublished transaction until sampling also succeeds.
+        batch_cache = self._merge_prepared_sparse_cache(cache)
+        candidate_rows = (row_state.clone(),)
+        _SupportedSparseCacheCheckpoint.capture(batch_cache, candidate_rows)
+
+        active = self.active_batch
+        active_checkpoint = None
+        if active is not None:
+            if active.sparse_execution_config != row_state.identity.execution_config:
+                raise SparseBatchCompatibilityError(
+                    "sparse decode rows require one exact execution configuration"
+                )
+            if any(
+                row is None
+                or row.physical_valid_length != row_state.physical_valid_length
+                for row in active.sparse_row_states
+            ):
+                raise SparseBatchCompatibilityError(
+                    "sparse target decode rows require equal physical occupancy"
+                )
+            if len(active.cache) != len(batch_cache) or any(
+                type(current) is not type(incoming)
+                for current, incoming in zip(active.cache, batch_cache, strict=True)
+            ):
+                raise SparseBatchCompatibilityError(
+                    "decode batches require identical supported cache topology"
+                )
+            active_checkpoint = _SupportedSparseCacheCheckpoint.capture(
+                active.cache, active.sparse_row_states
+            )
+            try:
+                for current, incoming in zip(active.cache, batch_cache, strict=True):
+                    current.extend(incoming)
+            except Exception:
+                active_checkpoint.restore()
+                raise
+
+        try:
+            processors, sampler = self._sampling_for_request(request)
+            sampled, logprobs = self._sample_prepared_first_token(
+                first_logits, full_tokens, processors, sampler
+            )
+            candidate = MLLMBatch(
+                uids=[candidate_uid],
+                request_ids=[request.request_id],
+                y=sampled.reshape(-1),
+                logprobs=[logprobs.squeeze(0)],
+                max_tokens=[request.max_tokens],
+                num_tokens=[0],
+                cache=batch_cache,
+                requests=[request],
+                logits_processors=[processors] if processors else None,
+                samplers=[sampler],
+                sparse_row_states=candidate_rows,
+            )
+            if active is not None:
+                self_len = len(active)
+                next_y = mx.concatenate([active.y, candidate.y])
+                next_processors = (
+                    list(active.logits_processors or [None] * self_len)
+                    + list(candidate.logits_processors or [None])
+                    if active.logits_processors is not None
+                    or candidate.logits_processors is not None
+                    else None
+                )
+                next_samplers = list(active.samplers or [None] * self_len) + list(
+                    candidate.samplers or [None]
+                )
+        except Exception:
+            if active_checkpoint is not None:
+                active_checkpoint.restore()
+            raise
+
+        if active is None:
+            self.active_batch = candidate
+        else:
+            # All values above were staged before these non-failing assignments.
+            active.uids = active.uids + candidate.uids
+            active.request_ids = active.request_ids + candidate.request_ids
+            active.y = next_y
+            active.logprobs = active.logprobs + candidate.logprobs
+            active.max_tokens = active.max_tokens + candidate.max_tokens
+            active.num_tokens = active.num_tokens + candidate.num_tokens
+            active.requests = active.requests + candidate.requests
+            active.logits_processors = next_processors
+            active.samplers = next_samplers
+            active.sparse_row_states = active.sparse_row_states + candidate_rows
+
+        request.uid = candidate_uid
+        request.is_text_only = True
+        self.uid_counter = max(self.uid_counter, candidate_uid + 1)
+        return candidate_uid
+
+    def _sampling_for_request(
+        self, request: MLLMBatchRequest
+    ) -> tuple[Optional[List[Callable]], Callable]:
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        processors: List[Callable] = []
+        processor_kwargs = {}
+        if request.repetition_penalty and request.repetition_penalty != 1.0:
+            processor_kwargs["repetition_penalty"] = request.repetition_penalty
+        if request.presence_penalty and request.presence_penalty != 0.0:
+            processor_kwargs["presence_penalty"] = request.presence_penalty
+        if processor_kwargs:
+            processors.extend(make_logits_processors(**processor_kwargs))
+        if request.logits_processors:
+            processors.extend(request.logits_processors)
+        sampler = make_sampler(
+            temp=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            min_p=request.min_p,
+        )
+        return processors or None, sampler
+
+    def _sample_prepared_first_token(
+        self,
+        first_logits: mx.array,
+        full_prompt_tokens: Sequence[int],
+        processors: Optional[List[Callable]],
+        sampler: Callable,
+    ) -> tuple[mx.array, mx.array]:
+        logits = (
+            first_logits.logits if hasattr(first_logits, "logits") else first_logits
+        )
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        if logits.ndim != 2 or logits.shape[0] != 1:
+            raise SparseBatchError(
+                "prepared sparse logits must contain exactly one request row"
+            )
+        logits = _apply_first_token_processors(logits, full_prompt_tokens, processors)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = sampler(logprobs)
+        mx.eval(sampled, logprobs)
+        return sampled, logprobs
+
+    @staticmethod
+    def _validate_prepared_sparse_cache(
+        cache: Sequence[Any], row_state: SparseCacheRowState
+    ) -> None:
+        if not isinstance(cache, Sequence) or not cache:
+            raise SparseBatchError("prepared sparse cache must be non-empty")
+        offsets = []
+        for entry in cache:
+            if not hasattr(entry, "offset"):
+                continue
+            offset = entry.offset
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise SparseBatchError(
+                    "prepared sparse cache offsets must be host integers"
+                )
+            offsets.append(offset)
+        if not offsets or any(
+            offset != row_state.physical_valid_length for offset in offsets
+        ):
+            raise SparseBatchError(
+                "prepared sparse cache occupancy must match immutable row state"
+            )
+
+    @staticmethod
+    def _merge_prepared_sparse_cache(cache: Sequence[Any]) -> List[Any]:
+        merged = []
+        for entry in cache:
+            merge = getattr(entry, "merge", None)
+            if not callable(merge):
+                raise SparseBatchError(
+                    "prepared sparse cache entries must support batch merge"
+                )
+            merged.append(merge([entry]))
+        return merged
 
     def remove(self, uids: List[int]) -> None:
         """
@@ -1343,9 +2027,13 @@ class MLLMBatchGenerator:
             sample_logits = logits
             processors = logits_processors_by_request.get(req.request_id)
             if processors:
-                empty_tokens = mx.array([], dtype=mx.uint32)
-                for processor in processors:
-                    sample_logits = processor(empty_tokens, sample_logits)
+                if req.input_ids is None:
+                    raise ValueError(
+                        "first-token processors require exact prompt tokens"
+                    )
+                sample_logits = _apply_first_token_processors(
+                    sample_logits, req.input_ids, processors
+                )
 
             logprobs = sample_logits - mx.logsumexp(
                 sample_logits, axis=-1, keepdims=True
@@ -1700,44 +2388,160 @@ class MLLMBatchGenerator:
         if input_tokens.ndim == 1:
             input_tokens = input_tokens[:, None]
 
-        # Run language model only (not full VLM)
-        output = self.language_model(input_tokens, cache=cache)
+        active_batch = self.active_batch
+        if (
+            active_batch is not None
+            and active_batch.has_sparse_rows
+            and len(active_batch) != input_tokens.shape[0]
+        ):
+            raise SparseBatchCompatibilityError(
+                "sparse target input row count must match the active batch"
+            )
+        sparse_rows = (
+            active_batch.sparse_row_states
+            if active_batch is not None and len(active_batch) == input_tokens.shape[0]
+            else ()
+        )
+        has_sparse_rows = any(row is not None for row in sparse_rows)
+        if has_sparse_rows and any(row is None for row in sparse_rows):
+            raise SparseBatchCompatibilityError(
+                "sparse and dense rows cannot share a target decode call"
+            )
+        cache_checkpoint = (
+            _SupportedSparseCacheCheckpoint.capture(cache, sparse_rows)
+            if has_sparse_rows
+            else None
+        )
 
-        # Handle LanguageModelOutput or plain tensor
-        if hasattr(output, "logits"):
-            logits = output.logits
+        try:
+            forward = MLLMTargetForward(
+                input_tokens=input_tokens,
+                cache=cache,
+                phase=MLLMTargetForwardPhase.DECODE,
+                sparse_row_states=sparse_rows,
+            )
+            context_factory = getattr(self, "_target_forward_context", None)
+            if has_sparse_rows and context_factory is None:
+                raise SparseBatchError(
+                    "sparse decode cannot run without target forward context"
+                )
+            context = (
+                nullcontext() if context_factory is None else context_factory(forward)
+            )
+            # Run language model only (not full VLM). The context is scoped to
+            # this one graph-construction boundary and never survives return.
+            with context:
+                output = self.language_model(input_tokens, cache=cache)
+
+            # Handle LanguageModelOutput or plain tensor
+            if hasattr(output, "logits"):
+                logits = output.logits
+            else:
+                logits = output
+
+            logits = logits[:, -1, :]
+
+            # Apply per-request logits processors (repetition penalty etc.)
+            if logits_processors and output_tokens and any(logits_processors):
+                processed_logits = []
+                for e in range(logits.shape[0]):
+                    sample_logits = logits[e : e + 1]
+                    if logits_processors[e]:
+                        # ``output_tokens[e]`` already contains all generated
+                        # tokens including the current step's input token (built
+                        # by the caller as ``req.output_tokens + [token]``).
+                        full_context = output_tokens[e]
+                        for processor in logits_processors[e]:
+                            sample_logits = processor(
+                                mx.array(full_context), sample_logits
+                            )
+                    processed_logits.append(sample_logits)
+                logits = mx.concatenate(processed_logits, axis=0)
+
+            # Sample — per-request samplers for top_k/min_p support
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            if samplers and any(samplers):
+                sampled_list = []
+                for e in range(logprobs.shape[0]):
+                    row_sampler = samplers[e] or self.sampler
+                    sampled_list.append(row_sampler(logprobs[e : e + 1]))
+                sampled = mx.concatenate(sampled_list, axis=0)
+            else:
+                sampled = self.sampler(logprobs)
+
+            if has_sparse_rows:
+                # Realize the target/cache mutation before replacing immutable
+                # logical state. A failure leaves both metadata and response
+                # emission untouched and restores the entry cache snapshot.
+                assert active_batch is not None
+                assert cache_checkpoint is not None
+                occupancy_ok, examined_scalars = (
+                    cache_checkpoint.one_token_advance_predicate(sparse_rows)
+                )
+                mx.eval(sampled, logprobs, occupancy_ok)
+                self._sparse_checkpoint_scalar_reads += examined_scalars
+                self._sparse_checkpoint_host_scalar_reads += 1
+                if not occupancy_ok.item():
+                    raise SparseBatchError(
+                        "sparse cache physical occupancy must advance exactly one per row"
+                    )
+                active_batch.commit_sparse_decode(1)
+            return sampled, list(logprobs)
+        except Exception:
+            if cache_checkpoint is not None:
+                cache_checkpoint.restore()
+            raise
+
+    def _pop_terminal_current_tokens(self) -> List[MLLMBatchResponse]:
+        """Emit already-terminal current tokens without speculative lookahead."""
+        batch = self.active_batch
+        if batch is None:
+            return []
+
+        tokens = batch.y.tolist()
+        end_idx = [
+            index
+            for index, (token, num_tokens, max_tokens) in enumerate(
+                zip(tokens, batch.num_tokens, batch.max_tokens, strict=True)
+            )
+            if token in self.stop_tokens or num_tokens + 1 >= max_tokens
+        ]
+        if not end_idx:
+            return []
+
+        responses: list[MLLMBatchResponse] = []
+        for index in end_idx:
+            request = batch.requests[index]
+            token = tokens[index]
+            request.num_tokens = batch.num_tokens[index] + 1
+            batch.num_tokens[index] = request.num_tokens
+            request.output_tokens.append(token)
+            finish_reason = "stop" if token in self.stop_tokens else "length"
+            cache_fn = None
+            if batch.sparse_row_states[index] is None:
+                extracted = batch.extract_cache(index)
+                cache_fn = lambda cache=extracted: cache
+            self._prefill_progress.pop(request.request_id, None)
+            responses.append(
+                MLLMBatchResponse(
+                    uid=batch.uids[index],
+                    request_id=request.request_id,
+                    token=token,
+                    logprobs=batch.logprobs[index],
+                    finish_reason=finish_reason,
+                    prompt_cache=cache_fn,
+                )
+            )
+
+        self._maybe_store_prefix_cache(batch, end_idx)
+        end_set = set(end_idx)
+        keep_idx = [index for index in range(len(batch)) if index not in end_set]
+        if keep_idx:
+            batch.filter(keep_idx)
         else:
-            logits = output
-
-        logits = logits[:, -1, :]
-
-        # Apply per-request logits processors (repetition penalty etc.)
-        if logits_processors and output_tokens and any(logits_processors):
-            processed_logits = []
-            for e in range(logits.shape[0]):
-                sample_logits = logits[e : e + 1]
-                if logits_processors[e]:
-                    # ``output_tokens[e]`` already contains all generated
-                    # tokens including the current step's input token (built
-                    # by the caller as ``req.output_tokens + [token]``).
-                    full_context = output_tokens[e]
-                    for processor in logits_processors[e]:
-                        sample_logits = processor(mx.array(full_context), sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        # Sample — per-request samplers for top_k/min_p support
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if samplers and any(samplers):
-            sampled_list = []
-            for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else self.sampler
-                sampled_list.append(s(logprobs[e : e + 1]))
-            sampled = mx.concatenate(sampled_list, axis=0)
-        else:
-            sampled = self.sampler(logprobs)
-
-        return sampled, list(logprobs)
+            self.active_batch = None
+        self._stats.generation_tokens += len(responses)
+        return responses
 
     def _next(self) -> List[MLLMBatchResponse]:
         """
@@ -1795,7 +2599,7 @@ class MLLMBatchGenerator:
 
         # Mid-batch extend: text-only requests can join an active batch
         # without vision encoding (no shape mismatch risk).
-        elif self.unprocessed_requests:
+        elif self.unprocessed_requests and not batch.has_sparse_rows:
             text_only = [
                 r for r in self.unprocessed_requests if not r.images and not r.videos
             ][: self.completion_batch_size]
@@ -1847,14 +2651,16 @@ class MLLMBatchGenerator:
         if batch is None:
             return error_responses
 
+        terminal_responses = self._pop_terminal_current_tokens()
+        batch = self.active_batch
+        if batch is None:
+            return error_responses + terminal_responses
+
         y, logprobs = batch.y, batch.logprobs
         output_tokens = None
         if batch.logits_processors:
             y_list = y.tolist()
-            output_tokens = [
-                list(req.output_tokens) + [token]
-                for req, token in zip(batch.requests, y_list)
-            ]
+            output_tokens = _decode_processor_contexts(batch.requests, y_list)
         batch.y, batch.logprobs = self._step(
             y[:, None],
             batch.cache,
@@ -1929,7 +2735,8 @@ class MLLMBatchGenerator:
 
             if finish_reason is not None:
                 # Extract cache for this request
-                cache_fn = lambda idx=i: batch.extract_cache(idx)
+                if batch.sparse_row_states[i] is None:
+                    cache_fn = lambda idx=i: batch.extract_cache(idx)
                 # Cleanup prefill progress tracking
                 self._prefill_progress.pop(request_id, None)
 
@@ -1955,7 +2762,7 @@ class MLLMBatchGenerator:
                 self.active_batch = None
 
         self._stats.generation_tokens += len(responses)
-        return error_responses + responses
+        return error_responses + terminal_responses + responses
 
     def next(self) -> List[MLLMBatchResponse]:
         """
@@ -1987,6 +2794,10 @@ class MLLMBatchGenerator:
         if self.prefix_cache is None or not end_indices:
             return
         for i in end_indices:
+            if batch.sparse_row_states[i] is not None:
+                # Sparse prompt rows are valid only under their exact
+                # SparseCacheIdentity and never enter ordinary LCP/KVQ/SSD.
+                continue
             req = batch.requests[i]
             if req.input_ids is not None:
                 try:
@@ -2078,6 +2889,7 @@ def install_mtp_mllm(
         "no_active_batch": 0,
         "concurrent_batch": 0,
         "logits_processors": 0,
+        "sparse_rows": 0,
     }
 
     def _get_mtp_stats() -> Dict[str, Any]:
@@ -2127,7 +2939,16 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
-        if prefill_bypass or no_active_batch_bypass or logits_processors_bypass:
+        sparse_rows_bypass = (
+            batch_gen.active_batch is not None
+            and batch_gen.active_batch.has_sparse_rows
+        )
+        if (
+            prefill_bypass
+            or no_active_batch_bypass
+            or logits_processors_bypass
+            or sparse_rows_bypass
+        ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
             # prefill=input_tokens.shape[1] > 1
@@ -2140,6 +2961,8 @@ def install_mtp_mllm(
                     _bypass_counts["no_active_batch"] += 1
                 if logits_processors_bypass:
                     _bypass_counts["logits_processors"] += 1
+                if sparse_rows_bypass:
+                    _bypass_counts["sparse_rows"] += 1
             _skip_state_by_uid.clear()
             return _orig_step(
                 input_tokens, cache, logits_processors, output_tokens, samplers
@@ -2624,10 +3447,15 @@ def install_chunked_prefill_mllm(
         if batch is None:
             return error_responses
 
+        terminal_responses = batch_gen._pop_terminal_current_tokens()
+        batch = batch_gen.active_batch
+        if batch is None:
+            return error_responses + terminal_responses
+
         tic = time.perf_counter()
         y, logprobs = batch.y, batch.logprobs
         output_tokens = (
-            [req.output_tokens for req in batch.requests]
+            _decode_processor_contexts(batch.requests, y.tolist())
             if batch.logits_processors
             else None
         )
@@ -2688,6 +3516,7 @@ def install_chunked_prefill_mllm(
                     prompt_cache=(
                         (lambda idx=i: batch.extract_cache(idx))
                         if finish_reason is not None
+                        and batch.sparse_row_states[i] is None
                         else None
                     ),
                 )
@@ -2704,7 +3533,7 @@ def install_chunked_prefill_mllm(
                 batch_gen.active_batch = None
 
         batch_gen._stats.generation_tokens += len(responses)
-        return error_responses + responses
+        return error_responses + terminal_responses + responses
 
     def _chunked_next() -> List[MLLMBatchResponse]:
         """Interleaved prefill/decode: one prefill chunk + one gen step."""
@@ -2798,25 +3627,6 @@ def install_chunked_prefill_mllm(
                     logits = logits.logits
                 last_logits = logits[:, -1, :]
 
-                # Apply logits processors for first token
-                if getattr(req, "logits_processors", None):
-                    empty_tokens = mx.array([], dtype=mx.int32)
-                    for processor in req.logits_processors:
-                        last_logits = processor(empty_tokens, last_logits)
-
-                logprobs = last_logits - mx.logsumexp(
-                    last_logits, axis=-1, keepdims=True
-                )
-                sampled = batch_gen.sampler(logprobs)
-                mx.eval(sampled, logprobs)
-
-                batch_gen._prefill_progress[req.request_id] = (
-                    partial["total"],
-                    partial["total"],
-                )
-                batch_gen._stats.prompt_time += time.perf_counter() - tic
-
-                # Build single-request batch
                 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
                 req_lp = []
@@ -2832,14 +3642,35 @@ def install_chunked_prefill_mllm(
                 if req.logits_processors:
                     req_lp.extend(req.logits_processors)
 
-                req_sampler = None
-                if req.top_k != 0 or req.min_p != 0.0:
-                    req_sampler = make_sampler(
-                        temp=req.temperature,
-                        top_p=req.top_p,
-                        top_k=req.top_k,
-                        min_p=req.min_p,
+                req_sampler = make_sampler(
+                    temp=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    min_p=req.min_p,
+                )
+
+                # Dense, chunked, and sparse first-token paths all pass the
+                # exact full prompt to the exact same processor stack.
+                if req_lp:
+                    if req.input_ids is None:
+                        raise ValueError(
+                            "first-token processors require exact prompt tokens"
+                        )
+                    last_logits = _apply_first_token_processors(
+                        last_logits, req.input_ids, req_lp
                     )
+
+                logprobs = last_logits - mx.logsumexp(
+                    last_logits, axis=-1, keepdims=True
+                )
+                sampled = req_sampler(logprobs)
+                mx.eval(sampled, logprobs)
+
+                batch_gen._prefill_progress[req.request_id] = (
+                    partial["total"],
+                    partial["total"],
+                )
+                batch_gen._stats.prompt_time += time.perf_counter() - tic
 
                 new_batch = MLLMBatch(
                     uids=[req.uid],
@@ -2851,7 +3682,7 @@ def install_chunked_prefill_mllm(
                     cache=partial["cache"],
                     requests=[req],
                     logits_processors=[req_lp] if req_lp else None,
-                    samplers=[req_sampler] if req_sampler else None,
+                    samplers=[req_sampler],
                 )
 
                 # Extend active batch or set as new
