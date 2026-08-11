@@ -54,9 +54,9 @@ class SelectionPolicy:
         if (
             isinstance(self.anchor_chunks, bool)
             or not isinstance(self.anchor_chunks, int)
-            or self.anchor_chunks < 0
+            or self.anchor_chunks <= 0
         ):
-            raise ValueError("anchor_chunks must be non-negative")
+            raise ValueError("anchor_chunks must be positive")
         if (
             isinstance(self.chunk_size, bool)
             or not isinstance(self.chunk_size, int)

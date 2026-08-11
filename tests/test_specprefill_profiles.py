@@ -65,6 +65,17 @@ def _calibration(*, keep_pct: float = 0.7) -> SpecPrefillCalibration:
     )
 
 
+def test_profile_tuning_requires_boundary_anchors():
+    with pytest.raises(ValueError, match="anchor_chunks must be positive"):
+        SpecPrefillTuning(
+            keep_pct=0.7,
+            backbone_pct=0.1,
+            halo_chunks=1,
+            anchor_chunks=0,
+            chunk_size=32,
+        )
+
+
 def _evidence(
     *,
     key: SpecPrefillProfileKey | None = None,

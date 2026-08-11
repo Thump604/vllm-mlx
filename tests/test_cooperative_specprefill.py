@@ -38,7 +38,7 @@ _TUNING = SparsePolicyTuning(
     keep_pct=0.25,
     backbone_pct=0.0,
     halo_chunks=0,
-    anchor_chunks=0,
+    anchor_chunks=1,
     chunk_size=2,
 )
 _CONFIG = CooperativeSpecPrefillConfig(

@@ -48,8 +48,8 @@ class SparsePolicyTuning:
             raise SparseCacheStateError("backbone_pct must be finite and in [0, 1]")
         if self.halo_chunks < 0:
             raise SparseCacheStateError("halo_chunks must be non-negative")
-        if self.anchor_chunks < 0:
-            raise SparseCacheStateError("anchor_chunks must be non-negative")
+        if self.anchor_chunks <= 0:
+            raise SparseCacheStateError("anchor_chunks must be positive")
         if self.chunk_size <= 0:
             raise SparseCacheStateError("chunk_size must be positive")
 

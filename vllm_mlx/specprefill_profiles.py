@@ -64,8 +64,10 @@ class SpecPrefillTuning:
             raise ValueError("keep_pct must be finite and in (0, 1]")
         if not math.isfinite(self.backbone_pct) or not 0.0 <= self.backbone_pct <= 1.0:
             raise ValueError("backbone_pct must be finite and in [0, 1]")
-        if self.halo_chunks < 0 or self.anchor_chunks < 0:
-            raise ValueError("halo_chunks and anchor_chunks must be non-negative")
+        if self.halo_chunks < 0:
+            raise ValueError("halo_chunks must be non-negative")
+        if self.anchor_chunks <= 0:
+            raise ValueError("anchor_chunks must be positive")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
 

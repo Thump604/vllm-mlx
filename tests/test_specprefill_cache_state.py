@@ -52,6 +52,17 @@ def _state(*, rows: int = 2) -> SparseCacheState:
     )
 
 
+def test_sparse_cache_tuning_requires_boundary_anchors():
+    with pytest.raises(SparseCacheStateError, match="anchor_chunks must be positive"):
+        SparsePolicyTuning(
+            keep_pct=0.7,
+            backbone_pct=0.1,
+            halo_chunks=1,
+            anchor_chunks=0,
+            chunk_size=32,
+        )
+
+
 def test_identity_includes_artifacts_policy_full_prompt_and_selection():
     base = _identity()
     assert base.full_token_hash == SparseCacheIdentity.hash_tokens((10, 11, 12, 13))

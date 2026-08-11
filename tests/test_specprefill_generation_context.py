@@ -45,7 +45,7 @@ class _Hooks:
 
 
 def _state():
-    tuning = SparsePolicyTuning(0.5, 0.0, 0, 0, 2)
+    tuning = SparsePolicyTuning(0.5, 0.0, 0, 1, 2)
     identity = SparseCacheIdentity.from_tokens(
         target_id="target",
         tokenizer_id="tokenizer",

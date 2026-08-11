@@ -17,7 +17,7 @@ def _policy(**overrides) -> SelectionPolicy:
         "keep_pct": 0.25,
         "backbone_pct": 0.0,
         "halo_chunks": 0,
-        "anchor_chunks": 0,
+        "anchor_chunks": 1,
         "chunk_size": 4,
     }
     values.update(overrides)
@@ -83,7 +83,9 @@ def test_halo_boundary_collision_and_stratified_backbone_are_provenanced():
     # control anchor and a halo candidate; each source remains observable.
     assert plan.backbone_chunks == (1, 3)
     assert plan.control_anchor_chunks == (1,)
-    assert plan.importance_chunks == (0,)
+    # The highest-scoring first chunk is already a mandatory boundary anchor,
+    # so it is not double-counted as an importance seed.
+    assert plan.importance_chunks == ()
     assert plan.halo_chunks == (2,)
     assert {0, 1, 2, 3}.issubset(plan.selected_chunks)
 
@@ -94,8 +96,9 @@ def test_tail_requirement_rejects_partial_or_unprovenanced_plans():
         SelectionPlan(
             prompt_length=20,
             policy=_policy(),
-            selected_chunks=(0,),
-            selected_indices=(0, 1, 2, 3),
+            selected_chunks=(0, 4),
+            selected_indices=(0, 1, 2, 3, 16, 17, 18, 19),
+            provenance=SelectionProvenance(anchor_chunks=(0, 4)),
             rotating_tail_requirement=requirement,
         )
 
@@ -117,6 +120,7 @@ def test_rotating_tail_requires_an_integer_window_size():
         ("halo_chunks", True),
         ("halo_chunks", 1.0),
         ("anchor_chunks", True),
+        ("anchor_chunks", 0),
         ("anchor_chunks", 1.0),
         ("chunk_size", True),
         ("chunk_size", 4.0),
@@ -127,7 +131,7 @@ def test_policy_rejects_boolean_and_coerced_numeric_values(field, value):
         "keep_pct": 0.25,
         "backbone_pct": 0.0,
         "halo_chunks": 0,
-        "anchor_chunks": 0,
+        "anchor_chunks": 1,
         "chunk_size": 4,
     }
     values[field] = value
@@ -145,14 +149,15 @@ def test_builder_requires_an_explicit_selection_policy():
 
 
 def test_budget_rejected_halo_is_not_recorded_as_retained_provenance():
-    plan = _plan(
-        scores=(0.99, 0.2, 0.3, 0.4, 0.5),
+    plan = build_selection_plan_from_chunk_scores(
+        prompt_length=40,
+        chunk_scores=(0.1, 0.1, 0.1, 0.1, 0.1, 0.99, 0.1, 0.1, 0.1, 0.1),
+        policy=_policy(keep_pct=0.3, halo_chunks=2, backbone_pct=0.2),
         control_token_indices=(4,),
-        policy={"halo_chunks": 2, "backbone_pct": 0.4},
     )
 
-    assert plan.selected_chunks == (0, 1, 3)
-    assert plan.importance_chunks == (0,)
+    assert plan.selected_chunks == (0, 1, 2, 5, 7, 9)
+    assert plan.importance_chunks == (5,)
     assert plan.halo_chunks == ()
 
 
@@ -173,9 +178,11 @@ def test_direct_plan_construction_cannot_forge_control_anchor_mapping():
         SelectionPlan(
             prompt_length=20,
             policy=_policy(),
-            selected_chunks=(1,),
-            selected_indices=(4, 5, 6, 7),
-            provenance=SelectionProvenance(control_anchor_indices=(4,)),
+            selected_chunks=(0, 1, 4),
+            selected_indices=(0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19),
+            provenance=SelectionProvenance(
+                anchor_chunks=(0, 4), control_anchor_indices=(4,)
+            ),
         )
 
 
@@ -184,9 +191,11 @@ def test_direct_plan_construction_cannot_forge_a_tail_without_requirement():
         SelectionPlan(
             prompt_length=20,
             policy=_policy(),
-            selected_chunks=(3,),
-            selected_indices=(12, 13, 14, 15),
-            provenance=SelectionProvenance(rotating_tail_chunks=(3,)),
+            selected_chunks=(0, 3, 4),
+            selected_indices=(0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 18, 19),
+            provenance=SelectionProvenance(
+                anchor_chunks=(0, 4), rotating_tail_chunks=(3,)
+            ),
         )
 
 
