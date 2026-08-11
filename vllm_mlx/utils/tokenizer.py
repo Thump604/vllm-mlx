@@ -154,30 +154,28 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
 
 
 def _try_inject_mtp(model, model_path, config):
-    """Inject MTP support if model has MTP config + weights."""
-    # Qwen3-Next: flat num_nextn_predict_layers
-    if config.get("num_nextn_predict_layers", 0) > 0:
-        # Detect Qwen3.5 vs Qwen3-Next by checking text_config or model_type
-        text_config = config.get("text_config", config)
-        model_type = text_config.get("model_type", config.get("model_type", ""))
-        if "qwen3_5" in model_type:
-            from ..patches.qwen3_5_mtp import inject_mtp_support
-        else:
-            from ..patches.qwen3_next_mtp import inject_mtp_support
-        inject_mtp_support(model, model_path, config)
-        return
+    """Retain legacy injection only for unrelated Qwen3-Next checkpoints.
 
-    # Qwen3.5: mtp_num_hidden_layers in text_config
+    Qwen3.5/3.6 native MTP is owned by mlx-lm's sanitize/load handshake.  A
+    post-load injector would create a mixed object whose head exists without a
+    verified native capability, so this helper deliberately does nothing for
+    that family.
+    """
+
     text_config = config.get("text_config", config)
-    num_mtp = text_config.get("mtp_num_hidden_layers", 0)
-    if num_mtp > 0:
-        from ..patches.qwen3_5_mtp import inject_mtp_support
+    model_type = text_config.get("model_type", config.get("model_type", ""))
+    if "qwen3_5" in model_type:
+        return
+    if "qwen3_next" not in model_type:
+        return
+    if config.get("num_nextn_predict_layers", 0) > 0:
+        from ..patches.qwen3_next_mtp import inject_mtp_support
 
         inject_mtp_support(model, model_path, config)
 
 
 def _try_inject_mtp_post_load(model, model_name):
-    """Check if MTP weights exist but were stripped by sanitize(), and inject."""
+    """Apply the legacy Qwen3-Next post-load injector only."""
     import json
 
     from mlx_lm.utils import _download
@@ -188,13 +186,17 @@ def _try_inject_mtp_post_load(model, model_name):
         return
     with open(config_path) as f:
         config = json.load(f)
+    text_config = config.get("text_config", config)
+    model_type = text_config.get("model_type", config.get("model_type", ""))
+    if "qwen3_5" in model_type:
+        return
+    if "qwen3_next" not in model_type:
+        return
+
     # Check for MTP in flat config and nested text_config
-    text_config = config.get("text_config", {})
     num_mtp = config.get("num_nextn_predict_layers", 0)
     if num_mtp == 0:
         num_mtp = text_config.get("num_nextn_predict_layers", 0)
-    if num_mtp == 0:
-        num_mtp = text_config.get("mtp_num_hidden_layers", 0)
     # Also check mtp attribute on language_model for VLM wrappers
     check_model = model
     if hasattr(model, "language_model"):
