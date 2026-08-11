@@ -2045,6 +2045,7 @@ class TestSimpleEngineConcurrency:
             mtp_num_draft_tokens=4,
             specprefill_enabled=True,
             specprefill_threshold=1,
+            specprefill_diagnostic_mode=True,
         )
         engine._loaded = True
         engine._text_model = text_model
@@ -2084,6 +2085,7 @@ class TestSimpleEngineConcurrency:
                     max_tokens=4,
                     temperature=0.6,
                     top_p=0.95,
+                    specprefill_policy="sparse",
                     specprefill_backbone_pct=0.25,
                 )
             ]
@@ -2478,6 +2480,7 @@ class TestSimpleEngineConcurrency:
             mtp=True,
             mtp_num_draft_tokens=4,
             specprefill_enabled=True,
+            specprefill_diagnostic_mode=True,
         )
         engine._loaded = True
         engine._draft_model = MagicMock()

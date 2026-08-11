@@ -17,6 +17,7 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -32,6 +33,12 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, has_media_content, is_mllm_model
+from ..specprefill import (
+    SPECPREFILL_SELECTOR_VERSION,
+    SpecPrefillDecision,
+    SpecPrefillPolicy,
+    resolve_specprefill_decision,
+)
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -119,6 +126,52 @@ class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
 
 
+@dataclass
+class _SpecPrefillTelemetry:
+    """Mutable, request-local SpecPrefill evidence shared by one stream.
+
+    Selection and execution run in a blocking worker while responses are yielded
+    on the event loop.  Keeping this state request-local means a sparse-prefill
+    failure can atomically turn subsequent output into an explicit dense
+    fallback without changing model-global state or MTP accounting.
+    """
+
+    decision: SpecPrefillDecision
+    total_tokens: int | None
+    selected_tokens: int | None
+    scorer_ms: float | None = None
+    target_prefill_ms: float | None = None
+
+    def fallback(self, reason: str) -> None:
+        self.decision = SpecPrefillDecision(
+            requested_policy=self.decision.requested_policy,
+            effective_policy=SpecPrefillPolicy.DENSE,
+            coverage=self.decision.coverage,
+            fallback_reason=reason,
+        )
+        # Dense fallback retains the complete prompt.  This is also the only
+        # cache state that may be used after a sparse execution error.
+        self.selected_tokens = self.total_tokens
+        # Retain completed phase timings: they are evidence of the failed
+        # sparse attempt and must not be mistaken for a zero-cost dense path.
+
+    def as_output_kwargs(self) -> dict[str, Any]:
+        decision = self.decision
+        return {
+            "specprefill_requested_policy": decision.requested_policy.value,
+            "specprefill_effective_policy": decision.effective_policy.value,
+            "specprefill_coverage": decision.coverage.value,
+            "specprefill_engaged": decision.effective_policy
+            is SpecPrefillPolicy.SPARSE,
+            "specprefill_selector_version": SPECPREFILL_SELECTOR_VERSION,
+            "specprefill_fallback_reason": decision.fallback_reason,
+            "specprefill_total_tokens": self.total_tokens,
+            "specprefill_selected_tokens": self.selected_tokens,
+            "specprefill_scorer_ms": self.scorer_ms,
+            "specprefill_target_prefill_ms": self.target_prefill_ms,
+        }
+
+
 class SimpleEngine(BaseEngine):
     """
     Simple engine for direct model calls.
@@ -141,6 +194,8 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
+        specprefill_diagnostic_mode: bool = False,
+        specprefill_max_tokens: int | None = None,
         max_kv_size: int = 0,
         mllm_draft_model: str | None = None,
         mllm_draft_kind: str | None = None,
@@ -163,6 +218,11 @@ class SimpleEngine(BaseEngine):
             specprefill_backbone_pct: Fraction of chunks to reserve for evenly
                 spaced coverage (default: 0.0)
             specprefill_draft_model: Path to small draft model for importance scoring
+            specprefill_diagnostic_mode: Allow forced sparse requests and
+                per-request selector overrides. Production routes keep this off.
+            specprefill_max_tokens: Optional explicit scorer-admission cap.
+                ``None`` leaves long-context admission to the profile/memory
+                controller rather than imposing a hidden engine ceiling.
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             mllm_draft_model: Optional MLLM speculative draft/assistant model path
             mllm_draft_kind: Optional mlx-vlm draft kind, for example "mtp"
@@ -196,6 +256,10 @@ class SimpleEngine(BaseEngine):
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+        self._specprefill_diagnostic_mode = specprefill_diagnostic_mode
+        if specprefill_max_tokens is not None and specprefill_max_tokens <= 0:
+            raise ValueError("specprefill_max_tokens must be positive when set")
+        self._specprefill_max_tokens = specprefill_max_tokens
         self._mllm_draft_model_path = mllm_draft_model
         self._mllm_draft_kind = mllm_draft_kind
         self._mllm_draft_block_size = mllm_draft_block_size
@@ -255,6 +319,136 @@ class SimpleEngine(BaseEngine):
         # cache classes such as ``RotatingKVCache`` remain disabled because
         # their extra cursor metadata is not captured by ``.state`` alone.
         self._supports_system_kv_cache: bool = False
+
+    def _resolve_specprefill_telemetry(
+        self,
+        *,
+        legacy: bool | None,
+        policy: str | None,
+        coverage: str | None,
+        has_media: bool,
+        total_tokens: int | None,
+    ) -> _SpecPrefillTelemetry:
+        """Resolve request intent before execution, with a safe dense default.
+
+        API validation rejects conflicts, but this engine may also be used
+        directly.  Its default is deliberately conservative: an omitted
+        coverage declaration is ``unknown`` and therefore never engages sparse
+        prefill in a production engine.
+        """
+        if policy is None:
+            policy = (
+                "sparse" if legacy is True else "dense" if legacy is False else "auto"
+            )
+        if coverage is None:
+            coverage = "unknown"
+
+        requested_policy = SpecPrefillPolicy(policy)
+        # ``sparse`` is a diagnostic forcing control. Its diagnostic-only
+        # meaning includes bypassing the calibrated crossover; production
+        # routes still resolve it dense before any scorer work begins.
+        if (
+            self._specprefill_diagnostic_mode
+            and requested_policy is SpecPrefillPolicy.SPARSE
+        ):
+            threshold_met = True
+        elif total_tokens is None:
+            threshold_met = False
+        else:
+            threshold_met = total_tokens > self._specprefill_threshold
+        # The engine owns no implicit maximum context. A deployment may install
+        # an explicit scorer cap, while the normal long-context admission
+        # decision belongs to the profile/memory controller.
+        admission_allowed = (
+            self._specprefill_max_tokens is None
+            or total_tokens is None
+            or total_tokens <= self._specprefill_max_tokens
+        )
+        decision = resolve_specprefill_decision(
+            policy,
+            coverage,
+            production=not self._specprefill_diagnostic_mode,
+            text_only=not has_media,
+            threshold_met=threshold_met,
+            admission_allowed=admission_allowed,
+        )
+        if (
+            decision.effective_policy is SpecPrefillPolicy.SPARSE
+            and self._draft_model is None
+        ):
+            decision = SpecPrefillDecision(
+                requested_policy=decision.requested_policy,
+                effective_policy=SpecPrefillPolicy.DENSE,
+                coverage=decision.coverage,
+                fallback_reason="specprefill_unavailable",
+            )
+
+        selected_tokens = (
+            total_tokens
+            if decision.effective_policy is SpecPrefillPolicy.DENSE
+            else None
+        )
+        return _SpecPrefillTelemetry(decision, total_tokens, selected_tokens)
+
+    def _specprefill_controls(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Remove public prefill controls before forwarding to model APIs."""
+        controls = {
+            "legacy": kwargs.pop("specprefill", None),
+            "policy": kwargs.pop("specprefill_policy", None),
+            "coverage": kwargs.pop("specprefill_coverage", None),
+            "has_media": bool(kwargs.pop("specprefill_has_media", False)),
+            "keep_pct": kwargs.pop("specprefill_keep_pct", None),
+            "backbone_pct": kwargs.pop("specprefill_backbone_pct", None),
+        }
+        if not self._specprefill_diagnostic_mode and (
+            controls["keep_pct"] is not None or controls["backbone_pct"] is not None
+        ):
+            raise ValueError(
+                "specprefill_keep_pct and specprefill_backbone_pct are "
+                "diagnostic-only controls"
+            )
+        return controls
+
+    def _has_eligible_sparse_chat_intent(self, kwargs: dict[str, Any]) -> bool:
+        """Whether chat must use the stream seam to permit sparse prefill.
+
+        The direct ``model.chat`` path has no sparse-prefill execution seam.
+        This predicate deliberately does not treat a loaded scorer as intent;
+        only a declared selective auto request or diagnostic sparse request may
+        switch a chat request onto that seam. Prompt-length admission remains
+        authoritative in the streaming implementation after template rendering.
+        """
+        policy = kwargs.get("specprefill_policy")
+        legacy = kwargs.get("specprefill")
+        coverage = kwargs.get("specprefill_coverage", "unknown")
+        has_media = bool(kwargs.get("specprefill_has_media", False))
+        if has_media or self._draft_model is None:
+            return False
+        if policy is None:
+            policy = (
+                "sparse" if legacy is True else "dense" if legacy is False else "auto"
+            )
+        if policy == "auto":
+            return coverage == "selective"
+        return policy == "sparse" and self._specprefill_diagnostic_mode
+
+    @staticmethod
+    def _prompt_add_special_tokens(tokenizer: Any, prompt: str) -> bool:
+        """Tokenize without assuming a concrete tokenizer attribute type.
+
+        Third-party wrappers and test doubles may expose ``bos_token`` as a
+        sentinel object rather than a string. Such a value cannot be passed to
+        ``str.startswith`` and should conservatively be treated as no BOS.
+        """
+        bos_token = getattr(tokenizer, "bos_token", None)
+        return not isinstance(bos_token, str) or not prompt.startswith(bos_token)
+
+    @classmethod
+    def _encode_prompt_tokens(cls, tokenizer: Any, prompt: str) -> list[int]:
+        return tokenizer.encode(
+            prompt,
+            add_special_tokens=cls._prompt_add_special_tokens(tokenizer, prompt),
+        )
 
     @staticmethod
     def _clone_cache_state(value: Any) -> Any:
@@ -727,6 +921,16 @@ class SimpleEngine(BaseEngine):
             completion_tokens=last_output.completion_tokens,
             finish_reason=last_output.finish_reason,
             finished=True,
+            specprefill_requested_policy=last_output.specprefill_requested_policy,
+            specprefill_effective_policy=last_output.specprefill_effective_policy,
+            specprefill_coverage=last_output.specprefill_coverage,
+            specprefill_engaged=last_output.specprefill_engaged,
+            specprefill_selector_version=last_output.specprefill_selector_version,
+            specprefill_fallback_reason=last_output.specprefill_fallback_reason,
+            specprefill_total_tokens=last_output.specprefill_total_tokens,
+            specprefill_selected_tokens=last_output.specprefill_selected_tokens,
+            specprefill_scorer_ms=last_output.specprefill_scorer_ms,
+            specprefill_target_prefill_ms=last_output.specprefill_target_prefill_ms,
         )
 
     async def _track_request_stream(
@@ -865,58 +1069,50 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        # Per-request specprefill overrides (from extra_body)
-        specprefill_override = kwargs.pop("specprefill", None)
-        specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
-        specprefill_backbone_pct_override = kwargs.pop("specprefill_backbone_pct", None)
+        # Resolve the complete public prefill contract before any model call.
+        # These controls must never leak into mlx-lm/mlx-vlm kwargs.
+        specprefill_controls = self._specprefill_controls(kwargs)
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
-        # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
-        if not self._is_mllm and self._draft_model is not None:
-            use_specprefill = True
-            if specprefill_override is False:
-                use_specprefill = False
+        tokenizer = self._model.tokenizer
+        tokens_list = self._encode_prompt_tokens(tokenizer, prompt)
+        telemetry = self._resolve_specprefill_telemetry(
+            legacy=specprefill_controls["legacy"],
+            policy=specprefill_controls["policy"],
+            coverage=specprefill_controls["coverage"],
+            has_media=specprefill_controls["has_media"],
+            total_tokens=len(tokens_list),
+        )
 
-            if use_specprefill:
-                tokenizer = self._model.tokenizer
-                add_special = tokenizer.bos_token is None or not prompt.startswith(
-                    tokenizer.bos_token
-                )
-                tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
-                n_tokens = len(tokens_list)
-
-                # Threshold check (skip when force-enabled via per-request override)
-                if (
-                    specprefill_override is not True
-                    and n_tokens <= self._specprefill_threshold
-                ):
-                    use_specprefill = False
-
-                # Upper bound: cap to avoid draft model OOM
-                _SPECPREFILL_MAX_TOKENS = 65536
-                if use_specprefill and n_tokens > _SPECPREFILL_MAX_TOKENS:
-                    logger.warning(
-                        "SpecPrefill: prompt %d tokens exceeds max %d, "
-                        "falling back to normal path",
-                        n_tokens,
-                        _SPECPREFILL_MAX_TOKENS,
-                    )
-                    use_specprefill = False
-
-                if use_specprefill:
-                    async for output in self._stream_generate_specprefill(
-                        prompt,
-                        tokens_list,
-                        max_tokens,
-                        temperature,
-                        top_p,
-                        stop=stop,
-                        specprefill_keep_pct=specprefill_keep_pct_override,
-                        specprefill_backbone_pct=specprefill_backbone_pct_override,
-                        **kwargs,
-                    ):
-                        yield output
-                    return
+        # SpecPrefill is independent from MTP. The direct path is used only
+        # for non-MLLM requests; the MLLM text route resolves the same contract
+        # in _stream_generate_text.
+        if (
+            not self._is_mllm
+            and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
+        ):
+            async for output in self._stream_generate_specprefill(
+                prompt,
+                tokens_list,
+                max_tokens,
+                temperature,
+                top_p,
+                stop=stop,
+                telemetry=telemetry,
+                specprefill_keep_pct=(
+                    specprefill_controls["keep_pct"]
+                    if self._specprefill_diagnostic_mode
+                    else None
+                ),
+                specprefill_backbone_pct=(
+                    specprefill_controls["backbone_pct"]
+                    if self._specprefill_diagnostic_mode
+                    else None
+                ),
+                **kwargs,
+            ):
+                yield output
+            return
 
         async with self._acquire_generation_slot(request_id):
             started_at = time.time()
@@ -984,6 +1180,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=completion_tokens,
                         finished=finished,
                         finish_reason=finish_reason,
+                        **telemetry.as_output_kwargs(),
                     )
 
                     if finished:
@@ -1007,6 +1204,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=completion_tokens,
                         finished=True,
                         finish_reason="stop",
+                        **telemetry.as_output_kwargs(),
                     )
             finally:
                 self._active_requests.pop(request_id, None)
@@ -1066,6 +1264,16 @@ class SimpleEngine(BaseEngine):
                 finish_reason=final_output.finish_reason,
                 mtp_drafts=final_output.mtp_drafts,
                 mtp_accepted=final_output.mtp_accepted,
+                specprefill_requested_policy=final_output.specprefill_requested_policy,
+                specprefill_effective_policy=final_output.specprefill_effective_policy,
+                specprefill_coverage=final_output.specprefill_coverage,
+                specprefill_engaged=final_output.specprefill_engaged,
+                specprefill_selector_version=final_output.specprefill_selector_version,
+                specprefill_fallback_reason=final_output.specprefill_fallback_reason,
+                specprefill_total_tokens=final_output.specprefill_total_tokens,
+                specprefill_selected_tokens=final_output.specprefill_selected_tokens,
+                specprefill_scorer_ms=final_output.specprefill_scorer_ms,
+                specprefill_target_prefill_ms=final_output.specprefill_target_prefill_ms,
             )
 
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
@@ -1073,6 +1281,12 @@ class SimpleEngine(BaseEngine):
         # streaming implementation and aggregate its final state so both chat
         # APIs share the same tool-capable execution path.
         if tools and not self._is_mllm:
+            return await aggregate_stream_chat()
+
+        # Keep the independently configurable prefill path identical for
+        # streaming and non-streaming SimpleEngine chat. This is intentionally
+        # not coupled to MTP.
+        if not self._is_mllm and self._has_eligible_sparse_chat_intent(kwargs):
             return await aggregate_stream_chat()
 
         # Request-local logits processors (response_format / constrained JSON)
@@ -1093,6 +1307,16 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         if self._is_mllm:
+            specprefill_controls = self._specprefill_controls(kwargs)
+            telemetry = self._resolve_specprefill_telemetry(
+                legacy=specprefill_controls["legacy"],
+                policy=specprefill_controls["policy"],
+                coverage=specprefill_controls["coverage"],
+                has_media=(
+                    has_media_content(messages) or specprefill_controls["has_media"]
+                ),
+                total_tokens=None,
+            )
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
@@ -1111,8 +1335,13 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=getattr(output, "mtp_drafts", 0),
                 mtp_accepted=getattr(output, "mtp_accepted", 0),
+                **telemetry.as_output_kwargs(),
             )
         else:
+            # Direct dense chat cannot accept the public policy kwargs, and a
+            # loaded scorer alone must not alter this route. Resolve after
+            # prompt accounting so this path still publishes full telemetry.
+            specprefill_controls = self._specprefill_controls(kwargs)
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,
@@ -1135,12 +1364,20 @@ class SimpleEngine(BaseEngine):
                 template_kwargs["tools"] = template_tools
             prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
             prompt_token_count = len(prompt_ids)
+            telemetry = self._resolve_specprefill_telemetry(
+                legacy=specprefill_controls["legacy"],
+                policy=specprefill_controls["policy"],
+                coverage=specprefill_controls["coverage"],
+                has_media=specprefill_controls["has_media"],
+                total_tokens=prompt_token_count,
+            )
             return GenerationOutput(
                 text=text,
                 tokens=output.tokens,
                 prompt_tokens=prompt_token_count,
                 completion_tokens=len(output.tokens),
                 finish_reason=output.finish_reason,
+                **telemetry.as_output_kwargs(),
             )
 
     async def stream_chat(
@@ -1202,20 +1439,21 @@ class SimpleEngine(BaseEngine):
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
-        has_media = has_media_content(messages)
+        request_has_media = has_media_content(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # Per-request routing: text-only through mlx_lm TextModel
-        if (
+        routes_text_model = (
             self._is_mllm
             and self._text_model is not None
             and self._should_route_text_through_text_model(
                 mllm_draft_requested=mllm_draft_requested
             )
-            and not has_media
-        ):
+            and not request_has_media
+        )
+        if routes_text_model:
             has_mtp = (
                 hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
             )
@@ -1233,6 +1471,20 @@ class SimpleEngine(BaseEngine):
                 yield chunk
             return
 
+        # Direct MLLM execution (including media) does not implement sparse
+        # token selection. It still consumes and reports the public contract so
+        # a media request is visibly dense rather than silently text-only.
+        direct_mllm_telemetry: _SpecPrefillTelemetry | None = None
+        if self._is_mllm:
+            specprefill_controls = self._specprefill_controls(kwargs)
+            direct_mllm_telemetry = self._resolve_specprefill_telemetry(
+                legacy=specprefill_controls["legacy"],
+                policy=specprefill_controls["policy"],
+                coverage=specprefill_controls["coverage"],
+                has_media=request_has_media or specprefill_controls["has_media"],
+                total_tokens=None,
+            )
+
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
             if chat_template_kwargs:
@@ -1244,7 +1496,7 @@ class SimpleEngine(BaseEngine):
         # Build prompt using tokenizer
         if self._is_mllm:
             if self._text_model is not None:
-                route_kind = "Media" if has_media else "Text-only"
+                route_kind = "Media" if request_has_media else "Text-only"
                 logger.info("%s request → MLLM path", route_kind)
             # For MLLM, use stream_chat which yields tokens incrementally.
             # Must hold the generation slot to prevent concurrent Metal access
@@ -1287,6 +1539,7 @@ class SimpleEngine(BaseEngine):
                             finish_reason=chunk.finish_reason if finished else None,
                             mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                             mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            **direct_mllm_telemetry.as_output_kwargs(),
                         )
 
                         if finished:
@@ -1326,6 +1579,7 @@ class SimpleEngine(BaseEngine):
                     finish_reason=chunk.finish_reason if finished else None,
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                     mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                    **direct_mllm_telemetry.as_output_kwargs(),
                 )
             return
 
@@ -1551,9 +1805,7 @@ class SimpleEngine(BaseEngine):
                         system_prefix_text.encode()
                     ).hexdigest()[:16]
 
-                    add_special = tokenizer.bos_token is None or not prompt.startswith(
-                        tokenizer.bos_token
-                    )
+                    add_special = self._prompt_add_special_tokens(tokenizer, prompt)
                     full_tokens_list = tokenizer.encode(
                         prompt, add_special_tokens=add_special
                     )
@@ -1801,6 +2053,7 @@ class SimpleEngine(BaseEngine):
         temperature: float,
         top_p: float,
         stop: list[str] | None = None,
+        telemetry: _SpecPrefillTelemetry | None = None,
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
         **kwargs,
@@ -1816,6 +2069,14 @@ class SimpleEngine(BaseEngine):
         model = self._model.model
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
+        if telemetry is None:
+            telemetry = self._resolve_specprefill_telemetry(
+                legacy=True,
+                policy="sparse",
+                coverage="selective",
+                has_media=False,
+                total_tokens=n_tokens,
+            )
         cancel_requested = Event()
 
         def _request_cancel() -> None:
@@ -1832,6 +2093,7 @@ class SimpleEngine(BaseEngine):
                 raise
             except Exception as e:
                 logger.error("SpecPrefill failed, falling back to normal path: %s", e)
+                telemetry.fallback("sparse_execution_failed")
                 return _run_normal()
 
         def _run_specprefill():
@@ -1862,6 +2124,7 @@ class SimpleEngine(BaseEngine):
                     cancel_check=_cancel_check,
                 )
                 t_score = time.monotonic() - t0
+                telemetry.scorer_ms = t_score * 1000
 
                 # Phase 2: Select important chunks
                 _cancel_check()
@@ -1877,6 +2140,7 @@ class SimpleEngine(BaseEngine):
                     backbone_pct=effective_backbone,
                 )
                 n_selected = selected.shape[0]
+                telemetry.selected_tokens = int(n_selected)
 
                 # Phase 3: Sparse prefill on target model
                 t0 = time.monotonic()
@@ -1889,6 +2153,7 @@ class SimpleEngine(BaseEngine):
                     cancel_check=_cancel_check,
                 )
                 t_prefill = time.monotonic() - t0
+                telemetry.target_prefill_ms = t_prefill * 1000
 
                 logger.info(
                     "SpecPrefill: scored %d tokens in %.1fs, "
@@ -1984,6 +2249,7 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=finished,
                 finish_reason=resp.finish_reason or ("stop" if finished else None),
+                **telemetry.as_output_kwargs(),
             )
 
             if finished:
@@ -1997,6 +2263,7 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+                **telemetry.as_output_kwargs(),
             )
 
     async def _stream_generate_text(
@@ -2026,10 +2293,19 @@ class SimpleEngine(BaseEngine):
         from mlx_lm.models.cache import make_prompt_cache
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
-        # Per-request specprefill overrides (from extra_body)
-        specprefill_override = kwargs.pop("specprefill", None)
-        specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
-        specprefill_backbone_pct = kwargs.pop("specprefill_backbone_pct", None)
+        # The text route has its own prompt rendering, but shares exactly the
+        # same policy resolver as direct SimpleEngine generation.
+        specprefill_controls = self._specprefill_controls(kwargs)
+        specprefill_keep_pct = (
+            specprefill_controls["keep_pct"]
+            if self._specprefill_diagnostic_mode
+            else None
+        )
+        specprefill_backbone_pct = (
+            specprefill_controls["backbone_pct"]
+            if self._specprefill_diagnostic_mode
+            else None
+        )
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         top_k = kwargs.pop("top_k", 0)
         min_p = kwargs.pop("min_p", 0.0)
@@ -2127,9 +2403,7 @@ class SimpleEngine(BaseEngine):
 
                 # Tokenize both (matching stream_generate's tokenization logic)
                 tokenizer = self._text_tokenizer
-                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                    tokenizer.bos_token
-                )
+                add_special = self._prompt_add_special_tokens(tokenizer, full_prompt)
                 full_tokens_list = tokenizer.encode(
                     full_prompt, add_special_tokens=add_special
                 )
@@ -2212,25 +2486,40 @@ class SimpleEngine(BaseEngine):
                     )
                     system_token_count = 0
 
-        # Determine if SpecPrefill should be used
-        # Per-request boolean override: True = force enable, False = force disable
-        if specprefill_override is False:
-            use_specprefill = False
-        elif specprefill_override is True and self._draft_model is not None:
-            use_specprefill = True  # Force enable, skip threshold check
-        else:
-            use_specprefill = self._draft_model is not None
-
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
+        # Do not tokenize a normal dense text-model request merely to compute
+        # optional feature telemetry: that breaks the no-extra-work contract of
+        # the unsafe system-cache path. Only sparse-capable intent needs prompt
+        # tokenization before the standard mlx-lm prefill.
+        telemetry = self._resolve_specprefill_telemetry(
+            legacy=specprefill_controls["legacy"],
+            policy=specprefill_controls["policy"],
+            coverage=specprefill_controls["coverage"],
+            has_media=specprefill_controls["has_media"],
+            total_tokens=(full_token_count if full_tokens_list is not None else None),
+        )
+        requested_policy = telemetry.decision.requested_policy
+        should_measure_sparse_prompt = not specprefill_controls["has_media"] and (
+            (
+                requested_policy is SpecPrefillPolicy.AUTO
+                and telemetry.decision.coverage.value == "selective"
             )
-            full_tokens_list = tokenizer.encode(
-                full_prompt, add_special_tokens=add_special
+            or (
+                requested_policy is SpecPrefillPolicy.SPARSE
+                and self._specprefill_diagnostic_mode
+            )
+        )
+        if should_measure_sparse_prompt and full_tokens_list is None:
+            full_tokens_list = self._encode_prompt_tokens(
+                self._text_tokenizer, full_prompt
             )
             full_token_count = len(full_tokens_list)
+            telemetry = self._resolve_specprefill_telemetry(
+                legacy=specprefill_controls["legacy"],
+                policy=specprefill_controls["policy"],
+                coverage=specprefill_controls["coverage"],
+                has_media=False,
+                total_tokens=full_token_count,
+            )
 
         # Tokens for specprefill: suffix (if system KV) or full prompt
         specprefill_tokens = (
@@ -2238,33 +2527,9 @@ class SimpleEngine(BaseEngine):
         )
         specprefill_offset = system_token_count if suffix_tokens is not None else 0
 
-        # Threshold check: only use specprefill on long prompts
-        # (skipped when per-request boolean forces enable)
-        if (
-            use_specprefill
-            and specprefill_override is not True
-            and (
-                specprefill_tokens is None
-                or len(specprefill_tokens) <= self._specprefill_threshold
-            )
-        ):
-            use_specprefill = False
-
-        # Upper bound: cap specprefill to avoid draft model OOM on very long prompts
-        # 65536 tokens ~ 2GB draft KV cache on Qwen3.5-4B (32KB/token x 8 attn layers)
-        _SPECPREFILL_MAX_TOKENS = 65536
-        if (
-            use_specprefill
-            and specprefill_tokens is not None
-            and len(specprefill_tokens) > _SPECPREFILL_MAX_TOKENS
-        ):
-            logger.warning(
-                "SpecPrefill: prompt %d tokens exceeds max %d, "
-                "falling back to normal path",
-                len(specprefill_tokens),
-                _SPECPREFILL_MAX_TOKENS,
-            )
-            use_specprefill = False
+        use_specprefill = (
+            telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
+        )
 
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -2403,6 +2668,7 @@ class SimpleEngine(BaseEngine):
                         "SpecPrefill failed, falling back to normal MTP path: %s",
                         e,
                     )
+                    telemetry.fallback("sparse_execution_failed")
                     # Discard potentially corrupted cache
                     backbone_cache = None
                     prompt_to_send = full_prompt
@@ -2513,6 +2779,7 @@ class SimpleEngine(BaseEngine):
                     prefill_step_size=self._prefill_step_size,
                 )
                 t_score = time.monotonic() - t0
+                telemetry.scorer_ms = t_score * 1000
 
                 # Phase 2: Select important chunks
                 effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
@@ -2528,6 +2795,7 @@ class SimpleEngine(BaseEngine):
                 )
                 n_selected = selected.shape[0]
                 n_total = len(specprefill_tokens)
+                telemetry.selected_tokens = specprefill_offset + int(n_selected)
 
                 # Phase 3: Sparse prefill on target model
                 t0 = time.monotonic()
@@ -2540,6 +2808,7 @@ class SimpleEngine(BaseEngine):
                     position_offset=specprefill_offset,
                 )
                 t_prefill = time.monotonic() - t0
+                telemetry.target_prefill_ms = t_prefill * 1000
 
                 logger.info(
                     "SpecPrefill: scored %d tokens in %.1fs, "
@@ -2714,6 +2983,7 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=finish_reason,
+                    **telemetry.as_output_kwargs(),
                 )
 
                 if finished:
@@ -2731,6 +3001,7 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+                **telemetry.as_output_kwargs(),
             )
 
     def get_stats(self) -> dict[str, Any]:
@@ -2810,6 +3081,8 @@ class SimpleEngine(BaseEngine):
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
                 "backbone_pct": self._specprefill_backbone_pct,
+                "max_tokens": self._specprefill_max_tokens,
+                "diagnostic_mode": self._specprefill_diagnostic_mode,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
