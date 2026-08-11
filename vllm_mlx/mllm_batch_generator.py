@@ -37,6 +37,19 @@ from .specprefill_cache import (
     SparseCacheRowState,
     SparseCacheState,
 )
+from .specprefill_gemma_cache import (
+    GEMMA4_ARTIFACTS,
+    GemmaArtifactSpec,
+    GemmaCacheBackend,
+    GemmaCacheCheckpoint,
+    GemmaCachePairCheckpoint,
+    GemmaOneTokenTransaction,
+    batch_cache_cursor,
+    atomic_batch_extend,
+    atomic_batch_filter,
+    validate_gemma_cache_topology,
+    validate_homogeneous_batch_lane,
+)
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
@@ -173,6 +186,183 @@ class SparseBatchCompatibilityError(SparseBatchError):
     """Sparse rows do not share one immutable execution configuration."""
 
 
+_GEMMA_PREPARED_ATTESTATION_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
+class GemmaPreparedTargetAttestation:
+    """Engine-prepared identity bound to verified bytes and a live Gemma model.
+
+    Instances can only be produced by :func:`prepare_gemma_sparse_target`.
+    Request/row configuration therefore cannot restate its own artifact hash or
+    topology and call those values attested.
+    """
+
+    target_model: Any
+    text_model: Any
+    processor: Any
+    target_artifact_hash: str
+    artifact: GemmaArtifactSpec
+    layer_types: tuple[str, ...]
+    previous_kvs: tuple[int, ...]
+    backend: GemmaCacheBackend
+
+    def __init__(
+        self,
+        *,
+        target_model: Any,
+        text_model: Any,
+        processor: Any,
+        target_artifact_hash: str,
+        artifact: GemmaArtifactSpec,
+        layer_types: tuple[str, ...],
+        previous_kvs: tuple[int, ...],
+        _token: object,
+    ) -> None:
+        if _token is not _GEMMA_PREPARED_ATTESTATION_TOKEN:
+            raise TypeError(
+                "Gemma target attestations must be created by the prepared runtime"
+            )
+        object.__setattr__(self, "target_model", target_model)
+        object.__setattr__(self, "text_model", text_model)
+        object.__setattr__(self, "processor", processor)
+        object.__setattr__(self, "target_artifact_hash", target_artifact_hash)
+        object.__setattr__(self, "artifact", artifact)
+        object.__setattr__(self, "layer_types", layer_types)
+        object.__setattr__(self, "previous_kvs", previous_kvs)
+        object.__setattr__(self, "backend", GemmaCacheBackend.MLX_VLM)
+
+    @property
+    def canonical_target_id(self) -> str:
+        return (
+            f"{self.artifact.artifact_id}@sha256:{self.target_artifact_hash}"
+        )
+
+    def validate_cache(self, cache: Sequence[Any]) -> None:
+        validate_gemma_cache_topology(
+            self.artifact,
+            layer_types=self.layer_types,
+            previous_kvs=self.previous_kvs,
+            cache=cache,
+            backend=self.backend,
+        )
+
+
+def prepare_gemma_sparse_target(
+    *,
+    target_model: Any,
+    processor: Any,
+    target_artifact_path: str,
+    artifact: GemmaArtifactSpec,
+    target_identity_attestation: Any,
+) -> GemmaPreparedTargetAttestation:
+    """Verify and freeze the engine-owned Gemma sparse target identity.
+
+    The generic target/processor attestation establishes the trusted binding
+    to loaded objects. This seam independently hashes the canonical artifact
+    path and derives topology from the live text model before any generator can
+    admit a Gemma sparse row.
+    """
+    # Local import avoids a module cycle: specprefill_runtime uses this module's
+    # target-forward types while startup invokes this function only afterwards.
+    from .specprefill_runtime import TargetProcessorAttestation, sha256_artifact_path
+
+    if not isinstance(target_identity_attestation, TargetProcessorAttestation):
+        raise TypeError(
+            "target_identity_attestation must be TargetProcessorAttestation"
+        )
+    if (
+        target_identity_attestation.target_model is not target_model
+        or target_identity_attestation.processor is not processor
+    ):
+        raise SparseBatchCompatibilityError(
+            "Gemma prepared identity is not bound to the loaded target/processor"
+        )
+    actual_hash = sha256_artifact_path(target_artifact_path)
+    if actual_hash != target_identity_attestation.target_artifact_hash:
+        raise SparseBatchCompatibilityError(
+            "Gemma target artifact bytes do not match the prepared identity"
+        )
+    if GEMMA4_ARTIFACTS.get(artifact.artifact_id) != artifact:
+        raise SparseBatchCompatibilityError("Gemma artifact is not certified")
+
+    text_model = getattr(target_model, "language_model", target_model)
+    model_config = getattr(text_model, "config", None)
+    if model_config is None:
+        model_config = getattr(text_model, "args", None)
+    model_backbone = getattr(text_model, "model", text_model)
+    layer_types = tuple(getattr(model_config, "layer_types", ()))
+    previous_kvs = tuple(getattr(model_backbone, "previous_kvs", ()))
+    if layer_types != artifact.layer_types:
+        raise SparseBatchCompatibilityError(
+            "live Gemma layer topology does not match the certified artifact"
+        )
+    if previous_kvs != artifact.previous_kvs:
+        raise SparseBatchCompatibilityError(
+            "live Gemma cache-owner topology does not match the certified artifact"
+        )
+    return GemmaPreparedTargetAttestation(
+        target_model=target_model,
+        text_model=text_model,
+        processor=processor,
+        target_artifact_hash=actual_hash,
+        artifact=artifact,
+        layer_types=layer_types,
+        previous_kvs=previous_kvs,
+        _token=_GEMMA_PREPARED_ATTESTATION_TOKEN,
+    )
+
+
+@dataclass(frozen=True)
+class GemmaSparseBatchConfig:
+    """Exact, opt-in mlx-vlm Gemma batch-cache contract.
+
+    Scheduler/runtime capability wiring intentionally does not construct this
+    yet.  Tests and a later certified runtime may install it explicitly.
+    """
+
+    attestation: GemmaPreparedTargetAttestation
+    execution_config: SparseCacheExecutionConfig
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attestation, GemmaPreparedTargetAttestation):
+            raise TypeError("attestation must be GemmaPreparedTargetAttestation")
+        if not isinstance(self.execution_config, SparseCacheExecutionConfig):
+            raise TypeError("execution_config must be SparseCacheExecutionConfig")
+        if self.execution_config.target_id != self.attestation.canonical_target_id:
+            raise SparseBatchCompatibilityError(
+                "Gemma sparse profile target_id does not match target attestation"
+            )
+
+    def validate_cache(self, cache: Sequence[Any]) -> None:
+        self.attestation.validate_cache(cache)
+
+
+def _validate_gemma_cache_rows(
+    cache: Sequence[Any], row_states: Sequence[SparseCacheRowState | None]
+) -> None:
+    if not row_states or any(row is None for row in row_states):
+        raise SparseBatchCompatibilityError(
+            "Gemma sparse cache requires homogeneous sparse rows"
+        )
+    rows = tuple(row for row in row_states if row is not None)
+    logical_positions = tuple(row.next_logical_position for row in rows)
+    expected_writes = tuple(row.physical_valid_length for row in rows)
+    validate_homogeneous_batch_lane(
+        cache,
+        logical_positions=logical_positions,
+    )
+    for entry in cache:
+        cursor = batch_cache_cursor(
+            entry,
+            logical_positions=logical_positions,
+        )
+        if cursor.total_writes != expected_writes:
+            raise SparseBatchCompatibilityError(
+                "Gemma cache physical writes do not match sparse row occupancy"
+            )
+
+
 class SparseAdoptionError(SparseBatchError):
     """Typed sparse-adoption failure with an immutable replay boundary."""
 
@@ -260,6 +450,63 @@ class _ArraysDecodeCheckpoint:
         self.entry.cache = list(self.cache)
         self.entry.left_padding = self.left_padding
         self.entry.lengths = self.lengths
+
+
+@dataclass(frozen=True)
+class _GemmaBatchMetadataState:
+    entry: Any
+    offset: mx.array
+    left_padding: mx.array
+    idx: int
+    physical_offset: int | None
+    rotated: bool | None
+
+
+@dataclass(frozen=True)
+class _GemmaBatchMetadataCheckpoint:
+    """Detached O(rows*owners) cursor metadata; never copies a KV window."""
+
+    states: tuple[_GemmaBatchMetadataState, ...]
+
+    @classmethod
+    def capture(cls, cache: Sequence[Any]) -> "_GemmaBatchMetadataCheckpoint":
+        states = []
+        tensors = []
+        for entry in cache:
+            if getattr(entry, "_right_padding", None) is not None or getattr(
+                entry, "_lengths", None
+            ) is not None:
+                raise SparseBatchError(
+                    "Gemma sparse decode requires finalized batch caches"
+                )
+            offset = entry.offset + mx.zeros_like(entry.offset)
+            left_padding = entry.left_padding + mx.zeros_like(entry.left_padding)
+            tensors.extend((offset, left_padding))
+            states.append(
+                _GemmaBatchMetadataState(
+                    entry=entry,
+                    offset=offset,
+                    left_padding=left_padding,
+                    idx=entry._idx,
+                    physical_offset=getattr(entry, "_offset", None),
+                    rotated=getattr(entry, "rotated", None),
+                )
+            )
+        mx.eval(*tensors)
+        return cls(tuple(states))
+
+    def restore(self) -> None:
+        tensors = []
+        for state in self.states:
+            state.entry.offset = state.offset
+            state.entry.left_padding = state.left_padding
+            state.entry._idx = state.idx
+            if state.physical_offset is not None:
+                state.entry._offset = state.physical_offset
+            if state.rotated is not None:
+                state.entry.rotated = state.rotated
+            tensors.extend((state.entry.offset, state.entry.left_padding))
+        mx.eval(*tensors)
 
 
 @dataclass(frozen=True)
@@ -555,6 +802,7 @@ class MLLMBatch:
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
     sparse_row_states: tuple[SparseCacheRowState | None, ...] = ()
+    gemma_sparse_config: GemmaSparseBatchConfig | None = None
 
     def __post_init__(self) -> None:
         row_count = len(self.uids)
@@ -599,6 +847,20 @@ class MLLMBatch:
                 raise SparseBatchCompatibilityError(
                     "sparse MLLMBatch rows require equal physical occupancy"
                 )
+        if self.gemma_sparse_config is not None:
+            if not self.has_sparse_rows:
+                raise SparseBatchCompatibilityError(
+                    "Gemma sparse cache config requires sparse rows"
+                )
+            if (
+                self.sparse_execution_config
+                != self.gemma_sparse_config.execution_config
+            ):
+                raise SparseBatchCompatibilityError(
+                    "Gemma sparse cache profile does not match row identity"
+                )
+            self.gemma_sparse_config.validate_cache(self.cache)
+            _validate_gemma_cache_rows(self.cache, self.sparse_row_states)
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -655,18 +917,39 @@ class MLLMBatch:
 
         checkpoint = (
             _SupportedSparseCacheCheckpoint.capture(self.cache, self.sparse_row_states)
-            if self.has_sparse_rows
+            if self.has_sparse_rows and self.gemma_sparse_config is None
+            else None
+        )
+        gemma_checkpoint = (
+            GemmaCacheCheckpoint(self.cache)
+            if self.gemma_sparse_config is not None
             else None
         )
         try:
-            for cache_entry in self.cache:
-                if hasattr(cache_entry, "filter"):
-                    cache_entry.filter(keep_idx_array)
-                elif self.has_sparse_rows:
-                    raise SparseBatchError(
-                        "sparse decode cache entries must support atomic filtering"
-                    )
-        except Exception:
+            if self.gemma_sparse_config is not None:
+                atomic_batch_filter(
+                    self.cache,
+                    keep_idx_array,
+                    logical_positions=tuple(
+                        row.next_logical_position
+                        for row in self.sparse_row_states
+                        if row is not None
+                    ),
+                )
+                _validate_gemma_cache_rows(self.cache, next_sparse_rows)
+                assert gemma_checkpoint is not None
+                gemma_checkpoint.seal()
+            else:
+                for cache_entry in self.cache:
+                    if hasattr(cache_entry, "filter"):
+                        cache_entry.filter(keep_idx_array)
+                    elif self.has_sparse_rows:
+                        raise SparseBatchError(
+                            "sparse decode cache entries must support atomic filtering"
+                        )
+        except BaseException:
+            if gemma_checkpoint is not None:
+                gemma_checkpoint.restore()
             if checkpoint is not None:
                 checkpoint.restore()
             raise
@@ -694,6 +977,10 @@ class MLLMBatch:
                 "sparse and dense rows cannot share a target decode batch"
             )
         _sparse_execution_config(self.sparse_row_states + other.sparse_row_states)
+        if self.gemma_sparse_config != other.gemma_sparse_config:
+            raise SparseBatchCompatibilityError(
+                "Gemma sparse batches require one exact topology/profile contract"
+            )
         if (
             self.has_sparse_rows
             and len(
@@ -745,26 +1032,46 @@ class MLLMBatch:
         # through empty()/extend() and do not publish .keys.
         checkpoint = (
             _SupportedSparseCacheCheckpoint.capture(self.cache, self.sparse_row_states)
-            if self.has_sparse_rows
+            if self.has_sparse_rows and self.gemma_sparse_config is None
             else None
         )
         try:
-            for c, o in zip(self.cache, other.cache, strict=True):
-                if c is not None and o is not None and hasattr(c, "extend"):
-                    has_kv = hasattr(c, "keys") and c.keys is not None
-                    has_arrays = hasattr(c, "cache")
-                    has_extendable_state = hasattr(c, "empty") and not c.empty()
-                    if has_kv or has_arrays or has_extendable_state:
-                        c.extend(o)
-                elif (c is None) != (o is None) or (
-                    (self.has_sparse_rows or other.has_sparse_rows)
-                    and c is not None
-                    and not hasattr(c, "extend")
-                ):
-                    raise SparseBatchError(
-                        "sparse decode cache entries must support atomic extension"
+            if self.gemma_sparse_config is not None:
+                combined_logical = tuple(
+                    row.next_logical_position
+                    for row in next_sparse_rows
+                    if row is not None
+                )
+                if len(set(combined_logical)) != 1:
+                    raise SparseBatchCompatibilityError(
+                        "Gemma sparse batches require equal logical write positions"
                     )
-        except Exception:
+                pair = GemmaCachePairCheckpoint(self.cache, other.cache)
+                try:
+                    atomic_batch_extend(self.cache, other.cache)
+                    _validate_gemma_cache_rows(self.cache, next_sparse_rows)
+                    pair.source.restore()
+                    pair.destination.seal()
+                except BaseException:
+                    pair.restore()
+                    raise
+            else:
+                for c, o in zip(self.cache, other.cache, strict=True):
+                    if c is not None and o is not None and hasattr(c, "extend"):
+                        has_kv = hasattr(c, "keys") and c.keys is not None
+                        has_arrays = hasattr(c, "cache")
+                        has_extendable_state = hasattr(c, "empty") and not c.empty()
+                        if has_kv or has_arrays or has_extendable_state:
+                            c.extend(o)
+                    elif (c is None) != (o is None) or (
+                        (self.has_sparse_rows or other.has_sparse_rows)
+                        and c is not None
+                        and not hasattr(c, "extend")
+                    ):
+                        raise SparseBatchError(
+                            "sparse decode cache entries must support atomic extension"
+                        )
+        except BaseException:
             if checkpoint is not None:
                 checkpoint.restore()
             raise
@@ -789,6 +1096,11 @@ class MLLMBatch:
         causing extract() to use Python negative indexing and truncate
         the buffer to only generation tokens instead of the full window.
         """
+        if self.gemma_sparse_config is not None:
+            raise SparseBatchError(
+                "prefix cache extraction is disabled for Gemma sparse rows"
+            )
+
         from mlx_lm.models.cache import (
             BatchRotatingKVCache,
             RotatingKVCache,
@@ -922,6 +1234,7 @@ class MLLMBatchGenerator:
         max_kv_size: int = 0,
         target_forward_context: Optional[TargetForwardContext] = None,
         expected_sparse_execution_config: SparseCacheExecutionConfig | None = None,
+        expected_gemma_sparse_config: GemmaSparseBatchConfig | None = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -943,6 +1256,8 @@ class MLLMBatchGenerator:
             target_forward_context: Request-local context factory for target decode
             expected_sparse_execution_config: Scheduler-selected exact sparse
                 profile/artifact identity admitted by this generator
+            expected_gemma_sparse_config: Explicit Gemma batch-cache foundation
+                contract. No scheduler/runtime currently supplies this value.
         """
         self.model = model
         self.processor = processor
@@ -958,6 +1273,21 @@ class MLLMBatchGenerator:
                 "expected_sparse_execution_config must be SparseCacheExecutionConfig"
             )
         self._expected_sparse_execution_config = expected_sparse_execution_config
+        if expected_gemma_sparse_config is not None and not isinstance(
+            expected_gemma_sparse_config, GemmaSparseBatchConfig
+        ):
+            raise TypeError(
+                "expected_gemma_sparse_config must be GemmaSparseBatchConfig"
+            )
+        if (
+            expected_gemma_sparse_config is not None
+            and expected_sparse_execution_config
+            != expected_gemma_sparse_config.execution_config
+        ):
+            raise SparseBatchCompatibilityError(
+                "Gemma sparse contract must match generator execution identity"
+            )
+        self._expected_gemma_sparse_config = expected_gemma_sparse_config
         # One aggregated predicate scalar is read at each realized sparse
         # boundary. Telemetry separately counts the device metadata scalars
         # examined by that predicate; no KV/state tensor is copied.
@@ -966,6 +1296,18 @@ class MLLMBatchGenerator:
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
+        if (
+            expected_gemma_sparse_config is not None
+            and (
+                expected_gemma_sparse_config.attestation.target_model is not model
+                or expected_gemma_sparse_config.attestation.text_model
+                is not self.language_model
+                or expected_gemma_sparse_config.attestation.processor is not processor
+            )
+        ):
+            raise SparseBatchCompatibilityError(
+                "Gemma prepared identity does not match generator-owned objects"
+            )
 
         # Check if this is actually a VLM with separate language model
         self.is_vlm = hasattr(model, "language_model")
@@ -1309,7 +1651,36 @@ class MLLMBatchGenerator:
             raise SparseBatchError(
                 "cannot replace sparse execution identity with sparse rows active"
             )
+        gemma_config = getattr(self, "_expected_gemma_sparse_config", None)
+        if gemma_config is not None and gemma_config.execution_config != config:
+            raise SparseBatchCompatibilityError(
+                "sparse execution identity must match the Gemma contract"
+            )
         self._expected_sparse_execution_config = config
+
+    def set_expected_gemma_sparse_config(
+        self, config: GemmaSparseBatchConfig
+    ) -> None:
+        """Install an exact Gemma foundation contract before sparse ownership."""
+        if not isinstance(config, GemmaSparseBatchConfig):
+            raise TypeError("config must be GemmaSparseBatchConfig")
+        if self.active_batch is not None and self.active_batch.has_sparse_rows:
+            raise SparseBatchError(
+                "cannot replace Gemma sparse contract with sparse rows active"
+            )
+        if self._expected_sparse_execution_config != config.execution_config:
+            raise SparseBatchCompatibilityError(
+                "Gemma sparse contract must match generator execution identity"
+            )
+        if (
+            config.attestation.target_model is not self.model
+            or config.attestation.text_model is not self.language_model
+            or config.attestation.processor is not self.processor
+        ):
+            raise SparseBatchCompatibilityError(
+                "Gemma prepared identity does not match generator-owned objects"
+            )
+        self._expected_gemma_sparse_config = config
 
     def adopt_prefilled_sparse_row(
         self,
@@ -1362,15 +1733,15 @@ class MLLMBatchGenerator:
 
     def _restore_sparse_adoption_checkpoint(
         self,
-        checkpoint: _SupportedSparseCacheCheckpoint,
+        checkpoint: Any,
         active: MLLMBatch,
         *,
-        adoption_failure: Exception,
+        adoption_failure: BaseException,
         sampling_consumed: bool,
     ) -> None:
         try:
             checkpoint.restore()
-        except Exception as rollback_failure:
+        except BaseException as rollback_failure:
             self._poison_active_sparse_batch_after_failed_rollback(active)
             raise SparseAdoptionError(
                 "prepared sparse adoption rollback failed after "
@@ -1425,6 +1796,30 @@ class MLLMBatchGenerator:
             raise SparseBatchCompatibilityError(
                 "prepared sparse identity does not match the generator-selected profile"
             )
+        gemma_config = getattr(self, "_expected_gemma_sparse_config", None)
+        if gemma_config is not None and getattr(self, "_mtp_installed", False):
+            raise SparseBatchCompatibilityError(
+                "Gemma sparse target decode cannot compose with MTP"
+            )
+        if (
+            gemma_config is not None
+            and (
+                gemma_config.attestation.target_model is not self.model
+                or gemma_config.attestation.text_model is not self.language_model
+                or gemma_config.attestation.processor is not self.processor
+            )
+        ):
+            raise SparseBatchCompatibilityError(
+                "prepared Gemma identity does not match generator-owned objects"
+            )
+        if (
+            gemma_config is not None
+            and gemma_config.execution_config
+            != row_state.identity.execution_config
+        ):
+            raise SparseBatchCompatibilityError(
+                "prepared Gemma topology does not match the sparse profile"
+            )
         if request.input_ids is None:
             raise SparseBatchError(
                 "prepared sparse adoption requires the exact full prompt token IDs"
@@ -1442,6 +1837,8 @@ class MLLMBatchGenerator:
                 "prepared sparse logical cursor must equal the full prompt length"
             )
         self._validate_prepared_sparse_cache(cache, row_state)
+        if gemma_config is not None:
+            gemma_config.validate_cache(cache)
 
         if self.active_batch is not None and not self.active_batch.has_sparse_rows:
             raise SparseBatchCompatibilityError(
@@ -1475,12 +1872,20 @@ class MLLMBatchGenerator:
         # held as an unpublished transaction until sampling also succeeds.
         batch_cache = self._merge_prepared_sparse_cache(cache)
         candidate_rows = (row_state.clone(),)
-        _SupportedSparseCacheCheckpoint.capture(batch_cache, candidate_rows)
+        if gemma_config is None:
+            _SupportedSparseCacheCheckpoint.capture(batch_cache, candidate_rows)
+        else:
+            gemma_config.validate_cache(batch_cache)
+            _validate_gemma_cache_rows(batch_cache, candidate_rows)
         _eval_sparse_adoption_cache(batch_cache)
 
         active = self.active_batch
         active_checkpoint = None
         if active is not None:
+            if active.gemma_sparse_config != gemma_config:
+                raise SparseBatchCompatibilityError(
+                    "sparse batches require one exact Gemma topology/profile contract"
+                )
             if active.sparse_execution_config != row_state.identity.execution_config:
                 raise SparseBatchCompatibilityError(
                     "sparse decode rows require one exact execution configuration"
@@ -1500,14 +1905,27 @@ class MLLMBatchGenerator:
                 raise SparseBatchCompatibilityError(
                     "decode batches require identical supported cache topology"
                 )
-            active_checkpoint = _SupportedSparseCacheCheckpoint.capture(
-                active.cache, active.sparse_row_states
+            active_checkpoint = (
+                _SupportedSparseCacheCheckpoint.capture(
+                    active.cache, active.sparse_row_states
+                )
+                if gemma_config is None
+                else GemmaCacheCheckpoint(active.cache)
             )
             try:
-                for current, incoming in zip(active.cache, batch_cache, strict=True):
-                    current.extend(incoming)
-                _eval_sparse_adoption_cache(active.cache)
-            except Exception as exc:
+                if gemma_config is None:
+                    for current, incoming in zip(
+                        active.cache, batch_cache, strict=True
+                    ):
+                        current.extend(incoming)
+                    _eval_sparse_adoption_cache(active.cache)
+                else:
+                    atomic_batch_extend(active.cache, batch_cache)
+                    _validate_gemma_cache_rows(
+                        active.cache,
+                        active.sparse_row_states + candidate_rows,
+                    )
+            except BaseException as exc:
                 self._restore_sparse_adoption_checkpoint(
                     active_checkpoint,
                     active,
@@ -1536,6 +1954,7 @@ class MLLMBatchGenerator:
                 logits_processors=[processors] if processors else None,
                 samplers=[sampler],
                 sparse_row_states=candidate_rows,
+                gemma_sparse_config=gemma_config,
             )
             if active is not None:
                 self_len = len(active)
@@ -1555,7 +1974,7 @@ class MLLMBatchGenerator:
                 )
             else:
                 _eval_sparse_adoption_publication(candidate.y, *candidate.logprobs)
-        except Exception as exc:
+        except BaseException as exc:
             if active_checkpoint is not None:
                 self._restore_sparse_adoption_checkpoint(
                     active_checkpoint,
@@ -1568,6 +1987,8 @@ class MLLMBatchGenerator:
         if active is None:
             self.active_batch = candidate
         else:
+            if isinstance(active_checkpoint, GemmaCacheCheckpoint):
+                active_checkpoint.seal()
             # All values above were staged before these non-failing assignments.
             active.uids = active.uids + candidate.uids
             active.request_ids = active.request_ids + candidate.request_ids
@@ -2552,10 +2973,41 @@ class MLLMBatchGenerator:
         cache_checkpoint = (
             _SupportedSparseCacheCheckpoint.capture(cache, sparse_rows)
             if has_sparse_rows
+            and active_batch is not None
+            and active_batch.gemma_sparse_config is None
             else None
         )
+        gemma_transaction = None
+        gemma_metadata_checkpoint = None
 
         try:
+            if (
+                has_sparse_rows
+                and active_batch is not None
+                and active_batch.gemma_sparse_config is not None
+            ):
+                attestation = active_batch.gemma_sparse_config.attestation
+                if (
+                    attestation.target_model is not self.model
+                    or attestation.text_model is not self.language_model
+                    or attestation.processor is not self.processor
+                ):
+                    raise SparseBatchCompatibilityError(
+                        "live Gemma identity does not match generator-owned objects"
+                    )
+                active_batch.gemma_sparse_config.validate_cache(cache)
+                _validate_gemma_cache_rows(cache, sparse_rows)
+                gemma_metadata_checkpoint = _GemmaBatchMetadataCheckpoint.capture(
+                    cache
+                )
+                gemma_transaction = GemmaOneTokenTransaction(
+                    cache,
+                    logical_positions=tuple(
+                        row.next_logical_position
+                        for row in sparse_rows
+                        if row is not None
+                    ),
+                )
             forward = MLLMTargetForward(
                 input_tokens=input_tokens,
                 cache=cache,
@@ -2616,20 +3068,34 @@ class MLLMBatchGenerator:
                 # logical state. A failure leaves both metadata and response
                 # emission untouched and restores the entry cache snapshot.
                 assert active_batch is not None
-                assert cache_checkpoint is not None
-                occupancy_ok, examined_scalars = (
-                    cache_checkpoint.one_token_advance_predicate(sparse_rows)
-                )
-                mx.eval(sampled, logprobs, occupancy_ok)
-                self._sparse_checkpoint_scalar_reads += examined_scalars
-                self._sparse_checkpoint_host_scalar_reads += 1
-                if not occupancy_ok.item():
-                    raise SparseBatchError(
-                        "sparse cache physical occupancy must advance exactly one per row"
+                if gemma_transaction is not None:
+                    mx.eval(sampled, logprobs)
+                    gemma_transaction.commit(
+                        logical_positions=tuple(
+                            row.next_logical_position + 1
+                            for row in sparse_rows
+                            if row is not None
+                        )
                     )
+                else:
+                    assert cache_checkpoint is not None
+                    occupancy_ok, examined_scalars = (
+                        cache_checkpoint.one_token_advance_predicate(sparse_rows)
+                    )
+                    mx.eval(sampled, logprobs, occupancy_ok)
+                    self._sparse_checkpoint_scalar_reads += examined_scalars
+                    self._sparse_checkpoint_host_scalar_reads += 1
+                    if not occupancy_ok.item():
+                        raise SparseBatchError(
+                            "sparse cache physical occupancy must advance exactly one per row"
+                        )
                 active_batch.commit_sparse_decode(1)
             return sampled, list(logprobs)
-        except Exception:
+        except BaseException:
+            if gemma_transaction is not None:
+                gemma_transaction.rollback()
+            if gemma_metadata_checkpoint is not None:
+                gemma_metadata_checkpoint.restore()
             if cache_checkpoint is not None:
                 cache_checkpoint.restore()
             raise
@@ -3026,6 +3492,8 @@ def install_mtp_mllm(
     _deferred_drafts: Dict[int, dict] = {}
     _attempted_drafts_by_uid: Dict[int, int] = {}
 
+    batch_gen._mtp_installed = True
+
     # MTP stats. These are intentionally exposed through get_mtp_stats() so
     # /v1/status can distinguish "weights injected" from useful draft work.
     _mtp_stats_lock = threading.Lock()
@@ -3087,7 +3555,7 @@ def install_mtp_mllm(
         )
         sparse_rows_bypass = (
             batch_gen.active_batch is not None
-            and batch_gen.active_batch.has_sparse_rows
+            and getattr(batch_gen.active_batch, "has_sparse_rows", False)
         )
         if (
             prefill_bypass
