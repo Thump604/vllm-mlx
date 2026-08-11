@@ -140,6 +140,7 @@ class SchedulerConfig:
     # target-adapter components; no first-request artifact/model load is allowed.
     specprefill_enabled: bool = False
     specprefill_prepare: Optional[Callable[[Any, Any], Any]] = None
+    specprefill_runtime_builder_inputs: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
@@ -148,6 +149,10 @@ class SchedulerConfig:
             self.specprefill_prepare
         ):
             raise TypeError("specprefill_prepare must be callable or None")
+        if self.specprefill_runtime_builder_inputs is not None and not isinstance(
+            self.specprefill_runtime_builder_inputs, dict
+        ):
+            raise TypeError("specprefill_runtime_builder_inputs must be a dict or None")
 
 
 @dataclass

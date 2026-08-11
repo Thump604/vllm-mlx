@@ -701,6 +701,15 @@ def _configure_batched_specprefill(
     else:
         configured = copy.copy(scheduler_config)
         configured.specprefill_enabled = True
+    builder_inputs = getattr(
+        configured, "specprefill_runtime_builder_inputs", None
+    )
+    if configured.specprefill_prepare is None and builder_inputs is not None:
+        from .specprefill_runtime import build_qwen_cb_specprefill_prepare
+
+        configured.specprefill_prepare = build_qwen_cb_specprefill_prepare(
+            **dict(builder_inputs)
+        )
     if not callable(getattr(configured, "specprefill_prepare", None)):
         raise ValueError(
             "continuous-batching SpecPrefill is unavailable without an explicit "
@@ -3742,6 +3751,8 @@ async def status():
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
         "mtp": stats.get("mtp") or {"enabled": False},
+        "specprefill": stats.get("specprefill")
+        or {"enabled": False, "advertisable": False, "diagnostic": False},
         "requests": stats.get("requests", []),
     }
 
@@ -3910,9 +3921,27 @@ async def list_models() -> ModelsResponse:
     """List available models."""
     models = []
     if _model_manager is not None:
-        models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
+        models.extend(
+            ModelInfo(
+                id=item["id"],
+                capabilities=list(item.get("capabilities", ())),
+            )
+            for item in _model_manager.list_models()
+        )
     elif _model_name:
-        models.append(ModelInfo(id=_model_name))
+        capabilities = []
+        if _engine is not None:
+            try:
+                specprefill = _engine.get_stats().get("specprefill", {})
+            except Exception:
+                specprefill = {}
+            if (
+                specprefill.get("enabled") is True
+                and specprefill.get("advertisable") is True
+                and specprefill.get("diagnostic") is False
+            ):
+                capabilities.append("specprefill")
+        models.append(ModelInfo(id=_model_name, capabilities=capabilities))
     if _embedding_engine is not None:
         models.append(
             ModelInfo(id=_embedding_engine.model_name, owned_by="vllm-mlx-embedding")

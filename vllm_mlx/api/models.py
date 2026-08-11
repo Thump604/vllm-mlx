@@ -413,6 +413,7 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "vllm-mlx"
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class ModelsResponse(BaseModel):

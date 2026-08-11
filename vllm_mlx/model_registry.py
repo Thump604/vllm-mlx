@@ -619,6 +619,59 @@ def load_registry_config(
     return manager, registry
 
 
+def _loaded_model_specprefill_status(
+    loaded: "LoadedModel | None",
+) -> dict[str, Any]:
+    if loaded is None:
+        return {
+            "state": "unloaded",
+            "enabled": False,
+            "advertisable": False,
+            "diagnostic": False,
+        }
+    try:
+        specprefill = loaded.engine.get_stats().get("specprefill", {})
+    except Exception:
+        specprefill = {}
+    if not isinstance(specprefill, dict) or not {
+        "enabled",
+        "advertisable",
+        "diagnostic",
+    }.issubset(specprefill):
+        return {
+            "state": "unavailable",
+            "enabled": False,
+            "advertisable": False,
+            "diagnostic": False,
+        }
+    enabled = specprefill.get("enabled") is True
+    advertisable = specprefill.get("advertisable") is True
+    diagnostic = specprefill.get("diagnostic") is True
+    if diagnostic:
+        state = "diagnostic"
+    elif enabled and advertisable:
+        state = "production"
+    else:
+        state = "disabled"
+    return {
+        "state": state,
+        "enabled": enabled,
+        "advertisable": advertisable,
+        "diagnostic": diagnostic,
+    }
+
+
+def _specprefill_capabilities(status: dict[str, Any]) -> list[str]:
+    if (
+        status["state"] == "production"
+        and status["enabled"] is True
+        and status["advertisable"] is True
+        and status["diagnostic"] is False
+    ):
+        return ["specprefill"]
+    return []
+
+
 class ModelManager:
     """Registry-backed model manager with lazy load and memory-budget eviction."""
 
@@ -680,6 +733,7 @@ class ModelManager:
                     )
                 )
             )
+            specprefill = _loaded_model_specprefill_status(loaded)
             data.append(
                 {
                     "id": name,
@@ -688,6 +742,8 @@ class ModelManager:
                     "owned_by": "vllm-mlx",
                     "source": entry.source,
                     "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
+                    "capabilities": _specprefill_capabilities(specprefill),
+                    "specprefill": specprefill,
                 }
             )
         return data
@@ -1167,6 +1223,19 @@ class ModelManager:
         if continuous_batching and scheduler_config is not None:
             scheduler_config.specprefill_enabled = specprefill_enabled
         if continuous_batching and specprefill_enabled:
+            builder_inputs = getattr(
+                scheduler_config, "specprefill_runtime_builder_inputs", None
+            )
+            if (
+                scheduler_config is not None
+                and scheduler_config.specprefill_prepare is None
+                and builder_inputs is not None
+            ):
+                from .specprefill_runtime import build_qwen_cb_specprefill_prepare
+
+                scheduler_config.specprefill_prepare = (
+                    build_qwen_cb_specprefill_prepare(**dict(builder_inputs))
+                )
             if scheduler_config is None or not callable(
                 getattr(scheduler_config, "specprefill_prepare", None)
             ):

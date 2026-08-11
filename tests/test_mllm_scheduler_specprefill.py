@@ -257,6 +257,8 @@ def _scheduler(
     enabled=True,
     mtp=False,
     cache_layout="qwen3_5_nonrotating_hybrid",
+    diagnostic=False,
+    advertisable=True,
 ):
     events = factory.events
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -274,6 +276,8 @@ def _scheduler(
             adapter_id=_PROFILE_KEY.adapter_id,
             layout=cache_layout,
         ),
+        specprefill_diagnostic=diagnostic,
+        specprefill_advertisable=advertisable,
     )
     scheduler.batch_generator = _BatchGenerator(events)
     scheduler.waiting = deque()
@@ -506,6 +510,38 @@ def test_dense_or_unavailable_policy_never_enters_cooperative_queue():
     assert factory.sessions == {}
     assert len(scheduler.batch_generator.inserted) == 1
     assert scheduler._specprefill_queue == deque()
+
+
+def test_diagnostic_forcing_is_distinct_and_auto_is_not_advertised():
+    factory = _AdmissionFactory()
+    scheduler = _scheduler(factory, diagnostic=True, advertisable=False)
+    scheduler.add_request(
+        "prompt",
+        request_id="diagnostic-auto",
+        specprefill_policy=SpecPrefillPolicy.AUTO,
+        specprefill_coverage=SpecPrefillCoverage.SELECTIVE,
+    )
+    scheduler.add_request(
+        "prompt",
+        request_id="diagnostic-force",
+        specprefill_policy=SpecPrefillPolicy.SPARSE,
+        specprefill_coverage=SpecPrefillCoverage.SELECTIVE,
+    )
+
+    scheduler._schedule_waiting()
+
+    auto = scheduler.running["diagnostic-auto"]
+    assert auto.specprefill_effective_policy is SpecPrefillPolicy.DENSE
+    assert auto.specprefill_fallback_reason == "admission_denied"
+    assert "diagnostic-auto" not in factory.sessions
+    assert "diagnostic-force" in factory.sessions
+    scheduler.batch_generator = None
+    status = scheduler.get_stats()["specprefill"]
+    assert status == {
+        "enabled": False,
+        "advertisable": False,
+        "diagnostic": True,
+    }
 
 
 def test_media_request_uses_separate_dense_fallback_path():

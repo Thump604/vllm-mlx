@@ -24,6 +24,7 @@ from vllm_mlx.model_registry import (
     build_memory_budget_report,
     load_registry_config,
     log_memory_budget_report,
+    _loaded_model_specprefill_status,
 )
 from vllm_mlx.scheduler import SchedulerConfig
 from vllm_mlx.utils.download import DownloadConfig
@@ -174,6 +175,45 @@ def test_registry_cb_specprefill_requires_and_propagates_explicit_builder(tmp_pa
     assert resolved.scheduler_config is not prepared_config
     assert resolved.scheduler_config.specprefill_enabled is True
     assert callable(resolved.scheduler_config.specprefill_prepare)
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected_state"),
+    [
+        (
+            {
+                "specprefill": {
+                    "enabled": False,
+                    "advertisable": False,
+                    "diagnostic": True,
+                }
+            },
+            "diagnostic",
+        ),
+        (
+            {
+                "specprefill": {
+                    "enabled": False,
+                    "advertisable": False,
+                    "diagnostic": False,
+                }
+            },
+            "disabled",
+        ),
+        ({}, "unavailable"),
+    ],
+)
+def test_registry_specprefill_status_distinguishes_diagnostic_and_unavailable(
+    stats, expected_state
+):
+    class Engine:
+        def get_stats(self):
+            return stats
+
+    loaded = type("Loaded", (), {"engine": Engine()})()
+
+    assert _loaded_model_specprefill_status(loaded)["state"] == expected_state
+    assert _loaded_model_specprefill_status(None)["state"] == "unloaded"
 
 
 def test_acquire_shares_single_inflight_load(tmp_path):

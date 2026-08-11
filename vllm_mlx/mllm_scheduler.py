@@ -125,6 +125,8 @@ class MLLMSchedulerConfig:
     specprefill_session_factory: Callable[..., "MLLMSpecPrefillAdmission"] | None = None
     specprefill_target_forward_context: Callable[..., Any] | None = None
     specprefill_cache_capability: "MLLMSpecPrefillCacheCapability" | None = None
+    specprefill_diagnostic: bool = False
+    specprefill_advertisable: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.specprefill_profile_registry, SpecPrefillProfileRegistry):
@@ -143,6 +145,12 @@ class MLLMSchedulerConfig:
         ):
             raise ValueError("specprefill residency estimate must be non-negative")
         capability = self.specprefill_cache_capability
+        if not isinstance(self.specprefill_diagnostic, bool):
+            raise TypeError("specprefill_diagnostic must be bool")
+        if not isinstance(self.specprefill_advertisable, bool):
+            raise TypeError("specprefill_advertisable must be bool")
+        if self.specprefill_diagnostic and self.specprefill_advertisable:
+            raise ValueError("diagnostic SpecPrefill cannot be advertisable")
         if capability is not None and not isinstance(
             capability, MLLMSpecPrefillCacheCapability
         ):
@@ -754,10 +762,19 @@ class MLLMScheduler:
         decision = resolve_specprefill_decision(
             request.specprefill_policy,
             request.specprefill_coverage,
-            production=True,
+            production=not self.config.specprefill_diagnostic,
             text_only=text_only,
             threshold_met=True,
-            admission_allowed=self.config.specprefill_enabled,
+            admission_allowed=(
+                self.config.specprefill_enabled
+                and (
+                    self.config.specprefill_advertisable
+                    or (
+                        self.config.specprefill_diagnostic
+                        and request.specprefill_policy is SpecPrefillPolicy.SPARSE
+                    )
+                )
+            ),
         )
         request.specprefill_effective_policy = decision.effective_policy
         request.specprefill_fallback_reason = decision.fallback_reason
@@ -791,6 +808,7 @@ class MLLMScheduler:
             key,
             prompt_tokens=len(request.prompt_token_ids),
             residency_bytes=residency,
+            diagnostic=self.config.specprefill_diagnostic,
         )
         if not profile_decision.eligible or profile_decision.tuning is None:
             return None, profile_decision.fallback_reason
@@ -1865,6 +1883,14 @@ class MLLMScheduler:
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
             "requests": self.get_running_requests_info(),
+            "specprefill": {
+                "enabled": (
+                    self.config.specprefill_enabled
+                    and self.config.specprefill_advertisable
+                ),
+                "advertisable": self.config.specprefill_advertisable,
+                "diagnostic": self.config.specprefill_diagnostic,
+            },
         }
 
         if self.batch_generator is not None:

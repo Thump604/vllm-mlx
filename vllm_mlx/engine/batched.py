@@ -50,6 +50,8 @@ class PreparedMLLMSpecPrefillRuntime:
     tokenizer_artifact_hash: str
     scorer_artifact_hash: str
     cleanup: Any
+    diagnostic: bool = False
+    advertisable: bool = True
 
     def __post_init__(self) -> None:
         from ..mllm_scheduler import MLLMSpecPrefillCacheCapability
@@ -87,9 +89,23 @@ class PreparedMLLMSpecPrefillRuntime:
             raise ValueError("prepared cache adapter must match the profile key")
         if self.cache_capability.layout != "qwen3_5_nonrotating_hybrid":
             raise ValueError("prepared cache capability is not admitted for CB")
-        if not any(
-            profile.key == self.profile_key and profile.production_certified
+        matching_profiles = tuple(
+            profile
             for profile in self.profile_registry.profiles
+            if profile.key == self.profile_key
+        )
+        if self.diagnostic:
+            from ..specprefill_profiles import SpecPrefillProfileTier
+
+            if self.advertisable:
+                raise ValueError("diagnostic SpecPrefill cannot be advertisable")
+            if not any(
+                profile.tier is SpecPrefillProfileTier.DIAGNOSTIC
+                for profile in matching_profiles
+            ):
+                raise ValueError("prepared diagnostic profile is not registered")
+        elif not self.advertisable or not any(
+            profile.production_certified for profile in matching_profiles
         ):
             raise ValueError("prepared profile is not production-certified")
         expected_hashes = (
@@ -103,6 +119,13 @@ class PreparedMLLMSpecPrefillRuntime:
             self.scorer_artifact_hash,
         ) != expected_hashes:
             raise ValueError("prepared artifact hashes must match the profile key")
+
+
+@dataclass(frozen=True)
+class _RetainedSpecPrefillCleanup:
+    """Cleanup-only ownership retained after a preparation exception."""
+
+    cleanup: Any
 
 
 _SPECPREFILL_OUTPUT_FIELDS = (
@@ -563,6 +586,8 @@ class BatchedEngine(BaseEngine):
                 "specprefill_cache_capability": (
                     prepared_specprefill.cache_capability
                 ),
+                "specprefill_diagnostic": prepared_specprefill.diagnostic,
+                "specprefill_advertisable": prepared_specprefill.advertisable,
             }
         try:
             mllm_config = MLLMSchedulerConfig(
@@ -629,7 +654,17 @@ class BatchedEngine(BaseEngine):
             raise RuntimeError(
                 "enabled CB SpecPrefill requires specprefill_prepare"
             )
-        candidate = prepare(self._model, self._processor)
+        try:
+            candidate = prepare(self._model, self._processor)
+        except BaseException as failure:
+            retained_cleanup = getattr(
+                failure, "specprefill_retained_cleanup", None
+            )
+            if callable(retained_cleanup):
+                self._prepared_specprefill_runtime = _RetainedSpecPrefillCleanup(
+                    retained_cleanup
+                )
+            raise
         if not isinstance(candidate, PreparedMLLMSpecPrefillRuntime):
             cleanup = getattr(candidate, "cleanup", None)
             if callable(cleanup):
@@ -1432,6 +1467,7 @@ class BatchedEngine(BaseEngine):
                 "prefix_cache",
                 "batch_generator",
                 "mtp",
+                "specprefill",
                 "requests",
             ):
                 if key in mllm_stats:
