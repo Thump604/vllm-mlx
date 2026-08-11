@@ -2279,15 +2279,38 @@ class SimpleEngine(BaseEngine):
             if cancel_requested.is_set():
                 raise _SpecPrefillCancelled()
 
+        loop = asyncio.get_running_loop()
+        response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        sparse_output_committed = False
+
+        def _emit_response(resp: Any) -> None:
+            if not cancel_requested.is_set():
+                loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+
+        def _emit_sparse_response(resp: Any) -> None:
+            nonlocal sparse_output_committed
+            # This boundary is deliberately before queuing the response: once a
+            # sparse token exists, retrying dense would create a second answer.
+            sparse_output_committed = True
+            _emit_response(resp)
+
+        def _emit_done() -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
+
+        def _emit_error(exc: BaseException) -> None:
+            loop.call_soon_threadsafe(response_queue.put_nowait, ("error", exc))
+
         def _run_all():
             try:
-                return _run_specprefill()
+                _run_specprefill()
             except _SpecPrefillCancelled:
                 raise
             except Exception as e:
+                if sparse_output_committed:
+                    raise
                 logger.error("SpecPrefill failed, falling back to normal path: %s", e)
                 telemetry.fallback("sparse_execution_failed")
-                return _run_normal()
+                _run_normal()
 
         def _run_specprefill():
             """Score tokens, sparse prefill, generate autoregressively."""
@@ -2296,7 +2319,7 @@ class SimpleEngine(BaseEngine):
 
             import mlx.core as mx
             from mlx_lm.models.cache import make_prompt_cache
-            from mlx_lm.sample_utils import make_sampler
+            from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
             from ..specprefill import (
                 cleanup_rope,
@@ -2373,21 +2396,62 @@ class SimpleEngine(BaseEngine):
                     t_prefill,
                 )
 
-                # Phase 4: Generate via engine's standard pipelined path
-                sampler = make_sampler(temp=temperature, top_p=top_p)
+                # Phase 4: Sample from the same sampler/processors as dense
+                # generation. The seed sees the complete prompt token history,
+                # then the standard wrapper owns continuation sampling.
+                top_k = kwargs.get("top_k", 0)
+                min_p = kwargs.get("min_p", 0.0)
+                presence_penalty = kwargs.get("presence_penalty", 0.0)
+                repetition_penalty = kwargs.get("repetition_penalty", 1.0)
+                sampler = make_sampler(
+                    temp=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                )
+                penalty_processors = make_logits_processors(
+                    repetition_penalty=(
+                        repetition_penalty if repetition_penalty != 1.0 else None
+                    ),
+                    presence_penalty=(
+                        presence_penalty if presence_penalty != 0.0 else None
+                    ),
+                )
+                all_processors = (kwargs.get("logits_processors") or []) + (
+                    penalty_processors or []
+                )
+                seeded_processors = _seed_logits_processors(
+                    mx.array(tokens, dtype=mx.uint32), all_processors
+                )
                 _cancel_check()
-                first_token_id = sampler(logits[:, -1, :]).item()
+                first_token, _ = _sample_with_processors(
+                    None,
+                    logits[:, -1, :].squeeze(0),
+                    sampler,
+                    seeded_processors,
+                )
+                mx.eval(first_token)
+                first_token_id = first_token.item()
                 first_text = tokenizer.decode([first_token_id])
                 eos_id = tokenizer.eos_token_id
 
-                results = [
+                _emit_sparse_response(
                     SimpleNamespace(
                         text=first_text,
                         finish_reason="stop" if first_token_id == eos_id else None,
                     )
-                ]
+                )
 
                 if first_token_id != eos_id:
+                    # The wrapper normally builds penalty processors and gives
+                    # user processors only the continuation token sequence.
+                    # Reuse the seeded processors instead so both seed and
+                    # continuation observe the full prompt history, and avoid
+                    # applying the request penalties twice.
+                    continuation_kwargs = dict(kwargs)
+                    continuation_kwargs["logits_processors"] = seeded_processors
+                    continuation_kwargs["presence_penalty"] = 0.0
+                    continuation_kwargs["repetition_penalty"] = 1.0
                     for chunk in self._model.stream_generate(
                         prompt=mx.array([first_token_id]),
                         max_tokens=max_tokens - 1,
@@ -2395,26 +2459,16 @@ class SimpleEngine(BaseEngine):
                         top_p=top_p,
                         stop=stop,
                         prompt_cache=cache,
+                        **continuation_kwargs,
                     ):
                         _cancel_check()
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason=getattr(chunk, "finish_reason", None),
-                            )
-                        )
-
-                return results
+                        _emit_sparse_response(chunk)
 
             finally:
                 cleanup_rope(model)
 
         def _run_normal():
             """Fallback: normal generation without specprefill."""
-            from types import SimpleNamespace
-
-            results = []
             for chunk in self._model.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -2424,43 +2478,71 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ):
                 _cancel_check()
-                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                results.append(
-                    SimpleNamespace(
-                        text=new_text,
-                        finish_reason=getattr(chunk, "finish_reason", None),
-                    )
-                )
-            return results
+                _emit_response(chunk)
 
-        all_resps = await self._run_blocking_serialized(
-            _run_all, on_cancel=_request_cancel
-        )
+        async def _produce_responses() -> None:
+            try:
+                await self._run_blocking_serialized(
+                    _run_all,
+                    on_cancel=_request_cancel,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                _emit_error(exc)
+            else:
+                _emit_done()
+
+        producer_task = asyncio.create_task(_produce_responses())
 
         # Yield results as GenerationOutput
         accumulated_text = ""
         token_count = 0
         finished = False
-        for i, resp in enumerate(all_resps):
-            token_count += 1
-            new_text = resp.text
-            accumulated_text += new_text
+        try:
+            while True:
+                kind, payload = await response_queue.get()
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise payload
+                if finished:
+                    # The terminal token was already yielded. Drain until the
+                    # producer's done/error sentinel so a late worker failure
+                    # cannot be hidden by cancelling the producer on EOS.
+                    continue
+                resp = payload
 
-            is_last = i == len(all_resps) - 1
-            finished = is_last or token_count >= max_tokens
+                token_count += 1
+                new_text = resp.text if hasattr(resp, "text") else str(resp)
+                accumulated_text += new_text
 
-            yield GenerationOutput(
-                text=accumulated_text,
-                new_text=new_text,
-                prompt_tokens=n_tokens,
-                completion_tokens=token_count,
-                finished=finished,
-                finish_reason=resp.finish_reason or ("stop" if finished else None),
-                **telemetry.as_output_kwargs(),
-            )
+                stop_hit = bool(stop) and any(
+                    stop_seq in accumulated_text for stop_seq in stop
+                )
+                finished = stop_hit or token_count >= max_tokens
+                finish_reason = getattr(resp, "finish_reason", None)
+                if stop_hit:
+                    finish_reason = "stop"
+                elif finish_reason is None and finished:
+                    finish_reason = "length"
+                elif finish_reason is not None:
+                    finished = True
 
-            if finished:
-                break
+                yield GenerationOutput(
+                    text=accumulated_text,
+                    new_text=new_text,
+                    prompt_tokens=n_tokens,
+                    completion_tokens=token_count,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                    **telemetry.as_output_kwargs(),
+                )
+
+        finally:
+            if not producer_task.done():
+                _request_cancel()
+            await producer_task
 
         if not finished:
             yield GenerationOutput(
@@ -2757,11 +2839,20 @@ class SimpleEngine(BaseEngine):
 
         loop = asyncio.get_running_loop()
         response_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        sparse_output_committed = False
 
         def _emit_response(resp: Any) -> None:
             if abort_event.is_set():
                 return
             loop.call_soon_threadsafe(response_queue.put_nowait, ("resp", resp))
+
+        def _emit_sparse_response(resp: Any) -> None:
+            nonlocal sparse_output_committed
+            # A sparse token makes dense restart unsafe: callers would observe
+            # two answers from one request. Commit before queueing to preserve
+            # the boundary even if the consumer is cancelled immediately.
+            sparse_output_committed = True
+            _emit_response(resp)
 
         def _emit_done() -> None:
             loop.call_soon_threadsafe(response_queue.put_nowait, ("done", None))
@@ -2784,6 +2875,7 @@ class SimpleEngine(BaseEngine):
             prompt_cache,
             prompt,
             remaining_tokens: int,
+            emit_response=_emit_response,
         ) -> None:
             resume_kwargs = dict(
                 max_tokens=remaining_tokens,
@@ -2806,7 +2898,7 @@ class SimpleEngine(BaseEngine):
                 if abort_event.is_set():
                     logger.info("Text route: abort requested; stopping resume decode")
                     break
-                _emit_response(resp)
+                emit_response(resp)
 
         # Run all Metal ops in a single serialized thread.
         def _run_all():
@@ -2888,6 +2980,8 @@ class SimpleEngine(BaseEngine):
                     _run_specprefill(model, backbone_cache, use_mtp)
                     return
                 except Exception as e:
+                    if sparse_output_committed or abort_event.is_set():
+                        raise
                     logger.error(
                         "SpecPrefill failed, falling back to normal MTP path: %s",
                         e,
@@ -3091,7 +3185,7 @@ class SimpleEngine(BaseEngine):
                 prev_decoded = decoded
 
                 is_eos = tok_id == eos_id
-                _emit_response(
+                _emit_sparse_response(
                     SimpleNamespace(
                         text=new_text,
                         finish_reason="stop" if is_eos else None,
@@ -3124,28 +3218,33 @@ class SimpleEngine(BaseEngine):
                         bc,
                         continuation_prompt,
                         max_tokens - token_count,
+                        emit_response=_emit_sparse_response,
                     )
                     return
 
                 last_resp = None
                 retired = False
-                for resp in mlx_stream_generate(
-                    model,
-                    self._text_tokenizer,
-                    prompt=continuation_prompt,
+                continuation_kwargs = dict(
                     max_tokens=max_tokens - token_count,
                     sampler=sampler,
                     prefill_step_size=self._prefill_step_size,
                     logits_processors=seeded_processors,
                     prompt_cache=prompt_cache,
-                    mtp=use_mtp,
+                )
+                if use_mtp:
+                    continuation_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                for resp in mlx_stream_generate(
+                    model,
+                    self._text_tokenizer,
+                    prompt=continuation_prompt,
+                    **continuation_kwargs,
                 ):
                     if abort_event.is_set():
                         logger.info(
                             "SpecPrefill text route: abort requested; stopping decode"
                         )
                         break
-                    _emit_response(resp)
+                    _emit_sparse_response(resp)
                     token_count += 1
                     last_resp = resp
                     retired = _processors_retired(all_processors)
@@ -3165,6 +3264,7 @@ class SimpleEngine(BaseEngine):
                         bc,
                         seed,
                         max_tokens - token_count,
+                        emit_response=_emit_sparse_response,
                     )
 
             finally:
@@ -3196,6 +3296,10 @@ class SimpleEngine(BaseEngine):
                     break
                 if kind == "error":
                     raise payload
+                if finished:
+                    # Drain producer completion after a terminal sparse token
+                    # rather than cancelling it and masking a late error.
+                    continue
                 resp = payload
 
                 token_count += 1
@@ -3224,8 +3328,6 @@ class SimpleEngine(BaseEngine):
                     **telemetry.as_output_kwargs(),
                 )
 
-                if finished:
-                    break
         finally:
             if not producer_task.done():
                 abort_event.set()

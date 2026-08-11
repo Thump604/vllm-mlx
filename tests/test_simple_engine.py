@@ -2098,7 +2098,8 @@ class TestSimpleEngineConcurrency:
             "min_p": 0.0,
         }
         assert captured["prompt"] == [17]
-        assert captured["kwargs"]["mtp"] is True
+        assert "mtp" not in captured["kwargs"]
+        assert captured["kwargs"]["num_draft_tokens"] == 4
         assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
@@ -2534,6 +2535,66 @@ class TestSimpleEngineConcurrency:
         assert "logits_processors" not in calls[0]
 
     @pytest.mark.anyio
+    async def test_text_specprefill_does_not_restart_dense_after_seed_failure(self):
+        """A text-route sparse seed commits the response before continuation."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = []
+
+        def failing_continuation(*_args, **_kwargs):
+            calls.append("continuation")
+            raise RuntimeError("after text seed")
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 99
+        tokenizer.encode.return_value = [1, 2, 3]
+        tokenizer.decode.return_value = "A"
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            specprefill_enabled=True,
+            specprefill_diagnostic_mode=True,
+        )
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "mlx_lm.sample_utils.make_sampler",
+                return_value=lambda _logits: mx.array(17, dtype=mx.uint32),
+            ),
+            patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
+            patch("mlx_lm.stream_generate", side_effect=failing_continuation),
+            patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
+            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 8)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            stream = engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=2,
+                temperature=0.0,
+                top_p=1.0,
+                specprefill=True,
+            )
+            first = await anext(stream)
+            assert first.new_text == "A"
+            with pytest.raises(RuntimeError, match="after text seed"):
+                await anext(stream)
+
+        assert calls == ["continuation"]
+
+    @pytest.mark.anyio
     async def test_cancellation_does_not_release_lock_before_worker_finishes(
         self, mock_llm_model
     ):
@@ -2634,6 +2695,166 @@ class TestSimpleEngineConcurrency:
             assert len(outputs) == 1
             assert outputs[0].finished
             assert outputs[0].completion_tokens == 0
+
+    @pytest.mark.anyio
+    async def test_direct_specprefill_streams_before_worker_completion_and_forwards_sampling(
+        self,
+    ):
+        """The sparse seed is observable before a blocked continuation ends."""
+        from threading import Event
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        continuation_started = Event()
+        release_continuation = Event()
+        worker_finished = Event()
+        captured = {}
+
+        def sampler_factory(**kwargs):
+            captured["sampler"] = kwargs
+            return lambda _logits: mx.array(17, dtype=mx.uint32)
+
+        def processor(tokens, logits):
+            captured.setdefault("processor_tokens", []).append(tokens.tolist())
+            return logits
+
+        def continuation(**kwargs):
+            captured["continuation"] = kwargs
+            kwargs["logits_processors"][0](
+                mx.array([17], dtype=mx.uint32), mx.zeros((1, 8), dtype=mx.float32)
+            )
+            continuation_started.set()
+            release_continuation.wait(timeout=1)
+            worker_finished.set()
+            yield SimpleNamespace(text="B", finish_reason="stop")
+
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._model = MagicMock()
+        engine._model.model = MagicMock()
+        engine._model.tokenizer = SimpleNamespace(
+            decode=lambda ids: "A", eos_token_id=99
+        )
+        engine._model.stream_generate.side_effect = continuation
+
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch("mlx_lm.sample_utils.make_sampler", side_effect=sampler_factory),
+            patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
+            patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
+            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 8)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            stream = engine._stream_generate_specprefill(
+                "prompt",
+                [1, 2, 3],
+                max_tokens=2,
+                temperature=0.6,
+                top_p=0.9,
+                top_k=23,
+                min_p=0.2,
+                presence_penalty=0.4,
+                repetition_penalty=1.2,
+                logits_processors=[processor],
+            )
+            first = await anext(stream)
+            assert first.new_text == "A"
+            assert await asyncio.to_thread(continuation_started.wait, 1)
+            assert not worker_finished.is_set()
+            release_continuation.set()
+            rest = [output async for output in stream]
+
+        assert [output.new_text for output in rest] == ["B"]
+        assert captured["sampler"] == {
+            "temp": 0.6,
+            "top_p": 0.9,
+            "top_k": 23,
+            "min_p": 0.2,
+        }
+        assert captured["processor_tokens"] == [[1, 2, 3], [1, 2, 3, 17]]
+        assert captured["continuation"]["top_k"] == 23
+        assert captured["continuation"]["min_p"] == 0.2
+        assert captured["continuation"]["presence_penalty"] == 0.0
+        assert captured["continuation"]["repetition_penalty"] == 1.0
+
+    @pytest.mark.anyio
+    async def test_direct_specprefill_falls_back_only_before_seed(self):
+        """Pre-seed sparse failures safely restart dense exactly once."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._model = MagicMock()
+        engine._model.model = MagicMock()
+        engine._model.tokenizer = SimpleNamespace(eos_token_id=99)
+        engine._model.stream_generate.return_value = iter(
+            [SimpleNamespace(text="dense", finish_reason="stop")]
+        )
+
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "vllm_mlx.specprefill.score_tokens",
+                side_effect=RuntimeError("before seed"),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            outputs = [
+                output
+                async for output in engine._stream_generate_specprefill(
+                    "prompt", [1], max_tokens=2, temperature=0.0, top_p=1.0
+                )
+            ]
+
+        assert [output.new_text for output in outputs] == ["dense"]
+        assert outputs[-1].specprefill_fallback_reason == "sparse_execution_failed"
+        assert engine._model.stream_generate.call_count == 1
+
+    @pytest.mark.anyio
+    async def test_direct_specprefill_never_restarts_dense_after_sparse_output(self):
+        """Seed and continuation failures propagate without duplicate dense text."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._draft_model = MagicMock()
+        engine._model = MagicMock()
+        engine._model.model = MagicMock()
+        engine._model.tokenizer = SimpleNamespace(
+            decode=lambda _ids: "A", eos_token_id=99
+        )
+        engine._model.stream_generate.side_effect = RuntimeError("after seed")
+
+        with (
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch(
+                "mlx_lm.sample_utils.make_sampler",
+                return_value=lambda _logits: mx.array(17, dtype=mx.uint32),
+            ),
+            patch("mlx_lm.sample_utils.make_logits_processors", return_value=[]),
+            patch("vllm_mlx.specprefill.score_tokens", return_value=mx.array([1.0])),
+            patch("vllm_mlx.specprefill.select_chunks", return_value=mx.array([0])),
+            patch(
+                "vllm_mlx.specprefill.sparse_prefill",
+                return_value=mx.zeros((1, 1, 8)),
+            ),
+            patch("vllm_mlx.specprefill.cleanup_rope"),
+        ):
+            stream = engine._stream_generate_specprefill(
+                "prompt", [1], max_tokens=2, temperature=0.0, top_p=1.0
+            )
+            first = await anext(stream)
+            assert first.new_text == "A"
+            with pytest.raises(RuntimeError, match="after seed"):
+                await anext(stream)
+
+        assert engine._model.stream_generate.call_count == 1
 
     @pytest.mark.anyio
     async def test_text_mtp_path_does_not_prelock_serialized_runner(self):
