@@ -18,6 +18,7 @@ from vllm_mlx.specprefill_cache import (
 )
 from vllm_mlx.specprefill_positions import QWEN_DENSE_TARGET
 from vllm_mlx.specprefill_target_executor import (
+    SparseTargetPrefillAuthorityError,
     SparseTargetPrefillError,
     SparseTargetPrefillLaneBusy,
     SparseTargetPrefillPhase,
@@ -32,6 +33,24 @@ class _Cache:
         self.offset = 0
         self.state = mx.array([0], dtype=mx.int32)
         self.meta_state = ()
+
+
+class _FreshKVCache:
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.meta_state = ()
+
+    @property
+    def state(self):
+        if self.keys is None:
+            raise AttributeError("fresh KV state is unavailable")
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
 
 
 class _Attention:
@@ -227,6 +246,150 @@ def test_adoption_cache_is_exact_executor_cache_only_after_completion():
     session.step()
 
     assert session.adoption_cache is cache
+
+
+def test_attested_chunk_forward_collects_ordered_receipts_on_exact_cache():
+    tokens = mx.array([[1, 4, 5]], dtype=mx.int32)
+    state = _state((0, 3, 4))
+    model, cache = _Model(), [_Cache()]
+    hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+    receipts = []
+
+    def attested_forward(token_rows, target_cache, plan):
+        assert target_cache is cache
+        receipt = object()
+        with hooks.session_for_plan(plan):
+            logits = model(token_rows, cache=target_cache)
+            target_executor._eval_forward(logits, target_cache)
+        receipts.append(receipt)
+        return logits, receipt
+
+    result = execute_sparse_target_prefill(
+        model,
+        tokens,
+        cache,
+        state,
+        QWEN_DENSE_TARGET,
+        step_size=2,
+        target_forward=attested_forward,
+    )
+
+    assert result.forward_receipts == tuple(receipts)
+    assert len(result.forward_receipts) == 2
+    assert cache[0].offset == 3
+
+
+def test_fresh_unallocated_kv_cache_has_atomic_empty_checkpoint():
+    cache = [_FreshKVCache()]
+    snapshot = target_executor._snapshot_cache(cache)
+    cache[0].keys = mx.ones((1, 1, 1, 1))
+    cache[0].values = mx.ones((1, 1, 1, 1))
+    cache[0].offset = 1
+
+    target_executor._restore_cache(cache, snapshot)
+
+    assert cache[0].keys is None
+    assert cache[0].values is None
+    assert cache[0].offset == 0
+
+
+def test_attested_chunk_failure_restores_cache_and_discards_receipts():
+    tokens = mx.array([[1, 4, 5]], dtype=mx.int32)
+    state = _state((0, 3, 4))
+    model, cache = _Model(), [_Cache()]
+    hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+    calls = 0
+    abandoned = []
+
+    def attested_forward(token_rows, target_cache, plan):
+        nonlocal calls
+        calls += 1
+        with hooks.session_for_plan(plan):
+            logits = model(token_rows, cache=target_cache)
+            target_executor._eval_forward(logits, target_cache)
+        if calls == 2:
+            raise RuntimeError("receipt issuance failed")
+        return logits, object()
+
+    session = SparseTargetPrefillSession(
+        model,
+        tokens,
+        cache,
+        state,
+        QWEN_DENSE_TARGET,
+        step_size=2,
+        target_forward=attested_forward,
+        receipt_abandon=lambda receipts: abandoned.extend(receipts),
+    )
+    session.step()
+    with pytest.raises(RuntimeError, match="receipt issuance failed"):
+        session.step()
+
+    assert session.closed
+    assert cache[0].offset == 0
+    assert session._forward_receipts == []
+    assert len(abandoned) == 1
+
+
+def test_attested_lazy_failure_abandons_issued_receipt_before_dense_retry(
+    monkeypatch,
+):
+    model, cache = _Model(), [_Cache()]
+    receipt = object()
+    abandoned = []
+
+    def attested_forward(token_rows, target_cache, plan):
+        hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+        with hooks.session_for_plan(plan):
+            logits = model(token_rows, cache=target_cache)
+        return logits, receipt
+
+    monkeypatch.setattr(
+        target_executor,
+        "_eval_forward",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("lazy eval failed")),
+    )
+    with pytest.raises(RuntimeError, match="lazy eval failed"):
+        execute_sparse_target_prefill(
+            model,
+            mx.array([[1]], dtype=mx.int32),
+            cache,
+            _state((0,)),
+            QWEN_DENSE_TARGET,
+            target_forward=attested_forward,
+            receipt_abandon=lambda receipts: abandoned.extend(receipts),
+        )
+
+    assert abandoned == [receipt]
+    assert cache[0].offset == 0
+
+
+def test_partial_receipt_abandon_failure_is_terminal_authority_error():
+    model, cache = _Model(), [_Cache()]
+
+    def attested_forward(token_rows, target_cache, plan):
+        hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+        with hooks.session_for_plan(plan):
+            logits = model(token_rows, cache=target_cache)
+        return logits, object()
+
+    session = SparseTargetPrefillSession(
+        model,
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache,
+        _state((0, 1)),
+        QWEN_DENSE_TARGET,
+        step_size=1,
+        target_forward=attested_forward,
+        receipt_abandon=lambda _receipts: (_ for _ in ()).throw(
+            RuntimeError("abandon failed")
+        ),
+    )
+    session.step()
+    with pytest.raises(SparseTargetPrefillAuthorityError, match="partial"):
+        session.cancel()
+    assert session.closed
+    assert cache[0].offset == 0
 
 
 def test_session_rejects_zero_selected_token_rows_before_forward():

@@ -9,7 +9,7 @@ integrating with vLLM's model execution system.
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from ..native_mtp_request import NativeMTPRequestConfig
 
@@ -17,6 +17,29 @@ if TYPE_CHECKING:
     import mlx.core as mx
 
 logger = logging.getLogger(__name__)
+
+
+def _seed_logits_processors(seed_tokens, processors):
+    """Prefix processor history while preserving native-MTP replay attestation."""
+    if not processors or seed_tokens is None or seed_tokens.size == 0:
+        return processors
+    import mlx.core as mx
+
+    wrapped = []
+    for processor in processors:
+
+        def _seeded(tokens, logits, _processor=processor):
+            merged = seed_tokens
+            if tokens is not None:
+                current = tokens if isinstance(tokens, mx.array) else mx.array(tokens)
+                if current.size:
+                    merged = mx.concatenate([seed_tokens, current])
+            return _processor(merged, logits)
+
+        if getattr(processor, "native_mtp_replay_safe", False):
+            _seeded.native_mtp_replay_safe = True
+        wrapped.append(_seeded)
+    return wrapped
 
 
 @dataclass
@@ -226,7 +249,7 @@ class MLXLanguageModel:
 
     def stream_generate(
         self,
-        prompt: Union[str, "mx.array", list[int]],
+        prompt: Union[str, "mx.array", list[int], None],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -240,6 +263,8 @@ class MLXLanguageModel:
         model_forward_context=None,
         native_mtp_request: NativeMTPRequestConfig | None = None,
         native_mtp_disabled: bool = False,
+        sparse_bootstrap: Any | None = None,
+        logits_processor_seed_tokens=None,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -295,9 +320,16 @@ class MLXLanguageModel:
         all_processors = None
         if penalty_processors or logits_processors:
             all_processors = (logits_processors or []) + (penalty_processors or [])
+        all_processors = _seed_logits_processors(
+            logits_processor_seed_tokens, all_processors
+        )
 
         # Count prompt tokens once upfront
-        if isinstance(prompt, str):
+        if prompt is None:
+            if sparse_bootstrap is None:
+                raise ValueError("prompt=None requires a sparse native MTP bootstrap")
+            num_prompt_tokens = sparse_bootstrap.next_logical_position
+        elif isinstance(prompt, str):
             num_prompt_tokens = len(self.tokenizer.encode(prompt))
         else:
             num_prompt_tokens = len(prompt)
@@ -311,6 +343,10 @@ class MLXLanguageModel:
             mtp_kwargs.update(
                 native_mtp_request.mlx_lm_call_kwargs(consumer=stream_generate)
             )
+            if sparse_bootstrap is not None:
+                mtp_kwargs["sparse_bootstrap"] = sparse_bootstrap
+        elif sparse_bootstrap is not None:
+            raise ValueError("sparse bootstrap requires request-selected native MTP")
         elif self._mtp and not native_mtp_disabled:
             # The legacy default is preserved only for callers outside the
             # public request contract. Public default-on requests always carry
@@ -376,9 +412,7 @@ class MLXLanguageModel:
                     logprobs=getattr(response, "logprobs", None),
                     mtp_drafts=getattr(response, "mtp_drafts", 0),
                     mtp_accepted=getattr(response, "mtp_accepted", 0),
-                    mtp_bypass_reason=getattr(
-                        response, "mtp_bypass_reason", None
-                    ),
+                    mtp_bypass_reason=getattr(response, "mtp_bypass_reason", None),
                 )
 
                 if finished:

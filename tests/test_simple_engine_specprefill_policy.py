@@ -461,7 +461,7 @@ async def test_production_profile_forwards_every_calibrated_selector_control(
 
 
 @pytest.mark.anyio
-async def test_direct_native_mtp_routes_dense_until_composition_is_qualified(
+async def test_direct_legacy_native_mtp_requires_request_contract_for_composition(
     monkeypatch,
 ):
     engine = _engine(mtp=True, registered=True)
@@ -495,12 +495,31 @@ async def test_direct_native_mtp_routes_dense_until_composition_is_qualified(
     assert outputs[-1].text == "dense"
     assert received == {}
     assert outputs[-1].specprefill_effective_policy == "dense"
-    assert outputs[-1].specprefill_fallback_reason == "mtp_composition_not_implemented"
+    assert (
+        outputs[-1].specprefill_fallback_reason == "native_mtp_request_contract_missing"
+    )
 
 
 def test_sparse_eos_accepts_tokenizer_multi_id_contract():
     tokenizer = SimpleNamespace(eos_token_id=1, eos_token_ids=(1, 7))
     assert SimpleEngine._eos_token_ids(tokenizer) == frozenset((1, 7))
+
+
+def test_composed_sparse_rejects_configured_rotating_cache_before_model_admission(
+    monkeypatch,
+):
+    engine = _engine(registered=True)
+    engine._max_kv_size = 128
+    profile_lookup = []
+    monkeypatch.setattr(
+        engine,
+        "_active_specprefill_profile_key",
+        lambda combined_mtp: profile_lookup.append(combined_mtp),
+    )
+
+    with pytest.raises(ValueError, match="nonrotating"):
+        engine._admit_sparse_target(object(), combined_mtp=True)
+    assert profile_lookup == []
 
 
 def test_sparse_cache_identity_rejects_selector_version_drift():
@@ -529,6 +548,47 @@ def test_sparse_cache_identity_rejects_selector_version_drift():
             profile_key=engine._active_specprefill_profile_key(False),
             adapter=QWEN_DENSE_TARGET,
         )
+
+
+def test_sparse_plan_missing_actual_final_prompt_token_fails_before_target_mutation(
+    monkeypatch,
+):
+    engine = _engine(registered=True)
+    plan = SimpleNamespace(
+        selected_indices=(0, 2),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.engine.simple.build_selection_plan",
+        lambda *_args, **_kwargs: plan,
+    )
+    target_calls = []
+    target = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3"),
+        __call__=lambda *_args, **_kwargs: target_calls.append(True),
+    )
+    telemetry = SimpleNamespace(
+        profile_selector_version=None,
+        selected_tokens=None,
+        target_prefill_ms=None,
+    )
+
+    with pytest.raises(ValueError, match="final prompt tokens"):
+        engine._prepare_sparse_target_prefill(
+            target_model=target,
+            tokenizer=SimpleNamespace(all_special_ids=()),
+            tokens=list(range(8)),
+            importance=mx.ones((8,)),
+            cache=[],
+            telemetry=telemetry,
+            keep_pct=0.25,
+            backbone_pct=0.0,
+            chunk_size=1,
+            halo_chunks=0,
+            anchor_chunks=1,
+            profile_key=engine._active_specprefill_profile_key(False),
+            adapter=QWEN_DENSE_TARGET,
+        )
+    assert target_calls == []
 
 
 @pytest.mark.anyio

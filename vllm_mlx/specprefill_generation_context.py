@@ -21,11 +21,12 @@ from typing import Any, Iterator, Sequence
 
 from .specprefill_cache import SparseCacheState, SparseCacheStateError
 from .specprefill_positions import (
+    PositionPhase,
     TargetPositionAdapter,
     decode_plan,
     verify_plan,
 )
-from .specprefill_target_hooks import TargetPositionHooks
+from .specprefill_target_hooks import TargetPositionHooks, TargetPositionSession
 
 
 class SparseGenerationContextError(SparseCacheStateError):
@@ -62,6 +63,7 @@ class SparseGenerationForwardContext:
         self.adapter = adapter
         self._state = state.clone()
         self._hooks = TargetPositionHooks.for_model(target_model, adapter)
+        self._mtp_cache: Any | None = None
         self._reconcile_cache()
 
     @property
@@ -84,12 +86,6 @@ class SparseGenerationForwardContext:
                 )
             yield
             return
-        if cache is not self.target_cache:
-            raise SparseGenerationContextError(
-                "target generation forward replaced the admitted sparse cache"
-            )
-
-        self._reconcile_cache()
         tokens = getattr(forward, "input_tokens", None)
         shape = getattr(tokens, "shape", None)
         if shape is None or len(shape) != 2 or shape[0] != 1 or shape[1] <= 0:
@@ -100,6 +96,51 @@ class SparseGenerationForwardContext:
         phase = getattr(getattr(forward, "phase", None), "value", None)
         if phase is None:
             phase = getattr(forward, "phase", None)
+        logical_positions = getattr(forward, "logical_positions", None)
+        logical_position_ack = getattr(forward, "logical_position_ack", None)
+
+        if phase == PositionPhase.MTP_DRAFT.value:
+            if cache is self.target_cache:
+                raise SparseGenerationContextError(
+                    "native MTP draft cannot share the sparse target cache"
+                )
+            if not isinstance(cache, list) or not cache:
+                raise SparseGenerationContextError(
+                    "native MTP draft requires a non-empty request-local cache list"
+                )
+            if self._mtp_cache is None:
+                self._mtp_cache = cache
+            elif cache is not self._mtp_cache:
+                raise SparseGenerationContextError(
+                    "native MTP draft replaced its request-local cache"
+                )
+            positions = _require_attested_positions(
+                logical_positions,
+                logical_position_ack,
+                token_count=token_count,
+            )
+            physical_start = _cache_offset(cache)
+            expected_end = physical_start + token_count
+            session = TargetPositionSession(
+                logical_positions=(positions,),
+                physical_starts=(physical_start,),
+                phase=PositionPhase.MTP_DRAFT,
+                logical_position_ack=logical_position_ack,
+            )
+            with self._hooks.session(session):
+                yield session
+            if _cache_offset(cache) != expected_end:
+                raise SparseGenerationContextError(
+                    "native MTP cache did not advance by the draft token count"
+                )
+            return
+
+        if cache is not self.target_cache:
+            raise SparseGenerationContextError(
+                "target generation forward replaced the admitted sparse cache"
+            )
+
+        self._reconcile_cache()
         if phase == "decode":
             if token_count != 1:
                 raise SparseGenerationContextError(
@@ -113,8 +154,28 @@ class SparseGenerationForwardContext:
                 "sparse target continuation accepts only decode or verify forwards"
             )
 
+        if logical_positions is None and logical_position_ack is not None:
+            raise SparseGenerationContextError(
+                "logical-position acknowledgement is missing immutable positions"
+            )
+        if logical_positions is not None:
+            positions = _require_attested_positions(
+                logical_positions,
+                logical_position_ack,
+                token_count=token_count,
+            )
+            if positions != plan.logical_positions[0]:
+                raise SparseGenerationContextError(
+                    "generation forward logical positions disagree with sparse state"
+                )
+
         expected_end = self._state.rows[0].physical_valid_length + token_count
-        with self._hooks.session_for_plan(plan):
+        session_kwargs = (
+            {"logical_position_ack": logical_position_ack}
+            if logical_position_ack is not None
+            else {}
+        )
+        with self._hooks.session_for_plan(plan, **session_kwargs):
             yield
         actual_end = _cache_offset(self.target_cache)
         if actual_end != expected_end:
@@ -164,3 +225,38 @@ def _cache_offset(cache: Sequence[Any]) -> int:
             "target cache layers disagree on physical occupancy"
         )
     return offsets[0]
+
+
+def _require_attested_positions(
+    logical_positions: Any,
+    logical_position_ack: Any,
+    *,
+    token_count: int,
+) -> tuple[int, ...]:
+    """Validate the host-only B=1 position receipt inputs before a model call."""
+    if (
+        not isinstance(logical_positions, tuple)
+        or len(logical_positions) != token_count
+    ):
+        raise SparseGenerationContextError(
+            "attested generation positions must be a host tuple matching tokens"
+        )
+    if logical_position_ack is None or not callable(
+        getattr(logical_position_ack, "acknowledge", None)
+    ):
+        raise SparseGenerationContextError(
+            "attested generation requires a request-local position consumer"
+        )
+    previous = -1
+    for position in logical_positions:
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+            or position <= previous
+        ):
+            raise SparseGenerationContextError(
+                "attested generation positions must be strictly increasing integers"
+            )
+        previous = position
+    return logical_positions

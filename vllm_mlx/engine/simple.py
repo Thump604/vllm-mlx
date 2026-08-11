@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,10 +51,14 @@ from ..specprefill_generation_context import SparseGenerationForwardContext
 from ..specprefill_positions import (
     TargetPositionAdapter,
     TargetPositionError,
+    TargetPositionFamily,
     resolve_target_position_adapter,
 )
-from ..specprefill_selection import RotatingTailRequirement, SelectionPlan
-from ..specprefill_target_executor import execute_sparse_target_prefill
+from ..specprefill_selection import RotatingTailRequirement
+from ..specprefill_target_executor import (
+    SparseTargetPrefillAuthorityError,
+    execute_sparse_target_prefill,
+)
 from ..specprefill_target_hooks import TargetPositionHooks
 from ..specprefill_profiles import (
     EMPTY_SPECPREFILL_PROFILE_REGISTRY,
@@ -109,6 +113,8 @@ def _seed_logits_processors(
                     merged = mx.concatenate([seed_tokens, tokens_arr])
             return processor(merged, logits)
 
+        if getattr(processor, "native_mtp_replay_safe", False):
+            _seeded.native_mtp_replay_safe = True
         return _seeded
 
     return [_wrap(processor) for processor in processors]
@@ -265,6 +271,30 @@ def _consume_native_mtp_request(
 
 class _SpecPrefillCancelled(Exception):
     """Cooperative cancellation sentinel for blocking SpecPrefill workers."""
+
+
+class _SpecPrefillAuthorityError(RuntimeError):
+    """Receipt/cache authority could not prove that dense replay is safe."""
+
+
+def _try_abandon_sparse_bootstrap(bootstrap: Any) -> bool:
+    """Atomically abandon only authority that has not begun a claim."""
+    abandon = getattr(bootstrap, "try_abandon_unclaimed", None)
+    if not callable(abandon):
+        raise _SpecPrefillAuthorityError(
+            "sparse native MTP bootstrap lacks atomic abandonment"
+        )
+    try:
+        abandoned = abandon()
+    except BaseException as exc:
+        raise _SpecPrefillAuthorityError(
+            "sparse native MTP authority cleanup failed"
+        ) from exc
+    if type(abandoned) is not bool:
+        raise _SpecPrefillAuthorityError(
+            "sparse native MTP abandonment returned a non-boolean result"
+        )
+    return abandoned
 
 
 async def _aclose_async_iterator(
@@ -752,10 +782,14 @@ class SimpleEngine(BaseEngine):
         return RotatingTailRequirement(max(maxima)) if maxima else None
 
     def _admit_sparse_target(
-        self, target_model: Any
+        self, target_model: Any, *, combined_mtp: bool = False
     ) -> tuple[SpecPrefillProfileKey, TargetPositionAdapter]:
         """Resolve artifact/adapter/hook compatibility before scorer work."""
-        profile_key = self._active_specprefill_profile_key(combined_mtp=False)
+        if combined_mtp and self._max_kv_size:
+            raise TargetPositionError(
+                "sparse native MTP requires an exact nonrotating target cache"
+            )
+        profile_key = self._active_specprefill_profile_key(combined_mtp=combined_mtp)
         if profile_key is None:
             raise TargetPositionError("exact sparse cache identity is unavailable")
         adapter = resolve_target_position_adapter(target_model)
@@ -763,10 +797,68 @@ class SimpleEngine(BaseEngine):
             raise TargetPositionError(
                 "qualified profile adapter does not match the target position adapter"
             )
+        if combined_mtp:
+            if adapter.family is not TargetPositionFamily.QWEN35_TEXT_HYBRID:
+                raise TargetPositionError(
+                    "sparse native MTP composition supports exact Qwen text targets only"
+                )
+            capability = getattr(target_model, "mtp_capability", None)
+            if capability is None or not capability.supported:
+                reason = (
+                    "native_mtp_model_capability_missing"
+                    if capability is None
+                    else capability.reason
+                )
+                raise TargetPositionError(reason)
+            self._resolve_native_mtp_sparse_api()
         # Installation is topology-preserving and immutable.  Doing it here
         # guarantees executor admission before scorer/RNG state can advance.
         TargetPositionHooks.for_model(target_model, adapter)
         return profile_key, adapter
+
+    @staticmethod
+    def _resolve_native_mtp_sparse_api() -> tuple[Any, Any, Any, Any]:
+        """Resolve the exact attested sparse-bootstrap API or fail closed."""
+        try:
+            from mlx_lm import stream_generate as mlx_stream_generate
+            from mlx_lm.generate import (
+                GenerationForwardPhase,
+                NativeMTPSparseBootstrap,
+                abandon_native_mtp_sparse_receipts,
+                attested_target_forward,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise TargetPositionError(
+                "mlx-lm does not expose attested native MTP sparse bootstrap"
+            ) from exc
+        try:
+            parameters = inspect.signature(mlx_stream_generate).parameters
+        except (TypeError, ValueError) as exc:
+            raise TargetPositionError(
+                "mlx-lm sparse native MTP public dispatch is unavailable"
+            ) from exc
+        required = {
+            "mtp",
+            "mtp_sampling_config",
+            "model_forward_context",
+            "sparse_bootstrap",
+        }
+        if not required.issubset(parameters):
+            raise TargetPositionError(
+                "mlx-lm sparse native MTP public dispatch is unavailable"
+            )
+        if not callable(
+            getattr(NativeMTPSparseBootstrap, "try_abandon_unclaimed", None)
+        ):
+            raise TargetPositionError(
+                "mlx-lm sparse native MTP atomic abandonment is unavailable"
+            )
+        return (
+            GenerationForwardPhase,
+            NativeMTPSparseBootstrap,
+            attested_target_forward,
+            abandon_native_mtp_sparse_receipts,
+        )
 
     def _prepare_sparse_target_prefill(
         self,
@@ -784,8 +876,9 @@ class SimpleEngine(BaseEngine):
         anchor_chunks: int,
         profile_key: SpecPrefillProfileKey,
         adapter: TargetPositionAdapter,
+        combined_mtp: bool = False,
         cancel_check: Any | None = None,
-    ) -> tuple[Any, SparseGenerationForwardContext, SelectionPlan]:
+    ) -> tuple[Any, ...]:
         """Build exact sparse state and run a fresh target prefill atomically.
 
         This is intentionally the only SimpleEngine entry point to the new
@@ -849,6 +942,80 @@ class SimpleEngine(BaseEngine):
             (plan.selected_indices,),
             (len(tokens),),
         )
+        target_forward = None
+        receipt_abandon = None
+        bootstrap_type = None
+        if combined_mtp:
+            (
+                phase_type,
+                bootstrap_type,
+                attested_target_forward,
+                receipt_abandon,
+            ) = self._resolve_native_mtp_sparse_api()
+            hooks = TargetPositionHooks.for_model(target_model, adapter)
+
+            @contextmanager
+            def _attested_forward_context(forward):
+                if forward.model is not target_model or forward.cache is not cache:
+                    raise TargetPositionError(
+                        "attested target model/cache identity changed"
+                    )
+                if forward.phase is not phase_type.PREFILL:
+                    raise TargetPositionError("attested sparse target phase changed")
+                positions = tuple(forward.logical_positions)
+                if positions != active_plan.logical_positions[0]:
+                    raise TargetPositionError(
+                        "attested sparse target logical positions changed"
+                    )
+                if tuple(forward.input_tokens.shape) != (1, len(positions)):
+                    raise TargetPositionError("attested sparse target requires B=1")
+                ack = getattr(forward, "logical_position_ack", None)
+                if not callable(getattr(ack, "acknowledge", None)):
+                    raise TargetPositionError(
+                        "attested sparse target requires a position consumer"
+                    )
+                with hooks.session_for_plan(active_plan, logical_position_ack=ack):
+                    yield
+
+            active_plan: Any = None
+
+            def _attested_chunk(token_rows, target_cache, chunk_plan):
+                nonlocal active_plan
+                if target_cache is not cache:
+                    raise TargetPositionError("sparse target cache identity changed")
+                positions = chunk_plan.logical_positions[0]
+                token_ids = tuple(tokens[position] for position in positions)
+                if tuple(token_rows.shape) != (1, len(token_ids)):
+                    raise TargetPositionError("attested sparse target requires B=1")
+                successors = tuple(
+                    tokens[position + 1]
+                    for position in positions
+                    if position < len(tokens) - 1
+                )
+                expected_successors = len(positions)
+                if positions[-1] == len(tokens) - 1:
+                    expected_successors -= 1
+                if len(successors) != expected_successors:
+                    raise TargetPositionError(
+                        "receipt chunk does not contain exact original successors"
+                    )
+                active_plan = chunk_plan
+                try:
+                    (logits, _hidden), receipt = attested_target_forward(
+                        target_model,
+                        token_ids,
+                        cache,
+                        phase=phase_type.PREFILL,
+                        logical_positions=positions,
+                        immediate_successor_token_ids=successors,
+                        model_forward_context=_attested_forward_context,
+                    )
+                finally:
+                    active_plan = None
+                return logits, receipt
+
+            target_forward = _attested_chunk
+
         result = execute_sparse_target_prefill(
             target_model,
             [tokens[index] for index in plan.selected_indices],
@@ -857,16 +1024,56 @@ class SimpleEngine(BaseEngine):
             adapter,
             step_size=self._prefill_step_size,
             cancel_check=cancel_check,
+            target_forward=target_forward,
+            receipt_abandon=receipt_abandon,
         )
         telemetry.selected_tokens = result.telemetry.selected_tokens
         telemetry.target_prefill_ms = result.telemetry.target_prefill_ms
-        return (
-            result,
-            SparseGenerationForwardContext(
+        sparse_bootstrap = None
+        forward_context = None
+        receipts = tuple(result.forward_receipts)
+        try:
+            forward_context = SparseGenerationForwardContext(
                 target_model, cache, result.cache_state, adapter
-            ),
+            )
+            if combined_mtp:
+                selected_positions = tuple(plan.selected_indices)
+                selected_token_ids = tuple(
+                    tokens[position] for position in selected_positions
+                )
+                immediate_successors = tuple(
+                    tokens[position + 1] for position in selected_positions[:-1]
+                )
+                sparse_bootstrap = bootstrap_type(
+                    receipts=receipts,
+                    selected_logical_positions=selected_positions,
+                    selected_token_ids=selected_token_ids,
+                    immediate_successor_token_ids=immediate_successors,
+                    target_cache=cache,
+                    next_logical_position=len(tokens),
+                )
+        except BaseException as preparation_error:
+            if combined_mtp:
+                if sparse_bootstrap is None:
+                    try:
+                        receipt_abandon(receipts)
+                    except BaseException as close_error:
+                        raise _SpecPrefillAuthorityError(
+                            "sparse native MTP authority cleanup failed"
+                        ) from close_error
+                elif not _try_abandon_sparse_bootstrap(sparse_bootstrap):
+                    raise _SpecPrefillAuthorityError(
+                        "sparse native MTP bootstrap claim already began"
+                    )
+            if forward_context is not None:
+                forward_context.finish()
+            raise preparation_error
+        prepared = (
+            result,
+            forward_context,
             plan,
         )
+        return (*prepared, sparse_bootstrap) if combined_mtp else prepared
 
     @staticmethod
     def _specprefill_dense_fallback(
@@ -1257,12 +1464,8 @@ class SimpleEngine(BaseEngine):
                             )
                             self._supports_system_kv_cache = False
 
-                        capability = getattr(
-                            self._text_model, "mtp_capability", None
-                        )
-                        has_mtp = bool(
-                            capability is not None and capability.supported
-                        )
+                        capability = getattr(self._text_model, "mtp_capability", None)
+                        has_mtp = bool(capability is not None and capability.supported)
                         logger.info(
                             "MLLM text routing: text-only -> mlx_lm TextModel "
                             "(MTP=%s), media -> mlx_vlm",
@@ -1663,16 +1866,15 @@ class SimpleEngine(BaseEngine):
             not self._is_mllm
             and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
             and effective_mtp
+            and native_mtp_config is None
         ):
-            # Sparse-only is independently qualified first. Native/external
-            # MTP composition cannot borrow this cache/position state yet.
-            telemetry.fallback("mtp_composition_not_implemented")
+            telemetry.fallback("native_mtp_request_contract_missing")
 
         if (
             not self._is_mllm
             and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
         ):
-            async for output in self._stream_generate_specprefill(
+            sparse_stream = self._stream_generate_specprefill(
                 prompt,
                 tokens_list,
                 max_tokens,
@@ -1680,6 +1882,8 @@ class SimpleEngine(BaseEngine):
                 top_p,
                 stop=stop,
                 telemetry=telemetry,
+                native_mtp_request=native_mtp_config,
+                mtp_bypass_reason=mtp_bypass_reason,
                 specprefill_keep_pct=(
                     specprefill_controls["keep_pct"]
                     if self._specprefill_diagnostic_mode
@@ -1714,8 +1918,21 @@ class SimpleEngine(BaseEngine):
                     else None
                 ),
                 **kwargs,
-            ):
-                yield output
+            )
+            primary_error: BaseException | None = None
+            try:
+                async for output in sparse_stream:
+                    yield output
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                # A public GeneratorExit can arrive while this wrapper is
+                # suspended at ``yield``.  ``async for`` does not close the
+                # delegated async iterator in that case, so explicitly drive
+                # its cancellation/worker/request cleanup before the tracker
+                # releases ownership.
+                await _aclose_async_iterator(sparse_stream, primary_error)
             return
 
         async with self._acquire_generation_slot(request_id):
@@ -2099,9 +2316,7 @@ class SimpleEngine(BaseEngine):
             native_mtp_disabled,
             effective_native_mtp,
             mtp_bypass_reason,
-        ) = (
-            _consume_native_mtp_request(kwargs, server_default=self._mtp)
-        )
+        ) = _consume_native_mtp_request(kwargs, server_default=self._mtp)
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
         request_has_media = has_media_content(messages)
 
@@ -2755,6 +2970,8 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         stop: list[str] | None = None,
         telemetry: _SpecPrefillTelemetry | None = None,
+        native_mtp_request: NativeMTPRequestConfig | None = None,
+        mtp_bypass_reason: str | None = None,
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
         specprefill_chunk_size: int | None = None,
@@ -2818,7 +3035,12 @@ class SimpleEngine(BaseEngine):
             except _SpecPrefillCancelled:
                 raise
             except Exception as e:
-                if sparse_output_committed or sparse_decode_transaction_started:
+                if (
+                    sparse_output_committed
+                    or sparse_decode_transaction_started
+                    or isinstance(e, _SpecPrefillAuthorityError)
+                    or isinstance(e, SparseTargetPrefillAuthorityError)
+                ):
                     raise
                 logger.error("SpecPrefill failed, falling back to normal path: %s", e)
                 telemetry.fallback("sparse_execution_failed")
@@ -2841,7 +3063,13 @@ class SimpleEngine(BaseEngine):
                     "mlx-lm does not expose model_forward_context continuation"
                 )
 
-            profile_key, adapter = self._admit_sparse_target(model)
+            combined_mtp = native_mtp_request is not None
+            if combined_mtp:
+                profile_key, adapter = self._admit_sparse_target(
+                    model, combined_mtp=True
+                )
+            else:
+                profile_key, adapter = self._admit_sparse_target(model)
             detokenizer = _new_sparse_detokenizer(tokenizer)
             top_k = kwargs.get("top_k", 0)
             min_p = kwargs.get("min_p", 0.0)
@@ -2865,7 +3093,15 @@ class SimpleEngine(BaseEngine):
                 mx.array(tokens, dtype=mx.uint32), all_processors
             )
 
-            cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            cache = (
+                model.make_cache()
+                if combined_mtp
+                else make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            )
+            if combined_mtp and (not isinstance(cache, list) or not cache):
+                raise TargetPositionError(
+                    "sparse native MTP target cache must be a fresh non-empty list"
+                )
 
             # Phase 1: Score with draft model
             t0 = time.monotonic()
@@ -2895,7 +3131,7 @@ class SimpleEngine(BaseEngine):
                 if specprefill_anchor_chunks is not None
                 else 1
             )
-            result, forward_context, plan = self._prepare_sparse_target_prefill(
+            prepare_kwargs = dict(
                 target_model=model,
                 tokenizer=tokenizer,
                 tokens=tokens,
@@ -2911,6 +3147,14 @@ class SimpleEngine(BaseEngine):
                 adapter=adapter,
                 cancel_check=_cancel_check,
             )
+            if combined_mtp:
+                prepare_kwargs["combined_mtp"] = True
+            prepared = self._prepare_sparse_target_prefill(**prepare_kwargs)
+            if combined_mtp:
+                result, forward_context, plan, sparse_bootstrap = prepared
+            else:
+                result, forward_context, plan = prepared
+                sparse_bootstrap = None
             logits = result.logits
             n_selected = len(plan.selected_indices)
             t_prefill = (telemetry.target_prefill_ms or 0.0) / 1000.0
@@ -2925,6 +3169,77 @@ class SimpleEngine(BaseEngine):
                 n_selected / n_tokens * 100,
                 t_prefill,
             )
+
+            if combined_mtp:
+                generation = None
+                authority_abandoned = False
+
+                def _abandon_before_first_output() -> bool:
+                    nonlocal authority_abandoned, sparse_decode_transaction_started
+                    if authority_abandoned:
+                        return True
+                    try:
+                        authority_abandoned = _try_abandon_sparse_bootstrap(
+                            sparse_bootstrap
+                        )
+                    except BaseException:
+                        sparse_decode_transaction_started = True
+                        raise
+                    if not authority_abandoned:
+                        sparse_decode_transaction_started = True
+                    return authority_abandoned
+
+                try:
+                    # Cancellation before the first resume owns no sample and
+                    # must atomically abandon still-unclaimed authority.
+                    _cancel_check()
+                    generation = self._model.stream_generate(
+                        prompt=None,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=None,
+                        native_mtp_request=native_mtp_request,
+                        sparse_bootstrap=sparse_bootstrap,
+                        model_forward_context=forward_context,
+                        # Upstream history starts with the final selected prompt
+                        # token, so prefix all earlier original prompt tokens.
+                        logits_processor_seed_tokens=mx.array(
+                            tokens[:-1], dtype=mx.uint32
+                        ),
+                        **kwargs,
+                    )
+                    iterator = iter(generation)
+                    while True:
+                        try:
+                            chunk = next(iterator)
+                        except StopIteration:
+                            break
+                        except BaseException:
+                            _abandon_before_first_output()
+                            raise
+                        # A yielded chunk proves sampling occurred and the
+                        # bootstrap claim was consumed. Replay is now terminal.
+                        sparse_decode_transaction_started = True
+                        _cancel_check()
+                        _emit_sparse_response(chunk)
+                except BaseException:
+                    if not sparse_decode_transaction_started:
+                        _abandon_before_first_output()
+                    raise
+                finally:
+                    try:
+                        if generation is not None:
+                            close = getattr(generation, "close", None)
+                            if close is not None:
+                                close()
+                    finally:
+                        try:
+                            if not sparse_decode_transaction_started:
+                                _abandon_before_first_output()
+                        finally:
+                            forward_context.finish()
+                return
 
             # Sample the seed under the complete prompt history, then retain
             # request-local sparse positions for every continuation forward.
@@ -3003,13 +3318,16 @@ class SimpleEngine(BaseEngine):
 
         def _run_normal():
             """Fallback: normal generation without specprefill."""
+            normal_kwargs = dict(kwargs)
+            if native_mtp_request is not None:
+                normal_kwargs["native_mtp_request"] = native_mtp_request
             for chunk in self._model.stream_generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stop=stop,
-                **kwargs,
+                **normal_kwargs,
             ):
                 _cancel_check()
                 _emit_response(chunk)
@@ -3033,10 +3351,16 @@ class SimpleEngine(BaseEngine):
         accumulated_text = ""
         token_count = 0
         finished = False
+        producer_exhausted = False
+        mtp_drafts = 0
+        mtp_accepted = 0
+        backend_mtp_bypass_reason = None
+        last_logprobs = None
         try:
             while True:
                 kind, payload = await response_queue.get()
                 if kind == "done":
+                    producer_exhausted = True
                     break
                 if kind == "error":
                     if finished and isinstance(payload, _SpecPrefillCancelled):
@@ -3050,6 +3374,12 @@ class SimpleEngine(BaseEngine):
                 resp = payload
 
                 token_count += 1
+                mtp_drafts = getattr(resp, "mtp_drafts", mtp_drafts)
+                mtp_accepted = getattr(resp, "mtp_accepted", mtp_accepted)
+                backend_mtp_bypass_reason = getattr(
+                    resp, "mtp_bypass_reason", backend_mtp_bypass_reason
+                )
+                last_logprobs = getattr(resp, "logprobs", last_logprobs)
                 new_text = resp.text if hasattr(resp, "text") else str(resp)
                 accumulated_text += new_text
 
@@ -3074,6 +3404,10 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=finish_reason,
+                    mtp_drafts=mtp_drafts,
+                    mtp_accepted=mtp_accepted,
+                    mtp_bypass_reason=(mtp_bypass_reason or backend_mtp_bypass_reason),
+                    logprobs=last_logprobs,
                     **telemetry.as_output_kwargs(),
                 )
 
@@ -3089,7 +3423,15 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=n_tokens,
                 completion_tokens=token_count,
                 finished=True,
-                finish_reason="length",
+                # A clean sparse producer end is an ordinary natural stop,
+                # even when it did not emit a backend terminal reason.  Keep
+                # this separate empty terminal frame so the already-observed
+                # token frames and their telemetry remain unchanged.
+                finish_reason="stop" if producer_exhausted else "length",
+                mtp_drafts=mtp_drafts,
+                mtp_accepted=mtp_accepted,
+                mtp_bypass_reason=(mtp_bypass_reason or backend_mtp_bypass_reason),
+                logprobs=last_logprobs,
                 **telemetry.as_output_kwargs(),
             )
 
@@ -3198,10 +3540,18 @@ class SimpleEngine(BaseEngine):
             ),
             presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
         )
+        if native_mtp_config is not None:
+            for processor in penalty_processors or ():
+                try:
+                    processor.native_mtp_replay_safe = True
+                except (AttributeError, TypeError) as exc:
+                    raise ValueError(
+                        "native MTP penalty processor cannot be replayed safely"
+                    ) from exc
         all_processors = (external_logits_processors or []) + (penalty_processors or [])
-        custom_logits_active = bool(all_processors)
+        custom_logits_active = bool(external_logits_processors)
         combined_mtp = (
-            _request_can_compose_mtp(combined_mtp, all_processors)
+            _request_can_compose_mtp(combined_mtp, external_logits_processors)
             and native_mtp_config is not None
         )
         sparse_no_completion_requested = max_tokens == 0
@@ -3395,9 +3745,6 @@ class SimpleEngine(BaseEngine):
         if use_specprefill and sparse_no_completion_requested:
             telemetry.fallback("sparse_no_completion_requested")
             use_specprefill = False
-        elif use_specprefill and combined_mtp:
-            telemetry.fallback("mtp_composition_not_implemented")
-            use_specprefill = False
         elif use_specprefill and (backbone_cache is not None or system_token_count):
             telemetry.fallback("sparse_prefix_cache_not_supported")
             use_specprefill = False
@@ -3485,10 +3832,6 @@ class SimpleEngine(BaseEngine):
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
                 )
-            if use_specprefill and use_mtp:
-                telemetry.fallback("mtp_composition_not_implemented")
-                use_specprefill = False
-
             # Cache MISS with valid prefix: prefill system tokens and snapshot
             if (
                 not cache_hit
@@ -3556,6 +3899,8 @@ class SimpleEngine(BaseEngine):
                         sparse_output_committed
                         or sparse_decode_transaction_started
                         or abort_event.is_set()
+                        or isinstance(e, _SpecPrefillAuthorityError)
+                        or isinstance(e, SparseTargetPrefillAuthorityError)
                     ):
                         raise
                     logger.error(
@@ -3680,19 +4025,41 @@ class SimpleEngine(BaseEngine):
 
             from ..specprefill import score_tokens
 
-            if bc is not None or use_mtp:
+            if bc is not None:
                 raise TargetPositionError(
-                    "sparse-only target prefill requires fresh cache"
+                    "sparse target prefill requires a fresh target cache"
                 )
-            profile_key, adapter = self._admit_sparse_target(model)
+            if use_mtp and native_mtp_config is None:
+                raise TargetPositionError(
+                    "native MTP composition requires a request-local config"
+                )
+            if use_mtp:
+                profile_key, adapter = self._admit_sparse_target(
+                    model, combined_mtp=True
+                )
+            else:
+                profile_key, adapter = self._admit_sparse_target(model)
             detokenizer = _new_sparse_detokenizer(self._text_tokenizer)
+            seed_values = full_tokens_list
+            if use_mtp and seed_values is not None:
+                # Native sparse MTP supplies the final selected prompt token as
+                # its initial history; prefix only the preceding original IDs.
+                seed_values = seed_values[:-1]
             seed_tokens = (
-                mx.array(full_tokens_list, dtype=mx.uint32)
-                if full_tokens_list is not None
+                mx.array(seed_values, dtype=mx.uint32)
+                if seed_values is not None
                 else None
             )
             seeded_processors = _seed_logits_processors(seed_tokens, all_processors)
-            cache = make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            cache = (
+                model.make_cache()
+                if use_mtp
+                else make_prompt_cache(model, max_kv_size=self._max_kv_size or None)
+            )
+            if use_mtp and (not isinstance(cache, list) or not cache):
+                raise TargetPositionError(
+                    "sparse native MTP target cache must be a fresh non-empty list"
+                )
             import time
 
             def _cancel_check() -> None:
@@ -3723,7 +4090,7 @@ class SimpleEngine(BaseEngine):
                 if specprefill_anchor_chunks is not None
                 else 1
             )
-            result, forward_context, plan = self._prepare_sparse_target_prefill(
+            prepare_kwargs = dict(
                 target_model=model,
                 tokenizer=self._text_tokenizer,
                 tokens=specprefill_tokens,
@@ -3739,6 +4106,14 @@ class SimpleEngine(BaseEngine):
                 adapter=adapter,
                 cancel_check=_cancel_check,
             )
+            if use_mtp:
+                prepare_kwargs["combined_mtp"] = True
+            prepared = self._prepare_sparse_target_prefill(**prepare_kwargs)
+            if use_mtp:
+                result, forward_context, plan, sparse_bootstrap = prepared
+            else:
+                result, forward_context, plan = prepared
+                sparse_bootstrap = None
             logits = result.logits
             n_selected = len(plan.selected_indices)
             n_total = len(specprefill_tokens)
@@ -3754,6 +4129,76 @@ class SimpleEngine(BaseEngine):
                 n_selected / n_total * 100,
                 t_prefill,
             )
+
+            if use_mtp:
+                generation = None
+                authority_abandoned = False
+
+                def _abandon_before_first_output() -> bool:
+                    nonlocal authority_abandoned, sparse_decode_transaction_started
+                    if authority_abandoned:
+                        return True
+                    try:
+                        authority_abandoned = _try_abandon_sparse_bootstrap(
+                            sparse_bootstrap
+                        )
+                    except BaseException:
+                        sparse_decode_transaction_started = True
+                        raise
+                    if not authority_abandoned:
+                        sparse_decode_transaction_started = True
+                    return authority_abandoned
+
+                try:
+                    gen_kwargs = dict(
+                        max_tokens=max_tokens,
+                        prefill_step_size=self._prefill_step_size,
+                        model_forward_context=forward_context,
+                        sparse_bootstrap=sparse_bootstrap,
+                    )
+                    if seeded_processors:
+                        gen_kwargs["logits_processors"] = seeded_processors
+                    gen_kwargs.update(
+                        native_mtp_config.mlx_lm_call_kwargs(
+                            consumer=mlx_stream_generate
+                        )
+                    )
+                    _cancel_check()
+                    generation = mlx_stream_generate(
+                        model,
+                        self._text_tokenizer,
+                        prompt=None,
+                        **gen_kwargs,
+                    )
+                    iterator = iter(generation)
+                    while True:
+                        try:
+                            resp = next(iterator)
+                        except StopIteration:
+                            break
+                        except BaseException:
+                            _abandon_before_first_output()
+                            raise
+                        sparse_decode_transaction_started = True
+                        _cancel_check()
+                        _emit_sparse_response(resp)
+                except BaseException:
+                    if not sparse_decode_transaction_started:
+                        _abandon_before_first_output()
+                    raise
+                finally:
+                    try:
+                        if generation is not None:
+                            close = getattr(generation, "close", None)
+                            if close is not None:
+                                close()
+                    finally:
+                        try:
+                            if not sparse_decode_transaction_started:
+                                _abandon_before_first_output()
+                        finally:
+                            forward_context.finish()
+                return
 
             # Phase 4: Sample the first token from the prefilled logits, then
             # continue through mlx_lm with the request-local forward context.
@@ -3863,6 +4308,7 @@ class SimpleEngine(BaseEngine):
         accumulated_text = ""
         token_count = 0
         finished = False
+        producer_exhausted = False
         mtp_drafts = 0
         mtp_accepted = 0
         backend_mtp_bypass_reason = None
@@ -3871,6 +4317,7 @@ class SimpleEngine(BaseEngine):
             while True:
                 kind, payload = await response_queue.get()
                 if kind == "done":
+                    producer_exhausted = True
                     break
                 if kind == "error":
                     if finished and isinstance(payload, _SpecPrefillCancelled):
@@ -3902,7 +4349,7 @@ class SimpleEngine(BaseEngine):
                 if stop_hit:
                     finish_reason = "stop"
                 elif finish_reason is None and finished:
-                    finish_reason = "stop"
+                    finish_reason = "length"
                 elif finish_reason is not None:
                     finished = True
                 if finished:
@@ -3917,9 +4364,7 @@ class SimpleEngine(BaseEngine):
                     finish_reason=finish_reason,
                     mtp_drafts=mtp_drafts,
                     mtp_accepted=mtp_accepted,
-                    mtp_bypass_reason=(
-                        mtp_bypass_reason or backend_mtp_bypass_reason
-                    ),
+                    mtp_bypass_reason=(mtp_bypass_reason or backend_mtp_bypass_reason),
                     logprobs=last_logprobs,
                     **telemetry.as_output_kwargs(),
                 )
@@ -3936,7 +4381,9 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=full_token_count or 0,
                 completion_tokens=token_count,
                 finished=True,
-                finish_reason="length",
+                # A clean sparse producer end is an ordinary natural stop,
+                # even when it did not emit a backend terminal reason.
+                finish_reason="stop" if producer_exhausted else "length",
                 mtp_drafts=mtp_drafts,
                 mtp_accepted=mtp_accepted,
                 mtp_bypass_reason=(mtp_bypass_reason or backend_mtp_bypass_reason),

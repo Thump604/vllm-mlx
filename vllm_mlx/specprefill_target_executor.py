@@ -66,6 +66,10 @@ class SparseTargetPrefillLaneBusy(SparseTargetPrefillError):
     """Another request owns this target model's bounded execution quantum."""
 
 
+class SparseTargetPrefillAuthorityError(SparseTargetPrefillError):
+    """Issued target-forward receipt authority could not be abandoned safely."""
+
+
 @dataclass(frozen=True)
 class SparseTargetPrefillTelemetry:
     """Executor-local facts suitable for request terminal metadata."""
@@ -83,6 +87,7 @@ class SparseTargetPrefillResult:
     logits: mx.array
     cache_state: SparseCacheState
     telemetry: SparseTargetPrefillTelemetry
+    forward_receipts: tuple[Any, ...] = ()
 
 
 class SparseTargetPrefillPhase(str, Enum):
@@ -125,6 +130,7 @@ class _GemmaChunkCursor:
 
 _TARGET_LANE_LOCK = threading.RLock()
 _TARGET_LANES: dict[int, tuple[weakref.ReferenceType[Any], threading.Lock]] = {}
+_EMPTY_KV_CACHE_STATE = object()
 
 
 def _target_lane_for(model: Any) -> threading.Lock:
@@ -180,6 +186,11 @@ class SparseTargetPrefillSession:
         *,
         step_size: int = 2048,
         cancel_check: Callable[[], None] | None = None,
+        target_forward: (
+            Callable[[Any, Sequence[Any], TargetPositionPlan], tuple[mx.array, Any]]
+            | None
+        ) = None,
+        receipt_abandon: Callable[[Sequence[Any]], None] | None = None,
     ):
         _validate_execution_inputs(cache, sparse_state, adapter, step_size)
         self._token_rows = _normalize_selected_tokens(selected_tokens, sparse_state)
@@ -189,11 +200,21 @@ class SparseTargetPrefillSession:
         self.adapter = adapter
         self._step_size = step_size
         self._cancel_check = cancel_check
+        self._target_forward = target_forward
+        self._receipt_abandon = receipt_abandon
         self._physical_entries = _physical_cache_entries(cache)
         _require_fresh_physical_cache(self._physical_entries, sparse_state.row_count)
         self._gemma = _resolve_gemma_scalar_execution(
             model, cache, adapter, sparse_state.row_count
         )
+        if target_forward is not None and sparse_state.row_count != 1:
+            raise SparseTargetPrefillError(
+                "attested sparse target execution is supported only for B=1"
+            )
+        if target_forward is not None and self._gemma is not None:
+            raise SparseTargetPrefillError(
+                "attested sparse target execution is not supported for Gemma"
+            )
         if self._gemma is not None and step_size == 1 and self._token_rows.shape[1] > 1:
             raise SparseTargetPrefillError(
                 "Gemma sparse prefill requires chunk_size > 1 except its final tail"
@@ -207,6 +228,7 @@ class SparseTargetPrefillSession:
         self._processed = 0
         self._starts: list[tuple[int, ...]] = []
         self._logits: mx.array | None = None
+        self._forward_receipts: list[Any] = []
         self._result: SparseTargetPrefillResult | None = None
         self._target_prefill_seconds = 0.0
         self._phase = SparseTargetPrefillPhase.ACTIVE
@@ -274,13 +296,22 @@ class SparseTargetPrefillSession:
             )
             forward_started_at = time.perf_counter()
             if self._gemma is None:
-                with self._hooks.session_for_plan(plan):
-                    self._logits = self.model(
-                        self._token_rows[
-                            :, self._processed : self._processed + chunk_size
-                        ],
-                        cache=self.cache,
+                token_rows = self._token_rows[
+                    :, self._processed : self._processed + chunk_size
+                ]
+                if self._target_forward is None:
+                    with self._hooks.session_for_plan(plan):
+                        self._logits = self.model(token_rows, cache=self.cache)
+                        _eval_forward(self._logits, self.cache)
+                else:
+                    self._logits, receipt = self._target_forward(
+                        token_rows, self.cache, plan
                     )
+                    if receipt is None:
+                        raise SparseTargetPrefillError(
+                            "attested target forward did not return a receipt"
+                        )
+                    self._forward_receipts.append(receipt)
                     _eval_forward(self._logits, self.cache)
             else:
                 self._logits = self._run_gemma_chunk(
@@ -317,12 +348,25 @@ class SparseTargetPrefillSession:
         """Restore the entry cache snapshot and discard this request's state."""
         if self.closed or self.complete:
             return
-        if self._gemma_checkpoint is not None:
-            self._gemma_checkpoint.restore()
-        elif self._snapshot is not None:
-            _restore_cache(self.cache, self._snapshot)
-        self._logits = None
-        self._phase = SparseTargetPrefillPhase.CLOSED
+        authority_error = None
+        try:
+            if self._forward_receipts and self._receipt_abandon is not None:
+                try:
+                    self._receipt_abandon(tuple(self._forward_receipts))
+                except BaseException as exc:
+                    authority_error = exc
+            if self._gemma_checkpoint is not None:
+                self._gemma_checkpoint.restore()
+            elif self._snapshot is not None:
+                _restore_cache(self.cache, self._snapshot)
+        finally:
+            self._logits = None
+            self._forward_receipts.clear()
+            self._phase = SparseTargetPrefillPhase.CLOSED
+        if authority_error is not None:
+            raise SparseTargetPrefillAuthorityError(
+                "failed to abandon partial sparse target receipts"
+            ) from authority_error
 
     @property
     def _total(self) -> int:
@@ -344,6 +388,7 @@ class SparseTargetPrefillSession:
                 chunk_count=len(self._starts),
                 physical_cache_starts=tuple(self._starts),
             ),
+            forward_receipts=tuple(self._forward_receipts),
         )
         if self._gemma_checkpoint is not None:
             self._gemma_checkpoint.seal()
@@ -419,6 +464,10 @@ def execute_sparse_target_prefill(
     *,
     step_size: int = 2048,
     cancel_check: Callable[[], None] | None = None,
+    target_forward: (
+        Callable[[Any, Sequence[Any], TargetPositionPlan], tuple[mx.array, Any]] | None
+    ) = None,
+    receipt_abandon: Callable[[Sequence[Any]], None] | None = None,
 ) -> SparseTargetPrefillResult:
     """Run selected target tokens under request-local logical positions.
 
@@ -440,6 +489,8 @@ def execute_sparse_target_prefill(
         adapter,
         step_size=step_size,
         cancel_check=cancel_check,
+        target_forward=target_forward,
+        receipt_abandon=receipt_abandon,
     ).run_to_completion()
 
 
@@ -758,7 +809,17 @@ def _clone_cache_value(value: Any) -> Any:
 
 def _snapshot_cache(cache: Sequence[Any]) -> _CacheSnapshot:
     try:
-        states = tuple(_clone_cache_value(entry.state) for entry in cache)
+        states = tuple(
+            (
+                _EMPTY_KV_CACHE_STATE
+                if hasattr(entry, "keys")
+                and hasattr(entry, "values")
+                and entry.keys is None
+                and entry.values is None
+                else _clone_cache_value(entry.state)
+            )
+            for entry in cache
+        )
         meta_states = tuple(
             (
                 _clone_cache_value(entry.meta_state)
@@ -784,7 +845,11 @@ def _restore_cache(cache: Sequence[Any], snapshot: _CacheSnapshot) -> None:
             snapshot.offsets,
             strict=True,
         ):
-            entry.state = _clone_cache_value(state)
+            if state is _EMPTY_KV_CACHE_STATE:
+                entry.keys = None
+                entry.values = None
+            else:
+                entry.state = _clone_cache_value(state)
             if meta_state is not None:
                 entry.meta_state = _clone_cache_value(meta_state)
             if offset is not None:

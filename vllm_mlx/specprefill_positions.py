@@ -62,6 +62,7 @@ class PositionPhase(str, Enum):
     SPARSE_PREFILL = "sparse_prefill"
     DECODE = "decode"
     VERIFY = "verify"
+    MTP_DRAFT = "mtp_draft"
 
 
 @dataclass(frozen=True)

@@ -53,7 +53,13 @@ class TargetPositionSession:
     logical_positions: tuple[tuple[int, ...], ...]
     physical_starts: tuple[int, ...]
     phase: PositionPhase
+    logical_position_ack: Any | None = field(
+        default=None, repr=False, compare=False, hash=False
+    )
     position_tensor: mx.array = field(init=False, repr=False, compare=False, hash=False)
+    _position_acknowledged: list[bool] = field(
+        default_factory=lambda: [False], repr=False, compare=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         if not self.logical_positions:
@@ -114,7 +120,9 @@ class TargetPositionSession:
         return len(self.logical_positions[0])
 
     @classmethod
-    def from_plan(cls, plan: TargetPositionPlan) -> "TargetPositionSession":
+    def from_plan(
+        cls, plan: TargetPositionPlan, *, logical_position_ack: Any | None = None
+    ) -> "TargetPositionSession":
         """Build an execution session from the cache-local position contract.
 
         The caller intentionally does not invoke ``plan.require_executable()``:
@@ -126,6 +134,7 @@ class TargetPositionSession:
             logical_positions=plan.logical_positions,
             physical_starts=plan.physical_cache_lengths,
             phase=plan.phase,
+            logical_position_ack=logical_position_ack,
         )
 
     def positions_for_forward(self, sequence_length: int) -> mx.array:
@@ -136,6 +145,22 @@ class TargetPositionSession:
                 "session for the next sparse-prefill chunk"
             )
         return self.position_tensor
+
+    def acknowledge_forward_positions(self) -> None:
+        """Acknowledge once, from the first RoPE call inside the model call."""
+        if self.logical_position_ack is None or self._position_acknowledged[0]:
+            return
+        if self.batch_size != 1:
+            raise TargetPositionHookError(
+                "logical-position acknowledgement is supported only for B=1"
+            )
+        acknowledge = getattr(self.logical_position_ack, "acknowledge", None)
+        if not callable(acknowledge):
+            raise TargetPositionHookError(
+                "logical-position acknowledgement consumer is invalid"
+            )
+        acknowledge(self.logical_positions[0])
+        self._position_acknowledged[0] = True
 
 
 @dataclass(frozen=True)
@@ -259,6 +284,7 @@ def _install_rope_dispatch(
                     )
                 offset = kwargs.get("offset", args[1] if len(args) > 1 else 0)
                 _validate_scalar_offset(offset, session)
+                session.acknowledge_forward_positions()
                 if session.batch_size == 1 and session.logical_positions[0] == tuple(
                     range(
                         session.physical_starts[0],
@@ -424,10 +450,17 @@ class TargetPositionHooks:
 
     @contextmanager
     def session_for_plan(
-        self, plan: TargetPositionPlan
+        self,
+        plan: TargetPositionPlan,
+        *,
+        logical_position_ack: Any | None = None,
     ) -> Iterator[TargetPositionSession]:
         """Activate a cache-local plan for the caller's entire model forward."""
-        with self.session(TargetPositionSession.from_plan(plan)) as session:
+        with self.session(
+            TargetPositionSession.from_plan(
+                plan, logical_position_ack=logical_position_ack
+            )
+        ) as session:
             yield session
 
 
@@ -441,11 +474,24 @@ def _target_attention_layers(model: Any) -> list[tuple[int, Any]]:
         layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         raise TargetPositionHookError("target model does not expose decoder layers")
-    return [
+    attention_layers = [
         (index, layer.self_attn)
         for index, layer in enumerate(layers)
         if getattr(layer, "self_attn", None) is not None
     ]
+    capability = getattr(model, "mtp_capability", None)
+    if capability is not None and getattr(capability, "supported", False):
+        mtp = getattr(model, "mtp", None)
+        if mtp is None:
+            mtp = getattr(getattr(model, "language_model", None), "mtp", None)
+        mtp_layers = getattr(mtp, "layers", ())
+        next_index = len(attention_layers)
+        attention_layers.extend(
+            (next_index + index, layer.self_attn)
+            for index, layer in enumerate(mtp_layers)
+            if getattr(layer, "self_attn", None) is not None
+        )
+    return attention_layers
 
 
 def _validate_scalar_offset(offset: Any, session: TargetPositionSession) -> None:

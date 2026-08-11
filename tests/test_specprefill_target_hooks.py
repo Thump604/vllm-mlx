@@ -138,6 +138,56 @@ def test_keep_ratio_one_matches_native_rope_without_model_weights(traditional):
     _assert_close(model.layers[0].self_attn.rope(x, offset=0), expected)
 
 
+def test_position_acknowledgement_occurs_once_during_rope_model_call():
+    first = nn.RoPE(8, traditional=False, base=10000.0)
+    second = nn.RoPE(8, traditional=False, base=10000.0)
+    model = Model([first, second])
+    hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+    events = []
+
+    class Ack:
+        active = False
+
+        def acknowledge(self, positions):
+            assert self.active is True
+            events.append(positions)
+
+    ack = Ack()
+    session = TargetPositionSession(
+        logical_positions=((0, 3),),
+        physical_starts=(0,),
+        phase=PositionPhase.SPARSE_PREFILL,
+        logical_position_ack=ack,
+    )
+    x = mx.random.normal((1, 2, 2, 8))
+
+    with hooks.session(session):
+        assert events == []
+        ack.active = True
+        mx.eval(
+            model.layers[0].self_attn.rope(x, offset=0),
+            model.layers[1].self_attn.rope(x, offset=0),
+        )
+        ack.active = False
+
+    assert events == [(0, 3)]
+
+
+def test_supported_native_mtp_rope_is_owned_by_same_request_local_hooks():
+    backbone_rope = nn.RoPE(8, traditional=False, base=10000.0)
+    mtp_rope = nn.RoPE(8, traditional=False, base=10000.0)
+    model = Model([backbone_rope])
+    model.mtp_capability = SimpleNamespace(supported=True)
+    model.mtp = SimpleNamespace(layers=[SimpleNamespace(self_attn=Attention(mtp_rope))])
+
+    hooks = TargetPositionHooks.for_model(model, QWEN_DENSE_TARGET)
+
+    assert tuple(wrapper[2] for wrapper in hooks._wrappers) == (
+        backbone_rope,
+        mtp_rope,
+    )
+
+
 def test_install_preserves_real_mlx_module_rope_identity_and_parameter_topology():
     rope = nn.RoPE(8, traditional=False, base=10000.0)
     model = ModuleModel([rope])

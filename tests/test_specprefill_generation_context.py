@@ -31,15 +31,28 @@ class _Cache:
 class _Hooks:
     def __init__(self):
         self.plans = []
+        self.sessions = []
+        self.acks = []
         self.active = False
 
     @contextmanager
-    def session_for_plan(self, plan):
+    def session_for_plan(self, plan, **kwargs):
         assert not self.active
         self.active = True
         self.plans.append(plan)
+        self.acks.append(kwargs.get("logical_position_ack"))
         try:
             yield
+        finally:
+            self.active = False
+
+    @contextmanager
+    def session(self, session):
+        assert not self.active
+        self.active = True
+        self.sessions.append(session)
+        try:
+            yield session
         finally:
             self.active = False
 
@@ -70,12 +83,14 @@ def _context(monkeypatch):
     return context, model, cache, hooks
 
 
-def _forward(model, cache, count, phase):
+def _forward(model, cache, count, phase, *, positions=None, ack=None):
     return SimpleNamespace(
         model=model,
         cache=cache,
         input_tokens=mx.zeros((1, count), dtype=mx.int32),
         phase=SimpleNamespace(value=phase),
+        logical_positions=positions,
+        logical_position_ack=ack,
     )
 
 
@@ -97,6 +112,60 @@ def test_decode_uses_logical_cursor_without_overwriting_physical_offset(monkeypa
     assert plan.physical_cache_lengths == (4,)
     assert context.state.next_logical_positions == (9,)
     assert context.state.physical_valid_lengths == (5,)
+
+
+def test_attested_target_decode_requires_exact_sparse_logical_positions(monkeypatch):
+    context, model, cache, hooks = _context(monkeypatch)
+    ack = SimpleNamespace(acknowledge=lambda _positions: None)
+
+    with context(_forward(model, cache, 1, "decode", positions=(8,), ack=ack)):
+        _advance(cache, 1)
+
+    assert hooks.acks == [ack]
+    with pytest.raises(SparseGenerationContextError, match="disagree"):
+        with context(_forward(model, cache, 1, "decode", positions=(99,), ack=ack)):
+            pass
+
+
+def test_native_mtp_draft_binds_one_request_cache_and_logical_positions(monkeypatch):
+    context, model, _target_cache, hooks = _context(monkeypatch)
+    mtp_cache = [_Cache(3)]
+    acknowledged = []
+
+    class Ack:
+        def acknowledge(self, positions):
+            acknowledged.append(positions)
+
+    ack = Ack()
+    with context(
+        _forward(
+            model,
+            mtp_cache,
+            2,
+            "mtp_draft",
+            positions=(3, 6),
+            ack=ack,
+        )
+    ) as session:
+        session.acknowledge_forward_positions()
+        _advance(mtp_cache, 2)
+
+    assert acknowledged == [(3, 6)]
+    assert hooks.sessions[-1].phase is PositionPhase.MTP_DRAFT
+    assert hooks.sessions[-1].physical_starts == (3,)
+    replacement_cache = [_Cache(5)]
+    with pytest.raises(SparseGenerationContextError, match="replaced"):
+        with context(
+            _forward(
+                model,
+                replacement_cache,
+                1,
+                "mtp_draft",
+                positions=(7,),
+                ack=Ack(),
+            )
+        ):
+            pass
 
 
 def test_verify_rollback_reconciles_before_the_next_target_forward(monkeypatch):
