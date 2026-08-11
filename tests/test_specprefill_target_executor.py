@@ -212,6 +212,23 @@ def test_session_phase_is_read_only():
     assert not session.complete
 
 
+def test_adoption_cache_is_exact_executor_cache_only_after_completion():
+    cache = [_Cache()]
+    session = SparseTargetPrefillSession(
+        _Model(),
+        mx.array([[1]], dtype=mx.int32),
+        cache,
+        _state((0,)),
+        QWEN_DENSE_TARGET,
+    )
+
+    with pytest.raises(SparseTargetPrefillError, match="before publishable"):
+        _ = session.adoption_cache
+    session.step()
+
+    assert session.adoption_cache is cache
+
+
 def test_session_rejects_zero_selected_token_rows_before_forward():
     model = _Model()
     with pytest.raises(SparseTargetPrefillError, match="at least one selected token"):

@@ -114,6 +114,7 @@ class _FakeTargetSession:
         self.cancelled = False
         self.active = False
         self._busy_returned = False
+        self.cache = [object()]
         self.result = SparseTargetPrefillResult(
             logits=mx.array([[[1.0, 0.0]]]),
             cache_state=self.state.clone(),
@@ -146,6 +147,12 @@ class _FakeTargetSession:
         self.cancelled = True
         if self.cleanup_raises:
             raise RuntimeError("target cleanup failed")
+
+    @property
+    def adoption_cache(self):
+        if self.calls < 2:
+            raise RuntimeError("cache not ready")
+        return self.cache
 
 
 class _TargetFactory:
@@ -513,10 +520,13 @@ def test_cleanup_failure_is_terminal_failed_and_drops_target_references(resource
 
 def test_decode_transition_requires_explicit_successful_adoption():
     session, _, factory = _cooperative()
+    with pytest.raises(CooperativeSpecPrefillError, match="not publishable"):
+        _ = session.prepared_cache
     with pytest.raises(CooperativeSpecPrefillError, match="adoption requires"):
         session.mark_adopted()
 
     _run_until_ready(session)
+    assert session.prepared_cache is factory.session.cache
     result = session.mark_adopted()
 
     assert result is factory.session.result

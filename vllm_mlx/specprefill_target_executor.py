@@ -185,6 +185,15 @@ class SparseTargetPrefillSession:
             )
         return self._result
 
+    @property
+    def adoption_cache(self) -> Sequence[Any]:
+        """Return the exact executor-owned cache only after completion."""
+        if not self.complete or self._result is None:
+            raise SparseTargetPrefillError(
+                "sparse target cache is unavailable before publishable completion"
+            )
+        return self.cache
+
     def step(self) -> SparseTargetPrefillProgress:
         """Run one target chunk quantum, then release hook context and lane."""
         if self.closed:

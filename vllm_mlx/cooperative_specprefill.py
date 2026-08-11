@@ -308,6 +308,15 @@ class CooperativeSpecPrefillSession:
             )
         return self._prepared_result
 
+    @property
+    def prepared_cache(self) -> Sequence[object]:
+        """Delegate the exact completed target-executor cache for adoption."""
+        if not self.ready_for_adoption or self._target_session is None:
+            raise CooperativeSpecPrefillError(
+                "target cache is not publishable before decoder adoption readiness"
+            )
+        return self._target_session.adoption_cache
+
     def step(self) -> CooperativeSpecPrefillProgress:
         """Attempt at most one scorer or target model quantum."""
         if self._outcome is not CooperativeSpecPrefillOutcome.ACTIVE:

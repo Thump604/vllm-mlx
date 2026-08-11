@@ -18,15 +18,18 @@ Architecture:
 4. Finished requests are removed and outputs returned
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
+import threading
 import time
 import uuid
 
 import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -34,10 +37,31 @@ from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
     MLLMBatchResponse,
+    SparseAdoptionError,
+)
+from .cooperative_specprefill import (
+    CooperativeSpecPrefillConfig,
+    CooperativeSpecPrefillOutcome,
+    CooperativeSpecPrefillPhase,
+    CooperativeSpecPrefillProgress,
+    CooperativeSpecPrefillSession,
 )
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
+from .specprefill import (
+    SpecPrefillCoverage,
+    SpecPrefillPolicy,
+    resolve_specprefill_decision,
+)
+from .specprefill_cache import SparsePolicyTuning
+from .specprefill_profiles import (
+    EMPTY_SPECPREFILL_PROFILE_REGISTRY,
+    SpecPrefillCell,
+    SpecPrefillEngine,
+    SpecPrefillProfileKey,
+    SpecPrefillProfileRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +114,97 @@ class MLLMSchedulerConfig:
     # evicted entries to disk and promotes them back on hit.
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_gb: float = 10.0
+    # Cooperative SpecPrefill is fail-closed unless every exact dependency is
+    # supplied. It is independent from native/external MTP composition.
+    specprefill_enabled: bool = False
+    specprefill_profile_registry: SpecPrefillProfileRegistry = field(
+        default_factory=lambda: EMPTY_SPECPREFILL_PROFILE_REGISTRY
+    )
+    specprefill_profile_key: SpecPrefillProfileKey | None = None
+    specprefill_estimated_residency_bytes: int | None = None
+    specprefill_session_factory: Callable[..., "MLLMSpecPrefillAdmission"] | None = None
+    specprefill_target_forward_context: Callable[..., Any] | None = None
+    specprefill_cache_capability: "MLLMSpecPrefillCacheCapability" | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.specprefill_profile_registry, SpecPrefillProfileRegistry):
+            raise TypeError("specprefill_profile_registry must be SpecPrefillProfileRegistry")
+        key = self.specprefill_profile_key
+        if key is not None and (
+            key.engine is not SpecPrefillEngine.CONTINUOUS_BATCHING
+            or key.cell is not SpecPrefillCell.SPARSE_ONLY
+        ):
+            raise ValueError(
+                "MLLM cooperative SpecPrefill requires a CB sparse-only profile key"
+            )
+        if (
+            self.specprefill_estimated_residency_bytes is not None
+            and self.specprefill_estimated_residency_bytes < 0
+        ):
+            raise ValueError("specprefill residency estimate must be non-negative")
+        capability = self.specprefill_cache_capability
+        if capability is not None and not isinstance(
+            capability, MLLMSpecPrefillCacheCapability
+        ):
+            raise TypeError(
+                "specprefill_cache_capability must be MLLMSpecPrefillCacheCapability"
+            )
+        if key is not None and capability is not None and (
+            capability.adapter_id != key.adapter_id
+        ):
+            raise ValueError("SpecPrefill capability adapter must match profile key")
+        for name in (
+            "specprefill_session_factory",
+            "specprefill_target_forward_context",
+        ):
+            value = getattr(self, name)
+            if value is not None and not callable(value):
+                raise TypeError(f"{name} must be callable or None")
+
+
+@dataclass(frozen=True)
+class MLLMSpecPrefillAdmission:
+    """Configured scheduler ownership for one cooperative session."""
+
+    session: CooperativeSpecPrefillSession
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session, CooperativeSpecPrefillSession):
+            raise TypeError("session must be CooperativeSpecPrefillSession")
+
+
+@dataclass(frozen=True)
+class MLLMSpecPrefillCacheCapability:
+    """Explicitly admitted target adapter/cache slice for sparse CB."""
+
+    adapter_id: str
+    layout: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.adapter_id, str) or not self.adapter_id.strip():
+            raise ValueError("SpecPrefill cache capability needs an adapter_id")
+        if self.layout not in {
+            "qwen3_5_nonrotating_hybrid",
+            "gemma4_dense",
+            "gemma4_a4b",
+            "mixed_rotating",
+        }:
+            raise ValueError("unknown SpecPrefill cache capability layout")
+
+
+@dataclass(frozen=True)
+class MLLMSpecPrefillStepTelemetry:
+    """One scheduler-visible cooperative phase/quantum boundary."""
+
+    phase: CooperativeSpecPrefillPhase
+    outcome: CooperativeSpecPrefillOutcome
+    attempted_phase: CooperativeSpecPrefillPhase | None
+    quantum_committed: bool
+    busy: bool
+    scorer_quanta: int
+    target_quanta: int
+    busy_retries: int
+    fallback_reason: str | None
 
 
 @dataclass
@@ -126,6 +241,21 @@ class MLLMRequest:
     # Timing
     first_token_time: Optional[float] = None
 
+    # Request-local SpecPrefill policy and immutable prompt identity.
+    specprefill_policy: SpecPrefillPolicy = SpecPrefillPolicy.AUTO
+    specprefill_coverage: SpecPrefillCoverage = SpecPrefillCoverage.UNKNOWN
+    specprefill_control_token_indices: tuple[int, ...] = ()
+    prompt_token_ids: tuple[int, ...] = ()
+    specprefill_effective_policy: SpecPrefillPolicy = SpecPrefillPolicy.DENSE
+    specprefill_fallback_reason: str | None = None
+    specprefill_phase: CooperativeSpecPrefillPhase | None = None
+    specprefill_outcome: CooperativeSpecPrefillOutcome | None = None
+    specprefill_selector_version: str | None = None
+    specprefill_total_tokens: int = 0
+    specprefill_selected_tokens: int = 0
+    specprefill_scorer_ms: float = 0.0
+    specprefill_target_prefill_ms: float = 0.0
+
 
 @dataclass
 class MLLMSchedulerOutput:
@@ -145,6 +275,11 @@ class MLLMSchedulerOutput:
     outputs: List[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
+    # At most one request can appear because one scheduler step attempts at
+    # most one round-robin cooperative quantum.
+    specprefill_progress: Dict[str, MLLMSpecPrefillStepTelemetry] = field(
+        default_factory=dict
+    )
 
 
 class MLLMScheduler:
@@ -223,6 +358,13 @@ class MLLMScheduler:
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
+
+        # Cooperative requests are scheduler-owned until sparse cache adoption.
+        self._specprefill_queue: deque[str] = deque()
+        self._specprefill_admissions: Dict[str, MLLMSpecPrefillAdmission] = {}
+        self._specprefill_batch_requests: Dict[str, MLLMBatchRequest] = {}
+        self._specprefill_cancel_pending: Set[str] = set()
+        self._specprefill_cancel_lock = threading.RLock()
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
@@ -324,6 +466,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                target_forward_context=self.config.specprefill_target_forward_context,
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -419,6 +562,22 @@ class MLLMScheduler:
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             logits_processors=kwargs.pop("logits_processors", None),
         )
+        specprefill_policy = SpecPrefillPolicy(
+            kwargs.pop("specprefill_policy", SpecPrefillPolicy.AUTO)
+        )
+        specprefill_coverage = SpecPrefillCoverage(
+            kwargs.pop("specprefill_coverage", SpecPrefillCoverage.UNKNOWN)
+        )
+        control_token_indices = tuple(
+            kwargs.pop("specprefill_control_token_indices", ())
+        )
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in control_token_indices
+        ):
+            raise ValueError(
+                "specprefill_control_token_indices must be non-negative integers"
+            )
 
         request = MLLMRequest(
             request_id=request_id,
@@ -427,6 +586,11 @@ class MLLMScheduler:
             videos=videos,
             audio=audio,
             sampling_params=sampling_params,
+            specprefill_policy=specprefill_policy,
+            specprefill_coverage=specprefill_coverage,
+            specprefill_control_token_indices=tuple(
+                sorted(set(control_token_indices))
+            ),
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -438,7 +602,10 @@ class MLLMScheduler:
             else self.processor
         )
         try:
-            request.num_prompt_tokens = len(tokenizer.encode(prompt))
+            prompt_token_ids = tuple(tokenizer.encode(prompt))
+            request.prompt_token_ids = prompt_token_ids
+            request.num_prompt_tokens = len(prompt_token_ids)
+            request.specprefill_total_tokens = len(prompt_token_ids)
         except Exception:
             pass
 
@@ -465,6 +632,12 @@ class MLLMScheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+
+        # Cancellation can arrive from the event-loop thread while the
+        # scheduler owns an MLX quantum. Only flag it here; session.cancel()
+        # and cache cleanup run at the next scheduler-thread safe boundary.
+        with self._specprefill_cancel_lock:
+            self._specprefill_cancel_pending.add(request_id)
 
         # Signal batch generator to abort any in-progress prefill for this
         # request.  The prefill loop checks _aborted_request_ids between
@@ -533,7 +706,9 @@ class MLLMScheduler:
 
     def has_requests(self) -> bool:
         """Check if there are any pending or running requests."""
-        return bool(self.waiting or self.running)
+        with self._specprefill_cancel_lock:
+            cooperative_cancel_pending = bool(self._specprefill_cancel_pending)
+        return bool(self.waiting or self.running or cooperative_cancel_pending)
 
     def get_num_waiting(self) -> int:
         """Get number of waiting requests."""
@@ -542,6 +717,137 @@ class MLLMScheduler:
     def get_num_running(self) -> int:
         """Get number of running requests."""
         return len(self.running)
+
+    @staticmethod
+    def _batch_request_for(request: MLLMRequest) -> MLLMBatchRequest:
+        return MLLMBatchRequest(
+            uid=-1,
+            request_id=request.request_id,
+            prompt=request.prompt,
+            images=request.images,
+            videos=request.videos,
+            audio=request.audio,
+            max_tokens=request.sampling_params.max_tokens,
+            temperature=request.sampling_params.temperature,
+            top_p=request.sampling_params.top_p,
+            top_k=request.sampling_params.top_k,
+            min_p=request.sampling_params.min_p,
+            presence_penalty=request.sampling_params.presence_penalty,
+            repetition_penalty=request.sampling_params.repetition_penalty,
+            logits_processors=request.sampling_params.logits_processors,
+        )
+
+    def _cooperative_config_for(
+        self, request: MLLMRequest
+    ) -> tuple[CooperativeSpecPrefillConfig | None, str | None]:
+        text_only = not (request.images or request.videos or request.audio)
+        decision = resolve_specprefill_decision(
+            request.specprefill_policy,
+            request.specprefill_coverage,
+            production=True,
+            text_only=text_only,
+            threshold_met=True,
+            admission_allowed=self.config.specprefill_enabled,
+        )
+        request.specprefill_effective_policy = decision.effective_policy
+        request.specprefill_fallback_reason = decision.fallback_reason
+        if decision.effective_policy is SpecPrefillPolicy.DENSE:
+            return None, decision.fallback_reason
+        if self.config.enable_mtp:
+            return None, "mtp_composition_unavailable"
+        if self.config.max_kv_size > 0:
+            return None, "rotating_tail_requirement_unavailable"
+        key = self.config.specprefill_profile_key
+        capability = self.config.specprefill_cache_capability
+        residency = self.config.specprefill_estimated_residency_bytes
+        if key is None:
+            return None, "profile_key_unavailable"
+        if residency is None:
+            return None, "residency_estimate_unavailable"
+        if capability is None:
+            return None, "cache_capability_unavailable"
+        if (
+            capability.adapter_id != key.adapter_id
+            or capability.layout != "qwen3_5_nonrotating_hybrid"
+        ):
+            return None, "cache_capability_unsupported"
+        if self.config.specprefill_session_factory is None:
+            return None, "cooperative_session_factory_unavailable"
+        if self.config.specprefill_target_forward_context is None:
+            return None, "target_forward_context_unavailable"
+        if not request.prompt_token_ids:
+            return None, "prompt_tokenization_unavailable"
+        profile_decision = self.config.specprefill_profile_registry.resolve(
+            key,
+            prompt_tokens=len(request.prompt_token_ids),
+            residency_bytes=residency,
+        )
+        if not profile_decision.eligible or profile_decision.tuning is None:
+            return None, profile_decision.fallback_reason
+        tuning = profile_decision.tuning
+        return (
+            CooperativeSpecPrefillConfig(
+                target_id=(
+                    f"{key.target_artifact_id}@sha256:{key.target_artifact_hash}"
+                ),
+                tokenizer_id=f"tokenizer@sha256:{key.tokenizer_artifact_hash}",
+                scorer_id=(
+                    f"{key.scorer_artifact_id}@sha256:{key.scorer_artifact_hash}"
+                ),
+                tuning=SparsePolicyTuning(
+                    keep_pct=tuning.keep_pct,
+                    backbone_pct=tuning.backbone_pct,
+                    halo_chunks=tuning.halo_chunks,
+                    anchor_chunks=tuning.anchor_chunks,
+                    chunk_size=tuning.chunk_size,
+                ),
+                control_token_indices=request.specprefill_control_token_indices,
+            ),
+            None,
+        )
+
+    def _admit_cooperative(
+        self,
+        request: MLLMRequest,
+        batch_request: MLLMBatchRequest,
+        cooperative_config: CooperativeSpecPrefillConfig,
+    ) -> bool:
+        factory = self.config.specprefill_session_factory
+        if factory is None:  # pragma: no cover - guarded by policy resolution.
+            return False
+        try:
+            admission = factory(
+                request,
+                request.prompt_token_ids,
+                cooperative_config,
+            )
+            if not isinstance(admission, MLLMSpecPrefillAdmission):
+                raise TypeError(
+                    "specprefill_session_factory must return MLLMSpecPrefillAdmission"
+                )
+            if admission.session.request_id != request.request_id:
+                raise ValueError("cooperative session request identity mismatch")
+            if admission.session.config != cooperative_config:
+                raise ValueError("cooperative session config identity mismatch")
+        except Exception as exc:
+            request.specprefill_effective_policy = SpecPrefillPolicy.DENSE
+            request.specprefill_fallback_reason = "cooperative_admission_failed"
+            logger.warning(
+                "Cooperative SpecPrefill admission failed for %s: %s",
+                request.request_id,
+                exc,
+            )
+            return False
+
+        batch_request.input_ids = mx.array([request.prompt_token_ids])
+        batch_request.is_text_only = True
+        request.specprefill_effective_policy = SpecPrefillPolicy.SPARSE
+        request.specprefill_phase = admission.session.phase
+        request.specprefill_outcome = admission.session.outcome
+        self._specprefill_admissions[request.request_id] = admission
+        self._specprefill_batch_requests[request.request_id] = batch_request
+        self._specprefill_queue.append(request.request_id)
+        return True
 
     def _schedule_waiting(self) -> List[MLLMRequest]:
         """
@@ -558,24 +864,21 @@ class MLLMScheduler:
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             request = self.waiting.popleft()
 
-            # Create batch request
-            batch_req = MLLMBatchRequest(
-                uid=-1,  # Will be assigned by batch generator
-                request_id=request.request_id,
-                prompt=request.prompt,
-                images=request.images,
-                videos=request.videos,
-                audio=request.audio,
-                max_tokens=request.sampling_params.max_tokens,
-                temperature=request.sampling_params.temperature,
-                top_p=request.sampling_params.top_p,
-                top_k=request.sampling_params.top_k,
-                min_p=request.sampling_params.min_p,
-                presence_penalty=request.sampling_params.presence_penalty,
-                repetition_penalty=request.sampling_params.repetition_penalty,
-                logits_processors=request.sampling_params.logits_processors,
+            batch_req = self._batch_request_for(request)
+            cooperative_config, fallback_reason = self._cooperative_config_for(
+                request
             )
-            batch_requests.append(batch_req)
+            cooperative = (
+                cooperative_config is not None
+                and self._admit_cooperative(
+                    request, batch_req, cooperative_config
+                )
+            )
+            if not cooperative:
+                request.specprefill_effective_policy = SpecPrefillPolicy.DENSE
+                if request.specprefill_fallback_reason is None:
+                    request.specprefill_fallback_reason = fallback_reason
+                batch_requests.append(batch_req)
 
             request.status = RequestStatus.RUNNING
             self.running[request.request_id] = request
@@ -584,10 +887,15 @@ class MLLMScheduler:
             self.total_prompt_tokens += request.num_prompt_tokens
 
         # Insert into batch generator
+        dense_scheduled = [
+            request
+            for request in scheduled
+            if request.request_id not in self._specprefill_admissions
+        ]
         if batch_requests and self.batch_generator is not None:
             uids = self.batch_generator.insert(batch_requests)
 
-            for uid, request in zip(uids, scheduled):
+            for uid, request in zip(uids, dense_scheduled, strict=True):
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
@@ -637,6 +945,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    **self._specprefill_output_metadata(request),
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -680,6 +989,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                **self._specprefill_output_metadata(request),
             )
 
             # Check if finished
@@ -715,6 +1025,43 @@ class MLLMScheduler:
 
         return outputs, finished_ids
 
+    @staticmethod
+    def _specprefill_output_metadata(request: MLLMRequest) -> Dict[str, Any]:
+        return {
+            "specprefill_requested_policy": request.specprefill_policy.value,
+            "specprefill_effective_policy": (
+                request.specprefill_effective_policy.value
+            ),
+            "specprefill_coverage": request.specprefill_coverage.value,
+            "specprefill_engaged": (
+                request.specprefill_effective_policy is SpecPrefillPolicy.SPARSE
+            ),
+            "specprefill_selector_version": request.specprefill_selector_version,
+            "specprefill_fallback_reason": request.specprefill_fallback_reason,
+            "specprefill_total_tokens": request.specprefill_total_tokens,
+            "specprefill_selected_tokens": request.specprefill_selected_tokens,
+            "specprefill_scorer_ms": request.specprefill_scorer_ms,
+            "specprefill_target_prefill_ms": (
+                request.specprefill_target_prefill_ms
+            ),
+        }
+
+    @staticmethod
+    def _update_request_specprefill(
+        request: MLLMRequest, session: CooperativeSpecPrefillSession
+    ) -> None:
+        telemetry = session.telemetry
+        request.specprefill_phase = session.phase
+        request.specprefill_outcome = session.outcome
+        request.specprefill_total_tokens = len(session.tokens)
+        request.specprefill_selected_tokens = telemetry.selected_tokens
+        request.specprefill_scorer_ms = telemetry.scorer_ms
+        request.specprefill_target_prefill_ms = telemetry.target_prefill_ms
+        plan = session.selection_plan
+        request.specprefill_selector_version = (
+            None if plan is None else plan.selector_version
+        )
+
     def _cleanup_finished(self, finished_ids: Set[str]) -> None:
         """Clean up finished requests."""
         for request_id in finished_ids:
@@ -734,6 +1081,8 @@ class MLLMScheduler:
 
             # Clean up detokenizer pool (handles abort/timeout cases)
             self._detokenizer_pool.pop(request_id, None)
+            self._specprefill_admissions.pop(request_id, None)
+            self._specprefill_batch_requests.pop(request_id, None)
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -742,6 +1091,338 @@ class MLLMScheduler:
         # Clear Metal buffer pool after cleanup to release memory
         if finished_ids:
             mx.clear_cache()
+
+    @staticmethod
+    def _specprefill_step_telemetry(
+        session: CooperativeSpecPrefillSession,
+        progress: CooperativeSpecPrefillProgress | None,
+    ) -> MLLMSpecPrefillStepTelemetry:
+        telemetry = session.telemetry
+        return MLLMSpecPrefillStepTelemetry(
+            phase=session.phase,
+            outcome=session.outcome,
+            attempted_phase=(None if progress is None else progress.attempted_phase),
+            quantum_committed=(
+                False if progress is None else progress.quantum_committed
+            ),
+            busy=False if progress is None else progress.busy,
+            scorer_quanta=telemetry.scorer_quanta,
+            target_quanta=telemetry.target_quanta,
+            busy_retries=telemetry.busy_retries,
+            fallback_reason=session.fallback_reason,
+        )
+
+    def _drain_cooperative_cancellations(self) -> None:
+        with self._specprefill_cancel_lock:
+            pending = self._specprefill_cancel_pending
+            self._specprefill_cancel_pending = set()
+        if not pending:
+            return
+        for request_id in pending:
+            admission = self._specprefill_admissions.pop(request_id, None)
+            self._specprefill_batch_requests.pop(request_id, None)
+            if admission is None:
+                continue
+            try:
+                admission.session.cancel()
+            except Exception:
+                logger.exception(
+                    "Failed to cancel cooperative SpecPrefill request %s",
+                    request_id,
+                )
+        self._specprefill_queue = deque(
+            request_id
+            for request_id in self._specprefill_queue
+            if request_id not in pending
+        )
+
+    def _consume_cooperative_cancellation(self, request_id: str) -> bool:
+        with self._specprefill_cancel_lock:
+            if request_id not in self._specprefill_cancel_pending:
+                return False
+            self._specprefill_cancel_pending.remove(request_id)
+        admission = self._specprefill_admissions.pop(request_id, None)
+        self._specprefill_batch_requests.pop(request_id, None)
+        if admission is not None:
+            try:
+                admission.session.cancel()
+            except Exception:
+                logger.exception(
+                    "Failed to cancel cooperative SpecPrefill request %s",
+                    request_id,
+                )
+        return True
+
+    def _remove_published_sparse_orphan(self, uid: int) -> None:
+        """Schedule and drain an orphan row at this owner-thread safe point."""
+        assert self.batch_generator is not None
+        self.batch_generator.schedule_removal([uid])
+        self.batch_generator.process_pending_removals()
+
+    def _fail_cooperative_terminal(
+        self,
+        request_id: str,
+        reason: str,
+        output: MLLMSchedulerOutput,
+        failure: Exception | None = None,
+    ) -> None:
+        admission = self._specprefill_admissions.pop(request_id, None)
+        self._specprefill_batch_requests.pop(request_id, None)
+        request = self.running.get(request_id)
+        if admission is not None and admission.session.outcome not in (
+            CooperativeSpecPrefillOutcome.DECODE,
+            CooperativeSpecPrefillOutcome.FALLBACK,
+            CooperativeSpecPrefillOutcome.FAILED,
+            CooperativeSpecPrefillOutcome.CANCELLED,
+        ):
+            admission.session.fallback(reason, failure)
+        if (
+            admission is not None
+            and admission.session.outcome is CooperativeSpecPrefillOutcome.FAILED
+        ):
+            reason = admission.session.fallback_reason or "resource_cleanup_failed"
+        if request is None:
+            return
+        if admission is not None:
+            self._update_request_specprefill(request, admission.session)
+        request.specprefill_fallback_reason = reason
+        request.finish_reason = "error"
+        request.status = RequestStatus.FINISHED_ABORTED
+        terminal = RequestOutput(
+            request_id=request_id,
+            finished=True,
+            finish_reason="error",
+            prompt_tokens=request.num_prompt_tokens,
+            completion_tokens=0,
+            mtp_drafts=request.mtp_drafts,
+            mtp_accepted=request.mtp_accepted,
+            **self._specprefill_output_metadata(request),
+        )
+        output.outputs.append(terminal)
+        output.finished_request_ids.add(request_id)
+        self.num_requests_processed += 1
+        queue = self.output_queues.get(request_id)
+        if queue is not None:
+            try:
+                queue.put_nowait(terminal)
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+    def _fallback_cooperative_to_dense(
+        self,
+        request_id: str,
+        reason: str,
+        output: MLLMSchedulerOutput,
+        failure: Exception | None = None,
+    ) -> bool:
+        admission = self._specprefill_admissions.pop(request_id, None)
+        batch_request = self._specprefill_batch_requests.pop(request_id, None)
+        request = self.running.get(request_id)
+        if admission is not None and admission.session.outcome not in (
+            CooperativeSpecPrefillOutcome.FALLBACK,
+            CooperativeSpecPrefillOutcome.FAILED,
+            CooperativeSpecPrefillOutcome.CANCELLED,
+        ):
+            admission.session.fallback(reason, failure)
+        if (
+            admission is not None
+            and admission.session.outcome is CooperativeSpecPrefillOutcome.FAILED
+        ):
+            # Re-publish ownership temporarily so the common terminal path can
+            # preserve the complete failed-session telemetry before cleanup.
+            self._specprefill_admissions[request_id] = admission
+            if batch_request is not None:
+                self._specprefill_batch_requests[request_id] = batch_request
+            self._fail_cooperative_terminal(
+                request_id, "resource_cleanup_failed", output, failure
+            )
+            return False
+        if request is None or batch_request is None:
+            return False
+        request.specprefill_effective_policy = SpecPrefillPolicy.DENSE
+        request.specprefill_fallback_reason = reason
+        if admission is not None:
+            self._update_request_specprefill(request, admission.session)
+        assert self.batch_generator is not None
+        uid = self.batch_generator.insert([batch_request])[0]
+        self.request_id_to_uid[request_id] = uid
+        self.uid_to_request_id[uid] = request_id
+        request.batch_uid = uid
+        return True
+
+    def _adoption_is_compatible(
+        self, session: CooperativeSpecPrefillSession
+    ) -> bool:
+        assert self.batch_generator is not None
+        active = self.batch_generator.active_batch
+        if active is None:
+            return True
+        if not active.has_sparse_rows or session.identity is None:
+            return False
+        return active.sparse_execution_config == session.identity.execution_config
+
+    def _adopt_ready_cooperative(
+        self, request_id: str, output: MLLMSchedulerOutput
+    ) -> bool:
+        admission = self._specprefill_admissions.get(request_id)
+        batch_request = self._specprefill_batch_requests.get(request_id)
+        request = self.running.get(request_id)
+        if admission is None or batch_request is None or request is None:
+            return False
+        session = admission.session
+        uid = None
+        try:
+            if not session.ready_for_adoption or not self._adoption_is_compatible(
+                session
+            ):
+                return False
+            assert self.batch_generator is not None
+            if session.identity is None:
+                raise RuntimeError("adoption_identity_unavailable")
+            execution_config = session.identity.execution_config
+            active = self.batch_generator.active_batch
+            if active is None:
+                self.batch_generator.set_expected_sparse_execution_config(
+                    execution_config
+                )
+            elif getattr(
+                self.batch_generator, "_expected_sparse_execution_config", None
+            ) != execution_config:
+                return False
+            result = session.prepared_result
+            cache = session.prepared_cache
+            cache_identity = (id(cache), tuple(id(entry) for entry in cache))
+            if session.sparse_state != result.cache_state:
+                raise RuntimeError("prepared_cache_state_identity_mismatch")
+            self._update_request_specprefill(request, session)
+            if self._consume_cooperative_cancellation(request_id):
+                return True
+            # Re-read the authoritative executor property immediately before
+            # publication so a replaced container/entry cannot cross adoption.
+            current_cache = session.prepared_cache
+            if (
+                id(current_cache),
+                tuple(id(entry) for entry in current_cache),
+            ) != cache_identity:
+                raise RuntimeError("adoption_cache_identity_changed")
+            uid = self.batch_generator.adopt_prefilled_sparse_row(
+                batch_request,
+                current_cache,
+                result.logits,
+                result.cache_state,
+            )
+        except SparseAdoptionError as exc:
+            if not exc.rollback_succeeded:
+                self._fail_cooperative_terminal(
+                    request_id, "adoption_rollback_failed", output, exc
+                )
+            elif exc.sampling_consumed:
+                self._fail_cooperative_terminal(
+                    request_id, "adoption_failed_after_sampling", output, exc
+                )
+            else:
+                self._fallback_cooperative_to_dense(
+                    request_id, "adoption_failed", output, exc
+                )
+            return True
+        except Exception as exc:
+            self._fail_cooperative_terminal(
+                request_id, "adoption_failed_unknown_boundary", output, exc
+            )
+            return True
+
+        # Publication succeeded. Coordinate the final cancellation check and
+        # request mapping with abort_request's flagging lock. An injected
+        # mark_adopted/mapping failure schedules removal of the orphan row.
+        try:
+            cancelled = False
+            with self._specprefill_cancel_lock:
+                if request_id in self._specprefill_cancel_pending:
+                    self._specprefill_cancel_pending.remove(request_id)
+                    cancelled = True
+                else:
+                    self.request_id_to_uid[request_id] = uid
+                    self.uid_to_request_id[uid] = request_id
+                    request.batch_uid = uid
+                    session.mark_adopted()
+            if cancelled:
+                self._remove_published_sparse_orphan(uid)
+                self._specprefill_admissions.pop(request_id, None)
+                self._specprefill_batch_requests.pop(request_id, None)
+                session.cancel()
+                return True
+        except Exception as exc:
+            self.request_id_to_uid.pop(request_id, None)
+            self.uid_to_request_id.pop(uid, None)
+            request.batch_uid = None
+            self._remove_published_sparse_orphan(uid)
+            self._fail_cooperative_terminal(
+                request_id, "adoption_transition_failed", output, exc
+            )
+            return True
+        self._specprefill_admissions.pop(request_id, None)
+        self._specprefill_batch_requests.pop(request_id, None)
+        return True
+
+    def _run_one_cooperative_quantum(
+        self, output: MLLMSchedulerOutput
+    ) -> None:
+        while self._specprefill_queue:
+            request_id = self._specprefill_queue.popleft()
+            admission = self._specprefill_admissions.get(request_id)
+            if admission is None:
+                continue
+            session = admission.session
+            progress = None
+            if session.outcome is CooperativeSpecPrefillOutcome.CANCELLED:
+                self.abort_request(request_id)
+            elif session.ready_for_adoption:
+                adopted_or_fallback = self._adopt_ready_cooperative(
+                    request_id, output
+                )
+                if not adopted_or_fallback:
+                    self._specprefill_queue.append(request_id)
+            elif session.outcome is CooperativeSpecPrefillOutcome.ACTIVE:
+                try:
+                    progress = session.step()
+                except Exception as exc:
+                    self._fallback_cooperative_to_dense(
+                        request_id, "cooperative_step_failed", output, exc
+                    )
+                else:
+                    if session.ready_for_adoption:
+                        adopted_or_fallback = self._adopt_ready_cooperative(
+                            request_id, output
+                        )
+                        if not adopted_or_fallback:
+                            self._specprefill_queue.append(request_id)
+                    elif session.outcome is CooperativeSpecPrefillOutcome.ACTIVE:
+                        # Busy is a normal zero-commit retry and still rotates.
+                        self._specprefill_queue.append(request_id)
+                    elif session.outcome in (
+                        CooperativeSpecPrefillOutcome.FALLBACK,
+                        CooperativeSpecPrefillOutcome.FAILED,
+                    ):
+                        self._fallback_cooperative_to_dense(
+                            request_id,
+                            session.fallback_reason or "cooperative_failed",
+                            output,
+                        )
+            else:
+                self._fallback_cooperative_to_dense(
+                    request_id,
+                    session.fallback_reason or "cooperative_failed",
+                    output,
+                )
+            request = self.requests.get(request_id)
+            if request is not None:
+                self._update_request_specprefill(request, session)
+            output.specprefill_progress[request_id] = (
+                self._specprefill_step_telemetry(session, progress)
+            )
+            output.has_work = True
+            return
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -756,6 +1437,8 @@ class MLLMScheduler:
             MLLMSchedulerOutput with results of this step
         """
         output = MLLMSchedulerOutput()
+
+        self._drain_cooperative_cancellations()
 
         # Drain any deferred removals queued from other threads (e.g.
         # the asyncio event loop during client-disconnect aborts).
@@ -794,6 +1477,18 @@ class MLLMScheduler:
                 self._cleanup_finished(finished_ids)
                 if finished_ids:
                     mx.clear_cache()
+
+        # Active target decode always gets the first model-work opportunity.
+        # Cooperative scoring/target prefill then receives at most one bounded
+        # round-robin quantum; a busy lane rotates without dense fallback.
+        self._run_one_cooperative_quantum(output)
+        cooperative_finished = {
+            request_id
+            for request_id in output.finished_request_ids
+            if request_id in self.running
+        }
+        if cooperative_finished:
+            self._cleanup_finished(cooperative_finished)
 
         # Adaptive periodic cache clear: scale inversely with concurrency
         # to prevent Metal buffer pool growth during long generations

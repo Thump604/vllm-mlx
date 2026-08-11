@@ -173,6 +173,40 @@ class SparseBatchCompatibilityError(SparseBatchError):
     """Sparse rows do not share one immutable execution configuration."""
 
 
+class SparseAdoptionError(SparseBatchError):
+    """Typed sparse-adoption failure with an immutable replay boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sampling_consumed: bool,
+        rollback_succeeded: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self._sampling_consumed = bool(sampling_consumed)
+        self._rollback_succeeded = bool(rollback_succeeded)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_sampling_consumed", "_rollback_succeeded"} and hasattr(
+            self, name
+        ):
+            raise AttributeError("sparse adoption replay boundary is immutable")
+        super().__setattr__(name, value)
+
+    @property
+    def sampling_consumed(self) -> bool:
+        return self._sampling_consumed
+
+    @property
+    def rollback_succeeded(self) -> bool:
+        return self._rollback_succeeded
+
+    @property
+    def replay_safe(self) -> bool:
+        return not self.sampling_consumed and self.rollback_succeeded
+
+
 class MLLMTargetForwardPhase(str, Enum):
     """Target call phases supported by the request-local CB seam."""
 
@@ -415,6 +449,24 @@ def _eval_prompt_cache(cache: List[Any]) -> None:
     tensors = _cache_eval_tensors(cache)
     if tensors:
         mx.eval(*tensors)
+
+
+def _eval_sparse_adoption_cache(cache: Sequence[Any]) -> None:
+    """Realize every tensor staged by sparse cache merge or extension."""
+    tensors = _cache_eval_tensors(list(cache))
+    for entry in cache:
+        for name in ("offset", "left_padding", "lengths"):
+            value = getattr(entry, name, None)
+            if value is not None and hasattr(value, "shape"):
+                tensors.append(value)
+    if tensors:
+        mx.eval(*tensors)
+
+
+def _eval_sparse_adoption_publication(*values: Any) -> None:
+    """Realize post-sampling tensors before publishing a sparse row."""
+    if values:
+        mx.eval(*values)
 
 
 @dataclass
@@ -1266,6 +1318,76 @@ class MLLMBatchGenerator:
         first_logits: mx.array,
         sparse_state: SparseCacheState,
     ) -> int:
+        """Adopt with an exact typed boundary for safe dense replay."""
+        sampling_consumed = False
+
+        def mark_sampling_consumed() -> None:
+            nonlocal sampling_consumed
+            sampling_consumed = True
+
+        try:
+            return self._adopt_prefilled_sparse_row(
+                request,
+                cache,
+                first_logits,
+                sparse_state,
+                mark_sampling_consumed=mark_sampling_consumed,
+            )
+        except SparseAdoptionError:
+            raise
+        except Exception as exc:
+            raise SparseAdoptionError(
+                f"prepared sparse adoption failed: {type(exc).__name__}: {exc}",
+                sampling_consumed=sampling_consumed,
+            ) from exc
+
+    def _poison_active_sparse_batch_after_failed_rollback(
+        self,
+        active: MLLMBatch,
+    ) -> None:
+        """Remove a possibly corrupted active batch and fail all owned rows."""
+        if self.active_batch is not active:
+            return
+        self.active_batch = None
+        for uid, request_id in zip(active.uids, active.request_ids, strict=True):
+            self._pending_error_responses.append(
+                MLLMBatchResponse(
+                    uid=uid,
+                    request_id=request_id,
+                    token=0,
+                    logprobs=mx.zeros(1),
+                    finish_reason="error",
+                )
+            )
+
+    def _restore_sparse_adoption_checkpoint(
+        self,
+        checkpoint: _SupportedSparseCacheCheckpoint,
+        active: MLLMBatch,
+        *,
+        adoption_failure: Exception,
+        sampling_consumed: bool,
+    ) -> None:
+        try:
+            checkpoint.restore()
+        except Exception as rollback_failure:
+            self._poison_active_sparse_batch_after_failed_rollback(active)
+            raise SparseAdoptionError(
+                "prepared sparse adoption rollback failed after "
+                f"{type(adoption_failure).__name__}: {adoption_failure}",
+                sampling_consumed=sampling_consumed,
+                rollback_succeeded=False,
+            ) from rollback_failure
+
+    def _adopt_prefilled_sparse_row(
+        self,
+        request: MLLMBatchRequest,
+        cache: Sequence[Any],
+        first_logits: mx.array,
+        sparse_state: SparseCacheState,
+        *,
+        mark_sampling_consumed: Callable[[], None],
+    ) -> int:
         """Atomically adopt one exact, fresh sparse-prefilled text row.
 
         The method never enters the ordinary unprocessed/prefix-cache path and
@@ -1354,6 +1476,7 @@ class MLLMBatchGenerator:
         batch_cache = self._merge_prepared_sparse_cache(cache)
         candidate_rows = (row_state.clone(),)
         _SupportedSparseCacheCheckpoint.capture(batch_cache, candidate_rows)
+        _eval_sparse_adoption_cache(batch_cache)
 
         active = self.active_batch
         active_checkpoint = None
@@ -1383,12 +1506,21 @@ class MLLMBatchGenerator:
             try:
                 for current, incoming in zip(active.cache, batch_cache, strict=True):
                     current.extend(incoming)
-            except Exception:
-                active_checkpoint.restore()
+                _eval_sparse_adoption_cache(active.cache)
+            except Exception as exc:
+                self._restore_sparse_adoption_checkpoint(
+                    active_checkpoint,
+                    active,
+                    adoption_failure=exc,
+                    sampling_consumed=False,
+                )
                 raise
 
+        sampling_started = False
         try:
             processors, sampler = self._sampling_for_request(request)
+            mark_sampling_consumed()
+            sampling_started = True
             sampled, logprobs = self._sample_prepared_first_token(
                 first_logits, full_tokens, processors, sampler
             )
@@ -1418,9 +1550,19 @@ class MLLMBatchGenerator:
                 next_samplers = list(active.samplers or [None] * self_len) + list(
                     candidate.samplers or [None]
                 )
-        except Exception:
+                _eval_sparse_adoption_publication(
+                    candidate.y, *candidate.logprobs, next_y
+                )
+            else:
+                _eval_sparse_adoption_publication(candidate.y, *candidate.logprobs)
+        except Exception as exc:
             if active_checkpoint is not None:
-                active_checkpoint.restore()
+                self._restore_sparse_adoption_checkpoint(
+                    active_checkpoint,
+                    active,
+                    adoption_failure=exc,
+                    sampling_consumed=sampling_started,
+                )
             raise
 
         if active is None:
@@ -2552,6 +2694,11 @@ class MLLMBatchGenerator:
         """
         tic = time.perf_counter()
 
+        # Rollback poisoning can detach the final active batch and leave only
+        # terminal error responses. Drain them before every empty-work return.
+        error_responses = list(self._pending_error_responses)
+        self._pending_error_responses.clear()
+
         prompt_processing = False
         batch = self.active_batch
         num_active = len(batch) if batch else 0
@@ -2568,7 +2715,7 @@ class MLLMBatchGenerator:
 
             if len(requests) == 0:
                 self.active_batch = None
-                return []
+                return error_responses
 
             try:
                 # Save count before _process_prompts which modifies
@@ -2641,9 +2788,8 @@ class MLLMBatchGenerator:
                         )
 
         # Collect any pending error responses (from failed preprocessing)
-        error_responses = []
         if self._pending_error_responses:
-            error_responses = list(self._pending_error_responses)
+            error_responses.extend(self._pending_error_responses)
             self._pending_error_responses.clear()
 
         # Generate next token for active batch

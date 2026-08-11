@@ -10,6 +10,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
+import vllm_mlx.mllm_batch_generator as mllm_batch_generator
 from vllm_mlx.mllm_batch_generator import (
     MLLMBatch,
     MLLMBatchGenerator,
@@ -18,6 +19,7 @@ from vllm_mlx.mllm_batch_generator import (
     MLLMTargetForwardPhase,
     SparseBatchCompatibilityError,
     SparseBatchError,
+    SparseAdoptionError,
     _SupportedSparseCacheCheckpoint,
     _apply_first_token_processors,
     _decode_processor_contexts,
@@ -392,13 +394,114 @@ def test_adoption_extend_failure_restores_active_batch_atomically():
     original_offsets = generator.active_batch.cache[0].offset.tolist()
     request = _request(request_id="sparse-extension")
 
-    with pytest.raises(RuntimeError, match="extend failed"):
+    with pytest.raises(SparseAdoptionError, match="extend failed") as failure:
         _adopt(generator, request=request)
+
+    assert failure.value.sampling_consumed is False
+    assert failure.value.rollback_succeeded is True
+    assert failure.value.replay_safe is True
+    assert isinstance(failure.value.__cause__, RuntimeError)
 
     assert generator.active_batch.uids == original_uids
     assert generator.active_batch.cache[0].offset.tolist() == original_offsets
     assert len(generator.active_batch.sparse_row_states) == 1
     assert request.uid == -1
+
+
+def test_pre_sampling_restore_failure_poison_active_sparse_batch(monkeypatch):
+    generator, _ = _generator()
+    _adopt(generator)
+    active = generator.active_batch
+    request = _request(request_id="pre-rollback-failure")
+    processor_calls = []
+    request.logits_processors = [
+        lambda tokens, logits: processor_calls.append(tokens.tolist()) or logits
+    ]
+
+    def fail_extend(_other):
+        raise RuntimeError("extend failed")
+
+    def fail_restore(_checkpoint):
+        raise RuntimeError("restore failed")
+
+    active.cache[0].extend = fail_extend
+    monkeypatch.setattr(_SupportedSparseCacheCheckpoint, "restore", fail_restore)
+
+    with pytest.raises(SparseAdoptionError, match="rollback failed") as failure:
+        _adopt(generator, request=request)
+
+    assert failure.value.sampling_consumed is False
+    assert failure.value.rollback_succeeded is False
+    assert failure.value.replay_safe is False
+    with pytest.raises(AttributeError):
+        failure.value._rollback_succeeded = True
+    assert processor_calls == []
+    assert generator.active_batch is None
+    assert [(item.uid, item.request_id, item.finish_reason) for item in generator._pending_error_responses] == [
+        (0, "request-1", "error")
+    ]
+    assert request.uid == -1
+
+
+def test_post_sampling_restore_failure_poison_active_sparse_batch(monkeypatch):
+    generator, _ = _generator()
+    _adopt(generator)
+    request = _request(request_id="post-rollback-failure")
+    request.logits_processors = [
+        lambda _tokens, _logits: (_ for _ in ()).throw(
+            RuntimeError("sampling failed")
+        )
+    ]
+
+    def fail_restore(_checkpoint):
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(_SupportedSparseCacheCheckpoint, "restore", fail_restore)
+
+    with pytest.raises(SparseAdoptionError, match="rollback failed") as failure:
+        _adopt(generator, request=request)
+
+    assert failure.value.sampling_consumed is True
+    assert failure.value.rollback_succeeded is False
+    assert failure.value.replay_safe is False
+    assert generator.active_batch is None
+    assert [(item.uid, item.request_id, item.finish_reason) for item in generator._pending_error_responses] == [
+        (0, "request-1", "error")
+    ]
+    assert request.uid == -1
+
+
+def test_public_next_drains_every_poisoned_row_with_no_remaining_work(monkeypatch):
+    generator, _ = _generator()
+    _adopt(generator)
+    _adopt(generator, request=_request(request_id="request-2"))
+    request = _request(request_id="rollback-candidate")
+
+    def fail_extend(_other):
+        raise RuntimeError("extend failed")
+
+    def fail_restore(_checkpoint):
+        raise RuntimeError("restore failed")
+
+    generator.active_batch.cache[0].extend = fail_extend
+    monkeypatch.setattr(_SupportedSparseCacheCheckpoint, "restore", fail_restore)
+    with pytest.raises(SparseAdoptionError):
+        _adopt(generator, request=request)
+
+    assert generator.active_batch is None
+    assert generator.unprocessed_requests == []
+    previous_stream = MLLMBatchGenerator._stream
+    MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
+    try:
+        responses = generator.next()
+    finally:
+        MLLMBatchGenerator._stream = previous_stream
+
+    assert [(item.uid, item.request_id, item.finish_reason) for item in responses] == [
+        (0, "request-1", "error"),
+        (1, "request-2", "error"),
+    ]
+    assert generator._pending_error_responses == []
 
 
 def test_extend_failure_does_not_consume_stochastic_sampling_and_retry_is_exact():
@@ -425,9 +528,10 @@ def test_extend_failure_does_not_consume_stochastic_sampling_and_retry_is_exact(
         raise RuntimeError("extend failed before sampling")
 
     generator.active_batch.cache[0].extend = failing_extend
-    with pytest.raises(RuntimeError, match="before sampling"):
+    with pytest.raises(SparseAdoptionError, match="before sampling") as failure:
         _adopt(generator, request=request)
 
+    assert failure.value.sampling_consumed is False
     assert sampling_factory_calls == 0
     assert processor_calls == []
     assert generator.active_batch.uids == [0]
@@ -442,6 +546,78 @@ def test_extend_failure_does_not_consume_stochastic_sampling_and_retry_is_exact(
     assert generator.active_batch.uids == [0, 1]
 
 
+def test_deferred_cache_realization_failure_rolls_back_before_sampling(monkeypatch):
+    generator, _ = _generator()
+    _adopt(generator)
+    batch = generator.active_batch
+    original_offsets = batch.cache[0].offset.tolist()
+    original_uids = list(batch.uids)
+    processor_calls = []
+    request = _request(request_id="lazy-cache-failure")
+    request.logits_processors = [
+        lambda tokens, logits: processor_calls.append(tokens.tolist()) or logits
+    ]
+    original_eval = mllm_batch_generator._eval_sparse_adoption_cache
+    eval_calls = 0
+
+    def fail_active_extension(cache):
+        nonlocal eval_calls
+        eval_calls += 1
+        if eval_calls == 2:
+            raise RuntimeError("deferred cache OOM")
+        original_eval(cache)
+
+    monkeypatch.setattr(
+        mllm_batch_generator, "_eval_sparse_adoption_cache", fail_active_extension
+    )
+
+    with pytest.raises(SparseAdoptionError, match="deferred cache OOM") as failure:
+        _adopt(generator, request=request)
+
+    assert failure.value.sampling_consumed is False
+    assert processor_calls == []
+    assert batch.uids == original_uids
+    assert batch.cache[0].offset.tolist() == original_offsets
+    assert request.uid == -1
+
+
+def test_deferred_publication_realization_failure_rolls_back_after_sampling(
+    monkeypatch,
+):
+    generator, _ = _generator()
+    _adopt(generator)
+    batch = generator.active_batch
+    original_offsets = batch.cache[0].offset.tolist()
+    original_uids = list(batch.uids)
+    processor_calls = []
+    request = _request(request_id="lazy-publication-failure")
+    request.logits_processors = [
+        lambda tokens, logits: processor_calls.append(tokens.tolist()) or logits
+    ]
+
+    def fail_publication(*_values):
+        raise RuntimeError("deferred publication OOM")
+
+    monkeypatch.setattr(
+        mllm_batch_generator,
+        "_eval_sparse_adoption_publication",
+        fail_publication,
+    )
+
+    with pytest.raises(
+        SparseAdoptionError, match="deferred publication OOM"
+    ) as failure:
+        _adopt(generator, request=request)
+
+    assert failure.value.sampling_consumed is True
+    assert failure.value.rollback_succeeded is True
+    assert failure.value.replay_safe is False
+    assert processor_calls == [list(_TOKENS)]
+    assert batch.uids == original_uids
+    assert batch.cache[0].offset.tolist() == original_offsets
+    assert request.uid == -1
+
+
 def test_sampling_failure_rolls_back_preextended_cache_without_publication():
     generator, _ = _generator()
     _adopt(generator)
@@ -453,9 +629,12 @@ def test_sampling_failure_rolls_back_preextended_cache_without_publication():
     original_offsets = batch.cache[0].offset.tolist()
     original_uids = list(batch.uids)
 
-    with pytest.raises(RuntimeError, match="sample failed"):
+    with pytest.raises(SparseAdoptionError, match="sample failed") as failure:
         _adopt(generator, request=request)
 
+    assert failure.value.sampling_consumed is True
+    with pytest.raises(AttributeError):
+        failure.value.sampling_consumed = False
     assert batch.cache[0].offset.tolist() == original_offsets
     assert batch.uids == original_uids
     assert request.uid == -1
@@ -469,12 +648,15 @@ def test_incompatible_sparse_adoption_splits_before_mutating_active_batch():
     original_states = generator.active_batch.sparse_row_states
     incompatible_request = _request(request_id="request-2")
 
-    with pytest.raises(SparseBatchCompatibilityError):
+    with pytest.raises(SparseAdoptionError) as failure:
         _adopt(
             generator,
             request=incompatible_request,
             state=_state(scorer_id="other-scorer@sha256:other"),
         )
+
+    assert failure.value.sampling_consumed is False
+    assert isinstance(failure.value.__cause__, SparseBatchCompatibilityError)
 
     assert generator.active_batch.uids == original_uids
     assert generator.active_batch.cache[0].offset.tolist() == original_offsets
