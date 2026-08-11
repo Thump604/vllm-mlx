@@ -498,14 +498,23 @@ class BatchedEngine(BaseEngine):
         from ..models.mllm import MLXMultimodalLM
 
         max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
-        self._mllm_instance = MLXMultimodalLM(
+        mllm_instance = MLXMultimodalLM(
             self._model_name,
             trust_remote_code=self._trust_remote_code,
             max_kv_size=max_kv_size,
         )
-        self._mllm_instance.load()
-        self._model = self._mllm_instance.model
-        self._processor = self._mllm_instance.processor
+        mllm_instance.load()
+        model = mllm_instance.model
+        processor = mllm_instance.processor
+
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..scheduler import _continuous_batching_mtp_capability
+
+            _continuous_batching_mtp_capability(model, enabled=True)
+
+        self._mllm_instance = mllm_instance
+        self._model = model
+        self._processor = processor
 
         # Set Metal memory limits (same as LLM path)
         try:
@@ -538,6 +547,8 @@ class BatchedEngine(BaseEngine):
 
         # Inject MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
+            # Legacy Qwen3-Next setup remains unchanged. Loader-owned
+            # Qwen3.5/3.6 capabilities fail above and never enter injection.
             self._inject_mtp_mllm()
 
     async def _start_mllm(self) -> None:
@@ -559,6 +570,10 @@ class BatchedEngine(BaseEngine):
 
         if self._model is None or self._processor is None:
             self._prepare_mllm_model()
+        if getattr(self._scheduler_config, "enable_mtp", False):
+            from ..scheduler import _continuous_batching_mtp_capability
+
+            _continuous_batching_mtp_capability(self._model, enabled=True)
 
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
@@ -795,7 +810,10 @@ class BatchedEngine(BaseEngine):
 
         from mlx_lm.utils import _download
 
+        from ..scheduler import _continuous_batching_mtp_capability
+
         model = self._model
+        _continuous_batching_mtp_capability(model, enabled=True)
         model_path = Path(_download(self._model_name))
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -806,6 +824,9 @@ class BatchedEngine(BaseEngine):
             config = json.load(f)
 
         text_config = config.get("text_config", config)
+        model_type = text_config.get("model_type", config.get("model_type", ""))
+        if "qwen3_5" in model_type or "qwen3_6" in model_type:
+            raise RuntimeError("native_mtp_capability_missing")
         num_mtp = text_config.get("mtp_num_hidden_layers", 0)
         if num_mtp == 0:
             num_mtp = text_config.get(
@@ -824,17 +845,7 @@ class BatchedEngine(BaseEngine):
             logger.info("[MTP-MLLM] Model already has MTP, skipping injection")
             return
 
-        model_type = text_config.get("model_type", config.get("model_type", ""))
-        if "qwen3_5" in model_type:
-            from ..patches.qwen3_5_mtp import inject_mtp_support
-
-            ok = inject_mtp_support(model, model_path, config)
-            if ok:
-                logger.info("[MTP-MLLM] Qwen3.5 MTP injected successfully")
-            else:
-                logger.warning("[MTP-MLLM] Qwen3.5 MTP injection failed")
-        else:
-            logger.info(f"[MTP-MLLM] MTP not supported for model_type={model_type}")
+        logger.info(f"[MTP-MLLM] MTP not supported for model_type={model_type}")
 
     def _prepare_llm_model(self) -> None:
         """Load the LLM model/tokenizer before engine loop startup."""
@@ -857,10 +868,11 @@ class BatchedEngine(BaseEngine):
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
-            from ..patches.qwen3_5_mtp import validate_mtp_support as validate_35
             from ..patches.qwen3_next_mtp import validate_mtp_support
+            from ..scheduler import _continuous_batching_mtp_capability
 
-            if validate_mtp_support(self._model) or validate_35(self._model):
+            _continuous_batching_mtp_capability(self._model, enabled=True)
+            if validate_mtp_support(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:
                 logger.warning(
@@ -911,7 +923,9 @@ class BatchedEngine(BaseEngine):
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             from ..patches.qwen3_next_mtp import validate_mtp_support
+            from ..scheduler import _continuous_batching_mtp_capability
 
+            _continuous_batching_mtp_capability(self._model, enabled=True)
             if validate_mtp_support(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:

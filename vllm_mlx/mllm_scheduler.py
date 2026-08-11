@@ -490,6 +490,12 @@ class MLLMScheduler:
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
         if self.batch_generator is None:
+            if self.config.enable_mtp:
+                lm = getattr(self.model, "language_model", self.model)
+                from .scheduler import _continuous_batching_mtp_capability
+
+                _continuous_batching_mtp_capability(lm, enabled=True)
+
             from mlx_lm.sample_utils import make_sampler
 
             from .memory_cache import MemoryCacheConfig

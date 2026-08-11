@@ -32,6 +32,53 @@ from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
 
+NATIVE_MTP_CONTINUOUS_BATCHING_UNSUPPORTED = (
+    "native_mtp_continuous_batching_unsupported"
+)
+
+
+def _native_mtp_capability(model: Any) -> Any | None:
+    """Return the loader-owned native-MTP contract for one exact target."""
+    candidates = (model, getattr(model, "language_model", None))
+    for candidate in candidates:
+        capability = getattr(candidate, "mtp_capability", None)
+        if capability is None:
+            continue
+        if not isinstance(getattr(capability, "supported", None), bool):
+            raise RuntimeError("native_mtp_capability_invalid")
+        return capability
+    return None
+
+
+def _native_qwen_model_type(model: Any) -> str:
+    candidates = (model, getattr(model, "language_model", None))
+    for candidate in candidates:
+        config = getattr(candidate, "config", None) or getattr(candidate, "args", None)
+        if isinstance(config, dict):
+            model_type = config.get("model_type", "")
+        else:
+            model_type = getattr(config, "model_type", "")
+        if isinstance(model_type, str) and model_type:
+            return model_type.lower()
+    return ""
+
+
+def _continuous_batching_mtp_capability(model: Any, *, enabled: bool) -> Any | None:
+    """Fail closed for native Qwen MTP until a batched transaction core exists."""
+    capability = _native_mtp_capability(model)
+    if enabled and capability is not None:
+        if capability.supported:
+            raise RuntimeError(NATIVE_MTP_CONTINUOUS_BATCHING_UNSUPPORTED)
+        reason = getattr(capability, "reason", None)
+        raise RuntimeError(
+            reason if isinstance(reason, str) and reason else "native_mtp_unsupported"
+        )
+    model_type = _native_qwen_model_type(model)
+    if enabled and ("qwen3_5" in model_type or "qwen3_6" in model_type):
+        raise RuntimeError("native_mtp_capability_missing")
+    return capability
+
+
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
 
@@ -1473,6 +1520,9 @@ class Scheduler:
         self, sampling_params: SamplingParams
     ) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
+        if self.config.enable_mtp:
+            _continuous_batching_mtp_capability(self.model, enabled=True)
+
         sampler = make_sampler(
             temp=sampling_params.temperature,
             top_p=sampling_params.top_p,
