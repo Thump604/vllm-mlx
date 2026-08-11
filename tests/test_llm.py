@@ -78,6 +78,34 @@ def test_model_stream_generate_passes_num_draft_tokens():
     assert captured_kwargs["num_draft_tokens"] == 4
 
 
+def test_model_stream_generate_passes_request_local_forward_context():
+    """Sparse decode forwards its request-local position context to mlx-lm."""
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel("test-model")
+    model._loaded = True
+    model.model = object()
+    tokenizer = MagicMock()
+    tokenizer.encode.return_value = [1, 2, 3]
+    model.tokenizer = tokenizer
+    forward_context = object()
+    captured_kwargs = {}
+
+    def fake_stream_generate(_model, _tokenizer, **kwargs):
+        captured_kwargs.update(kwargs)
+        yield SimpleNamespace(text="Hello")
+
+    with patch("mlx_lm.stream_generate", side_effect=fake_stream_generate):
+        chunks = list(
+            model.stream_generate(
+                "Hello", max_tokens=8, model_forward_context=forward_context
+            )
+        )
+
+    assert chunks[-1].text == "Hello"
+    assert captured_kwargs["model_forward_context"] is forward_context
+
+
 @pytest.mark.slow
 def test_model_load(small_model_name):
     """Test loading a model (slow test, downloads model)."""

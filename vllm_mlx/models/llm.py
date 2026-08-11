@@ -231,6 +231,7 @@ class MLXLanguageModel:
         stop: list[str] | None = None,
         logits_processors: list | None = None,
         prompt_cache=None,
+        model_forward_context=None,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -247,6 +248,8 @@ class MLXLanguageModel:
             repetition_penalty: Multiplicative penalty for repeating tokens
             stop: List of stop sequences
             prompt_cache: Pre-populated KV cache (e.g. from SpecPrefill)
+            model_forward_context: Optional request-local context factory passed
+                to mlx-lm for every target model forward.
 
         Yields:
             StreamingOutput for each generated token
@@ -281,6 +284,8 @@ class MLXLanguageModel:
             mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
+        if model_forward_context is not None:
+            mtp_kwargs["model_forward_context"] = model_forward_context
 
         for token_count, response in enumerate(
             stream_generate(
