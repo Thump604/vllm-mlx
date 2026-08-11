@@ -39,7 +39,11 @@ Reference: arxiv.org/abs/2502.02789 (SpecPrefill: Speculative Prefilling)
 """
 
 import hashlib
+import inspect
 import math
+import threading
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -229,26 +233,129 @@ def resolve_specprefill_decision(
 
 
 class _AttentionCapture:
-    """Wrapper that captures post-RoPE query vectors and delegates to original.
+    """Install-once attention wrapper with immutable delegation.
 
-    Installed on attention layers during lookahead decode to capture query
-    vectors for importance scoring. Supports multiple architectures via
-    query_extractor callback.
+    Normal model calls are delegated without touching scorer state. During a
+    request-local scorer session, the owning :class:`SpecPrefillScorer`
+    supplies the capture buffer and extractor. The legacy buffer arguments are
+    retained for callers that construct a standalone wrapper directly; model
+    installation always uses the scorer-owned path.
     """
 
-    def __init__(self, original, buf_idx, query_buffer, query_extractor=None):
+    def __init__(
+        self,
+        original,
+        buf_idx,
+        query_buffer=None,
+        query_extractor=None,
+        *,
+        scorer=None,
+    ):
+        if isinstance(original, _AttentionCapture):
+            raise RuntimeError("SpecPrefill attention wrappers cannot be nested")
+        if scorer is not None and (
+            query_buffer is not None or query_extractor is not None
+        ):
+            raise ValueError("scorer-owned wrappers cannot use legacy capture state")
         self._original = original
         self._buf_idx = buf_idx
         self._query_buffer = query_buffer
         self._query_extractor = query_extractor or _qwen35_extract_queries
+        self._scorer_ref = weakref.ref(scorer) if scorer is not None else None
+        self._call_plan = _build_capture_call_plan(original)
 
-    def __call__(self, x, mask=None, cache=None, **kwargs):
-        queries = self._query_extractor(self._original, x, cache=cache, **kwargs)
-        self._query_buffer[self._buf_idx].append(queries)
-        return self._original(x, mask=mask, cache=cache, **kwargs)
+    def __call__(self, *args, **kwargs):
+        if self._scorer_ref is None:
+            query_buffer = self._query_buffer
+            query_extractor = self._query_extractor
+        else:
+            scorer = self._scorer_ref()
+            if scorer is None:
+                raise RuntimeError("Detached SpecPrefill capture wrapper")
+            session = scorer._capture_session_for_wrapper()
+            if session is None:
+                return self._original(*args, **kwargs)
+            query_buffer = session.query_buffer
+            query_extractor = session.query_extractor
+
+        x, cache, capture_kwargs = _capture_call_arguments(
+            self._call_plan, args, kwargs
+        )
+        queries = query_extractor(self._original, x, cache=cache, **capture_kwargs)
+        query_buffer[self._buf_idx].append(queries)
+        return self._original(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._original, name)
+
+
+@dataclass(frozen=True)
+class _CaptureCallPlan:
+    input_name: str
+    input_position: int | None
+    cache_position: int | None
+    positional_names: tuple[str, ...]
+
+
+def _build_capture_call_plan(original):
+    """Inspect an attention callable once when its stable wrapper is installed."""
+    try:
+        signature = inspect.signature(original)
+        positional_names = tuple(
+            name
+            for name, parameter in signature.parameters.items()
+            if parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
+    except (TypeError, ValueError):
+        positional_names = ()
+
+    input_name = "x" if "x" in positional_names else None
+    if input_name is None:
+        input_name = positional_names[0] if positional_names else "x"
+    input_position = (
+        positional_names.index(input_name) if input_name in positional_names else 0
+    )
+    cache_position = (
+        positional_names.index("cache") if "cache" in positional_names else 2
+    )
+    return _CaptureCallPlan(
+        input_name=input_name,
+        input_position=input_position,
+        cache_position=cache_position,
+        positional_names=positional_names,
+    )
+
+
+def _capture_call_arguments(plan, args, kwargs):
+    """Extract scorer inputs without changing the delegated attention call."""
+    if plan.input_name in kwargs:
+        x = kwargs[plan.input_name]
+    elif plan.input_position is not None and len(args) > plan.input_position:
+        x = args[plan.input_position]
+    else:
+        raise RuntimeError("Cannot identify attention input for SpecPrefill")
+
+    if "cache" in kwargs:
+        cache = kwargs["cache"]
+    elif plan.cache_position is not None and len(args) > plan.cache_position:
+        cache = args[plan.cache_position]
+    else:
+        cache = None
+
+    capture_kwargs = dict(kwargs)
+    capture_kwargs.pop(plan.input_name, None)
+    capture_kwargs.pop("mask", None)
+    capture_kwargs.pop("cache", None)
+    for position, name in enumerate(plan.positional_names):
+        if position >= len(args):
+            break
+        if name not in (plan.input_name, "mask", "cache"):
+            capture_kwargs.setdefault(name, args[position])
+    return x, cache, capture_kwargs
 
 
 def _qwen35_extract_queries(attn, x, cache=None, **_kwargs):
@@ -345,34 +452,215 @@ def _nemotron_h_extract_queries(attn, x, cache=None, **_kwargs):
     return queries
 
 
-def _patch_attention_for_capture(model, query_buffer, query_extractor=None):
-    """Replace attention modules on full-attention layers with capture wrappers.
+@dataclass
+class _ScorerCaptureSession:
+    query_extractor: Callable[..., mx.array]
+    query_buffer: list[list[mx.array]]
+    owner_thread_id: int
+    capture_enabled: bool = True
 
-    Supports both `self_attn` (Qwen3.5/Llama/GPT-OSS) and `mixer`
-    (Nemotron-H block_type="*") attribute conventions.
 
-    Returns (originals, attn_layer_indices) for cleanup.
+class SpecPrefillScorer:
+    """Install-once, serialized scorer for one draft model.
+
+    Attention wrappers are a stable part of the scorer model after
+    construction. Only the capture session is request-local and mutable. The
+    initial implementation deliberately rejects overlapping work instead of
+    allowing requests to share capture buffers.
     """
-    originals = []
-    attn_indices = []
-    for layer_idx, layer in _find_attention_layers(model):
-        buf_idx = len(attn_indices)
-        attn_indices.append(layer_idx)
-        orig = _get_attn_module(layer)
-        _set_attn_module(
-            layer,
-            _AttentionCapture(
-                orig, buf_idx, query_buffer, query_extractor=query_extractor
+
+    def __init__(self, model):
+        self._model_ref = weakref.ref(model)
+        self.adapter = resolve_specprefill_adapter(model)
+        self._session_lock = threading.Lock()
+        self._active_session = None
+        self._session_context = threading.local()
+
+        attention_layers = _find_attention_layers(model)
+        if not attention_layers:
+            raise ValueError("SpecPrefill scorer model has no attention layers")
+        originals = [_get_attn_module(layer) for _, layer in attention_layers]
+        if any(isinstance(original, _AttentionCapture) for original in originals):
+            raise RuntimeError("SpecPrefill attention wrappers are already installed")
+
+        wrappers = [
+            (layer_idx, layer, _AttentionCapture(original, buf_idx, scorer=self))
+            for buf_idx, ((layer_idx, layer), original) in enumerate(
+                zip(attention_layers, originals)
+            )
+        ]
+        installed = []
+        try:
+            for (layer_idx, layer, wrapper), original in zip(wrappers, originals):
+                _set_attn_module(layer, wrapper)
+                installed.append((layer, original))
+        except Exception:
+            for layer, original in installed:
+                _set_attn_module(layer, original)
+            raise
+        wrappers = [(layer_idx, wrapper) for layer_idx, _, wrapper in wrappers]
+        self.attention_layer_indices = tuple(layer_idx for layer_idx, _ in wrappers)
+        self._wrappers = tuple(wrappers)
+
+    @classmethod
+    def for_model(cls, model):
+        """Return the sole scorer for ``model``, installing wrappers once."""
+        with _SCORER_REGISTRY_LOCK:
+            try:
+                scorer = _SCORER_REGISTRY.get(model)
+            except TypeError as exc:
+                raise RuntimeError(
+                    "SpecPrefill scorer models must support weak references"
+                ) from exc
+            if scorer is None:
+                scorer = cls(model)
+                _SCORER_REGISTRY[model] = scorer
+            scorer._verify_installed()
+            return scorer
+
+    @property
+    def model(self):
+        model = self._model_ref()
+        if model is None:
+            raise RuntimeError("SpecPrefill scorer model is no longer available")
+        return model
+
+    @property
+    def capture_active(self) -> bool:
+        return self._active_session is not None
+
+    def _verify_installed(self):
+        model = self.model
+        for layer_idx, wrapper in self._wrappers:
+            if _get_attn_module(model.layers[layer_idx]) is not wrapper:
+                raise RuntimeError("SpecPrefill scorer wrapper topology was modified")
+
+    def _capture_session_for_wrapper(self):
+        session = self._active_session
+        if session is None:
+            return None
+        context_session = getattr(self._session_context, "capture", None)
+        if (
+            context_session is not session
+            or session.owner_thread_id != threading.get_ident()
+        ):
+            raise RuntimeError(
+                "SpecPrefill scorer invoked outside its active request session"
+            )
+        return session if session.capture_enabled else None
+
+    @contextmanager
+    def capture_session(self, query_extractor=None, *, capture_enabled=True):
+        """Activate one fail-closed request-local capture session."""
+        self._verify_installed()
+        if not self._session_lock.acquire(blocking=False):
+            raise RuntimeError("SpecPrefill scorer already has an active session")
+        if self._active_session is not None:
+            self._session_lock.release()
+            raise RuntimeError("SpecPrefill scorer already has an active session")
+
+        session = _ScorerCaptureSession(
+            query_extractor=query_extractor or self.adapter.query_extractor,
+            query_buffer=[[] for _ in self.attention_layer_indices],
+            owner_thread_id=threading.get_ident(),
+            capture_enabled=capture_enabled,
+        )
+        self._active_session = session
+        self._session_context.capture = session
+        try:
+            yield session
+        finally:
+            self._active_session = None
+            try:
+                del self._session_context.capture
+            except AttributeError:
+                pass
+            self._session_lock.release()
+
+    def score_tokens(
+        self,
+        tokens,
+        n_lookahead=8,
+        pool_kernel=13,
+        temp=0.6,
+        top_p=0.95,
+        prefill_step_size=2048,
+        query_extractor=None,
+        cancel_check=None,
+    ):
+        """Score one prompt with all lazy capture work inside its session."""
+        model = self.model
+        if isinstance(tokens, mx.array):
+            tokens = tokens.tolist()
+        n_prompt = len(tokens)
+
+        first_attention = self._wrappers[0][1]._original
+        n_attn_heads = getattr(
+            first_attention,
+            "num_attention_heads",
+            getattr(
+                first_attention,
+                "n_heads",
+                getattr(first_attention, "num_heads", None),
             ),
         )
-        originals.append((layer_idx, orig))
-    return originals, attn_indices
+        n_kv_heads = getattr(
+            first_attention,
+            "num_key_value_heads",
+            getattr(first_attention, "n_kv_heads", None),
+        )
+
+        cache = None
+        logits = None
+        try:
+            with self.capture_session(
+                query_extractor=query_extractor, capture_enabled=False
+            ) as session:
+                cache = make_prompt_cache(model)
+                logits = _prefill_draft(
+                    model,
+                    tokens,
+                    cache,
+                    step_size=prefill_step_size,
+                    cancel_check=cancel_check,
+                )
+                session.capture_enabled = True
+                _lookahead_decode(
+                    model,
+                    logits,
+                    cache,
+                    n_lookahead,
+                    temp=temp,
+                    top_p=top_p,
+                    cancel_check=cancel_check,
+                )
+
+                layer_to_cache = self.adapter.cache_map_builder(model)
+                attn_caches = [
+                    cache[layer_to_cache[index]]
+                    for index in self.attention_layer_indices
+                ]
+                if cancel_check is not None:
+                    cancel_check()
+                importance = _compute_importance(
+                    session.query_buffer,
+                    attn_caches,
+                    n_prompt,
+                    n_attn_heads,
+                    n_kv_heads,
+                    pool_kernel=pool_kernel if pool_kernel > 0 else None,
+                )
+                # MLX execution is lazy. Realize both captured queries and the
+                # final scores while this request still owns the scorer lane.
+                mx.eval(session.query_buffer, importance)
+            return importance
+        finally:
+            del cache, logits
+            mx.clear_cache()
 
 
-def _unpatch_attention_capture(model, originals):
-    """Restore original attention modules after capture."""
-    for layer_idx, orig in originals:
-        _set_attn_module(model.layers[layer_idx], orig)
+_SCORER_REGISTRY = weakref.WeakKeyDictionary()
+_SCORER_REGISTRY_LOCK = threading.Lock()
 
 
 def _prefill_draft(model, tokens, cache, step_size=2048, cancel_check=None):
@@ -526,82 +814,17 @@ def score_tokens(
     Returns:
         importance: (M,) mx.array of per-token importance scores
     """
-    if isinstance(tokens, mx.array):
-        tokens = tokens.tolist()
-    n_prompt = len(tokens)
-
-    # Model topology — detect attribute names across architectures
-    attn_layers = _find_attention_layers(model)
-    n_attn_layers = len(attn_layers)
-    attn_obj = _get_attn_module(attn_layers[0][1])
-    # Attribute names vary: num_attention_heads (Qwen3.5), n_heads (Llama),
-    # num_heads (Nemotron-H)
-    n_attn_heads = getattr(
-        attn_obj,
-        "num_attention_heads",
-        getattr(attn_obj, "n_heads", getattr(attn_obj, "num_heads", None)),
-    )
-    n_kv_heads = getattr(
-        attn_obj, "num_key_value_heads", getattr(attn_obj, "n_kv_heads", None)
-    )
-
-    # Resolve known model families through an explicit adapter registry. The
-    # generic fallback remains only for legacy callers that pass a custom
-    # extractor; unknown model types must not silently acquire a scoring path.
-    if query_extractor is None:
-        query_extractor = resolve_specprefill_adapter(model).query_extractor
-
-    # Phase 1: Prefill
-    cache = make_prompt_cache(model)
-    logits = _prefill_draft(
-        model,
+    scorer = SpecPrefillScorer.for_model(model)
+    return scorer.score_tokens(
         tokens,
-        cache,
-        step_size=prefill_step_size,
+        n_lookahead=n_lookahead,
+        pool_kernel=pool_kernel,
+        temp=temp,
+        top_p=top_p,
+        prefill_step_size=prefill_step_size,
+        query_extractor=query_extractor,
         cancel_check=cancel_check,
     )
-
-    # Phase 2: Lookahead decode with query capture
-    query_buffer = [[] for _ in range(n_attn_layers)]
-    patches, attn_indices = _patch_attention_for_capture(
-        model, query_buffer, query_extractor=query_extractor
-    )
-    try:
-        _lookahead_decode(
-            model,
-            logits,
-            cache,
-            n_lookahead,
-            temp=temp,
-            top_p=top_p,
-            cancel_check=cancel_check,
-        )
-        mx.eval(query_buffer)
-    finally:
-        _unpatch_attention_capture(model, patches)
-
-    # Phase 3: Compute importance
-    # Map layer indices to cache indices (identity for standard models,
-    # compacted for Nemotron-H where only M/* layers have cache entries)
-    layer_to_cache = resolve_specprefill_adapter(model).cache_map_builder(model)
-    attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
-    if cancel_check is not None:
-        cancel_check()
-    importance = _compute_importance(
-        query_buffer,
-        attn_caches,
-        n_prompt,
-        n_attn_heads,
-        n_kv_heads,
-        pool_kernel=pool_kernel if pool_kernel > 0 else None,
-    )
-    mx.eval(importance)
-
-    # Draft cache is no longer needed — let GC reclaim it
-    del cache, logits, query_buffer, attn_caches
-    mx.clear_cache()
-
-    return importance
 
 
 def _chunk_scores(importance, chunk_size: int) -> tuple[int, list[float]]:
