@@ -33,6 +33,7 @@ class GenerationOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    mtp_bypass_reason: str | None = None
     # SpecPrefill is independent of decode speculation.  Keep its terminal
     # state separate so composing MTP cannot erase sparse-prefill evidence.
     specprefill_requested_policy: str | None = None

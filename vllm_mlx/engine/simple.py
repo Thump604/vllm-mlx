@@ -64,6 +64,11 @@ from ..specprefill_profiles import (
     SpecPrefillProfileRegistry,
     SpecPrefillTuning,
 )
+from ..native_mtp_request import (
+    NativeMTPRequestConfig,
+    NativeMTPServerState,
+    resolve_native_mtp_consumer,
+)
 from .base import (
     BaseEngine,
     EngineBusy,
@@ -232,6 +237,30 @@ def _request_can_compose_mtp(route_mtp: bool, processors: list[Any] | None) -> b
     requires the independently qualified combined profile cell.
     """
     return route_mtp and (not processors or _processors_can_retire(processors))
+
+
+def _consume_native_mtp_request(
+    kwargs: dict[str, Any], *, server_default: bool
+) -> tuple[NativeMTPRequestConfig | None, bool, bool, str | None]:
+    """Consume private server controls before backend kwargs are constructed."""
+
+    config = kwargs.pop("_native_mtp_request_config", None)
+    disabled = kwargs.pop("_native_mtp_disabled", False)
+    bypass_reason = kwargs.pop("_native_mtp_bypass_reason", None)
+    if config is not None and not isinstance(config, NativeMTPRequestConfig):
+        raise ValueError("invalid native MTP request config")
+    if not isinstance(disabled, bool):
+        raise ValueError("invalid native MTP disable control")
+    if config is not None and disabled:
+        raise ValueError("native MTP request cannot be selected and disabled")
+    if bypass_reason is not None and not isinstance(bypass_reason, str):
+        raise ValueError("invalid native MTP bypass reason")
+    if config is not None and bypass_reason is not None:
+        raise ValueError("native MTP bypass cannot be selected")
+    selected = config is not None or (server_default and not disabled)
+    if bypass_reason is not None:
+        selected = False
+    return config, disabled, selected, bypass_reason
 
 
 class _SpecPrefillCancelled(Exception):
@@ -984,6 +1013,43 @@ class SimpleEngine(BaseEngine):
             return getattr(self._model, "processor", None)
         return self._model.tokenizer
 
+    def native_mtp_server_state(
+        self, *, has_media: bool = False
+    ) -> NativeMTPServerState:
+        """Return native-MTP admission facts without mutating model state."""
+
+        incompatibility = None
+        if has_media:
+            incompatibility = "native_mtp_media_unsupported"
+        elif (self._max_kv_size or 0) > 0:
+            incompatibility = "native_mtp_max_kv_unsupported"
+        elif self._system_kv_cache:
+            # Native MTP cannot consume the cache snapshot contract yet.  Do
+            # not guess that a resident prefix belongs to another request.
+            incompatibility = "native_mtp_prefix_cache_unsupported"
+
+        if self._is_mllm:
+            target = self._text_model
+        else:
+            target = getattr(self._model, "model", None)
+        capability = getattr(target, "mtp_capability", None)
+        capable = bool(capability is not None and capability.supported)
+        if incompatibility is None and not capable:
+            incompatibility = (
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+        if incompatibility is None and resolve_native_mtp_consumer() is None:
+            incompatibility = "native_mtp_consumer_contract_missing"
+        return NativeMTPServerState(
+            server_default=bool(self._mtp),
+            capable=capable,
+            num_draft_tokens=self._mtp_num_draft_tokens,
+            supports_penalty_processors=not self._is_mllm,
+            incompatibility=incompatibility,
+        )
+
     def _generation_lock_holder_summary(self) -> str:
         if not self._active_requests:
             return "none"
@@ -1172,9 +1238,11 @@ class SimpleEngine(BaseEngine):
                             )
                             self._supports_system_kv_cache = False
 
-                        has_mtp = (
-                            hasattr(self._text_model, "mtp")
-                            and self._text_model.mtp is not None
+                        capability = getattr(
+                            self._text_model, "mtp_capability", None
+                        )
+                        has_mtp = bool(
+                            capability is not None and capability.supported
                         )
                         logger.info(
                             "MLLM text routing: text-only -> mlx_lm TextModel "
@@ -1367,6 +1435,9 @@ class SimpleEngine(BaseEngine):
             completion_tokens=last_output.completion_tokens,
             finish_reason=last_output.finish_reason,
             finished=True,
+            mtp_drafts=last_output.mtp_drafts,
+            mtp_accepted=last_output.mtp_accepted,
+            mtp_bypass_reason=last_output.mtp_bypass_reason,
             specprefill_requested_policy=last_output.specprefill_requested_policy,
             specprefill_effective_policy=last_output.specprefill_effective_policy,
             specprefill_coverage=last_output.specprefill_coverage,
@@ -1518,6 +1589,9 @@ class SimpleEngine(BaseEngine):
         # Resolve the complete public prefill contract before any model call.
         # These controls must never leak into mlx-lm/mlx-vlm kwargs.
         specprefill_controls = self._specprefill_controls(kwargs)
+        native_mtp_config, native_mtp_disabled, effective_mtp, mtp_bypass_reason = (
+            _consume_native_mtp_request(kwargs, server_default=self._mtp)
+        )
         request_id = str(kwargs.pop("request_id", "") or f"simple-{id(prompt):x}")
 
         tokenizer = self._model.tokenizer
@@ -1531,7 +1605,7 @@ class SimpleEngine(BaseEngine):
             # MLXLanguageModel injects native MTP into its decode call when
             # configured. Other routes pass their request-effective value
             # explicitly (for example, an MLLM assistant request).
-            combined_mtp=self._mtp,
+            combined_mtp=effective_mtp,
         )
 
         # SpecPrefill is independent from MTP. The direct path is used only
@@ -1546,7 +1620,7 @@ class SimpleEngine(BaseEngine):
         if (
             not self._is_mllm
             and telemetry.decision.effective_policy is SpecPrefillPolicy.SPARSE
-            and self._mtp
+            and effective_mtp
         ):
             # Sparse-only is independently qualified first. Native/external
             # MTP composition cannot borrow this cache/position state yet.
@@ -1624,12 +1698,18 @@ class SimpleEngine(BaseEngine):
                 completion_tokens = 0
                 finished = False
 
+                native_mtp_kwargs: dict[str, Any] = {}
+                if native_mtp_config is not None:
+                    native_mtp_kwargs["native_mtp_request"] = native_mtp_config
+                elif native_mtp_disabled:
+                    native_mtp_kwargs["native_mtp_disabled"] = True
                 for chunk in self._model.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     stop=stop,
+                    **native_mtp_kwargs,
                     **kwargs,
                 ):
                     prompt_tokens = (
@@ -1668,6 +1748,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=completion_tokens,
                         finished=finished,
                         finish_reason=finish_reason,
+                        mtp_bypass_reason=mtp_bypass_reason,
                         **telemetry.as_output_kwargs(),
                     )
 
@@ -1692,6 +1773,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=completion_tokens,
                         finished=True,
                         finish_reason="stop",
+                        mtp_bypass_reason=mtp_bypass_reason,
                         **telemetry.as_output_kwargs(),
                     )
             finally:
@@ -1752,6 +1834,7 @@ class SimpleEngine(BaseEngine):
                 finish_reason=final_output.finish_reason,
                 mtp_drafts=final_output.mtp_drafts,
                 mtp_accepted=final_output.mtp_accepted,
+                mtp_bypass_reason=final_output.mtp_bypass_reason,
                 specprefill_requested_policy=final_output.specprefill_requested_policy,
                 specprefill_effective_policy=final_output.specprefill_effective_policy,
                 specprefill_coverage=final_output.specprefill_coverage,
@@ -1785,11 +1868,20 @@ class SimpleEngine(BaseEngine):
         if kwargs.get("logits_processors") and not self._is_mllm:
             return await aggregate_stream_chat()
 
+        # Explicit native MTP is implemented by the streaming decode seam.
+        # The legacy blocking chat call does not expose speculative controls.
+        if kwargs.get("_native_mtp_request_config") is not None:
+            return await aggregate_stream_chat()
+
         # Text-only requests on MLLM models should always aggregate the
         # streaming path for non-streaming chat. This keeps one execution seam
         # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
         if self._is_mllm and not has_media_content(messages):
             return await aggregate_stream_chat()
+
+        _, _, _, direct_mtp_bypass_reason = _consume_native_mtp_request(
+            kwargs, server_default=self._mtp
+        )
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -1823,6 +1915,7 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
                 mtp_drafts=getattr(output, "mtp_drafts", 0),
                 mtp_accepted=getattr(output, "mtp_accepted", 0),
+                mtp_bypass_reason=direct_mtp_bypass_reason,
                 **telemetry.as_output_kwargs(),
             )
         else:
@@ -1865,6 +1958,7 @@ class SimpleEngine(BaseEngine):
                 prompt_tokens=prompt_token_count,
                 completion_tokens=len(output.tokens),
                 finish_reason=output.finish_reason,
+                mtp_bypass_reason=direct_mtp_bypass_reason,
                 **telemetry.as_output_kwargs(),
             )
 
@@ -1926,6 +2020,14 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        (
+            native_mtp_config,
+            native_mtp_disabled,
+            effective_native_mtp,
+            mtp_bypass_reason,
+        ) = (
+            _consume_native_mtp_request(kwargs, server_default=self._mtp)
+        )
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
         request_has_media = has_media_content(messages)
 
@@ -1942,19 +2044,23 @@ class SimpleEngine(BaseEngine):
             and not request_has_media
         )
         if routes_text_model:
-            has_mtp = (
-                hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
-            )
-            logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
+            use_native_mtp = effective_native_mtp
+            logger.info("Text-only request → LLM path (MTP=%s)", use_native_mtp)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
+            if native_mtp_config is not None:
+                kwargs["_native_mtp_request_config"] = native_mtp_config
+            elif native_mtp_disabled:
+                kwargs["_native_mtp_disabled"] = True
+            elif mtp_bypass_reason is not None:
+                kwargs["_native_mtp_bypass_reason"] = mtp_bypass_reason
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
                 temperature,
                 top_p,
                 tools=template_tools,
-                combined_mtp=has_mtp and self._mtp,
+                combined_mtp=use_native_mtp,
                 **kwargs,
             ):
                 yield chunk
@@ -2029,6 +2135,7 @@ class SimpleEngine(BaseEngine):
                             finish_reason=chunk.finish_reason if finished else None,
                             mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                             mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            mtp_bypass_reason=mtp_bypass_reason,
                             **direct_mllm_telemetry.as_output_kwargs(),
                         )
 
@@ -2069,6 +2176,7 @@ class SimpleEngine(BaseEngine):
                     finish_reason=chunk.finish_reason if finished else None,
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
                     mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                    mtp_bypass_reason=mtp_bypass_reason,
                     **direct_mllm_telemetry.as_output_kwargs(),
                 )
             return
@@ -2203,7 +2311,7 @@ class SimpleEngine(BaseEngine):
         #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
         #     branch builds its cache with ``make_prompt_cache(model)`` and has
         #     no equivalent bound.
-        if self._mtp:
+        if effective_native_mtp:
             cache_blocking_controls.append("mtp")
         if self._draft_model is not None:
             cache_blocking_controls.append("specprefill_loaded")
@@ -2499,6 +2607,7 @@ class SimpleEngine(BaseEngine):
                         completion_tokens=token_count,
                         finished=finished,
                         finish_reason=finish_reason,
+                        mtp_bypass_reason=mtp_bypass_reason,
                     )
                     if finished:
                         break
@@ -2514,11 +2623,23 @@ class SimpleEngine(BaseEngine):
                 # Internal fallback to the public stream_generate. The
                 # ``_in_tracker`` context flag prevents double counting
                 # in _track_request_stream.
+                native_forward_kwargs: dict[str, Any] = {}
+                if native_mtp_config is not None:
+                    native_forward_kwargs["_native_mtp_request_config"] = (
+                        native_mtp_config
+                    )
+                elif native_mtp_disabled:
+                    native_forward_kwargs["_native_mtp_disabled"] = True
+                elif mtp_bypass_reason is not None:
+                    native_forward_kwargs["_native_mtp_bypass_reason"] = (
+                        mtp_bypass_reason
+                    )
                 async for output in self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    **native_forward_kwargs,
                     **kwargs,
                 ):
                     yield output
@@ -2526,11 +2647,19 @@ class SimpleEngine(BaseEngine):
 
         # Fallback: no system prefix detected -> original uncached path.
         # Re-entrancy guard in _track_request_stream keeps stats single-counted.
+        native_forward_kwargs = {}
+        if native_mtp_config is not None:
+            native_forward_kwargs["_native_mtp_request_config"] = native_mtp_config
+        elif native_mtp_disabled:
+            native_forward_kwargs["_native_mtp_disabled"] = True
+        elif mtp_bypass_reason is not None:
+            native_forward_kwargs["_native_mtp_bypass_reason"] = mtp_bypass_reason
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            **native_forward_kwargs,
             **kwargs,
         ):
             yield output
@@ -2913,6 +3042,9 @@ class SimpleEngine(BaseEngine):
         # The text route has its own prompt rendering, but shares exactly the
         # same policy resolver as direct SimpleEngine generation.
         specprefill_controls = self._specprefill_controls(kwargs)
+        native_mtp_config, _, combined_mtp, mtp_bypass_reason = (
+            _consume_native_mtp_request(kwargs, server_default=combined_mtp)
+        )
         specprefill_keep_pct = (
             specprefill_controls["keep_pct"]
             if self._specprefill_diagnostic_mode
@@ -2935,6 +3067,14 @@ class SimpleEngine(BaseEngine):
         external_logits_processors = kwargs.pop("logits_processors", None)
         abort_event = threading.Event()
 
+        if native_mtp_config is not None:
+            sampling = native_mtp_config.sampling
+            temperature = sampling.temperature
+            top_p = sampling.top_p
+            top_k = sampling.top_k
+            min_p = sampling.min_p
+            presence_penalty = sampling.presence_penalty
+            repetition_penalty = sampling.repetition_penalty
         # Per-request enable_thinking override; fall back to env var / default True.
         enable_thinking = kwargs.pop("enable_thinking", None)
         if enable_thinking is None:
@@ -2980,8 +3120,7 @@ class SimpleEngine(BaseEngine):
         custom_logits_active = bool(all_processors)
         combined_mtp = (
             _request_can_compose_mtp(combined_mtp, all_processors)
-            and self._text_model is not None
-            and getattr(self._text_model, "mtp", None) is not None
+            and native_mtp_config is not None
         )
         sparse_no_completion_requested = max_tokens == 0
         max_tokens = max_tokens or 4096
@@ -3236,12 +3375,11 @@ class SimpleEngine(BaseEngine):
                 prefill_step_size=self._prefill_step_size,
                 prompt_cache=prompt_cache,
             )
-            if hasattr(model, "make_mtp_cache") and model.mtp is not None:
+            if native_mtp_config is not None:
                 # Resume speculative decode from the retained backbone cache with
                 # a fresh MTP cache so stale speculative state cannot survive the
                 # processor-to-content handoff.
-                resume_kwargs["prompt_cache"] = prompt_cache + model.make_mtp_cache()
-                resume_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                resume_kwargs.update(native_mtp_config.mlx_lm_call_kwargs())
             for resp in mlx_stream_generate(
                 model,
                 self._text_tokenizer,
@@ -3259,9 +3397,7 @@ class SimpleEngine(BaseEngine):
 
             model = self._text_model
             can_retire_processors = _processors_can_retire(all_processors)
-            use_mtp = (
-                combined_mtp and not custom_logits_active and model.mtp is not None
-            )
+            use_mtp = combined_mtp and not custom_logits_active
             if self._mtp and custom_logits_active:
                 logger.info(
                     "Text route: disabling MTP for request-local logits processors"
@@ -3366,7 +3502,11 @@ class SimpleEngine(BaseEngine):
             if all_processors:
                 gen_kwargs["logits_processors"] = all_processors
             if use_mtp:
-                gen_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
+                if native_mtp_config is None:
+                    raise RuntimeError(
+                        "native MTP selection requires a request-local config"
+                    )
+                gen_kwargs.update(native_mtp_config.mlx_lm_call_kwargs())
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
             if can_retire_processors and not use_mtp:
@@ -3401,7 +3541,7 @@ class SimpleEngine(BaseEngine):
                             "Text route: request-local processor retired after %d tokens; "
                             "resuming content phase with MTP=%s",
                             token_count,
-                            hasattr(model, "make_mtp_cache") and model.mtp is not None,
+                            native_mtp_config is not None,
                         )
                         break
 
@@ -3658,6 +3798,7 @@ class SimpleEngine(BaseEngine):
                     completion_tokens=token_count,
                     finished=finished,
                     finish_reason=finish_reason,
+                    mtp_bypass_reason=mtp_bypass_reason,
                     **telemetry.as_output_kwargs(),
                 )
 
@@ -3674,6 +3815,7 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+                mtp_bypass_reason=mtp_bypass_reason,
                 **telemetry.as_output_kwargs(),
             )
 

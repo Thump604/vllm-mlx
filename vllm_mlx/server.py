@@ -174,6 +174,12 @@ from .model_registry import (
 )
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
+from .native_mtp_request import (
+    NativeMTPRequestError,
+    NativeMTPSampling,
+    NativeMTPServerState,
+    resolve_native_mtp_request,
+)
 from .reasoning import get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
@@ -575,6 +581,7 @@ def _generation_metadata(
     feature_fields = {
         "mtp_drafts": getattr(output, "mtp_drafts", None),
         "mtp_accepted": getattr(output, "mtp_accepted", None),
+        "mtp_bypass_reason": getattr(output, "mtp_bypass_reason", None),
         "specprefill_requested_policy": getattr(
             output, "specprefill_requested_policy", None
         ),
@@ -648,6 +655,7 @@ def _aggregate_completion_generation_metadata(
     return GenerationMetadata(
         mtp_drafts=summed("mtp_drafts"),
         mtp_accepted=summed("mtp_accepted"),
+        mtp_bypass_reason=common("mtp_bypass_reason"),
         specprefill_requested_policy=common("specprefill_requested_policy"),
         specprefill_effective_policy=common("specprefill_effective_policy"),
         specprefill_coverage=common("specprefill_coverage"),
@@ -681,6 +689,114 @@ def _attach_specprefill_request_kwargs(
             kwargs[name] = value
     # Engines use this explicit signal to make text-only support fail safe.
     kwargs["specprefill_has_media"] = bool(has_media)
+
+
+def _attach_native_mtp_request_kwargs(
+    engine: BaseEngine,
+    request: ChatCompletionRequest | CompletionRequest,
+    kwargs: dict[str, object],
+    *,
+    has_media: bool = False,
+) -> None:
+    """Resolve and attach native MTP before invoking an engine method.
+
+    The private kwargs are consumed by ``SimpleEngine`` and never forwarded to
+    mlx-lm/mlx-vlm. Default-off and external-drafter paths get no new kwargs.
+    """
+
+    requested = request.mtp
+    state_resolver = getattr(engine, "native_mtp_server_state", None)
+    if state_resolver is None:
+        state = NativeMTPServerState(
+            server_default=False,
+            capable=False,
+            incompatibility="native_mtp_unsupported_engine",
+        )
+    else:
+        state = state_resolver(has_media=has_media)
+        if not isinstance(state, NativeMTPServerState):
+            raise RuntimeError("native_mtp_server_state returned an invalid contract")
+
+    if requested is False:
+        # An opt-out only needs an internal control when it changes an active
+        # native default. Default-off and external-drafter routes stay byte-for-
+        # byte identical and receive no new backend kwargs.
+        if state.server_default and state.capable:
+            kwargs["_native_mtp_disabled"] = True
+        return
+
+    processors = tuple(kwargs.get("logits_processors") or ())
+    incompatibility = state.incompatibility
+    if getattr(request, "mllm_draft", None) is True:
+        incompatibility = "native_mtp_external_draft_selected"
+    elif processors:
+        # Processor state/opacity is not introspected.  A future capability may
+        # explicitly admit a known immutable processor type, but the default is
+        # deliberately fail closed.
+        incompatibility = "native_mtp_logits_processors_unsupported"
+    elif not state.supports_penalty_processors and (
+        float(kwargs["presence_penalty"]) != 0.0
+        or float(kwargs["repetition_penalty"]) != 1.0
+    ):
+        incompatibility = "native_mtp_penalty_processors_unsupported"
+
+    sampling = NativeMTPSampling(
+        temperature=float(kwargs["temperature"]),
+        top_p=float(kwargs["top_p"]),
+        top_k=int(kwargs["top_k"]),
+        min_p=float(kwargs["min_p"]),
+        presence_penalty=float(kwargs["presence_penalty"]),
+        repetition_penalty=float(kwargs["repetition_penalty"]),
+        seed=request.seed,
+    )
+    try:
+        decision = resolve_native_mtp_request(
+            requested=requested,
+            sampling=sampling,
+            server_default=state.server_default,
+            capable=state.capable,
+            num_draft_tokens=state.num_draft_tokens,
+            incompatibility=incompatibility,
+        )
+    except NativeMTPRequestError as exc:
+        raise HTTPException(status_code=422, detail=exc.reason) from exc
+
+    if request.seed is not None and decision.config is None:
+        raise HTTPException(
+            status_code=422,
+            detail="native_mtp_seed_requires_effective_mtp",
+        )
+    if decision.config is not None:
+        kwargs["_native_mtp_request_config"] = decision.config
+    elif decision.bypass_reason is not None:
+        # Prevent the downstream wrapper's legacy model-global default from
+        # re-enabling MTP after request admission deliberately bypassed it.
+        kwargs["_native_mtp_disabled"] = True
+        kwargs["_native_mtp_bypass_reason"] = decision.bypass_reason
+
+
+def _preflight_streaming_completion_native_mtp(
+    engine: BaseEngine,
+    request: CompletionRequest,
+    *,
+    repetition_penalty: float | None,
+) -> dict[str, object]:
+    """Finish explicit MTP admission before an SSE response starts."""
+
+    kwargs: dict[str, object] = {
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "top_k": _resolve_top_k(request.top_k),
+        "min_p": _resolve_min_p(request.min_p),
+        "presence_penalty": _resolve_presence_penalty(request.presence_penalty),
+        "repetition_penalty": _resolve_repetition_penalty(repetition_penalty),
+    }
+    _attach_native_mtp_request_kwargs(engine, request, kwargs)
+    return {
+        name: value
+        for name, value in kwargs.items()
+        if name.startswith("_native_mtp_")
+    }
 
 
 def _configure_batched_specprefill(
@@ -994,6 +1110,13 @@ def _prepare_chat_completion_invocation(
             ):
                 existing_processors = existing_processors[:-1]
             chat_kwargs["logits_processors"] = existing_processors + [thinking_proc]
+
+    _attach_native_mtp_request_kwargs(
+        engine,
+        request,
+        chat_kwargs,
+        has_media=has_media,
+    )
 
     return PreparedChatInvocation(
         messages=messages,
@@ -1758,6 +1881,8 @@ def _metrics_result_from_status(status_code: int) -> str:
         return "timeout"
     if status_code >= 500:
         return "error"
+    if status_code >= 400:
+        return "client_error"
     return "success"
 
 
@@ -4977,6 +5102,15 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     try:
         if request.stream:
+            try:
+                native_mtp_controls = _preflight_streaming_completion_native_mtp(
+                    engine,
+                    request,
+                    repetition_penalty=comp_rep_penalty,
+                )
+            except HTTPException as exc:
+                tracker.finish(result=_metrics_result_from_status(exc.status_code))
+                raise
             response = StreamingResponse(
                 _disconnect_guard(
                     _ensure_sse_terminal(
@@ -4986,6 +5120,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                             request,
                             effective_max_tokens,
                             repetition_penalty=comp_rep_penalty,
+                            native_mtp_controls=native_mtp_controls,
                             metrics_tracker=tracker,
                         ),
                         "data: [DONE]\n\n",
@@ -5019,8 +5154,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             generate_kwargs["repetition_penalty"] = _resolve_repetition_penalty(
                 comp_rep_penalty
             )
-            _attach_specprefill_request_kwargs(request, generate_kwargs)
             try:
+                _attach_specprefill_request_kwargs(request, generate_kwargs)
+                _attach_native_mtp_request_kwargs(engine, request, generate_kwargs)
                 if raw_request is None:
                     output = await engine.generate(**generate_kwargs)
                 else:
@@ -5185,6 +5321,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         except UnsafeRemoteURLError as exc:
             tracker.finish(result="client_error")
             _raise_remote_media_http_error(exc)
+        except HTTPException as exc:
+            tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
 
         if request.stream:
             response = StreamingResponse(
@@ -6188,6 +6327,7 @@ async def stream_completion(
     request: CompletionRequest,
     max_tokens: int,
     repetition_penalty: float | None = None,
+    native_mtp_controls: dict[str, object] | None = None,
     metrics_tracker=None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
@@ -6208,6 +6348,10 @@ async def stream_completion(
         repetition_penalty
     )
     _attach_specprefill_request_kwargs(request, generate_kwargs)
+    if native_mtp_controls is None:
+        _attach_native_mtp_request_kwargs(engine, request, generate_kwargs)
+    else:
+        generate_kwargs.update(native_mtp_controls)
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):

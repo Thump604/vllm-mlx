@@ -18,6 +18,7 @@ from pydantic import (
     AliasChoices,
     BaseModel,
     Field,
+    StrictBool,
     StrictInt,
     model_serializer,
     model_validator,
@@ -191,6 +192,15 @@ def _validate_specprefill_policy_compatibility(model):
     return model
 
 
+def _validate_native_mtp_request(model):
+    """Reject ambiguous native/external MTP and seed combinations."""
+    if model.seed is not None and model.mtp is False:
+        raise ValueError("seed conflicts with mtp=false")
+    if model.mtp is True and getattr(model, "mllm_draft", None) is True:
+        raise ValueError("mtp=true conflicts with mllm_draft=true")
+    return model
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -241,6 +251,10 @@ class ChatCompletionRequest(BaseModel):
     # Text-only requests also use this flag to leave the default TextModel route
     # and run through the MLLM path where the drafter can participate.
     mllm_draft: bool | None = None
+    # Request-local native Qwen MTP. None preserves the server default; this is
+    # independent from the external MLLM assistant-drafter control above.
+    mtp: StrictBool | None = None
+    seed: StrictInt | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
     thinking_token_budget: int | None = Field(default=None, gt=0)
@@ -254,7 +268,8 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError(
                 "specprefill_control_token_indices must be non-negative integers"
             )
-        return _validate_specprefill_policy_compatibility(self)
+        _validate_specprefill_policy_compatibility(self)
+        return _validate_native_mtp_request(self)
 
 
 class AssistantMessage(BaseModel):
@@ -310,6 +325,7 @@ class GenerationMetadata(BaseModel):
     no_final_content_watchdog_enforced: bool = False
     mtp_drafts: int | None = None
     mtp_accepted: int | None = None
+    mtp_bypass_reason: str | None = None
     specprefill_requested_policy: SpecPrefillPolicy | None = None
     specprefill_effective_policy: SpecPrefillPolicy | None = None
     specprefill_coverage: SpecPrefillCoverage | None = None
@@ -354,6 +370,10 @@ class CompletionRequest(BaseModel):
     stop: list[str] | None = None
     # Sampling penalties
     repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
+    # Request-local native Qwen MTP. A seed requires an effective explicit or
+    # server-default native-MTP route.
+    mtp: StrictBool | None = None
+    seed: StrictInt | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
@@ -375,7 +395,8 @@ class CompletionRequest(BaseModel):
             raise ValueError(
                 "specprefill_control_token_indices must be non-negative integers"
             )
-        return _validate_specprefill_policy_compatibility(self)
+        _validate_specprefill_policy_compatibility(self)
+        return _validate_native_mtp_request(self)
 
 
 class CompletionChoice(BaseModel):

@@ -11,6 +11,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
+from ..native_mtp_request import NativeMTPRequestConfig
+
 if TYPE_CHECKING:
     import mlx.core as mx
 
@@ -232,6 +234,8 @@ class MLXLanguageModel:
         logits_processors: list | None = None,
         prompt_cache=None,
         model_forward_context=None,
+        native_mtp_request: NativeMTPRequestConfig | None = None,
+        native_mtp_disabled: bool = False,
         **kwargs,
     ) -> Iterator[StreamingOutput]:
         """
@@ -259,11 +263,30 @@ class MLXLanguageModel:
 
         from mlx_lm import stream_generate
 
+        if native_mtp_request is not None and native_mtp_disabled:
+            raise ValueError("native MTP cannot be selected and disabled")
+        if native_mtp_request is not None:
+            sampling = native_mtp_request.sampling
+            temperature = sampling.temperature
+            top_p = sampling.top_p
+            top_k = sampling.top_k
+            min_p = sampling.min_p
+            presence_penalty = sampling.presence_penalty
+            repetition_penalty = sampling.repetition_penalty
+
         # Create sampler and logits processors with full Unsloth params
         sampler = self._create_sampler(temperature, top_p, top_k, min_p)
         penalty_processors = self._create_logits_processors(
             presence_penalty, repetition_penalty
         )
+        if native_mtp_request is not None:
+            for processor in penalty_processors or ():
+                try:
+                    processor.native_mtp_replay_safe = True
+                except (AttributeError, TypeError) as exc:
+                    raise ValueError(
+                        "native MTP penalty processor cannot be replayed safely"
+                    ) from exc
         # Merge any externally-provided logits_processors with penalty processors
         all_processors = None
         if penalty_processors or logits_processors:
@@ -280,7 +303,14 @@ class MLXLanguageModel:
         accumulated_tail = ""
 
         mtp_kwargs = {}
-        if self._mtp:
+        if native_mtp_request is not None:
+            mtp_kwargs.update(
+                native_mtp_request.mlx_lm_call_kwargs(consumer=stream_generate)
+            )
+        elif self._mtp and not native_mtp_disabled:
+            # The legacy default is preserved only for callers outside the
+            # public request contract. Public default-on requests always carry
+            # either an exact config or an explicit disable/bypass control.
             mtp_kwargs["num_draft_tokens"] = self._mtp_num_draft_tokens
         if prompt_cache is not None:
             mtp_kwargs["prompt_cache"] = prompt_cache
