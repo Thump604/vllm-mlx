@@ -169,18 +169,18 @@ def test_sparse_qwen_vlm_moe_has_same_explicit_mrope_contract():
     )
 
 
-def test_sparse_prefill_fails_closed_for_cache_offset_and_current_gemma_paths():
+def test_sparse_prefill_requires_hook_transport_and_gemma_scalar_is_executable():
     sparse_state = _state()
-    for adapter in (QWEN_DENSE_TARGET, QWEN35_TEXT_HYBRID_TARGET, GEMMA4_DENSE_TARGET):
+    for adapter in (QWEN_DENSE_TARGET, QWEN35_TEXT_HYBRID_TARGET):
         with pytest.raises(
             TargetPositionError, match="no request-local|cannot execute"
         ):
             sparse_prefill_plan(adapter, sparse_state).require_executable()
 
-    # Gemma's owner attention replaces the passed offset with cache.offset;
-    # shared-KV forwarding therefore does not make sparse decode representable.
-    with pytest.raises(TargetPositionError, match="cannot execute"):
-        decode_plan(GEMMA4_DENSE_TARGET, sparse_state).gemma4_offsets()
+    gemma_sparse = sparse_prefill_plan(GEMMA4_DENSE_TARGET, sparse_state)
+    gemma_sparse.require_executable()
+    assert gemma_sparse.gemma4_offsets() == (0,)
+    assert decode_plan(GEMMA4_DENSE_TARGET, sparse_state).gemma4_offsets() == (6,)
 
 
 def test_heterogeneous_rows_are_planned_but_only_verified_transport_executes_them():
@@ -192,7 +192,7 @@ def test_heterogeneous_rows_are_planned_but_only_verified_transport_executes_the
     qwen.require_executable()
 
     gemma = sparse_prefill_plan(GEMMA4_DENSE_TARGET, state)
-    with pytest.raises(TargetPositionError, match="non-contiguous"):
+    with pytest.raises(TargetPositionError, match="heterogeneous-row"):
         gemma.require_executable()
 
     # Even normal Gemma decode cannot join rows whose logical cursors differ

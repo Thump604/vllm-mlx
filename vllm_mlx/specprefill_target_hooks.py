@@ -259,6 +259,17 @@ def _install_rope_dispatch(
                     )
                 offset = kwargs.get("offset", args[1] if len(args) > 1 else 0)
                 _validate_scalar_offset(offset, session)
+                if session.batch_size == 1 and session.logical_positions[0] == tuple(
+                    range(
+                        session.physical_starts[0],
+                        session.physical_starts[0] + session.token_count,
+                    )
+                ):
+                    # Keep-ratio-one and any other dense-equivalent quantum
+                    # must use the model's native fused RoPE implementation.
+                    # Besides avoiding redundant position tensors/elementwise
+                    # work, this preserves BF16 rounding through deep stacks.
+                    return original_call(self, *args, **kwargs)
                 return _apply_request_positions(
                     x,
                     session.positions_for_forward(x.shape[2]),

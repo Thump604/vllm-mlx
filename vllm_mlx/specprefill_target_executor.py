@@ -25,13 +25,37 @@ from typing import Any, Callable, Iterable, Sequence
 import mlx.core as mx
 
 from .specprefill_cache import SparseCacheState, SparseCacheStateError
+from .specprefill_gemma_cache import (
+    GEMMA4_26B_A4B,
+    GEMMA4_31B,
+    GEMMA4_E2B,
+    GemmaArtifactSpec,
+    GemmaCacheBackend,
+    GemmaCacheCheckpoint,
+    GemmaCacheTopology,
+    GemmaOneTokenTransaction,
+    normalize_scalar_rotating,
+    gemma_cache_backend,
+    validate_aligned_scalar_cache,
+    validate_gemma_cache_topology,
+)
 from .specprefill_positions import (
     PositionPhase,
     PositionRow,
     TargetPositionAdapter,
+    TargetPositionFamily,
     TargetPositionPlan,
 )
 from .specprefill_target_hooks import TargetPositionHooks
+
+from mlx_lm.models.cache import RotatingKVCache as LmGemmaRotatingKVCache
+from mlx_lm.models.gemma4_text import Model as LmGemmaTextModel
+from mlx_vlm.models.base import LanguageModelOutput
+from mlx_vlm.models.cache import RotatingKVCache as VlmGemmaRotatingKVCache
+from mlx_vlm.models.gemma4.language import LanguageModel as VlmGemmaLanguageModel
+from mlx_vlm.models.gemma4_text.language import (
+    LanguageModel as VlmGemmaTextLanguageModel,
+)
 
 
 class SparseTargetPrefillError(SparseCacheStateError):
@@ -83,6 +107,20 @@ class _CacheSnapshot:
     states: tuple[Any, ...]
     meta_states: tuple[Any | None, ...]
     offsets: tuple[int | None, ...]
+
+
+@dataclass(frozen=True)
+class _GemmaScalarExecution:
+    spec: GemmaArtifactSpec
+    topology: GemmaCacheTopology
+    backend: GemmaCacheBackend
+
+
+@dataclass(frozen=True)
+class _GemmaChunkCursor:
+    offset: int
+    circular_index: int | None
+    allocated_tokens: int
 
 
 _TARGET_LANE_LOCK = threading.RLock()
@@ -153,7 +191,17 @@ class SparseTargetPrefillSession:
         self._cancel_check = cancel_check
         self._physical_entries = _physical_cache_entries(cache)
         _require_fresh_physical_cache(self._physical_entries, sparse_state.row_count)
-        self._snapshot = _snapshot_cache(cache)
+        self._gemma = _resolve_gemma_scalar_execution(
+            model, cache, adapter, sparse_state.row_count
+        )
+        if self._gemma is not None and step_size == 1 and self._token_rows.shape[1] > 1:
+            raise SparseTargetPrefillError(
+                "Gemma sparse prefill requires chunk_size > 1 except its final tail"
+            )
+        self._gemma_checkpoint = (
+            GemmaCacheCheckpoint(cache) if self._gemma is not None else None
+        )
+        self._snapshot = None if self._gemma is not None else _snapshot_cache(cache)
         self._hooks = TargetPositionHooks.for_model(model, adapter)
         self._lane = _target_lane_for(model)
         self._processed = 0
@@ -225,12 +273,19 @@ class SparseTargetPrefillSession:
                 physical_start,
             )
             forward_started_at = time.perf_counter()
-            with self._hooks.session_for_plan(plan):
-                self._logits = self.model(
-                    self._token_rows[:, self._processed : self._processed + chunk_size],
-                    cache=self.cache,
+            if self._gemma is None:
+                with self._hooks.session_for_plan(plan):
+                    self._logits = self.model(
+                        self._token_rows[
+                            :, self._processed : self._processed + chunk_size
+                        ],
+                        cache=self.cache,
+                    )
+                    _eval_forward(self._logits, self.cache)
+            else:
+                self._logits = self._run_gemma_chunk(
+                    plan, chunk_size, physical_start[0]
                 )
-                _eval_forward(self._logits, self.cache)
             self._target_prefill_seconds += time.perf_counter() - forward_started_at
             self._processed += chunk_size
             actual_end = _physical_cache_lengths(
@@ -242,6 +297,8 @@ class SparseTargetPrefillSession:
                     "target cache did not advance by the bounded sparse target chunk"
                 )
             if self._processed == self._total:
+                if self._gemma is not None:
+                    self._finalize_gemma_sparse_boundary()
                 self._publish_result()
             return self._progress()
         except BaseException:
@@ -260,7 +317,10 @@ class SparseTargetPrefillSession:
         """Restore the entry cache snapshot and discard this request's state."""
         if self.closed or self.complete:
             return
-        _restore_cache(self.cache, self._snapshot)
+        if self._gemma_checkpoint is not None:
+            self._gemma_checkpoint.restore()
+        elif self._snapshot is not None:
+            _restore_cache(self.cache, self._snapshot)
         self._logits = None
         self._phase = SparseTargetPrefillPhase.CLOSED
 
@@ -285,7 +345,62 @@ class SparseTargetPrefillSession:
                 physical_cache_starts=tuple(self._starts),
             ),
         )
+        if self._gemma_checkpoint is not None:
+            self._gemma_checkpoint.seal()
         self._phase = SparseTargetPrefillPhase.COMPLETE
+
+    def _run_gemma_chunk(
+        self, plan: TargetPositionPlan, chunk_size: int, physical_start: int
+    ) -> mx.array:
+        """Execute one compact scalar Gemma cache quantum atomically."""
+
+        transaction: GemmaOneTokenTransaction | GemmaCacheCheckpoint
+        transaction = (
+            GemmaOneTokenTransaction(
+                self.cache, logical_positions=(physical_start,)
+            )
+            if chunk_size == 1 and _gemma_one_token_guardable(self.cache)
+            else GemmaCacheCheckpoint(self.cache)
+        )
+        before = _gemma_chunk_cursors(self.cache)
+        try:
+            with self._hooks.session_for_plan(plan):
+                output = self.model(
+                    self._token_rows[
+                        :, self._processed : self._processed + chunk_size
+                    ],
+                    cache=self.cache,
+                )
+                logits = _normalize_gemma_logits(output, self._gemma.backend)
+                _eval_forward(logits, self.cache)
+            if isinstance(transaction, GemmaOneTokenTransaction):
+                transaction.commit(logical_positions=(physical_start + 1,))
+            else:
+                _validate_gemma_chunk_transition(
+                    self.cache,
+                    before,
+                    chunk_size,
+                    physical_start + chunk_size,
+                )
+                _eval_forward(logits, self.cache)
+                transaction.seal()
+            return logits
+        except BaseException:
+            transaction.rollback() if isinstance(
+                transaction, GemmaOneTokenTransaction
+            ) else transaction.restore()
+            raise
+
+    def _finalize_gemma_sparse_boundary(self) -> None:
+        """Normalize rotating owners once, after all sparse chunks commit."""
+
+        for entry in self.cache:
+            if type(entry) in (
+                LmGemmaRotatingKVCache,
+                VlmGemmaRotatingKVCache,
+            ):
+                normalize_scalar_rotating(entry)
+        validate_aligned_scalar_cache(self.cache, logical_position=self._total)
 
     def _progress(self) -> SparseTargetPrefillProgress:
         return SparseTargetPrefillProgress(
@@ -326,6 +441,206 @@ def execute_sparse_target_prefill(
         step_size=step_size,
         cancel_check=cancel_check,
     ).run_to_completion()
+
+
+def _config_value(config: Any, name: str) -> Any:
+    if config is None:
+        return None
+    return config.get(name) if isinstance(config, dict) else getattr(config, name, None)
+
+
+def _gemma_one_token_guardable(cache: Sequence[Any]) -> bool:
+    """Use the overwrite journal only from a normalized rotating boundary."""
+
+    return all(
+        type(entry)
+        not in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
+        or entry.keys is None
+        or entry.keys.shape[2] <= entry.max_size
+        for entry in cache
+    )
+
+
+def _gemma_chunk_cursors(cache: Sequence[Any]) -> tuple[_GemmaChunkCursor, ...]:
+    return tuple(
+        _GemmaChunkCursor(
+            offset=entry.offset,
+            circular_index=(
+                entry._idx
+                if type(entry)
+                in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
+                else None
+            ),
+            allocated_tokens=(entry.keys.shape[2] if entry.keys is not None else 0),
+        )
+        for entry in cache
+    )
+
+
+def _validate_gemma_chunk_transition(
+    cache: Sequence[Any],
+    before: Sequence[_GemmaChunkCursor],
+    chunk_size: int,
+    logical_position: int,
+) -> None:
+    for entry, old in zip(cache, before, strict=True):
+        if entry.offset != old.offset + chunk_size:
+            raise SparseTargetPrefillError(
+                "Gemma cache owners did not advance by the target chunk"
+            )
+        if type(entry) not in (
+            LmGemmaRotatingKVCache,
+            VlmGemmaRotatingKVCache,
+        ):
+            continue
+        allocated = entry.keys.shape[2] if entry.keys is not None else 0
+        if chunk_size > 1:
+            if entry._idx != allocated or allocated > entry.max_size + chunk_size - 1:
+                raise SparseTargetPrefillError(
+                    "Gemma rotating cache concat cursor is inconsistent"
+                )
+            if allocated < min(entry.offset, entry.max_size):
+                raise SparseTargetPrefillError(
+                    "Gemma rotating cache lost resident target tokens"
+                )
+        else:
+            expected_index = (
+                1
+                if old.circular_index is not None
+                and old.circular_index >= entry.max_size
+                else (old.circular_index or 0) + 1
+            )
+            if entry._idx != expected_index or allocated > entry.max_size:
+                raise SparseTargetPrefillError(
+                    "Gemma rotating cache one-token cursor is inconsistent"
+                )
+    validate_aligned_scalar_cache(cache, logical_position=logical_position)
+
+
+def _gemma_config(model: Any) -> Any:
+    candidates = (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "model", None),
+        getattr(getattr(model, "language_model", None), "model", None),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        config = getattr(candidate, "config", None) or getattr(candidate, "args", None)
+        text_config = _config_value(config, "text_config")
+        if text_config is not None:
+            config = text_config
+        if _config_value(config, "layer_types") is not None:
+            return config
+    raise SparseTargetPrefillError("Gemma target does not expose a known text config")
+
+
+def _gemma_model_backend(model: Any) -> GemmaCacheBackend:
+    if type(model) is LmGemmaTextModel:
+        return GemmaCacheBackend.MLX_LM
+    if type(model) in (VlmGemmaLanguageModel, VlmGemmaTextLanguageModel):
+        return GemmaCacheBackend.MLX_VLM
+    raise SparseTargetPrefillError(
+        "Gemma sparse target requires an exact mlx-lm or mlx-vlm text model"
+    )
+
+
+def _normalize_gemma_logits(output: Any, backend: GemmaCacheBackend) -> mx.array:
+    if backend is GemmaCacheBackend.MLX_LM:
+        if not isinstance(output, mx.array):
+            raise SparseTargetPrefillError("mlx-lm Gemma must return raw logits")
+        return output
+    if type(output) is not LanguageModelOutput or not isinstance(
+        output.logits, mx.array
+    ):
+        raise SparseTargetPrefillError(
+            "mlx-vlm Gemma must return LanguageModelOutput logits"
+        )
+    return output.logits
+
+
+def _gemma_previous_kvs(model: Any) -> tuple[int, ...]:
+    candidates = (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(getattr(model, "language_model", None), "model", None),
+    )
+    for candidate in candidates:
+        previous = getattr(candidate, "previous_kvs", None)
+        if previous is not None:
+            return tuple(previous)
+    raise SparseTargetPrefillError(
+        "Gemma target does not expose the known compact cache-owner mapping"
+    )
+
+
+def _resolve_gemma_scalar_execution(
+    model: Any,
+    cache: Sequence[Any],
+    adapter: TargetPositionAdapter,
+    row_count: int,
+) -> _GemmaScalarExecution | None:
+    if adapter.family not in (
+        TargetPositionFamily.GEMMA4_DENSE,
+        TargetPositionFamily.GEMMA4_A4B,
+    ):
+        return None
+    if row_count != 1:
+        raise SparseTargetPrefillError(
+            "Gemma sparse target execution is scalar-only; CB remains disabled"
+        )
+    backend = _gemma_model_backend(model)
+    config = _gemma_config(model)
+    layer_types = tuple(_config_value(config, "layer_types") or ())
+    layer_count = _config_value(config, "num_hidden_layers")
+    shared_count = _config_value(config, "num_kv_shared_layers")
+    window = _config_value(config, "sliding_window")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (layer_count, shared_count, window)
+    ):
+        raise SparseTargetPrefillError("Gemma target config is incomplete")
+    owner_count = layer_count - shared_count
+    matches = tuple(
+        spec
+        for spec in (GEMMA4_E2B, GEMMA4_31B, GEMMA4_26B_A4B)
+        if (
+            spec.layer_types == layer_types
+            and spec.layer_count == layer_count
+            and spec.owner_count == owner_count
+            and spec.sliding_window == window
+        )
+    )
+    if len(matches) != 1:
+        raise SparseTargetPrefillError(
+            "Gemma target config is not one of the bounded E2B/31B/A4B layouts"
+        )
+    spec = matches[0]
+    if (spec is GEMMA4_26B_A4B) != (
+        adapter.family is TargetPositionFamily.GEMMA4_A4B
+    ):
+        raise SparseTargetPrefillError(
+            "Gemma target position adapter disagrees with cache architecture"
+        )
+    previous_kvs = _gemma_previous_kvs(model)
+    try:
+        topology = validate_gemma_cache_topology(
+            spec,
+            layer_types=layer_types,
+            previous_kvs=previous_kvs,
+            cache=cache,
+            backend=backend,
+        )
+        validate_aligned_scalar_cache(cache, logical_position=0)
+    except Exception as exc:
+        raise SparseTargetPrefillError(
+            "Gemma target cache topology is not safe for sparse execution"
+        ) from exc
+    if gemma_cache_backend(cache) is not backend:  # defensive typed pairing
+        raise SparseTargetPrefillError("Gemma model/cache backend pairing changed")
+    return _GemmaScalarExecution(spec, topology, backend)
 
 
 def _chunk_plan(

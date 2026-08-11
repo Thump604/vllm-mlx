@@ -10,15 +10,59 @@ rotating cache's physical cursors.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Sequence
 
 import mlx.core as mx
-from mlx_vlm.models.cache import (
-    BatchKVCache,
-    BatchRotatingKVCache,
-    KVCache,
-    RotatingKVCache,
-)
+from mlx_lm.models.cache import BatchKVCache as LmBatchKVCache
+from mlx_lm.models.cache import BatchRotatingKVCache as LmBatchRotatingKVCache
+from mlx_lm.models.cache import KVCache as LmKVCache
+from mlx_lm.models.cache import RotatingKVCache as LmRotatingKVCache
+from mlx_vlm.models.cache import BatchKVCache as VlmBatchKVCache
+from mlx_vlm.models.cache import BatchRotatingKVCache as VlmBatchRotatingKVCache
+from mlx_vlm.models.cache import KVCache as VlmKVCache
+from mlx_vlm.models.cache import RotatingKVCache as VlmRotatingKVCache
+
+
+class GemmaCacheBackend(str, Enum):
+    MLX_LM = "mlx_lm"
+    MLX_VLM = "mlx_vlm"
+
+
+_BACKEND_TYPES = {
+    GemmaCacheBackend.MLX_LM: (
+        LmKVCache,
+        LmRotatingKVCache,
+        LmBatchKVCache,
+        LmBatchRotatingKVCache,
+    ),
+    GemmaCacheBackend.MLX_VLM: (
+        VlmKVCache,
+        VlmRotatingKVCache,
+        VlmBatchKVCache,
+        VlmBatchRotatingKVCache,
+    ),
+}
+_SCALAR_FULL = (LmKVCache, VlmKVCache)
+_SCALAR_ROTATING = (LmRotatingKVCache, VlmRotatingKVCache)
+_BATCH_FULL = (LmBatchKVCache, VlmBatchKVCache)
+_BATCH_ROTATING = (LmBatchRotatingKVCache, VlmBatchRotatingKVCache)
+_FULL = (*_SCALAR_FULL, *_BATCH_FULL)
+_ROTATING = (*_SCALAR_ROTATING, *_BATCH_ROTATING)
+_BATCH = (*_BATCH_FULL, *_BATCH_ROTATING)
+
+
+def gemma_cache_backend(cache: Sequence[Any]) -> GemmaCacheBackend:
+    if not cache:
+        raise GemmaCacheError("Gemma cache cannot be empty")
+    matches = tuple(
+        backend
+        for backend, types in _BACKEND_TYPES.items()
+        if all(type(entry) in types for entry in cache)
+    )
+    if len(matches) != 1:
+        raise GemmaCacheError("Gemma cache entries cross or lack a known backend")
+    return matches[0]
 
 
 class GemmaCacheError(RuntimeError):
@@ -106,11 +150,11 @@ class GemmaCacheTopology:
 
 
 def _is_full_cache(cache: Any) -> bool:
-    return type(cache) in (KVCache, BatchKVCache)
+    return type(cache) in _FULL
 
 
 def _is_rotating_cache(cache: Any) -> bool:
-    return type(cache) in (RotatingKVCache, BatchRotatingKVCache)
+    return type(cache) in _ROTATING
 
 
 def validate_gemma_cache_topology(
@@ -119,6 +163,7 @@ def validate_gemma_cache_topology(
     layer_types: Sequence[str],
     previous_kvs: Sequence[int],
     cache: Sequence[Any],
+    backend: GemmaCacheBackend | None = None,
 ) -> GemmaCacheTopology:
     """Validate a cache against one of the bounded, observed Gemma layouts."""
 
@@ -134,6 +179,14 @@ def validate_gemma_cache_topology(
         )
     if len({id(entry) for entry in cache}) != len(cache):
         raise GemmaCacheTopologyError("cache owner entries must not alias")
+    resolved_backend = gemma_cache_backend(cache)
+    if backend is not None and resolved_backend is not backend:
+        raise GemmaCacheTopologyError(
+            f"cache backend {resolved_backend.value} does not match {backend.value} model"
+        )
+    full_type, rotating_type, batch_full_type, batch_rotating_type = _BACKEND_TYPES[
+        resolved_backend
+    ]
 
     owner_layers = tuple(dict.fromkeys(spec.previous_kvs))
     if owner_layers != tuple(range(spec.owner_count)):
@@ -146,7 +199,7 @@ def validate_gemma_cache_topology(
 
     batch_kind: bool | None = None
     for owner, entry in enumerate(cache):
-        is_batch = type(entry) in (BatchKVCache, BatchRotatingKVCache)
+        is_batch = type(entry) in (batch_full_type, batch_rotating_type)
         if batch_kind is None:
             batch_kind = is_batch
         elif is_batch != batch_kind:
@@ -163,7 +216,7 @@ def validate_gemma_cache_topology(
                 raise GemmaCacheTopologyError(
                     f"owner {owner} window {entry.max_size} != {spec.sliding_window}"
                 )
-            if type(entry) is RotatingKVCache and entry.keep != 0:
+            if type(entry) is rotating_type and entry.keep != 0:
                 raise GemmaCacheTopologyError("Gemma rotating caches require keep=0")
     return GemmaCacheTopology(
         artifact_id=spec.artifact_id,
@@ -194,9 +247,9 @@ class BatchCacheCursor:
 def scalar_cache_cursor(cache: Any, *, logical_position: int) -> ScalarCacheCursor:
     if logical_position < 0:
         raise GemmaCacheError("logical position must be non-negative")
-    if type(cache) is KVCache:
+    if type(cache) in _SCALAR_FULL:
         return ScalarCacheCursor(cache.offset, cache.offset, cache.offset, logical_position)
-    if type(cache) is RotatingKVCache:
+    if type(cache) in _SCALAR_ROTATING:
         _validate_scalar_rotating(cache, allow_oversized=True)
         return ScalarCacheCursor(
             cache.offset, min(cache.offset, cache.max_size), cache._idx, logical_position
@@ -215,11 +268,11 @@ def batch_cache_cursor(
     logical = tuple(int(position) for position in logical_positions)
     if not logical or min(logical) < 0:
         raise GemmaCacheError("logical positions must be non-empty and non-negative")
-    if type(cache) is BatchKVCache:
+    if type(cache) in _BATCH_FULL:
         total = _host_ints(cache.offset)
         physical, resident, index = cache._idx, cache._idx, cache._idx
         rotated = False
-    elif type(cache) is BatchRotatingKVCache:
+    elif type(cache) in _BATCH_ROTATING:
         _validate_batch_rotating(cache)
         total = _host_ints(cache.offset)
         physical = cache._offset
@@ -253,7 +306,7 @@ def validate_homogeneous_batch_lane(
             physical = cursor.physical_write_cursor
         elif cursor.physical_write_cursor != physical:
             raise GemmaCacheError("Gemma cache owners disagree on write cursor")
-        if type(entry) is BatchRotatingKVCache:
+        if type(entry) in _BATCH_ROTATING:
             state = (
                 cursor.resident_tokens,
                 cursor.circular_index,
@@ -278,7 +331,7 @@ def validate_aligned_scalar_cache(
     rotating = tuple(
         (cursor.resident_tokens, cursor.circular_index)
         for entry, cursor in zip(cache, cursors)
-        if type(entry) is RotatingKVCache
+        if type(entry) in _SCALAR_ROTATING
     )
     if rotating and len(set(rotating)) != 1:
         raise GemmaCacheError("Gemma rotating owners disagree on resident state")
@@ -294,13 +347,13 @@ class _Snapshot:
         cache_type = type(cache)
         common = ("keys", "values", "offset")
         extras: tuple[str, ...]
-        if cache_type is KVCache:
+        if cache_type in _SCALAR_FULL:
             extras = ()
-        elif cache_type is RotatingKVCache:
+        elif cache_type in _SCALAR_ROTATING:
             extras = ("keep", "max_size", "_idx")
-        elif cache_type is BatchKVCache:
+        elif cache_type in _BATCH_FULL:
             extras = ("left_padding", "_idx", "_right_padding")
-        elif cache_type is BatchRotatingKVCache:
+        elif cache_type in _BATCH_ROTATING:
             extras = (
                 "left_padding",
                 "max_size",
@@ -385,7 +438,7 @@ class GemmaCachePairCheckpoint:
 
 
 def _validate_scalar_rotating(
-    cache: RotatingKVCache, *, allow_oversized: bool = False
+    cache: Any, *, allow_oversized: bool = False
 ) -> None:
     if cache.offset < 0 or cache._idx < 0 or cache.max_size <= 0 or cache.keep != 0:
         raise GemmaCacheError("invalid scalar rotating-cache metadata")
@@ -408,10 +461,10 @@ def _validate_scalar_rotating(
         raise GemmaCacheError("unsaturated rotating cache cursors disagree")
 
 
-def normalize_scalar_rotating(cache: RotatingKVCache) -> None:
+def normalize_scalar_rotating(cache: Any) -> None:
     """Normalize resident storage without changing the lifetime write cursor."""
 
-    if type(cache) is not RotatingKVCache:
+    if type(cache) not in _SCALAR_ROTATING:
         raise GemmaCacheError("normalization requires RotatingKVCache")
     _validate_scalar_rotating(cache, allow_oversized=True)
     if cache.keys is None:
@@ -440,7 +493,7 @@ def normalize_scalar_rotating(cache: RotatingKVCache) -> None:
 
 
 def _validate_batch_rotating(
-    cache: BatchRotatingKVCache, *, allow_oversized: bool = False
+    cache: Any, *, allow_oversized: bool = False
 ) -> None:
     if cache.max_size <= 0 or cache._offset < 0 or cache._idx < 0:
         raise GemmaCacheError("invalid batch rotating-cache metadata")
@@ -474,10 +527,10 @@ def _validate_batch_rotating(
         raise GemmaCacheError("invalid wrapped batch rotating state")
 
 
-def normalize_batch_rotating(cache: BatchRotatingKVCache) -> None:
+def normalize_batch_rotating(cache: Any) -> None:
     """Normalize a finalized batch cache while preserving lifetime cursors."""
 
-    if type(cache) is not BatchRotatingKVCache:
+    if type(cache) not in _BATCH_ROTATING:
         raise GemmaCacheError("normalization requires BatchRotatingKVCache")
     if cache._lengths is not None:
         raise GemmaCacheError("right-padded batch cache must be finalized first")
@@ -520,9 +573,9 @@ class GemmaOneTokenTransaction:
         self._state = "active"
         self.logical_before = tuple(int(value) for value in logical_positions)
         for entry in cache:
-            if type(entry) is RotatingKVCache:
+            if type(entry) in _SCALAR_ROTATING:
                 _validate_scalar_rotating(entry)
-            elif type(entry) is BatchRotatingKVCache:
+            elif type(entry) in _BATCH_ROTATING:
                 _validate_batch_rotating(entry)
         self.checkpoint = GemmaCacheCheckpoint(cache)
         self._write_journal = tuple(self._capture_overwrite(entry) for entry in cache)
@@ -534,7 +587,7 @@ class GemmaOneTokenTransaction:
                 for tensor in journal[1:]
             )
         )
-        self._batch = type(cache[0]) in (BatchKVCache, BatchRotatingKVCache)
+        self._batch = type(cache[0]) in _BATCH
         if self._batch:
             validate_homogeneous_batch_lane(cache, logical_positions=self.logical_before)
             self.before = tuple(
@@ -594,13 +647,13 @@ class GemmaOneTokenTransaction:
 
         if cache.keys is None:
             return None
-        if type(cache) is KVCache:
+        if type(cache) in _SCALAR_FULL:
             index = cache.offset
-        elif type(cache) is BatchKVCache:
+        elif type(cache) in _BATCH_FULL:
             index = cache._idx
-        elif type(cache) is RotatingKVCache:
+        elif type(cache) in _SCALAR_ROTATING:
             index = 0 if cache._idx == cache.max_size else cache._idx
-        elif type(cache) is BatchRotatingKVCache:
+        elif type(cache) in _BATCH_ROTATING:
             index = 0 if cache._idx == cache.max_size else cache._idx
         else:  # pragma: no cover - constructor rejects other cache types
             raise GemmaCacheError(f"unsupported cache: {type(cache).__name__}")
@@ -653,7 +706,7 @@ class GemmaOneTokenTransaction:
             # only this metadata bit; no window normalization/copy is needed.
             for entry in self.cache:
                 if (
-                    type(entry) is BatchRotatingKVCache
+                    type(entry) in _BATCH_ROTATING
                     and entry._idx == entry.max_size
                     and entry.rotated
                 ):
@@ -677,7 +730,7 @@ class GemmaOneTokenTransaction:
                         )
                     expected_index = old.circular_index + 1
                     if (
-                        type(entry) is BatchRotatingKVCache
+                        type(entry) in _BATCH_ROTATING
                         and old.circular_index == entry.max_size
                     ):
                         expected_index = 1
@@ -686,7 +739,7 @@ class GemmaOneTokenTransaction:
                             "batch circular index transition is invalid"
                         )
                     expected_rotated = (
-                        type(entry) is BatchRotatingKVCache
+                        type(entry) in _BATCH_ROTATING
                         and new.physical_write_cursor >= entry.max_size
                         and new.circular_index < entry.max_size
                     )
@@ -696,7 +749,7 @@ class GemmaOneTokenTransaction:
                         )
                     expected_resident = (
                         min(old.physical_write_cursor + 1, entry.max_size)
-                        if type(entry) is BatchRotatingKVCache
+                        if type(entry) in _BATCH_ROTATING
                         else old.resident_tokens + 1
                     )
                     if new.resident_tokens != expected_resident:
@@ -718,7 +771,7 @@ class GemmaOneTokenTransaction:
                         )
                     expected_index = old.circular_index + 1
                     if (
-                        type(entry) is RotatingKVCache
+                        type(entry) in _SCALAR_ROTATING
                         and old.circular_index == entry.max_size
                     ):
                         expected_index = 1
@@ -728,7 +781,7 @@ class GemmaOneTokenTransaction:
                         )
                     expected_resident = (
                         min(old.total_writes + 1, entry.max_size)
-                        if type(entry) is RotatingKVCache
+                        if type(entry) in _SCALAR_ROTATING
                         else old.resident_tokens + 1
                     )
                     if new.resident_tokens != expected_resident:
@@ -756,7 +809,7 @@ def atomic_batch_filter(
     checkpoint = GemmaCacheCheckpoint(cache)
     try:
         for entry in cache:
-            if type(entry) not in (BatchKVCache, BatchRotatingKVCache):
+            if type(entry) not in _BATCH:
                 raise GemmaCacheError("filter requires batch cache entries")
             entry.filter(indices)
         selected = tuple(logical_positions[int(index)] for index in indices)
@@ -781,10 +834,7 @@ def atomic_batch_extend(destination: Sequence[Any], source: Sequence[Any]) -> No
     checkpoint = GemmaCachePairCheckpoint(destination, source)
     try:
         for target, addition in zip(destination, source):
-            if type(target) is not type(addition) or type(target) not in (
-                BatchKVCache,
-                BatchRotatingKVCache,
-            ):
+            if type(target) is not type(addition) or type(target) not in _BATCH:
                 raise GemmaCacheError("extend cache types differ")
             if _is_rotating_cache(target) and target.max_size != addition.max_size:
                 raise GemmaCacheError("extend rotating windows differ")
@@ -830,6 +880,7 @@ __all__ = [
     "GEMMA4_ARTIFACTS",
     "GEMMA4_E2B",
     "GemmaArtifactSpec",
+    "GemmaCacheBackend",
     "GemmaCacheCheckpoint",
     "GemmaCacheError",
     "GemmaCachePairCheckpoint",
@@ -841,6 +892,7 @@ __all__ = [
     "atomic_batch_extend",
     "atomic_batch_filter",
     "batch_cache_cursor",
+    "gemma_cache_backend",
     "normalize_scalar_rotating",
     "normalize_batch_rotating",
     "run_atomic_one_token",

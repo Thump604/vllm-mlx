@@ -15,10 +15,9 @@ capability matrix is intentional:
 * normal Qwen attention and Qwen3.5/3.6 text/hybrid targets currently accept
   cache-derived scalar offsets only, so sparse position transport is blocked;
 * Qwen3.5/3.6 VLM attention accepts explicit M-RoPE IDs shaped ``(3, B, L)``;
-* Gemma4 forwards an explicit scalar offset through shared-KV layers, but its
-  KV-owning attention replaces that value with the physical cache offset.  No
-  current public call accepts a non-contiguous position sequence, so sparse
-  prefill and sparse decode are both blocked pending a future sparse hook.
+* Gemma4's native call still derives owner positions from physical cache
+  offsets, but the install-once request-local RoPE hook provides the separately
+  tested scalar sparse transport without changing cache metadata.
 
 This prevents the former model-global ``.rope`` replacement from being used as
 an implicit execution mechanism.  A later family-local hook can advertise a
@@ -153,7 +152,7 @@ GEMMA4_DENSE_TARGET = TargetPositionAdapter(
     family=TargetPositionFamily.GEMMA4_DENSE,
     model_types=("gemma4", "gemma4_text"),
     transport=PositionTransport.GEMMA4_EXPLICIT_OFFSET,
-    supports_noncontiguous_prefill=False,
+    supports_noncontiguous_prefill=True,
     supports_heterogeneous_batch_rows=False,
     supports_shared_kv=True,
     supports_partial_rope=True,
@@ -165,7 +164,7 @@ GEMMA4_A4B_TARGET = TargetPositionAdapter(
     family=TargetPositionFamily.GEMMA4_A4B,
     model_types=("gemma4",),
     transport=PositionTransport.GEMMA4_EXPLICIT_OFFSET,
-    supports_noncontiguous_prefill=False,
+    supports_noncontiguous_prefill=True,
     supports_heterogeneous_batch_rows=False,
     supports_shared_kv=True,
     supports_partial_rope=True,
@@ -369,10 +368,7 @@ class TargetPositionPlan:
                 "a batched target invocation requires equal token counts; "
                 "scheduler must use padded, adapter-verified transport or separate lanes"
             )
-        if self.adapter.transport in (
-            PositionTransport.CACHE_DERIVED_OFFSET,
-            PositionTransport.GEMMA4_EXPLICIT_OFFSET,
-        ):
+        if self.adapter.transport is PositionTransport.CACHE_DERIVED_OFFSET:
             for row in self.rows:
                 expected = tuple(
                     range(
@@ -403,11 +399,9 @@ class TargetPositionPlan:
     def gemma4_offsets(self) -> tuple[int, ...]:
         """Return scalar starting offsets for Gemma's explicit-offset call path.
 
-        This helper is valid for normal dense-contiguous decode only.  Gemma's
-        owner attention overwrites its ``offset`` from the physical cache;
-        shared-KV layers merely carry that owner value.  It therefore never
-        claims that the current Gemma API can execute sparse decode, sparse
-        prefill, or batch different row offsets.
+        The request-local hook consumes these logical positions while native
+        cache/mask code retains the independent physical cursor. Heterogeneous
+        batch rows remain unsupported by the scalar Gemma adapter.
         """
         if self.adapter.transport is not PositionTransport.GEMMA4_EXPLICIT_OFFSET:
             raise TargetPositionError("target does not accept Gemma4 explicit offsets")

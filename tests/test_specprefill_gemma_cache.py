@@ -17,6 +17,7 @@ from vllm_mlx.specprefill_gemma_cache import (
     GEMMA4_E2B,
     GemmaArtifactSpec,
     GemmaCacheCheckpoint,
+    GemmaCacheBackend,
     GemmaCacheError,
     GemmaCacheTopologyError,
     GemmaCacheTransactionError,
@@ -127,16 +128,28 @@ def _append(cache, values, *, rows=1):
     return result
 
 
-def _artifact_cache(spec, *, batch=False):
+def _artifact_cache(spec, *, batch=False, backend=GemmaCacheBackend.MLX_VLM):
     entries = []
     for layer_type in spec.layer_types[: spec.owner_count]:
         if layer_type == "full_attention":
-            entries.append(BatchKVCache([0]) if batch else KVCache())
+            entries.append(
+                BatchKVCache([0])
+                if batch
+                else (
+                    MlxLmKVCache()
+                    if backend is GemmaCacheBackend.MLX_LM
+                    else KVCache()
+                )
+            )
         else:
             entries.append(
                 BatchRotatingKVCache(spec.sliding_window, [0])
                 if batch
-                else RotatingKVCache(spec.sliding_window, keep=0)
+                else (
+                    MlxLmRotatingKVCache(spec.sliding_window, keep=0)
+                    if backend is GemmaCacheBackend.MLX_LM
+                    else RotatingKVCache(spec.sliding_window, keep=0)
+                )
             )
     return entries
 
@@ -158,18 +171,33 @@ def test_certified_artifact_topologies_are_exact(config):
     assert len(config["config_sha256"]) == 64
 
 
-def test_mlx_lm_cache_classes_are_rejected_even_when_shape_compatible():
-    cache = _artifact_cache(GEMMA4_E2B)
-    cache[0] = MlxLmRotatingKVCache(512, keep=0)
-    with pytest.raises(GemmaCacheTopologyError, match="rotating KV cache"):
+def test_explicit_backends_accept_exact_types_and_reject_crossed_pairs():
+    lm_cache = _artifact_cache(GEMMA4_E2B, backend=GemmaCacheBackend.MLX_LM)
+    validate_gemma_cache_topology(
+        GEMMA4_E2B,
+        layer_types=GEMMA4_E2B.layer_types,
+        previous_kvs=GEMMA4_E2B.previous_kvs,
+        cache=lm_cache,
+        backend=GemmaCacheBackend.MLX_LM,
+    )
+    with pytest.raises(GemmaCacheTopologyError, match="does not match"):
         validate_gemma_cache_topology(
             GEMMA4_E2B,
             layer_types=GEMMA4_E2B.layer_types,
             previous_kvs=GEMMA4_E2B.previous_kvs,
-            cache=cache,
+            cache=lm_cache,
+            backend=GemmaCacheBackend.MLX_VLM,
         )
-    with pytest.raises(GemmaCacheError, match="unsupported scalar"):
-        scalar_cache_cursor(MlxLmKVCache(), logical_position=0)
+    crossed = list(lm_cache)
+    crossed[0] = RotatingKVCache(512, keep=0)
+    with pytest.raises(GemmaCacheError, match="cross"):
+        validate_gemma_cache_topology(
+            GEMMA4_E2B,
+            layer_types=GEMMA4_E2B.layer_types,
+            previous_kvs=GEMMA4_E2B.previous_kvs,
+            cache=crossed,
+            backend=GemmaCacheBackend.MLX_LM,
+        )
 
 
 def test_e2b_followers_use_last_owner_of_matching_type():
