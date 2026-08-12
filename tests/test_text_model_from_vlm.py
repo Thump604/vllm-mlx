@@ -202,6 +202,12 @@ def test_qwen36_text_model_return_hidden_is_pre_norm_for_mtp():
     from mlx_vlm import load as vlm_load
 
     assert QWEN36_VLM_MTP_MODEL is not None
+    config = json.loads((QWEN36_VLM_MTP_MODEL / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    assert text_config.get("mtp_hidden_state_mode") == "pre_norm", (
+        "qualification artifact must explicitly declare "
+        "mtp_hidden_state_mode=pre_norm"
+    )
     vlm_model, _ = vlm_load(str(QWEN36_VLM_MTP_MODEL))
     text_model = build_text_model(vlm_model, QWEN36_VLM_MTP_MODEL)
     tokens = mx.array([[1, 2, 3]])

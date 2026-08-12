@@ -35,6 +35,29 @@ _QWEN_MTP_RMSNORM_WEIGHT_SUFFIXES = (
     "norm.weight",
 )
 
+_QWEN_MTP_HIDDEN_STATE_MODES = frozenset({"post_norm", "pre_norm"})
+
+
+def _resolve_qwen_mtp_hidden_state_mode(config: dict) -> str:
+    """Resolve the checkpoint's MTP hidden-state contract safely."""
+    text_config = config.get("text_config", config)
+    mode = text_config.get(
+        "mtp_hidden_state_mode",
+        config.get("mtp_hidden_state_mode", "post_norm"),
+    )
+    if not isinstance(mode, str) or mode not in _QWEN_MTP_HIDDEN_STATE_MODES:
+        logger.warning(
+            "[MTP inject] Unsupported mtp_hidden_state_mode=%r; using post_norm",
+            mode,
+        )
+        return "post_norm"
+    return mode
+
+
+def _select_qwen_mtp_hidden_state(mode: str, hidden_states, normed):
+    """Select the representation expected by the checkpoint's MTP head."""
+    return hidden_states if mode == "pre_norm" else normed
+
 
 def _is_qwen_mtp_rmsnorm_weight(key: str, weight) -> bool:
     """Return True for MTP RMSNorm weights that use Qwen's offset convention."""
@@ -145,6 +168,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
 
     # Navigate nested config: text_config for VLM wrappers
     text_config = config.get("text_config", config)
+    hidden_state_mode = _resolve_qwen_mtp_hidden_state_mode(config)
     num_mtp_layers = text_config.get("mtp_num_hidden_layers", 0)
     if num_mtp_layers == 0:
         # Fallback: check flat config for num_nextn_predict_layers
@@ -194,7 +218,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
 
     logger.info(
         f"[MTP inject] Creating MTP module ({num_mtp_layers} layers, "
-        f"{'MoE' if is_moe else 'Dense'})"
+        f"{'MoE' if is_moe else 'Dense'}, hidden_state={hidden_state_mode})"
     )
 
     # MTP decoder uses full attention (not GatedDeltaNet).
@@ -363,9 +387,11 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
                 out = self.lm_head(normed)
 
             if return_hidden:
-                # The MTP head applies pre_fc_norm_hidden itself. Returning the
-                # backbone's pre-norm state avoids normalizing it twice.
-                return out, hidden_states
+                return out, _select_qwen_mtp_hidden_state(
+                    hidden_state_mode,
+                    hidden_states,
+                    normed,
+                )
             return out
 
         def mtp_forward(
