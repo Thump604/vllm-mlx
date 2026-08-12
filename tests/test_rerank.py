@@ -146,13 +146,13 @@ class TestRerankAdapterContract:
             "input_ids": [[101, 2054, 102, 3793, 102]],
             "attention_mask": [[1, 1, 1, 1, 1]],
         }
-        result = adapter.tokenize_pair(mock_tokenizer, "query", "document")
+        result = adapter.tokenize_pair(mock_tokenizer, "query", "document", 8192)
         mock_tokenizer.assert_called_once_with(
             "query",
             "document",
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=8192,
             return_tensors="np",
         )
         assert "input_ids" in result
@@ -215,6 +215,61 @@ class TestRerankEngine:
         expected_1 = 1.0 / (1.0 + math.exp(1.0))
         assert abs(scores[0] - expected_0) < 1e-6
         assert abs(scores[1] - expected_1) < 1e-6
+
+    def test_score_pairs_resolves_max_length_from_config(self):
+        """Positive: a large-context model tokenizes with its own max_length."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model")
+
+        mock_model = MagicMock()
+        mock_model.config = {"max_position_embeddings": 8192}
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[1.0, 0.0]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3]]),
+            "attention_mask": np.array([[1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        engine.score_pairs("query", ["doc"])
+        assert mock_tokenizer.call_args.kwargs["max_length"] == 8192
+
+    def test_score_pairs_defaults_to_512_without_config(self):
+        """Negative: no usable config/tokenizer value falls back to 512."""
+        import numpy as np
+
+        from vllm_mlx.rerank import RerankEngine, SigmoidAdapter
+
+        engine = RerankEngine("test-model")
+
+        mock_model = MagicMock()  # .config is a MagicMock (non-int)
+        mock_logits = MagicMock()
+        mock_logits.tolist.return_value = [[1.0, 0.0]]
+        mock_model.return_value = MagicMock(logits=mock_logits)
+
+        mock_tokenizer = MagicMock()
+        # model_max_length as a non-int so the resolver rejects it too
+        mock_tokenizer.model_max_length = MagicMock()
+        mock_tokenizer.return_value = {
+            "input_ids": np.array([[1, 2, 3]]),
+            "attention_mask": np.array([[1, 1, 1]]),
+        }
+
+        engine._model = mock_model
+        engine._tokenizer = mock_tokenizer
+        engine._adapter = SigmoidAdapter()
+
+        engine.score_pairs("query", ["doc"])
+        assert mock_tokenizer.call_args.kwargs["max_length"] == 512
 
     def test_score_pairs_token_budget_batching(self):
         """Test that score_pairs splits work into batches by token budget."""
@@ -425,6 +480,59 @@ class TestClassifierForward:
                 config,
             )
 
+    def test_classifier_forward_supports_xlm_roberta_two_layer_head(self):
+        """XLM-RoBERTa rerankers use dense -> tanh -> out_proj classifier heads."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import classifier_forward
+
+        config = {
+            "model_type": "xlm-roberta",
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_labels": 1,
+            "vocab_size": 20,
+            "max_position_embeddings": 32,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-12,
+            "hidden_act": "gelu",
+            "pad_token_id": 1,
+        }
+        weights = _rename_bert_prefix(_make_bert_weights(config), "xlm-roberta")
+        del weights["classifier.weight"]
+        del weights["classifier.bias"]
+        weights["classifier.dense.weight"] = mx.random.normal((8, 8)) * 0.02
+        weights["classifier.dense.bias"] = mx.zeros((8,))
+        weights["classifier.out_proj.weight"] = mx.random.normal((1, 8)) * 0.02
+        weights["classifier.out_proj.bias"] = mx.zeros((1,))
+
+        logits = classifier_forward(
+            mx.array([[1, 2, 3]]),
+            mx.array([[1, 1, 1]]),
+            weights,
+            config,
+        )
+        mx.eval(logits)
+
+        assert logits.shape == (1, 1)
+
+    def test_roberta_position_ids_use_padding_offset(self):
+        """RoBERTa-family rerankers reserve pad position and offset real tokens."""
+        import mlx.core as mx
+
+        from vllm_mlx.rerank_forward import _position_ids_for_config
+
+        config = {"model_type": "xlm-roberta", "pad_token_id": 1}
+        input_ids = mx.array([[7, 8, 1, 1], [9, 10, 11, 1]])
+        attention_mask = mx.array([[1, 1, 0, 0], [1, 1, 1, 0]])
+
+        position_ids = _position_ids_for_config(config, input_ids, attention_mask)
+        mx.eval(position_ids)
+
+        assert position_ids.tolist() == [[2, 3, 1, 1], [2, 3, 4, 1]]
+
 
 def _make_bert_weights(config: dict) -> dict:
     """Build minimal random BERT-style weights for testing."""
@@ -479,6 +587,13 @@ def _make_bert_weights(config: dict) -> dict:
     w["classifier.bias"] = mx.zeros((num_labels,))
 
     return w
+
+
+def _rename_bert_prefix(weights: dict, new_prefix: str) -> dict:
+    renamed = {}
+    for key, value in weights.items():
+        renamed[key.replace("bert.", f"{new_prefix}.", 1)] = value
+    return renamed
 
 
 # =============================================================================

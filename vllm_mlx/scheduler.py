@@ -42,6 +42,28 @@ CACHE_CORRUPTION_PATTERNS = [
 ]
 
 
+def _normalize_logits_processors(logits_processors):
+    """Normalize empty per-sequence processor slots to lists."""
+    if logits_processors is None:
+        return None
+    return [processors or [] for processors in logits_processors]
+
+
+def _sanitize_batch_generator_logits_processors(batch_generator) -> None:
+    """Sanitize stale BatchGenerator processor state before decode."""
+    active_batch = getattr(batch_generator, "active_batch", None)
+    if active_batch is not None and hasattr(active_batch, "logits_processors"):
+        active_batch.logits_processors = _normalize_logits_processors(
+            active_batch.logits_processors
+        )
+
+    partial = getattr(batch_generator, "_partial", None)
+    if isinstance(partial, dict) and "logits_processors" in partial:
+        partial["logits_processors"] = _normalize_logits_processors(
+            partial["logits_processors"]
+        )
+
+
 class SchedulingPolicy(Enum):
     """Scheduling policy for request ordering."""
 
@@ -674,6 +696,64 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _configure_chunked_prefill(
+    scheduler: "Scheduler",
+    batch_gen: "BatchGenerator",
+    budget: int,
+    prompt_cache_save,
+) -> None:
+    """Enable the matching legacy or native mlx-lm chunked-prefill API."""
+    legacy_api = hasattr(batch_gen, "_process_prompts") and hasattr(
+        batch_gen, "active_batch"
+    )
+    if legacy_api:
+        save_interval = scheduler.config.mid_prefill_save_interval
+        mid_prefill_save = None
+        if save_interval > 0 and scheduler.memory_aware_cache is not None:
+            mid_prefill_save = scheduler._make_mid_prefill_save_callback(save_interval)
+            logger.info(
+                "[mid_prefill_cache] enabled, interval=%s",
+                save_interval,
+            )
+        _install_chunked_prefill(
+            batch_gen,
+            budget,
+            mid_prefill_save,
+            prompt_cache_save=prompt_cache_save,
+            pending_abort_ids=scheduler._pending_abort_ids,
+            uid_to_request_id=scheduler.uid_to_request_id,
+            requests=scheduler.requests,
+        )
+        return
+
+    native_api = all(
+        hasattr(batch_gen, attribute)
+        for attribute in (
+            "_prompt_batch",
+            "_generation_batch",
+            "_unprocessed_sequences",
+            "_next",
+        )
+    )
+    if native_api:
+        # Native mlx-lm chunking processes at most this many prompt tokens per
+        # scheduler turn and returns to generation between turns. Its internal
+        # API has no safe extension point for the legacy prompt-cache and
+        # mid-prefill callbacks, which were already unavailable on this layout.
+        batch_gen.prefill_step_size = budget
+        logger.info(
+            "Chunked prefill enabled through native mlx-lm BatchGenerator: "
+            "budget=%s tokens per step",
+            budget,
+        )
+        return
+
+    logger.warning(
+        "Chunked prefill disabled: mlx-lm BatchGenerator matches neither "
+        "the legacy nor native chunked-prefill API."
+    )
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -786,6 +866,7 @@ def _install_mtp(
             logits = logits[:, -1, :]
 
         # --- Apply logits processors + sample primary ---
+        logits_processors = _normalize_logits_processors(logits_processors) or []
         if any(logits_processors):
             logger.debug(
                 f"[logits_proc] applying {sum(len(lp) for lp in logits_processors)} "
@@ -1337,40 +1418,16 @@ class Scheduler:
         chunked_budget = self.config.chunked_prefill_tokens
         need_chunked = chunked_budget > 0
 
-        # The chunked prefill monkey-patch relies on BatchGenerator internals
-        # (_process_prompts, active_batch, _step, etc.) that were refactored
-        # in mlx-lm 0.31.x.  Skip gracefully when the required API is absent.
-        chunked_compatible = hasattr(bg, "_process_prompts") and hasattr(
-            bg, "active_batch"
-        )
-
         prompt_cache_cb = None
         if self.memory_aware_cache is not None:
             prompt_cache_cb = self._make_prompt_cache_save_callback()
 
-        if need_chunked and chunked_compatible:
-            # Full chunked prefill with mid-prefill saves and prompt cache
-            # save wired through the chunked next() and _process_prompts
-            # monkey-patches inside _install_chunked_prefill.
-            mid_prefill_cb = None
-            save_interval = self.config.mid_prefill_save_interval
-            if save_interval > 0 and self.memory_aware_cache is not None:
-                mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
-                logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
-            _install_chunked_prefill(
+        if need_chunked:
+            _configure_chunked_prefill(
+                self,
                 bg,
                 chunked_budget,
-                mid_prefill_cb,
-                prompt_cache_save=prompt_cache_cb,
-                pending_abort_ids=self._pending_abort_ids,
-                uid_to_request_id=self.uid_to_request_id,
-                requests=self.requests,
-            )
-        elif need_chunked and not chunked_compatible:
-            logger.warning(
-                "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
-                "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
-                "check compatibility."
+                prompt_cache_cb,
             )
 
         # When chunked prefill is off but memory_aware_cache is active,
@@ -2497,6 +2554,7 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
+                    _sanitize_batch_generator_logits_processors(self.batch_generator)
                     result = self.batch_generator.next()
                     output.has_work = True
 
@@ -2980,12 +3038,28 @@ class Scheduler:
         try:
             from mlx_lm.models.cache import ArraysCache, KVCache
 
+            # Cast restored arrays back to their original dtype if the spill
+            # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
+            # dtype on this version; accept default from mx.array(np_fp32).
+            def _mx_dtype_from_name(name: str):
+                return getattr(mx, name, None)
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
                     kv = KVCache()
                     kv.keys = mx.array(ld["keys"])
                     kv.values = mx.array(ld["values"])
+                    keys_orig = ld.get("keys_original_dtype")
+                    if keys_orig is not None:
+                        dt = _mx_dtype_from_name(keys_orig)
+                        if dt is not None:
+                            kv.keys = kv.keys.astype(dt)
+                    values_orig = ld.get("values_original_dtype")
+                    if values_orig is not None:
+                        dt = _mx_dtype_from_name(values_orig)
+                        if dt is not None:
+                            kv.values = kv.values.astype(dt)
                     kv.offset = ld["offset"]
                     for attr in ("max_size", "keep", "step", "_idx"):
                         if attr in ld:
@@ -2993,6 +3067,14 @@ class Scheduler:
                     result.append(kv)
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
+                    state_dtypes = ld.get("state_original_dtypes")
+                    if state_dtypes is not None:
+                        for i, dtype_name in enumerate(state_dtypes):
+                            if dtype_name is None:
+                                continue
+                            dt = _mx_dtype_from_name(dtype_name)
+                            if dt is not None:
+                                state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
                     layer_obj.state = state_arrays
                     result.append(layer_obj)

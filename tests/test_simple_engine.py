@@ -104,6 +104,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Launch multiple concurrent generate calls
             tasks = [
@@ -128,6 +129,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Launch multiple concurrent chat calls
             tasks = [
@@ -144,6 +146,88 @@ class TestSimpleEngineConcurrency:
                 f"Expected max concurrent to be 1, but got {mock_llm_model._max_concurrent}. "
                 "The lock is not working correctly."
             )
+
+    @pytest.mark.anyio
+    async def test_default_admission_rejects_second_serialized_request(self):
+        """Default SimpleEngine admission fails fast instead of queueing."""
+        from vllm_mlx.engine.base import EngineBusy
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_call():
+                started.set()
+                release.wait(timeout=1.0)
+                return "ok"
+
+            first = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    slow_call,
+                    request_id="first-serialized-request",
+                )
+            )
+            await asyncio.to_thread(started.wait, 1.0)
+
+            with pytest.raises(EngineBusy) as excinfo:
+                await engine._run_blocking_serialized(
+                    lambda: "late",
+                    request_id="second-serialized-request",
+                )
+
+            assert "text_generation_busy" == excinfo.value.code
+            assert "active=first-serialized-request" in str(excinfo.value)
+            assert engine._generation_busy_rejections == 1
+
+            release.set()
+            await first
+
+    def test_lock_admission_env_wait_is_preserved(self, monkeypatch):
+        """VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=wait keeps queued behavior."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "wait")
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+
+        assert engine._generation_lock_admission == "wait"
+        assert engine.get_stats()["generation_lock"]["admission"] == "wait"
+
+    @pytest.mark.anyio
+    async def test_blocking_serialized_tracks_active_request(self):
+        """Busy errors include the current blocking serialized holder."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+
+            def slow_call():
+                import time
+
+                time.sleep(0.05)
+                return "ok"
+
+            first = asyncio.create_task(
+                engine._run_blocking_serialized(
+                    slow_call,
+                    request_id="probe-active-holder",
+                )
+            )
+            for _ in range(100):
+                if engine._generation_lock.locked():
+                    break
+                await asyncio.sleep(0.001)
+
+            assert "probe-active-holder" in engine._generation_lock_holder_summary()
+
+            await first
+            assert engine._generation_lock_holder_summary() == "none"
 
     async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
         """Tool-enabled non-stream chat should use the streaming path."""
@@ -996,6 +1080,109 @@ class TestSimpleEngineConcurrency:
         }
 
     @pytest.mark.anyio
+    async def test_stream_chat_system_cache_copies_arrays_cache_state(self):
+        """Hybrid cache snapshots must not alias ``ArraysCache.state`` lists."""
+        import mlx.core as mx
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        def apply_chat_template_side_effect(messages, **kwargs):
+            user_content = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    user_content = m.get("content") or ""
+                    break
+            return (
+                "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+        tokenizer.bos_token = None
+        tokenizer.encode = MagicMock(side_effect=[list(range(10)), list(range(5))])
+
+        model = MagicMock()
+        model.tokenizer = tokenizer
+
+        class MutableListCache:
+            def __init__(self):
+                self.cache = [None]
+
+            @property
+            def state(self):
+                return self.cache
+
+            @state.setter
+            def state(self, value):
+                self.cache = value
+
+            @property
+            def nbytes(self):
+                return sum(c.nbytes for c in self.cache if c is not None)
+
+        cache_entry = MutableListCache()
+
+        def fake_model(tokens, cache):
+            cache[0].cache[0] = mx.array([[1, 2, 3]])
+            return MagicMock()
+
+        model.model = fake_model
+
+        def fake_stream_generate(model_arg, tokenizer_arg, prompt, **kwargs):
+            # Simulate suffix/decode state advancing after the system-prefix
+            # snapshot has been stored. The saved snapshot must not follow this
+            # mutable list change.
+            prompt_cache = kwargs["prompt_cache"]
+            prompt_cache[0].cache[0] = mx.array([[9, 9, 9]])
+            yield SimpleNamespace(text="ok", token=7, finish_reason="stop")
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = model
+            engine._loaded = True
+            engine._supports_system_kv_cache = True
+
+            with (
+                patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+                patch(
+                    "mlx_lm.models.cache.make_prompt_cache",
+                    return_value=[cache_entry],
+                ),
+                patch("mlx_lm.sample_utils.make_sampler"),
+            ):
+                chunks = [
+                    c
+                    async for c in engine.stream_chat(
+                        messages=[
+                            {"role": "system", "content": "You are helpful."},
+                            {"role": "user", "content": "hello"},
+                        ],
+                    )
+                ]
+
+        assert chunks[-1].text == "ok"
+        assert engine._system_kv_cache
+        saved_snapshot, saved_token_count = next(iter(engine._system_kv_cache.values()))
+        assert saved_token_count == 5
+        saved = saved_snapshot[0][0]
+        assert saved.tolist() == [[1, 2, 3]]
+        assert cache_entry.cache[0].tolist() == [[9, 9, 9]]
+
+    def test_system_cache_probe_allows_arrays_cache_and_rejects_rotating(self):
+        """Hybrid ArraysCache is snapshot-safe; rotating cache still is not."""
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        assert SimpleEngine._cache_class_is_system_snapshot_safe(KVCache())
+        assert SimpleEngine._cache_class_is_system_snapshot_safe(ArraysCache(size=2))
+        assert not SimpleEngine._cache_class_is_system_snapshot_safe(
+            RotatingKVCache(max_size=128)
+        )
+
+    @pytest.mark.anyio
     async def test_stream_chat_uses_gate_time_snapshot_under_concurrent_mutation(
         self,
     ):
@@ -1142,6 +1329,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             # Test that stream_generate acquires the lock
             # by checking if it blocks when lock is already held
@@ -1296,6 +1484,239 @@ class TestSimpleEngineConcurrency:
         assert engine._text_tokenizer is tokenizer
 
     @pytest.mark.anyio
+    async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
+        """Media requests must not move mlx_vlm generation to a worker thread."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def __init__(self):
+                self._owner_thread = threading.get_ident()
+
+            def stream_chat(self, **_kwargs):
+                if threading.get_ident() != self._owner_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                yield SimpleNamespace(
+                    text="image described",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("MLLM requests must not use worker routing")
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_tokenizer = MagicMock()
+        engine._model = FakeMllmModel()
+        engine._run_blocking_serialized = fail_if_called  # type: ignore[method-assign]
+
+        outputs = [
+            chunk
+            async for chunk in engine.stream_chat(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe this"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=16,
+            )
+        ]
+
+        assert outputs[-1].text == "image described"
+        assert outputs[-1].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_mllm_draft_stream_stays_on_owner_thread_with_text_route(self):
+        """Text-only MLLM draft requests share mlx_vlm's owner thread."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured = {}
+
+        class FakeMllmModel:
+            def __init__(self):
+                self._owner_thread = threading.get_ident()
+
+            def stream_chat(self, **kwargs):
+                if threading.get_ident() != self._owner_thread:
+                    raise RuntimeError("There is no Stream(gpu, 3) in current thread.")
+                captured.update(kwargs)
+                yield SimpleNamespace(
+                    text="drafted",
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                )
+
+        engine = SimpleEngine(
+            "test-model",
+            force_mllm=True,
+            mllm_draft_model="assistant",
+            mllm_draft_kind="mtp",
+        )
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        outputs = [
+            chunk
+            async for chunk in engine.stream_chat(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=8,
+                mllm_draft=True,
+            )
+        ]
+
+        assert captured["mllm_draft"] is True
+        assert outputs[-1].text == "drafted"
+
+    @pytest.mark.anyio
+    async def test_mllm_media_stream_uses_fail_fast_admission(self):
+        """A concurrent media request must receive EngineBusy instead of queueing."""
+        from vllm_mlx.engine.base import EngineBusy
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def stream_chat(self, **_kwargs):
+                yield SimpleNamespace(
+                    text="first",
+                    finish_reason=None,
+                    prompt_tokens=5,
+                )
+                yield SimpleNamespace(
+                    text=" second",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        def media_messages(label):
+            return [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": label},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def consume_first():
+            outputs = []
+            async for output in engine.stream_chat(
+                messages=media_messages("first"),
+                request_id="first-media",
+            ):
+                outputs.append(output)
+                if len(outputs) == 1:
+                    first_started.set()
+                    await release_first.wait()
+            return outputs
+
+        first_task = asyncio.create_task(consume_first())
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        try:
+            with pytest.raises(EngineBusy) as excinfo:
+                _ = [
+                    output
+                    async for output in engine.stream_chat(
+                        messages=media_messages("second"),
+                        request_id="second-media",
+                    )
+                ]
+
+            assert excinfo.value.code == "text_generation_busy"
+            assert "request_id=second-media" in str(excinfo.value)
+            assert "active=none" not in str(excinfo.value)
+            assert engine._generation_busy_rejections == 1
+        finally:
+            release_first.set()
+
+        outputs = await first_task
+        assert outputs[-1].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_mllm_native_video_stream_stays_off_event_loop(self):
+        """Native video generation must not block the asyncio event loop."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        owner_thread = threading.get_ident()
+        release = threading.Event()
+        worker_thread = None
+
+        class FakeMllmModel:
+            _video_native = True
+
+            def _collect_video_inputs(self, _messages):
+                return {0: ["video.mp4"]}
+
+            def stream_chat(self, **_kwargs):
+                nonlocal worker_thread
+                worker_thread = threading.get_ident()
+                release.wait(timeout=0.2)
+                yield SimpleNamespace(
+                    text="video described",
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": "video.mp4"}},
+                    {"type": "text", "text": "describe this"},
+                ],
+            }
+        ]
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        async def consume():
+            return [
+                output
+                async for output in engine.stream_chat(
+                    messages=messages,
+                    request_id="native-video",
+                )
+            ]
+
+        release_timer = threading.Timer(0.2, release.set)
+        release_timer.start()
+        started_at = asyncio.get_running_loop().time()
+        stream_task = asyncio.create_task(consume())
+        try:
+            await asyncio.sleep(0.02)
+            loop_delay = asyncio.get_running_loop().time() - started_at
+        finally:
+            release.set()
+            release_timer.cancel()
+
+        outputs = await stream_task
+        assert loop_delay < 0.1
+        assert worker_thread != owner_thread
+        assert outputs[-1].text == "video described"
+
+    @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
         """Non-stream text-only MLLM chat must aggregate the TextModel route."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -1396,6 +1817,62 @@ class TestSimpleEngineConcurrency:
 
         assert output.text == "one, two, three"
         assert output.finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_llm_nonstream_with_logits_processors_uses_stream_path(self):
+        """Constrained non-stream chat must not call the blocking chat API.
+
+        ``response_format`` is implemented by request-local logits processors.
+        If a non-stream request goes through the blocking model.chat() path,
+        the server cannot observe token progress or cancel at token boundaries
+        when a client/proxy disconnects.  Aggregating stream_chat keeps the
+        constrained and unconstrained chat paths on the same cancellable stream
+        implementation.
+        """
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        captured_stream_kwargs = {}
+
+        class FakeTokenizer:
+            bos_token = None
+
+            def apply_chat_template(self, messages, **kwargs):
+                return "<|im_start|>user\nhello"
+
+            def encode(self, text, **kwargs):
+                return [1, 2, 3]
+
+        class FakeModel:
+            tokenizer = FakeTokenizer()
+
+            def chat(self, **kwargs):
+                raise AssertionError("blocking chat path should not be used")
+
+            def stream_generate(self, **kwargs):
+                captured_stream_kwargs.update(kwargs)
+                yield SimpleNamespace(
+                    text="{}",
+                    finish_reason="stop",
+                    finished=True,
+                    prompt_tokens=3,
+                )
+
+        engine = SimpleEngine("test-model", force_mllm=False, mtp=False)
+        engine._loaded = True
+        engine._model = FakeModel()
+        sentinel_processor = object()
+
+        output = await engine.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=16,
+            logits_processors=[sentinel_processor],
+        )
+
+        assert output.text == "{}"
+        assert output.finish_reason == "stop"
+        assert captured_stream_kwargs["logits_processors"] == [sentinel_processor]
 
     @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
@@ -1544,6 +2021,10 @@ class TestSimpleEngineConcurrency:
             captured["kwargs"] = kwargs
             yield SimpleNamespace(text="B", finish_reason="stop")
 
+        def fake_select_chunks(_importance, **kwargs):
+            captured["select_chunks_kwargs"] = kwargs
+            return mx.array([0, 1, 2], dtype=mx.int32)
+
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "<|im_start|>user\nhello"
         tokenizer.bos_token = None
@@ -1588,7 +2069,7 @@ class TestSimpleEngineConcurrency:
             ),
             patch(
                 "vllm_mlx.specprefill.select_chunks",
-                return_value=mx.array([0, 1, 2], dtype=mx.int32),
+                side_effect=fake_select_chunks,
             ),
             patch(
                 "vllm_mlx.specprefill.sparse_prefill",
@@ -1603,6 +2084,7 @@ class TestSimpleEngineConcurrency:
                     max_tokens=4,
                     temperature=0.6,
                     top_p=0.95,
+                    specprefill_backbone_pct=0.25,
                 )
             ]
 
@@ -1618,6 +2100,7 @@ class TestSimpleEngineConcurrency:
         assert captured["kwargs"]["prompt_cache"] == ["backbone-cache", "mtp-cache"]
         assert captured["kwargs"]["max_tokens"] == 3
         assert captured["kwargs"]["logits_processors"] is None
+        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
 
     @pytest.mark.anyio
     async def test_stream_generate_text_forwards_logits_processors_and_sampler_args(
@@ -1687,6 +2170,70 @@ class TestSimpleEngineConcurrency:
             user_processor,
             penalty_processor,
         ]
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_skips_system_cache_when_text_model_not_safe(
+        self,
+    ):
+        """MLLM TextModel routing must not snapshot hybrid ArraysCache state."""
+        from types import SimpleNamespace
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        tokenizer.bos_token = None
+        tokenizer.eos_token_id = 42
+        tokenizer.encode = MagicMock(
+            side_effect=[
+                list(range(10)),  # full prompt
+                list(range(5)),  # system prefix
+            ]
+        )
+
+        captured_prompts = []
+
+        def fake_stream_generate(model, tokenizer, prompt, **kwargs):
+            captured_prompts.append(prompt)
+            yield SimpleNamespace(text="Hello", finish_reason="stop")
+
+        def fail_if_manual_cache_path_runs(*args, **kwargs):
+            raise AssertionError("manual system-cache path must be skipped")
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._text_model.mtp = None
+        engine._text_tokenizer = tokenizer
+        engine._supports_system_kv_cache = False
+
+        with (
+            patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+            patch(
+                "mlx_lm.models.cache.make_prompt_cache",
+                side_effect=fail_if_manual_cache_path_runs,
+            ),
+        ):
+            outputs = [
+                chunk
+                async for chunk in engine._stream_generate_text(
+                    messages=[
+                        {"role": "system", "content": "You are helpful."},
+                        {"role": "user", "content": "hello"},
+                    ],
+                    max_tokens=16,
+                    temperature=0.3,
+                    top_p=0.8,
+                )
+            ]
+
+        assert outputs[-1].text == "Hello"
+        assert captured_prompts == [tokenizer.apply_chat_template.return_value]
+        tokenizer.encode.assert_not_called()
 
     @pytest.mark.anyio
     async def test_stream_generate_text_disables_mtp_when_logits_processors_active(
@@ -2027,6 +2574,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
+            engine._generation_lock_admission = "wait"
 
             task1 = asyncio.create_task(
                 engine.chat(
@@ -2132,6 +2680,10 @@ class TestSimpleEngineConcurrency:
             captured["prefill"] = cancel_check
             return mx.zeros((1, 1, 8), dtype=mx.float32)
 
+        def fake_select_chunks(_importance, **kwargs):
+            captured["select_chunks_kwargs"] = kwargs
+            return mx.array([0], dtype=mx.int32)
+
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._loaded = True
@@ -2154,7 +2706,7 @@ class TestSimpleEngineConcurrency:
                 ),
                 patch(
                     "vllm_mlx.specprefill.select_chunks",
-                    return_value=mx.array([0], dtype=mx.int32),
+                    side_effect=fake_select_chunks,
                 ),
                 patch(
                     "vllm_mlx.specprefill.sparse_prefill",
@@ -2168,12 +2720,14 @@ class TestSimpleEngineConcurrency:
                     max_tokens=4,
                     temperature=0.7,
                     top_p=0.9,
+                    specprefill_backbone_pct=0.25,
                 ):
                     outputs.append(chunk.new_text)
 
         assert outputs == ["A"]
         assert callable(captured["score"])
         assert captured["score"] is captured["prefill"]
+        assert captured["select_chunks_kwargs"]["backbone_pct"] == 0.25
 
     @pytest.mark.anyio
     async def test_cancelling_specprefill_request_stops_during_scoring(self):
@@ -2295,6 +2849,89 @@ class TestSimpleEngineConcurrency:
                 with pytest.raises(asyncio.CancelledError):
                     await task
         assert await asyncio.to_thread(prefill_cancelled.wait, 1.0)
+
+
+class TestSimpleEngineNaturalStop:
+    @staticmethod
+    def _engine(stream_generate):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = MagicMock()
+        engine._model.tokenizer.encode.return_value = [1, 2, 3]
+        engine._model.stream_generate.side_effect = stream_generate
+        return engine
+
+    @pytest.mark.anyio
+    async def test_generator_exhaustion_emits_one_stop(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="Hel", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="lo", prompt_tokens=3, finish_reason="stop")
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
+        ]
+
+        finished = [output for output in outputs if output.finished]
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].new_text == ""
+        assert finished[0].finish_reason == "stop"
+
+    @pytest.mark.anyio
+    async def test_token_limit_keeps_length_reason(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="a", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="b", prompt_tokens=3, finish_reason=None)
+            yield SimpleNamespace(text="c", prompt_tokens=3, finish_reason=None)
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=3
+            )
+        ]
+
+        finished = [output for output in outputs if output.finished]
+        assert len(finished) == 1
+        assert finished[0] is outputs[-1]
+        assert finished[0].finish_reason == "length"
+
+    @pytest.mark.anyio
+    async def test_exception_is_not_reported_as_stop(self):
+        def generate(**kwargs):
+            yield SimpleNamespace(text="partial", prompt_tokens=3, finish_reason=None)
+            raise RuntimeError("backend failed")
+
+        engine = self._engine(generate)
+        outputs = []
+        with pytest.raises(RuntimeError, match="backend failed"):
+            async for output in engine.stream_generate(prompt="hi", max_tokens=50):
+                outputs.append(output)
+
+        assert not any(output.finished for output in outputs)
+        assert not engine._active_requests
+
+    @pytest.mark.anyio
+    async def test_empty_generator_emits_stop(self):
+        def generate(**kwargs):
+            yield from ()
+
+        outputs = [
+            output
+            async for output in self._engine(generate).stream_generate(
+                prompt="hi", max_tokens=50
+            )
+        ]
+
+        assert len(outputs) == 1
+        assert outputs[0].finished
+        assert outputs[0].finish_reason == "stop"
 
 
 class TestSimpleEngineClearRuntimeCaches:

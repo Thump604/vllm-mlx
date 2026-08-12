@@ -22,6 +22,50 @@ import mlx.utils
 logger = logging.getLogger(__name__)
 
 
+# Text-model classes keyed by config ``model_type`` *prefix*, longest first.
+# A family has to cover its variants: Gemma 4 reports ``gemma4_text`` on some
+# checkpoints and ``gemma4_unified_text`` on others, and an exact match on the
+# former silently sent the latter to the generic fallback below.
+_TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
+    ("gemma4", "mlx_lm.models.gemma4_text", ("Model", "ModelArgs")),
+)
+
+# Fallback. qwen3_5.TextModel and TextModelArgs handle both dense and MoE
+# natively (MTPDecoderLayer auto-selects SparseMoeBlock when
+# args.num_experts > 0), which makes them a reasonable generic choice — but it
+# is a guess, and a wrong guess dies deep inside the constructor with an error
+# that names neither the model nor the class. Hence the logging either side.
+_DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
+
+
+def _import_text_model_classes(model_type: str):
+    """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
+    import importlib
+
+    module_name, (model_attr, args_attr) = _DEFAULT_TEXT_MODEL
+    matched = False
+    for prefix, family_module, (family_model, family_args) in sorted(
+        _TEXT_MODEL_FAMILIES, key=lambda f: len(f[0]), reverse=True
+    ):
+        if model_type.startswith(prefix):
+            module_name, model_attr, args_attr = (
+                family_module,
+                family_model,
+                family_args,
+            )
+            matched = True
+            break
+
+    if not matched:
+        logger.debug(
+            "No text-model family matches model_type=%r; falling back to %s",
+            model_type,
+            module_name,
+        )
+    module = importlib.import_module(module_name)
+    return getattr(module, model_attr), getattr(module, args_attr)
+
+
 def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     """Build an mlx_lm TextModel from a vlm-loaded model's weights.
 
@@ -39,14 +83,17 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
     if model_path is None or not (model_path / "config.json").exists():
         return None
 
+    model_type = ""
+    text_model_cls = None
     try:
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
-
-        # Always import from qwen3_5 — TextModel and TextModelArgs handle both
-        # dense and MoE natively (MTPDecoderLayer auto-selects SparseMoeBlock
-        # when args.num_experts > 0). qwen3_5_moe.py does NOT export these.
-        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+        model_type = text_config.get("model_type") or config.get("model_type", "")
+        TextModel, TextModelArgs = _import_text_model_classes(model_type)
+        text_model_cls = f"{TextModel.__module__}.{TextModel.__qualname__}"
+        logger.debug(
+            "Building TextModel for model_type=%r using %s", model_type, text_model_cls
+        )
 
         # Build args with proper __post_init__ (handles partial_rotary_factor,
         # rope_scaling, head_dim derivation)
@@ -66,11 +113,28 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         # This prevents quantizing layers like mtp.fc which are BF16.
         quantization = text_config.get("quantization", config.get("quantization", None))
         if quantization is not None:
+            # Per-layer quantization overrides (e.g. 8-bit MoE gates over a 4-bit
+            # body) may be keyed with the source checkpoint's "language_model."
+            # wrapper prefix, which the extracted TextModel doesn't carry. Index
+            # them by suffix so the prefix-stripped module path resolves to the
+            # correct bits/group_size; without this the override is ignored and the
+            # layer is quantized at the global width, producing a quantized_matmul
+            # shape mismatch at decode.
+            per_layer_overrides = {
+                k: v for k, v in quantization.items() if isinstance(v, dict)
+            }
 
             def _class_predicate(path, module):
                 if not hasattr(module, "to_quantized"):
                     return False
-                return f"{path}.scales" in all_weight_names
+                if f"{path}.scales" not in all_weight_names:
+                    return False
+                if path in quantization:
+                    return quantization[path]
+                for key, override in per_layer_overrides.items():
+                    if key.endswith("." + path):
+                        return override
+                return True
 
             nn.quantize(
                 text_model,
@@ -116,13 +180,48 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         else:
             logger.info("TextModel built without MTP")
 
+        # Put the derived TextModel in eval mode. mlx_lm.load / mlx_vlm.load both
+        # eval() their models (this is also what LM Studio's mlx-engine does), but
+        # this freshly-constructed TextModel defaults to training=True. Hybrid
+        # layers (Qwen3.5/3.6 gated-delta) select their compute path with
+        # `use_kernel = not self.training`, so in training mode prefill/decode fall
+        # to the slow Python recurrence instead of the Metal kernel.
+        text_model.train(False)
+
+        # Realize every array the model holds before it leaves the build
+        # thread — including underscore-private module attributes such as
+        # RoPE._freqs, which parameters() excludes. MLX lazy graphs are tagged
+        # to the stream of the thread that recorded them; a lazy array
+        # surviving into generation dies with "There is no Stream(gpu, N) in
+        # current thread" the moment a worker on another thread evaluates it
+        # (Gemma 4: the scaled-RoPE _freqs of the first full_attention layer).
+        if hasattr(text_model, "modules"):
+            mx.eval(
+                [
+                    v
+                    for module in text_model.modules()
+                    for v in module.values()
+                    if isinstance(v, mx.array)
+                ]
+            )
+
         return text_model
 
     except ImportError as e:
         logger.error("Cannot import mlx_lm TextModel (need PR #990): %s", e)
         return None
     except Exception as e:
-        logger.error("Failed to build TextModel from vlm: %s", e)
+        # Name the model_type and the class that was picked. Without them this
+        # is a bare TypeError from inside someone else's constructor, and the
+        # engine carries on with _text_model=None — a route quietly losing its
+        # backend, which reads like a warning rather than the failure it is.
+        logger.error(
+            "Failed to build TextModel from vlm (model_type=%r, class=%s): %s",
+            model_type,
+            text_model_cls or "<not selected>",
+            e,
+            exc_info=True,
+        )
         return None
 
 

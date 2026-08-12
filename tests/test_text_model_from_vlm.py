@@ -2,10 +2,14 @@
 """Tests for building mlx_lm TextModel from mlx_vlm-loaded weights."""
 
 import json
+import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
+import vllm_mlx.text_model_from_vlm as text_model_from_vlm
 from vllm_mlx.text_model_from_vlm import build_text_model
 
 # VLM+MTP model (created by merging mlx-community VLM + our MTP weights)
@@ -13,6 +17,15 @@ VLM_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-VLM-MTP-8bit
 
 # Text-only MTP model (no vision tower — can't test VLM loading)
 TEXT_MTP_MODEL = Path.home() / "ai-models/mlx_models/Qwen3.5-35B-A3B-8bit"
+
+# Deliberately opt in to the large Qwen3.6 MTP artifact. This regression is
+# exercised in an isolated model-qualification window, never by the ordinary
+# unit suite on developer machines or CI.
+QWEN36_VLM_MTP_MODEL = (
+    Path(os.environ["VLLM_MLX_QWEN36_VLM_MTP_MODEL"])
+    if os.environ.get("VLLM_MLX_QWEN36_VLM_MTP_MODEL")
+    else None
+)
 
 
 def test_build_text_model_no_config():
@@ -25,6 +38,69 @@ def test_build_text_model_none_vlm():
     """Returns None when vlm_model is None."""
     result = build_text_model(None, TEXT_MTP_MODEL)
     assert result is None
+
+
+def test_build_text_model_dispatches_gemma4_text_model(tmp_path, monkeypatch):
+    """Gemma 4 text configs should use mlx_lm.models.gemma4_text classes."""
+
+    model_path = tmp_path / "gemma4"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"text_config": {"model_type": "gemma4_text"}})
+    )
+
+    class FakeLanguageModel:
+        def parameters(self):
+            return {}
+
+    class FakeVlmModel:
+        language_model = FakeLanguageModel()
+
+    class QwenTextModelArgs:
+        @classmethod
+        def from_dict(cls, _config):
+            raise AssertionError("qwen3_5 dispatch should not be used for gemma4_text")
+
+    class QwenTextModel:
+        pass
+
+    qwen_module = types.ModuleType("mlx_lm.models.qwen3_5")
+    qwen_module.TextModel = QwenTextModel
+    qwen_module.TextModelArgs = QwenTextModelArgs
+
+    class GemmaModelArgs:
+        seen_config = None
+
+        @classmethod
+        def from_dict(cls, config):
+            cls.seen_config = config
+            return "gemma4-args"
+
+    class GemmaModel:
+        def __init__(self, args):
+            self.args = args
+            self.loaded_weights = []
+
+        def load_weights(self, weights, strict=False):
+            self.loaded_weights.append((weights, strict))
+
+        def train(self, mode=True):
+            self.training = mode
+            return self
+
+    gemma_module = types.ModuleType("mlx_lm.models.gemma4_text")
+    gemma_module.Model = GemmaModel
+    gemma_module.ModelArgs = GemmaModelArgs
+
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", qwen_module)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gemma4_text", gemma_module)
+    monkeypatch.setattr(text_model_from_vlm.mlx.utils, "tree_flatten", lambda _p: [])
+
+    text_model = build_text_model(FakeVlmModel(), model_path)
+
+    assert isinstance(text_model, GemmaModel)
+    assert text_model.args == "gemma4-args"
+    assert GemmaModelArgs.seen_config == {"model_type": "gemma4_text"}
 
 
 @pytest.mark.skipif(not VLM_MTP_MODEL.exists(), reason="VLM+MTP model not on disk")
@@ -111,6 +187,52 @@ def test_text_model_return_hidden():
     assert hidden.shape[-1] == text_config["hidden_size"]
 
 
+@pytest.mark.skipif(
+    QWEN36_VLM_MTP_MODEL is None or not QWEN36_VLM_MTP_MODEL.exists(),
+    reason="set VLLM_MLX_QWEN36_VLM_MTP_MODEL for the isolated Qwen3.6 MTP regression",
+)
+def test_qwen36_text_model_return_hidden_is_pre_norm_for_mtp():
+    """MTP receives the pre-final-norm backbone state exactly once."""
+    import mlx.core as mx
+    import runtime_patches
+
+    runtime_patches.apply()
+
+    from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    from mlx_vlm import load as vlm_load
+
+    assert QWEN36_VLM_MTP_MODEL is not None
+    config = json.loads((QWEN36_VLM_MTP_MODEL / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    assert text_config.get("mtp_hidden_state_mode") == "pre_norm", (
+        "qualification artifact must explicitly declare "
+        "mtp_hidden_state_mode=pre_norm"
+    )
+    vlm_model, _ = vlm_load(str(QWEN36_VLM_MTP_MODEL))
+    text_model = build_text_model(vlm_model, QWEN36_VLM_MTP_MODEL)
+    tokens = mx.array([[1, 2, 3]])
+
+    reference_cache = text_model.make_cache()
+    inner = text_model.model
+    pre_norm = inner.embed_tokens(tokens)
+    fa_mask = create_attention_mask(pre_norm, reference_cache[inner.fa_idx])
+    ssm_mask = create_ssm_mask(pre_norm, reference_cache[inner.ssm_idx])
+    for layer, cache in zip(inner.layers, reference_cache):
+        pre_norm = layer(
+            pre_norm,
+            mask=ssm_mask if layer.is_linear else fa_mask,
+            cache=cache,
+        )
+
+    _, returned_hidden = text_model(
+        tokens,
+        cache=text_model.make_cache(),
+        return_hidden=True,
+    )
+
+    assert bool(mx.allclose(returned_hidden, pre_norm).item())
+
+
 @pytest.mark.skipif(not VLM_MTP_MODEL.exists(), reason="VLM+MTP model not on disk")
 def test_weight_sharing():
     """Backbone weights are shared (zero-copy) between vlm and TextModel."""
@@ -138,3 +260,79 @@ def test_weight_sharing():
             break
     else:
         pytest.fail("No layer with self_attn found")
+
+
+def test_build_text_model_realizes_private_lazy_arrays(tmp_path, monkeypatch):
+    """Lazy private arrays (e.g. RoPE._freqs) must be realized at build time.
+
+    MLX lazy graphs are tagged to the stream of the thread that recorded
+    them; nn.Module.parameters() excludes underscore-prefixed attributes, so
+    a private lazy array built on the load thread survives into generation
+    and fails with "There is no Stream(gpu, N) in current thread" when a
+    worker on another thread evaluates it. Regression: Gemma 4's scaled-RoPE
+    _freqs broke every MLLM text-route generation once #595 enabled the
+    route.
+    """
+    import threading
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    model_path = tmp_path / "gemma4"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"text_config": {"model_type": "gemma4_text"}})
+    )
+
+    class FakeRope(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Lazy graph, like rope_utils' scaled-RoPE _freqs computation.
+            self._freqs = mx.exp(mx.arange(0, 8, dtype=mx.float32) * -0.5)
+
+    class GemmaModel(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.args_value = args
+            self.rope = FakeRope()
+
+        def load_weights(self, weights, strict=False):
+            pass
+
+    class GemmaModelArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return "gemma4-args"
+
+    gemma_module = types.ModuleType("mlx_lm.models.gemma4_text")
+    gemma_module.Model = GemmaModel
+    gemma_module.ModelArgs = GemmaModelArgs
+
+    class FakeLanguageModel:
+        def parameters(self):
+            return {}
+
+    class FakeVlmModel:
+        language_model = FakeLanguageModel()
+
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gemma4_text", gemma_module)
+    # No tree_flatten patch here (unlike the dispatch test above): the fix's
+    # module walk relies on the real helper, and tree_flatten({}) is [] anyway.
+
+    text_model = build_text_model(FakeVlmModel(), model_path)
+    assert isinstance(text_model, GemmaModel)
+
+    # The private array must be evaluable from a different thread, which
+    # only holds if build_text_model realized it on the build thread.
+    errors = []
+
+    def cross_thread_eval():
+        try:
+            mx.eval(text_model.rope._freqs)
+        except RuntimeError as e:  # pragma: no cover - the regression itself
+            errors.append(e)
+
+    t = threading.Thread(target=cross_thread_eval)
+    t.start()
+    t.join()
+    assert not errors, f"private lazy array not realized at build: {errors[0]}"
