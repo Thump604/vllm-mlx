@@ -697,11 +697,34 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+@dataclass
+class _MTPStatsState:
+    """Cumulative native-MTP counters shared across generator instances."""
+
+    counters: Dict[str, int] = field(
+        default_factory=lambda: {
+            "attempted": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+        }
+    )
+    bypass_counts: Dict[str, int] = field(
+        default_factory=lambda: {
+            "prefill": 0,
+            "no_active_batch": 0,
+            "cache_mismatch": 0,
+        }
+    )
+    lock: Any = field(default_factory=Lock)
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
     num_draft_tokens: int = 1,
     optimistic: bool = False,
+    stats_state: Optional["_MTPStatsState"] = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
@@ -731,15 +754,13 @@ def _install_mtp(
     # Format: {uid: {'token': int, 'logprobs': mx.array}}
     _deferred_drafts = {}
 
-    # MTP stats are read by the server status endpoint while the engine thread
-    # updates them. Keep the snapshot internally consistent for operators.
-    _mtp_stats = {"attempted": 0, "accepted": 0, "rejected": 0, "errors": 0}
-    _mtp_bypass_counts = {
-        "prefill": 0,
-        "no_active_batch": 0,
-        "cache_mismatch": 0,
-    }
-    _mtp_stats_lock = Lock()
+    # Scheduler-created generators share one state so sampler-driven generator
+    # replacement does not reset the operator-facing counters.
+    if stats_state is None:
+        stats_state = _MTPStatsState()
+    _mtp_stats = stats_state.counters
+    _mtp_bypass_counts = stats_state.bypass_counts
+    _mtp_stats_lock = stats_state.lock
 
     def _get_mtp_stats() -> Dict[str, Any]:
         with _mtp_stats_lock:
@@ -1314,6 +1335,7 @@ class Scheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._mtp_stats_state = _MTPStatsState()
 
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
@@ -1472,6 +1494,7 @@ class Scheduler:
                     model=self.model,
                     num_draft_tokens=self.config.mtp_num_draft_tokens,
                     optimistic=self.config.mtp_optimistic,
+                    stats_state=self._mtp_stats_state,
                 )
             else:
                 logger.warning(

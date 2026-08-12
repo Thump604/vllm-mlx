@@ -726,6 +726,53 @@ class TestSchedulerBasic:
 
         assert batch_gen.get_mtp_stats()["bypass_counts"]["no_active_batch"] == 1
 
+    def test_mtp_stats_survive_sampler_driven_generator_replacement(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """Replacing BatchGenerator must not reset cumulative MTP counters."""
+
+        class FakeBatchGenerator:
+            active_batch = None
+
+            def __init__(self, **kwargs):
+                self.sampler = kwargs["sampler"]
+
+            @staticmethod
+            def _step(input_tokens, prompt_cache, samplers, logits_processors, tokens):
+                return input_tokens, []
+
+            @staticmethod
+            def _next():
+                return []
+
+        monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", FakeBatchGenerator)
+        mock_model.mtp = object()
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+        )
+        first_params = SamplingParams(temperature=0.0, top_p=1.0, min_p=0.0)
+        scheduler._ensure_batch_generator(first_params)
+        first_generator = scheduler.batch_generator
+
+        first_generator._step(
+            mx.array([[1]]),
+            [],
+            None,
+            None,
+            None,
+        )
+        before = scheduler.get_stats()["mtp"]
+        assert before["bypass_counts"]["no_active_batch"] == 1
+
+        second_params = SamplingParams(temperature=0.7, top_p=0.9, min_p=0.0)
+        scheduler._ensure_batch_generator(second_params)
+
+        after = scheduler.get_stats()["mtp"]
+        assert scheduler.batch_generator is not first_generator
+        assert after["bypass_counts"] == before["bypass_counts"]
+
     def test_reset(self, mock_model, mock_tokenizer):
         """Test resetting scheduler."""
         scheduler = Scheduler(
