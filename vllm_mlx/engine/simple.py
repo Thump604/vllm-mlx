@@ -3193,6 +3193,7 @@ class SimpleEngine(BaseEngine):
                     # Cancellation before the first resume owns no sample and
                     # must atomically abandon still-unclaimed authority.
                     _cancel_check()
+                    forward_context.transfer_to_native_mtp()
                     generation = self._model.stream_generate(
                         prompt=None,
                         max_tokens=max_tokens,
@@ -4164,6 +4165,11 @@ class SimpleEngine(BaseEngine):
                         )
                     )
                     _cancel_check()
+                    if callable(getattr(model, "generation_forward_context", None)):
+                        forward_context.transfer_to_native_mtp()
+                        # Canonical native MTP owns positioned forwards after
+                        # the validated sparse-context transfer.
+                        gen_kwargs.pop("model_forward_context", None)
                     generation = mlx_stream_generate(
                         model,
                         self._text_tokenizer,

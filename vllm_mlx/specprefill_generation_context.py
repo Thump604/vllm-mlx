@@ -64,6 +64,8 @@ class SparseGenerationForwardContext:
         self._state = state.clone()
         self._hooks = TargetPositionHooks.for_model(target_model, adapter)
         self._mtp_cache: Any | None = None
+        self._native_mtp_transferred = False
+        self._terminal_state: SparseCacheState | None = None
         self._reconcile_cache()
 
     @property
@@ -73,7 +75,28 @@ class SparseGenerationForwardContext:
 
     def __call__(self, forward: Any):
         """Return the request-local context for one mlx-lm forward."""
+        if self._native_mtp_transferred:
+            raise SparseGenerationContextError(
+                "sparse generation context was transferred to native MTP"
+            )
         return self._forward_context(forward)
+
+    def transfer_to_native_mtp(self) -> SparseCacheState:
+        """Seal SimpleEngine sparse state before native MTP adopts its cache.
+
+        Native MTP becomes the sole owner of target-cache reconciliation after
+        its bootstrap claim.  Validate that no external advance occurred before
+        the handoff, then retain a terminal snapshot so later cleanup cannot
+        inspect the cache that native MTP now owns.
+        """
+        if self._native_mtp_transferred:
+            raise SparseGenerationContextError(
+                "sparse generation context was already transferred to native MTP"
+            )
+        self._reconcile_cache()
+        self._terminal_state = self._state.clone()
+        self._native_mtp_transferred = True
+        return self._terminal_state.clone()
 
     @contextmanager
     def _forward_context(self, forward: Any) -> Iterator[None]:
@@ -186,6 +209,9 @@ class SparseGenerationForwardContext:
 
     def finish(self) -> SparseCacheState:
         """Reconcile final speculative rollback and return terminal state."""
+        if self._native_mtp_transferred:
+            assert self._terminal_state is not None
+            return self._terminal_state.clone()
         self._reconcile_cache()
         return self.state
 

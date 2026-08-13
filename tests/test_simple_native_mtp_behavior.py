@@ -280,7 +280,11 @@ def _prepare_native_sparse(monkeypatch, model, tokens, selected_indices):
 def _position_correct_sequential_oracle(
     monkeypatch, model, tokens, selected_indices, *, max_tokens
 ):
-    from mlx_lm.generate import GenerationForward, GenerationForwardPhase
+    from mlx_lm.generate import (
+        GenerationForward,
+        GenerationForwardPhase,
+        GenerationForwardPositionAck,
+    )
 
     result, forward_context, bootstrap = _prepare_native_sparse(
         monkeypatch, model, tokens, selected_indices
@@ -288,15 +292,16 @@ def _position_correct_sequential_oracle(
     assert bootstrap.try_abandon_unclaimed() is True
     generated = [mx.argmax(result.logits[:, -1, :], axis=-1).item()]
 
-    class Ack:
-        def acknowledge(self, positions):
-            self.positions = positions
-
     try:
         while len(generated) < max_tokens:
             position = len(tokens) + len(generated) - 1
             input_tokens = mx.array([[generated[-1]]], dtype=mx.uint32)
-            ack = Ack()
+            ack = GenerationForwardPositionAck(
+                (position,),
+                model=model,
+                cache=bootstrap.target_cache,
+                phase=GenerationForwardPhase.DECODE,
+            )
             forward = GenerationForward(
                 model=model,
                 input_tokens=input_tokens,
@@ -306,9 +311,13 @@ def _position_correct_sequential_oracle(
                 logical_position_ack=ack,
             )
             with forward_context(forward):
-                logits = model(input_tokens, cache=bootstrap.target_cache)
-                mx.eval(logits, [entry.state for entry in bootstrap.target_cache])
-            assert ack.positions == (position,)
+                ack._activate()
+                try:
+                    logits = model(input_tokens, cache=bootstrap.target_cache)
+                    ack._require_acknowledged()
+                    mx.eval(logits, [entry.state for entry in bootstrap.target_cache])
+                finally:
+                    ack._finish()
             generated.append(mx.argmax(logits[:, -1, :], axis=-1).item())
     finally:
         forward_context.finish()
@@ -664,11 +673,20 @@ async def test_public_simple_preclaim_failure_abandons_and_dense_falls_back(
     engine._loaded = True
     _configure_public_sparse_engine(monkeypatch, engine, model, tokens, selected)
     bootstraps = []
+    transfers = []
     original_prepare = engine._prepare_sparse_target_prefill
 
     def capture_prepare(**kwargs):
         prepared = original_prepare(**kwargs)
         bootstraps.append(prepared[-1])
+        forward_context = prepared[-3]
+        original_transfer = forward_context.transfer_to_native_mtp
+
+        def track_transfer():
+            transfers.append("before_native_iteration")
+            return original_transfer()
+
+        monkeypatch.setattr(forward_context, "transfer_to_native_mtp", track_transfer)
         return prepared
 
     monkeypatch.setattr(engine, "_prepare_sparse_target_prefill", capture_prepare)
@@ -677,6 +695,7 @@ async def test_public_simple_preclaim_failure_abandons_and_dense_falls_back(
     @wraps(original_stream)
     def fail_sparse_before_claim(**kwargs):
         if kwargs.get("sparse_bootstrap") is not None:
+            assert transfers == ["before_native_iteration"]
 
             def failed():
                 raise ValueError("invalid sparse processor config")
@@ -702,6 +721,7 @@ async def test_public_simple_preclaim_failure_abandons_and_dense_falls_back(
 
     assert outputs[-1].specprefill_effective_policy == "dense"
     assert outputs[-1].specprefill_fallback_reason == "sparse_execution_failed"
+    assert transfers == ["before_native_iteration"]
     assert bootstraps[0].try_abandon_unclaimed() is False
     _assert_requests_closed(requests)
 

@@ -200,6 +200,27 @@ def test_finish_reconciles_a_final_speculative_rejection(monkeypatch):
     assert final_state.next_logical_positions == (9,)
 
 
+def test_native_mtp_transfer_seals_context_before_bootstrap_claim(monkeypatch):
+    context, model, cache, _ = _context(monkeypatch)
+
+    snapshot = context.transfer_to_native_mtp()
+
+    assert snapshot == _state()
+    _advance(cache, 1)
+    assert context.finish() == snapshot
+    with pytest.raises(SparseGenerationContextError, match="transferred"):
+        with context(_forward(model, cache, 1, "decode")):
+            pass
+
+
+def test_native_mtp_transfer_rejects_preclaim_external_cache_advance(monkeypatch):
+    context, _, cache, _ = _context(monkeypatch)
+    _advance(cache, 1)
+
+    with pytest.raises(SparseGenerationContextError, match="outside"):
+        context.transfer_to_native_mtp()
+
+
 def test_foreign_draft_forward_delegates_without_target_state_mutation(monkeypatch):
     context, _, _, hooks = _context(monkeypatch)
     draft_cache = [_Cache(8)]
