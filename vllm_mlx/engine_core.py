@@ -71,8 +71,7 @@ class EngineConfig:
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.001  # 1ms between steps
-    idle_step_interval: float = 0.1  # 100ms idle wait when scheduler is empty
+    step_interval: float = 0.1  # Idle wait when the scheduler is empty
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
 
@@ -255,7 +254,7 @@ class EngineCore:
             self.scheduler._close_batch_generator()
 
         stream_interval = self.config.stream_interval
-        idle_step_interval = self.config.idle_step_interval
+        step_interval = self.config.step_interval
         use_simple_streaming = stream_interval == 1
 
         # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
@@ -350,7 +349,7 @@ class EngineCore:
                         # No work; wait longer than the active loop but wake
                         # immediately when add_request signals new work.
                         await _wait_for_idle_or_request(
-                            getattr(self, "_request_event", None), idle_step_interval
+                            getattr(self, "_request_event", None), step_interval
                         )
 
                 except asyncio.CancelledError:
