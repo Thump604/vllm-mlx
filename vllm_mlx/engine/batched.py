@@ -848,6 +848,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             return GenerationOutput(
@@ -937,6 +938,7 @@ class BatchedEngine(BaseEngine):
                 presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
                 logits_processors=kwargs.pop("logits_processors", None),
+                mllm_draft=bool(kwargs.pop("mllm_draft", False)),
             )
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):

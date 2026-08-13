@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -256,6 +257,40 @@ class TestLifecycleCli:
 
         assert captured["use_batching"] is True
         assert captured["mllm_draft_model"] == "assistant"
+
+    def test_serve_command_rejects_batched_mllm_draft_without_mtp_kind(
+        self, monkeypatch, capsys
+    ):
+        """Invalid assistant batching must fail before downloading models."""
+        import vllm_mlx.cli as cli
+        import vllm_mlx.utils.download as download
+
+        download_model = MagicMock()
+        monkeypatch.setattr(download, "ensure_model_downloaded", download_model)
+
+        args = SimpleNamespace(
+            model="gemma4",
+            models_config=None,
+            served_model_name=None,
+            enable_auto_tool_choice=False,
+            tool_call_parser=None,
+            gpu_memory_utilization=0.90,
+            max_tokens=32768,
+            max_request_tokens=32768,
+            mllm_draft_model="assistant",
+            mllm_draft_kind=None,
+            mllm_draft_block_size=6,
+            continuous_batching=True,
+            auto_unload_idle_seconds=0.0,
+            lazy_load_model=False,
+            mllm=True,
+        )
+
+        with pytest.raises(SystemExit):
+            cli.serve_command(args)
+
+        download_model.assert_not_called()
+        assert "requires --mllm-draft-kind mtp" in capsys.readouterr().out
 
     def test_serve_command_rejects_mllm_draft_without_mllm(self, capsys):
         """Drafter flags should not be silently ignored on text-only models."""

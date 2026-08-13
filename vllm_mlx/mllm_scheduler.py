@@ -106,6 +106,7 @@ class MLLMRequest:
     videos: Optional[List[str]] = None
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
+    mllm_draft: bool = False
     arrival_time: float = field(default_factory=time.time)
 
     # Batch generator UID (assigned when scheduled)
@@ -454,6 +455,7 @@ class MLLMScheduler:
             videos=videos,
             audio=audio,
             sampling_params=sampling_params,
+            mllm_draft=bool(kwargs.pop("mllm_draft", False)),
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -601,6 +603,7 @@ class MLLMScheduler:
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
+                mllm_draft=request.mllm_draft,
             )
             batch_requests.append(batch_req)
 

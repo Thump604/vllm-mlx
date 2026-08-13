@@ -7,6 +7,7 @@ import asyncio
 import time
 from contextlib import suppress
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,6 +16,25 @@ async def _wait_for_resident_state(manager, model_key: str, state: str) -> None:
     """Poll until a resident reaches the expected state."""
     while manager.get_status(model_key)["state"] != state:
         await asyncio.sleep(0)
+
+
+def test_load_model_rejects_batched_mllm_draft_without_mtp_kind(monkeypatch):
+    """Programmatic startup must reject invalid batching before engine creation."""
+    import vllm_mlx.server as srv
+
+    batched_engine = MagicMock()
+    monkeypatch.setattr(srv, "BatchedEngine", batched_engine)
+
+    with pytest.raises(ValueError, match="mllm_draft_kind='mtp'"):
+        srv.load_model(
+            "gemma4",
+            use_batching=True,
+            force_mllm=True,
+            mllm_draft_model="assistant",
+            mllm_draft_kind=None,
+        )
+
+    batched_engine.assert_not_called()
 
 
 @pytest.fixture(autouse=True)

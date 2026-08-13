@@ -8,6 +8,7 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 
 def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch):
@@ -140,6 +141,32 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         "draft_kind": "mtp",
         "draft_block_size": 6,
     }
+
+
+def test_generate_forwards_mllm_draft_opt_in():
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    scheduler = SimpleNamespace(
+        generate=AsyncMock(
+            return_value=SimpleNamespace(
+                output_text="ok",
+                output_token_ids=[1],
+                prompt_tokens=2,
+                completion_tokens=1,
+                finish_reason="stop",
+                mtp_drafts=1,
+                mtp_accepted=1,
+            )
+        )
+    )
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._loaded = True
+    engine._is_mllm = True
+    engine._mllm_scheduler = scheduler
+
+    asyncio.run(engine.generate("hello", mllm_draft=True))
+
+    assert scheduler.generate.await_args.kwargs["mllm_draft"] is True
 
 
 def _run_start_mllm(monkeypatch, scheduler_config):

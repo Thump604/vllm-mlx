@@ -3321,6 +3321,10 @@ def load_model(
         raise ValueError("Default max tokens cannot exceed max request tokens")
     if mllm_draft_model and not force_mllm:
         raise ValueError("MLLM draft models require force_mllm/--mllm")
+    if mllm_draft_model and use_batching and mllm_draft_kind != "mtp":
+        raise ValueError(
+            "Continuous-batching MLLM draft models require mllm_draft_kind='mtp'"
+        )
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         raise ValueError("MLLM draft block size must be a positive integer")
     if mllm_draft_model and (auto_unload_idle_seconds > 0 or lazy_load_model):

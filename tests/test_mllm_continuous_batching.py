@@ -221,6 +221,7 @@ class TestMLLMBatchRequest:
         assert req.max_tokens == 256
         assert req.temperature == 0.7
         assert req.top_p == 0.9
+        assert req.mllm_draft is False
         assert req.output_tokens == []
 
 
@@ -500,6 +501,7 @@ class TestMLLMRequest:
         assert req.prompt == "Describe this image"
         assert req.images == ["image.jpg"]
         assert req.status == RequestStatus.WAITING
+        assert req.mllm_draft is False
         assert req.output_text == ""
 
 
@@ -1020,6 +1022,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             "no_active_batch": 0,
             "concurrent_batch": 0,
             "logits_processors": 0,
+            "assistant_not_requested": 0,
         }
 
         logits_processor = MagicMock()
@@ -1041,6 +1044,210 @@ class TestMLLMBatchGeneratorMTPGuards:
         stats = batch_gen.get_mtp_stats()
         assert stats["attempted"] == 0
         assert stats["bypass_counts"]["logits_processors"] == 1
+
+    def test_external_mtp_requires_every_active_request_to_opt_in(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        expected_tokens = mx.array([7, 8])
+        expected_logprobs = [mx.array([0.1, 0.9]), mx.array([0.2, 0.8])]
+        original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
+        draft_model = MagicMock()
+
+        class FakeBatchGen:
+            def __init__(self):
+                self.model = object()
+                self._step = original_step
+                self._next = MagicMock(return_value=[])
+                self.active_batch = SimpleNamespace(
+                    requests=[
+                        SimpleNamespace(mllm_draft=True),
+                        SimpleNamespace(mllm_draft=False),
+                    ]
+                )
+                self.sampler = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        language_model = MagicMock()
+        install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
+
+        assert batch_gen._allow_mid_batch_extend is False
+
+        tokens, logprobs = batch_gen._step(
+            mx.array([[1], [2]]),
+            cache=[],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        )
+
+        assert tokens.tolist() == expected_tokens.tolist()
+        assert [lp.tolist() for lp in logprobs] == [
+            lp.tolist() for lp in expected_logprobs
+        ]
+        original_step.assert_called_once()
+        language_model.assert_not_called()
+        assert batch_gen.get_mtp_stats()["attempted"] == 0
+        assert (
+            batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
+        )
+
+    def test_positive_temperature_is_stochastic_without_sampling_filters(self):
+        from vllm_mlx.mllm_batch_generator import _request_uses_stochastic_sampling
+
+        request = SimpleNamespace(temperature=0.7, top_p=1.0, top_k=0, min_p=0.0)
+
+        assert _request_uses_stochastic_sampling(request) is True
+
+    def test_external_stochastic_rejection_replays_sampled_target(self, monkeypatch):
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchResponse,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (10, [10] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_draft_block_active",
+            lambda *args, **kwargs: mx.array([[2]], dtype=mx.uint32),
+        )
+
+        request = SimpleNamespace(
+            uid=7,
+            request_id="sampled-external",
+            temperature=0.7,
+            top_p=1.0,
+            top_k=1,
+            min_p=0.0,
+            mllm_draft=True,
+            output_tokens=[],
+        )
+        active_batch = SimpleNamespace(
+            uids=[7],
+            requests=[request],
+            num_tokens=[0],
+            max_tokens=[8],
+        )
+        primary_response = MLLMBatchResponse(
+            uid=7,
+            request_id=request.request_id,
+            token=1,
+            logprobs=mx.zeros(4),
+        )
+
+        class Generator:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self._step = MagicMock(
+                    side_effect=AssertionError("external MTP must not bypass")
+                )
+                self._next = MagicMock(return_value=[primary_response])
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        class TrimmableCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, count):
+                self.trim_calls.append(count)
+
+        class DraftModel:
+            def __init__(self):
+                self.accept_lens = []
+                self.draft_lens = []
+
+            def reset(self, model):
+                self.model = model
+
+            def set_shared_kv(self, *args, **kwargs):
+                return None
+
+        class LanguageModel:
+            def __init__(self):
+                self.inputs = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                self.inputs.append(input_tokens.tolist())
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((1, seq_len, 4), -1000.0)
+                if seq_len == 2:
+                    logits[:, 0, 3] = 0.0
+                else:
+                    logits[:, -1, 1] = 0.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        language_model = LanguageModel()
+        draft_model = DraftModel()
+        cache = TrimmableCache()
+        install_mtp_mllm(generator, language_model, draft_model=draft_model)
+
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[lambda logprobs: mx.array([1], dtype=mx.uint32)],
+        )
+        responses = generator._next()
+
+        assert language_model.inputs == [[[0]], [[1, 2]], [[3]]]
+        assert cache.trim_calls == [1]
+        assert [response.token for response in responses] == [1, 3]
+        assert responses[1].from_draft is False
+        assert int(mx.argmax(responses[1].logprobs).item()) == 3
+        assert draft_model.accept_lens == [0]
+        assert generator.get_mtp_stats()["rejected"] == 1
+
+    def test_uniform_draft_batches_remove_only_selected_requests(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        requests = [
+            MLLMBatchRequest(uid=1, request_id="a", prompt="a", mllm_draft=True),
+            MLLMBatchRequest(uid=2, request_id="b", prompt="b", mllm_draft=False),
+            MLLMBatchRequest(uid=3, request_id="c", prompt="c", mllm_draft=True),
+        ]
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.active_batch = None
+        generator.unprocessed_requests = requests
+        generator.completion_batch_size = 2
+        generator._require_uniform_mllm_draft = True
+        generator._allow_mid_batch_extend = False
+        generator._pending_error_responses = []
+        generator._process_prompts = MagicMock(side_effect=RuntimeError("failed"))
+
+        responses = MLLMBatchGenerator._next(generator)
+
+        assert [request.request_id for request in generator.unprocessed_requests] == [
+            "b"
+        ]
+        assert [response.request_id for response in responses] == ["a", "c"]
 
     def test_sampled_mtp_uses_post_filter_distributions_and_residuals(self):
         from vllm_mlx.mllm_batch_generator import (

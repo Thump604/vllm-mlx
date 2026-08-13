@@ -110,6 +110,12 @@ def serve_command(args):
     if mllm_draft_model and not getattr(args, "mllm", False):
         print("Error: --mllm-draft-model requires --mllm")
         sys.exit(1)
+    if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
+        print(
+            "Error: --mllm-draft-model with --continuous-batching "
+            "requires --mllm-draft-kind mtp"
+        )
+        sys.exit(1)
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
         sys.exit(1)

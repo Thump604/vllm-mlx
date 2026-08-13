@@ -77,19 +77,12 @@ def _drop_retired_processors(
 def _request_uses_stochastic_sampling(request: Any) -> bool:
     """Return whether a request needs sampler-aware speculative verification.
 
-    Greedy (temperature 0) requests are excluded regardless of top_p/top_k/
-    min_p: _sampling_logprobs() collapses to an argmax delta distribution for
-    temperature 0 and never applies those filters, so a greedy request left at
-    a non-default top_p/top_k/min_p is not actually stochastic.
+    Any positive temperature samples even when top-p, top-k, and min-p are at
+    their unrestricted defaults. Temperature zero remains greedy regardless of
+    the filter settings.
     """
     temperature = getattr(request, "temperature", 0.0)
-    if temperature in (0, 0.0):
-        return False
-    return (
-        getattr(request, "top_p", 1.0) < 1.0
-        or getattr(request, "top_k", 0) != 0
-        or getattr(request, "min_p", 0.0) != 0.0
-    )
+    return temperature not in (0, 0.0)
 
 
 def _sampling_logprobs(logits: mx.array, request: Any) -> mx.array:
@@ -212,6 +205,7 @@ class MLLMBatchRequest:
     min_p: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    mllm_draft: bool = False
     # Extra logits processors (e.g. JSON schema constrained decoding).
     # Merged with built-in repetition/presence penalty processors in
     # ``_prefill_batch``.
@@ -549,6 +543,8 @@ class MLLMBatchGenerator:
         self.unprocessed_requests: List[MLLMBatchRequest] = []
         self.active_batch: Optional[MLLMBatch] = None
         self.uid_counter = 0
+        self._require_uniform_mllm_draft = False
+        self._allow_mid_batch_extend = True
 
         # Statistics
         self._stats = MLLMBatchStats()
@@ -862,6 +858,24 @@ class MLLMBatchGenerator:
         self.unprocessed_requests = [
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
+
+    def _compatible_pending_requests(
+        self,
+        requests: List[MLLMBatchRequest],
+        limit: int,
+        reference: Optional[MLLMBatchRequest] = None,
+    ) -> List[MLLMBatchRequest]:
+        """Select requests that can safely share an assistant-drafter batch."""
+        if not requests or not getattr(self, "_require_uniform_mllm_draft", False):
+            return requests[:limit]
+
+        if reference is None and self.active_batch is not None:
+            reference = self.active_batch.requests[0]
+        if reference is None:
+            reference = requests[0]
+
+        draft_requested = reference.mllm_draft
+        return [r for r in requests if r.mllm_draft == draft_requested][:limit]
 
     def _preprocess_request(self, request: MLLMBatchRequest) -> None:
         """
@@ -1760,7 +1774,9 @@ class MLLMBatchGenerator:
         # Exception: text-only requests can be extended into an active batch
         # via the elif branch below (they skip vision encoding entirely).
         if num_active == 0:
-            requests = self.unprocessed_requests[: self.completion_batch_size]
+            requests = self._compatible_pending_requests(
+                self.unprocessed_requests, self.completion_batch_size
+            )
 
             if len(requests) == 0:
                 self.active_batch = None
@@ -1769,9 +1785,11 @@ class MLLMBatchGenerator:
             try:
                 # Save count before _process_prompts which modifies
                 # `requests` in-place via .remove() for failed items.
-                num_to_consume = len(requests)
+                requested_uids = {r.uid for r in requests}
                 new_batch = self._process_prompts(requests)
-                self.unprocessed_requests = self.unprocessed_requests[num_to_consume:]
+                self.unprocessed_requests = [
+                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                ]
                 self.active_batch = new_batch
                 prompt_processing = True
             except Exception as e:
@@ -1781,7 +1799,9 @@ class MLLMBatchGenerator:
                     exc_info=True,
                 )
                 # Remove failed requests to avoid infinite retry loop
-                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.unprocessed_requests = [
+                    r for r in self.unprocessed_requests if r.uid not in requested_uids
+                ]
                 for req in requests:
                     self._pending_error_responses.append(
                         MLLMBatchResponse(
@@ -1795,10 +1815,13 @@ class MLLMBatchGenerator:
 
         # Mid-batch extend: text-only requests can join an active batch
         # without vision encoding (no shape mismatch risk).
-        elif self.unprocessed_requests:
-            text_only = [
-                r for r in self.unprocessed_requests if not r.images and not r.videos
-            ][: self.completion_batch_size]
+        elif self.unprocessed_requests and getattr(
+            self, "_allow_mid_batch_extend", True
+        ):
+            text_only = self._compatible_pending_requests(
+                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                self.completion_batch_size,
+            )
 
             if text_only:
                 try:
@@ -2085,6 +2108,8 @@ def install_mtp_mllm(
     _draft_sampler = make_sampler(temp=0.0)
     external_drafter = draft_model is not None
     if external_drafter:
+        batch_gen._require_uniform_mllm_draft = True
+        batch_gen._allow_mid_batch_extend = False
         draft_model.reset(batch_gen.model)
 
     def _model_parts(output: Any) -> Tuple[mx.array, Optional[mx.array]]:
@@ -2124,6 +2149,7 @@ def install_mtp_mllm(
         "no_active_batch": 0,
         "concurrent_batch": 0,
         "logits_processors": 0,
+        "assistant_not_requested": 0,
     }
 
     def _get_mtp_stats() -> Dict[str, Any]:
@@ -2176,12 +2202,22 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
-        if prefill_bypass or no_active_batch_bypass or logits_processors_bypass:
+        assistant_not_requested_bypass = external_drafter and (
+            not active_requests
+            or not all(request.mllm_draft for request in active_requests)
+        )
+        if (
+            prefill_bypass
+            or no_active_batch_bypass
+            or logits_processors_bypass
+            or assistant_not_requested_bypass
+        ):
             # Keep the descriptions near the guards so operator-facing
             # telemetry stays dynamic instead of duplicating code predicates:
             # prefill=input_tokens.shape[1] > 1
             # no_active_batch=active_batch is None
             # logits_processors=request-local processors are active
+            # assistant_not_requested=not every active request opted in
             with _mtp_stats_lock:
                 if prefill_bypass:
                     _bypass_counts["prefill"] += 1
@@ -2189,6 +2225,8 @@ def install_mtp_mllm(
                     _bypass_counts["no_active_batch"] += 1
                 if logits_processors_bypass:
                     _bypass_counts["logits_processors"] += 1
+                if assistant_not_requested_bypass:
+                    _bypass_counts["assistant_not_requested"] += 1
             _skip_state_by_uid.clear()
             return _orig_step(
                 input_tokens, cache, logits_processors, output_tokens, samplers
@@ -2350,19 +2388,17 @@ def install_mtp_mllm(
                     ],
                     axis=0,
                 )
-                sampled_target = mx.concatenate(
-                    [
-                        (
-                            samplers[row]
-                            if samplers and samplers[row]
-                            else batch_gen.sampler
-                        )(verify_distribution[row : row + 1])
-                        for row in range(batch_size)
-                    ],
-                    axis=0,
-                )
+                # _sampling_logprobs already applies each request's sampler
+                # transforms. Draw directly from that distribution so
+                # temperature and top-k/top-p/min-p are not applied twice.
+                sampled_target = mx.random.categorical(verify_distribution)
                 mx.eval(sampled_target, draft_tokens)
                 all_accepted = sampled_target.tolist() == draft_list
+                if not all_accepted:
+                    sampled_target_list = sampled_target.tolist()
+                    for row, uid in enumerate(current_uids):
+                        residual_tokens_by_uid[uid] = int(sampled_target_list[row])
+                        residual_logprobs_by_uid[uid] = verify_distribution[row]
             elif uses_stochastic_sampling:
                 verify_distribution = mx.concatenate(
                     [
@@ -2402,6 +2438,9 @@ def install_mtp_mllm(
                 verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
                     verify_logits[:, 0, :], axis=-1, keepdims=True
                 )
+                accepted_logprobs = (
+                    verify_distribution if uses_stochastic_sampling else verify_lp
+                )
                 for e in range(batch_size):
                     uid = current_uids[e]
                     _skip_state_by_uid[uid] = {
@@ -2410,7 +2449,8 @@ def install_mtp_mllm(
                     }
                     _deferred_drafts[uid] = {
                         "token": draft_list[e],
-                        "logprobs": verify_lp[e],
+                        "logprobs": accepted_logprobs[e],
+                        "from_draft": True,
                     }
                 with _mtp_stats_lock:
                     _mtp_stats["accepted"] += 1
@@ -2420,20 +2460,20 @@ def install_mtp_mllm(
 
             else:
                 # A batch cache cannot roll back an individual row. On a mixed
-                # concurrent rejection, replay only the primary token for every
-                # row; this preserves each target distribution and trades that
-                # step's acceleration for exact cache state. A single sampled
-                # rejection can retain its residual token and still advance.
-                sampled_single_reject = (
-                    uses_stochastic_sampling
-                    and batch_size == 1
-                    and bool(residual_tokens_by_uid)
+                # concurrent rejection, replay the same suffix for every row.
+                # External assistant verification retains the already sampled
+                # target token instead of sampling it twice. Native sampled MTP
+                # only retains a residual for a single-row rejection.
+                sampled_reject = uses_stochastic_sampling and bool(
+                    residual_tokens_by_uid
                 )
                 replay_tokens = primary_tokens
-                if sampled_single_reject:
-                    residual_token = residual_tokens_by_uid[current_uids[0]]
+                if sampled_reject:
+                    residual_tokens = mx.array(
+                        [residual_tokens_by_uid[uid] for uid in current_uids]
+                    )
                     replay_tokens = mx.concatenate(
-                        [primary_tokens[:, None], mx.array([[residual_token]])],
+                        [primary_tokens[:, None], residual_tokens[:, None]],
                         axis=1,
                     )
 
@@ -2450,11 +2490,7 @@ def install_mtp_mllm(
                     for _ci, _snap in _rnn_snapshots.items():
                         cache[_ci].state = _snap
                     rerun_out = language_model(
-                        (
-                            replay_tokens
-                            if sampled_single_reject
-                            else primary_tokens[:, None]
-                        ),
+                        (replay_tokens if sampled_reject else primary_tokens[:, None]),
                         cache=cache,
                         return_hidden=True,
                     )
@@ -2480,10 +2516,12 @@ def install_mtp_mllm(
                             and hasattr(c, "trim")
                         ):
                             c.trim(1)
-                    if sampled_single_reject:
-                        residual_token = residual_tokens_by_uid[current_uids[0]]
+                    if sampled_reject:
+                        residual_tokens = mx.array(
+                            [residual_tokens_by_uid[uid] for uid in current_uids]
+                        )
                         rerun_out = language_model(
-                            mx.array([[residual_token]]),
+                            residual_tokens[:, None],
                             cache=cache,
                             return_hidden=True,
                         )
@@ -2515,13 +2553,14 @@ def install_mtp_mllm(
                         _skip_state_by_uid.clear()
                 for row, uid in enumerate(current_uids):
                     _deferred_drafts.pop(uid, None)
-                    if sampled_single_reject:
+                    if sampled_reject:
                         # Report the logprob from the residual distribution the
                         # token was actually drawn from, not the raw unfiltered
                         # target distribution at this position.
                         _deferred_drafts[uid] = {
                             "token": residual_tokens_by_uid[uid],
                             "logprobs": residual_logprobs_by_uid[uid],
+                            "from_draft": False,
                         }
                 with _mtp_stats_lock:
                     _mtp_stats["rejected"] += 1
@@ -2604,6 +2643,7 @@ def install_mtp_mllm(
                     draft_info = prev_deferred.pop(uid)
                     draft_t = draft_info["token"]
                     draft_lp = draft_info["logprobs"]
+                    from_draft = draft_info.get("from_draft", True)
 
                     if draft_t in batch_gen.stop_tokens:
                         augmented.append(
@@ -2613,7 +2653,7 @@ def install_mtp_mllm(
                                 token=draft_t,
                                 logprobs=draft_lp,
                                 finish_reason="stop",
-                                from_draft=True,
+                                from_draft=from_draft,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -2637,7 +2677,7 @@ def install_mtp_mllm(
                                 token=draft_t,
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
-                                from_draft=True,
+                                from_draft=from_draft,
                             )
                         )
 
@@ -2860,11 +2900,22 @@ def install_chunked_prefill_mllm(
                 # IMPORTANT: Only inline requests whose prompt fits
                 # within the chunk budget — longer requests must wait
                 # for their own interleaved prefill (Phase 2).
-                if batch_gen.unprocessed_requests:
+                if batch_gen.unprocessed_requests and getattr(
+                    batch_gen, "_allow_mid_batch_extend", True
+                ):
                     _budget = batch_gen._chunked_prefill_budget
                     short_reqs = []
+                    reference = (
+                        batch_gen.active_batch.requests[0]
+                        if batch_gen.active_batch is not None
+                        else req
+                    )
                     for r in batch_gen.unprocessed_requests:
                         if r.images or r.videos:
+                            continue
+                        if not batch_gen._compatible_pending_requests(
+                            [r], 1, reference=reference
+                        ):
                             continue
                         if r.input_ids is None:
                             try:
@@ -3027,10 +3078,16 @@ def install_chunked_prefill_mllm(
         batch = batch_gen.active_batch
         num_active = len(batch) if batch else 0
 
-        if batch_gen.unprocessed_requests:
+        if batch_gen.unprocessed_requests and (
+            num_active == 0 or getattr(batch_gen, "_allow_mid_batch_extend", True)
+        ):
             # Find first text-only request eligible for interleaving
             text_only_req = None
-            for r in batch_gen.unprocessed_requests:
+            compatible_pending = batch_gen._compatible_pending_requests(
+                batch_gen.unprocessed_requests,
+                len(batch_gen.unprocessed_requests),
+            )
+            for r in compatible_pending:
                 if not r.images and not r.videos:
                     text_only_req = r
                     break
