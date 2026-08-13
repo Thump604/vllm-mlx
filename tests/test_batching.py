@@ -768,6 +768,8 @@ class TestSchedulerBasic:
 
         monkeypatch.setattr("vllm_mlx.scheduler.BatchGenerator", FakeBatchGenerator)
         mock_model.mtp = object()
+        mock_model.mtp_capability = None
+        mock_model.language_model.mtp_capability = None
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,

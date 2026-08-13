@@ -924,7 +924,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert batch.y.tolist() == [3]
         assert batch.samplers == [request_sampler]
         assert batch.logits_processors == [[processor]]
-        assert processor.calls == [[]]
+        assert processor.calls == [[42]]
         assert request_sampler.call_count == 1
         fallback_sampler.assert_not_called()
         assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
@@ -1020,6 +1020,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             "no_active_batch": 0,
             "concurrent_batch": 0,
             "logits_processors": 0,
+            "sparse_rows": 0,
         }
 
         logits_processor = MagicMock()
@@ -1469,6 +1470,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self.active_batch = MagicMock()
                 self.active_batch.__len__.return_value = 1
                 self.active_batch.uids = [7]
+                self.active_batch.has_sparse_rows = False
                 request = MagicMock(
                     request_id="req-7",
                     temperature=0.0,
@@ -1476,6 +1478,7 @@ class TestMLLMBatchGeneratorMTPGuards:
                     top_k=0,
                     min_p=0.0,
                     output_tokens=[],
+                    specprefill=False,
                 )
                 self.active_batch.requests = [request]
                 self.active_batch.num_tokens = [0]

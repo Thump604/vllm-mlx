@@ -170,7 +170,8 @@ class _Processor:
     eos_token_id = 31
     clean_up_tokenization_spaces = False
 
-    def encode(self, _prompt):
+    def encode(self, _prompt, *, add_special_tokens=False):
+        assert add_special_tokens is False
         return [1, 2, 3, 4]
 
     def decode(self, tokens):

@@ -228,6 +228,10 @@ def test_mllm_scheduler_exposes_mtp_attempts_and_accepts_on_outputs():
     class _Tokenizer:
         clean_up_tokenization_spaces = False
 
+        def encode(self, _text, *, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [1, 2, 3]
+
         def decode(self, tokens):
             return "".join(str(token) for token in tokens)
 

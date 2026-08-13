@@ -704,7 +704,7 @@ def _attach_native_mtp_request_kwargs(
     mlx-lm/mlx-vlm. Default-off and external-drafter paths get no new kwargs.
     """
 
-    requested = request.mtp
+    requested = getattr(request, "mtp", None)
     state_resolver = getattr(engine, "native_mtp_server_state", None)
     if state_resolver is None:
         state = NativeMTPServerState(
@@ -740,6 +740,7 @@ def _attach_native_mtp_request_kwargs(
     ):
         incompatibility = "native_mtp_penalty_processors_unsupported"
 
+    seed = getattr(request, "seed", None)
     sampling = NativeMTPSampling(
         temperature=float(kwargs["temperature"]),
         top_p=float(kwargs["top_p"]),
@@ -747,7 +748,7 @@ def _attach_native_mtp_request_kwargs(
         min_p=float(kwargs["min_p"]),
         presence_penalty=float(kwargs["presence_penalty"]),
         repetition_penalty=float(kwargs["repetition_penalty"]),
-        seed=request.seed,
+        seed=seed,
     )
     try:
         decision = resolve_native_mtp_request(
@@ -761,7 +762,7 @@ def _attach_native_mtp_request_kwargs(
     except NativeMTPRequestError as exc:
         raise HTTPException(status_code=422, detail=exc.reason) from exc
 
-    if request.seed is not None and decision.config is None:
+    if seed is not None and decision.config is None:
         raise HTTPException(
             status_code=422,
             detail="native_mtp_seed_requires_effective_mtp",

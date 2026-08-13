@@ -43,9 +43,11 @@ def _import_qwen_model_classes(model_type: str):
 def _import_text_model_classes(model_type: str):
     """Compatibility helper retained for the separate Gemma extraction path."""
 
-    if model_type == "gemma4_text":
+    if _is_gemma_text_model_type(model_type):
         return _import_gemma_text_model_classes()
-    return _import_qwen_model_classes(model_type)
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    return TextModel, TextModelArgs
 
 
 def _safetensors_shapes(shard_path: Path, keys: set[str]) -> dict[str, tuple[int, ...]]:
@@ -335,6 +337,8 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
                 capability.reason,
             )
         elif _is_gemma_text_model_type(model_type):
+            Model, _ = _import_gemma_text_model_classes()
+            text_model_cls = f"{Model.__module__}.{Model.__qualname__}"
             text_model = _build_gemma_text_model(vlm_lm, config, text_config)
         else:
             raise ValueError(
