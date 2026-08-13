@@ -456,7 +456,10 @@ class BatchedEngine(BaseEngine):
         if self._is_mllm or has_media:
             incompatibility = "native_mtp_media_unsupported"
         elif getattr(self._scheduler_config, "specprefill_enabled", False):
-            incompatibility = "native_mtp_specprefill_composition_unsupported"
+            if getattr(
+                self._scheduler_config, "native_mtp_specprefill_runtime", None
+            ) is None or not getattr(self._scheduler_config, "enable_mtp", False):
+                incompatibility = "native_mtp_specprefill_composition_unsupported"
         elif getattr(self._scheduler_config, "enable_prefix_cache", True):
             incompatibility = "native_mtp_prefix_reuse_unsupported"
         elif getattr(self._scheduler_config, "chunked_prefill_tokens", 0):
@@ -497,6 +500,7 @@ class BatchedEngine(BaseEngine):
             return
 
         try:
+            self._preflight_llm_native_mtp_specprefill_startup()
             if self._model is None:
                 if self._uses_default_prepare_for_start():
                     # Load inline on the event-loop thread so mlx-lm's
@@ -512,7 +516,10 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm:
                 await self._start_mllm()
             else:
-                if getattr(self._scheduler_config, "specprefill_enabled", False):
+                if (
+                    getattr(self._scheduler_config, "specprefill_enabled", False)
+                    and not getattr(self._scheduler_config, "enable_mtp", False)
+                ):
                     raise RuntimeError(
                         "continuous-batching SpecPrefill requires the MLLM scheduler"
                     )
@@ -525,6 +532,24 @@ class BatchedEngine(BaseEngine):
         except asyncio.CancelledError:
             await cleanup_startup_cancellation(self.stop)
             raise
+
+    def _preflight_llm_native_mtp_specprefill_startup(self) -> None:
+        """Reject impossible text combined startup before model side effects."""
+        config = self._scheduler_config
+        if self._is_mllm or not bool(getattr(config, "specprefill_enabled", False)):
+            return
+        if not bool(getattr(config, "enable_mtp", False)):
+            return
+        if getattr(config, "enable_prefix_cache", True):
+            raise RuntimeError("native_mtp_prefix_reuse_unsupported")
+        if getattr(config, "chunked_prefill_tokens", 0):
+            raise RuntimeError("native_mtp_chunked_prefill_unsupported")
+        if getattr(config, "kv_cache_quantization", False):
+            raise RuntimeError("native_mtp_quantized_cache_unsupported")
+        if getattr(config, "max_kv_size", 0):
+            raise RuntimeError("native_mtp_max_kv_unsupported")
+        if not callable(getattr(config, "specprefill_prepare", None)):
+            raise RuntimeError("enabled CB SpecPrefill requires specprefill_prepare")
 
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
@@ -825,6 +850,10 @@ class BatchedEngine(BaseEngine):
                 failures.append(exc)
             else:
                 self._prepared_specprefill_runtime = None
+                if getattr(
+                    self._scheduler_config, "native_mtp_specprefill_runtime", None
+                ) is prepared:
+                    self._scheduler_config.native_mtp_specprefill_runtime = None
         return failures
 
     def _inject_mtp_mllm(self) -> None:
@@ -941,50 +970,187 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
-        if self._model is None or self._tokenizer is None:
-            self._prepare_llm_model()
+        if self._engine is not None or self._prepared_specprefill_runtime is not None:
+            with suspend_cancellation():
+                prior_engine_failures = await self._cleanup_llm_engine_ownership()
+                prior_runtime_failures = []
+                if not prior_engine_failures:
+                    prior_runtime_failures = (
+                        await self._cleanup_mllm_runtime_ownership()
+                    )
+            prior_failures = (*prior_engine_failures, *prior_runtime_failures)
+            if prior_failures:
+                raise RuntimeError(
+                    "previous standard-text startup cleanup remains incomplete"
+                ) from prior_failures[0]
 
-        # Validate MTP support if enabled
-        if self._scheduler_config and self._scheduler_config.enable_mtp:
-            from ..patches.qwen3_next_mtp import validate_mtp_support
-            from ..scheduler import _continuous_batching_mtp_capability
+        try:
+            if self._model is None or self._tokenizer is None:
+                self._prepare_llm_model()
 
-            _continuous_batching_mtp_capability(self._model, enabled=True)
-            if validate_mtp_support(self._model):
-                logger.info("[MTP] Model validated for MTP speculative decoding")
-            else:
-                logger.warning(
-                    "[MTP] MTP validation failed — --enable-mtp will be ignored. "
-                    "See warnings above for details."
+            # Validate MTP support if enabled
+            if self._scheduler_config and self._scheduler_config.enable_mtp:
+                from ..patches.qwen3_next_mtp import validate_mtp_support
+                from ..scheduler import _continuous_batching_mtp_capability
+
+                _continuous_batching_mtp_capability(self._model, enabled=True)
+                if validate_mtp_support(self._model):
+                    logger.info("[MTP] Model validated for MTP speculative decoding")
+                else:
+                    logger.warning(
+                        "[MTP] MTP validation failed — --enable-mtp will be ignored. "
+                        "See warnings above for details."
+                    )
+
+            prepared_specprefill = self._prepare_llm_native_mtp_specprefill_runtime()
+            self._prepared_specprefill_runtime = prepared_specprefill
+
+            # Create engine config
+            scheduler_config = self._scheduler_config or SchedulerConfig()
+            engine_config = EngineConfig(
+                model_name=self._model_name,
+                scheduler_config=scheduler_config,
+                stream_interval=self._stream_interval,
+                gpu_memory_utilization=self._gpu_memory_utilization,
+            )
+
+            # Create async engine
+            self._engine = AsyncEngineCore(
+                model=self._model,
+                tokenizer=self._tokenizer,
+                config=engine_config,
+            )
+
+            await self._engine.engine.start()
+        except BaseException:
+            with suspend_cancellation():
+                engine_cleanup_failures = await self._cleanup_llm_engine_ownership()
+                cleanup_failures = []
+                if not engine_cleanup_failures:
+                    cleanup_failures = await self._cleanup_mllm_runtime_ownership()
+            for failure in (*engine_cleanup_failures, *cleanup_failures):
+                logger.error(
+                    "Standard-text SpecPrefill startup cleanup failed while preserving original error",
+                    exc_info=(type(failure), failure, failure.__traceback__),
                 )
+            raise
 
-        # Create engine config
-        scheduler_config = self._scheduler_config or SchedulerConfig()
-        engine_config = EngineConfig(
-            model_name=self._model_name,
-            scheduler_config=scheduler_config,
-            stream_interval=self._stream_interval,
-            gpu_memory_utilization=self._gpu_memory_utilization,
-        )
+    def _prepare_llm_native_mtp_specprefill_runtime(
+        self,
+    ) -> PreparedMLLMSpecPrefillRuntime | None:
+        """Prepare the sole admitted standard-text native-MTP sparse owner.
 
-        # Create async engine
-        self._engine = AsyncEngineCore(
-            model=self._model,
-            tokenizer=self._tokenizer,
-            config=engine_config,
-        )
+        This intentionally reuses the public, fail-atomic SpecPrefill builder.
+        It does not alter the loaded target model or inject a private scheduler
+        dependency: the completed immutable runtime is passed through the
+        existing public ``SchedulerConfig`` seam before ``AsyncEngineCore`` is
+        constructed.
+        """
+        config = self._scheduler_config
+        if not bool(getattr(config, "specprefill_enabled", False)):
+            return None
+        if not bool(getattr(config, "enable_mtp", False)):
+            raise RuntimeError(
+                "continuous-batching SpecPrefill requires the MLLM scheduler"
+            )
+        if self._is_mllm:
+            raise RuntimeError("native_mtp_media_unsupported")
+        if getattr(config, "enable_prefix_cache", True):
+            raise RuntimeError("native_mtp_prefix_reuse_unsupported")
+        if getattr(config, "chunked_prefill_tokens", 0):
+            raise RuntimeError("native_mtp_chunked_prefill_unsupported")
+        if getattr(config, "kv_cache_quantization", False):
+            raise RuntimeError("native_mtp_quantized_cache_unsupported")
+        if getattr(config, "max_kv_size", 0):
+            raise RuntimeError("native_mtp_max_kv_unsupported")
+        prepare = getattr(config, "specprefill_prepare", None)
+        if not callable(prepare):
+            raise RuntimeError("enabled CB SpecPrefill requires specprefill_prepare")
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("standard-text target and tokenizer must be loaded")
+        # A stopped or failed prior attempt must not leave a closed bundle
+        # visible to request admission while this replacement is being built.
+        config.native_mtp_specprefill_runtime = None
+        try:
+            candidate = prepare(self._model, self._tokenizer)
+        except BaseException as failure:
+            retained_cleanup = getattr(failure, "specprefill_retained_cleanup", None)
+            if callable(retained_cleanup):
+                self._prepared_specprefill_runtime = _RetainedSpecPrefillCleanup(
+                    retained_cleanup
+                )
+            raise
+        if not isinstance(candidate, PreparedMLLMSpecPrefillRuntime):
+            cleanup = getattr(candidate, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+            raise TypeError(
+                "specprefill_prepare must return PreparedMLLMSpecPrefillRuntime"
+            )
+        if candidate.target_model is not self._model:
+            self._cleanup_invalid_prepared_specprefill_runtime(
+                candidate, "prepared target model identity mismatch"
+            )
+        if candidate.processor is not self._tokenizer:
+            self._cleanup_invalid_prepared_specprefill_runtime(
+                candidate, "prepared tokenizer identity mismatch"
+            )
+        if not callable(candidate.native_mtp_session_factory):
+            self._cleanup_invalid_prepared_specprefill_runtime(
+                candidate, "prepared native MTP session factory missing"
+            )
+        self._prepared_specprefill_runtime = candidate
+        config.native_mtp_specprefill_runtime = candidate
+        return candidate
 
-        await self._engine.engine.start()
+    def _cleanup_invalid_prepared_specprefill_runtime(
+        self,
+        candidate: PreparedMLLMSpecPrefillRuntime,
+        message: str,
+    ) -> None:
+        """Close a rejected prepared bundle without losing cleanup failures."""
+        mismatch = ValueError(message)
+        self._prepared_specprefill_runtime = candidate
+        try:
+            candidate.cleanup()
+        except BaseException as cleanup_failure:
+            logger.error(
+                "Rejected prepared standard-text SpecPrefill cleanup failed",
+                exc_info=(
+                    type(cleanup_failure),
+                    cleanup_failure,
+                    cleanup_failure.__traceback__,
+                ),
+            )
+            raise mismatch from cleanup_failure
+        self._prepared_specprefill_runtime = None
+        raise mismatch
+
+    async def _cleanup_llm_engine_ownership(self) -> list[BaseException]:
+        """Stop and close a partially started standard-text core exactly once."""
+        failures: list[BaseException] = []
+        engine = self._engine
+        if engine is None:
+            return failures
+        try:
+            await engine.stop()
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            engine.engine.close()
+        except BaseException as exc:
+            failures.append(exc)
+        if not failures:
+            self._engine = None
+        return failures
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         with suspend_cancellation():
-            cleanup_failures = await self._cleanup_mllm_runtime_ownership()
-
-        if self._engine:
-            await self._engine.stop()
-            self._engine.engine.close()
-            self._engine = None
+            engine_cleanup_failures = await self._cleanup_llm_engine_ownership()
+            cleanup_failures = []
+            if not engine_cleanup_failures:
+                cleanup_failures = await self._cleanup_mllm_runtime_ownership()
 
         self._model = None
         self._tokenizer = None
@@ -992,6 +1158,8 @@ class BatchedEngine(BaseEngine):
         self._mllm_instance = None
         self._loaded = False
         logger.info("BatchedEngine stopped")
+        if engine_cleanup_failures:
+            raise engine_cleanup_failures[0]
         if cleanup_failures:
             raise cleanup_failures[0]
 

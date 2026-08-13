@@ -105,7 +105,7 @@ def _scorer_artifact(tmp_path, contents=b"synthetic scorer weights"):
     return str(path), hashlib.sha256(contents).hexdigest()
 
 
-def _bundle(cleanup, target_model, processor):
+def _bundle(cleanup, target_model, processor, *, native_mtp_session_factory=None):
     registry, key = _certified_registry()
     return PreparedMLLMSpecPrefillRuntime(
         profile_registry=registry,
@@ -123,6 +123,7 @@ def _bundle(cleanup, target_model, processor):
         tokenizer_artifact_hash=key.tokenizer_artifact_hash,
         scorer_artifact_hash=key.scorer_artifact_hash,
         cleanup=cleanup,
+        native_mtp_session_factory=native_mtp_session_factory,
     )
 
 
@@ -189,6 +190,288 @@ def test_prepared_launch_wires_exact_scheduler_dependencies(monkeypatch):
 
     asyncio.run(engine.stop())
     assert cleanup_calls == ["cleanup"]
+
+
+def test_standard_text_native_mtp_specprefill_prepares_and_wires_public_config():
+    """Combined text startup owns one prepared bundle through SchedulerConfig."""
+    model = SimpleNamespace(mtp_capability=SimpleNamespace(supported=True, reason=None))
+    tokenizer = object()
+    cleaned = []
+    factory = lambda *_args: None
+    bundle = _bundle(
+        lambda: cleaned.append("cleanup"),
+        model,
+        tokenizer,
+        native_mtp_session_factory=factory,
+    )
+    config = SchedulerConfig(
+        enable_mtp=True,
+        enable_prefix_cache=False,
+        specprefill_enabled=True,
+        specprefill_prepare=lambda actual_model, actual_tokenizer: (
+            bundle
+            if (actual_model, actual_tokenizer) == (model, tokenizer)
+            else pytest.fail("prepare received an unexpected startup identity")
+        ),
+    )
+    engine = BatchedEngine("test", scheduler_config=config)
+    engine._model = model
+    engine._tokenizer = tokenizer
+
+    assert engine._prepare_llm_native_mtp_specprefill_runtime() is bundle
+    assert config.native_mtp_specprefill_runtime is bundle
+    assert engine.native_mtp_server_state().incompatibility is None
+    assert cleaned == []
+
+    asyncio.run(engine.stop())
+    assert cleaned == ["cleanup"]
+    assert config.native_mtp_specprefill_runtime is None
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (
+            SchedulerConfig(
+                enable_mtp=True,
+                enable_prefix_cache=True,
+                specprefill_enabled=True,
+                specprefill_prepare=lambda *_args: None,
+            ),
+            "native_mtp_prefix_reuse_unsupported",
+        ),
+        (
+            SchedulerConfig(
+                enable_mtp=True,
+                enable_prefix_cache=False,
+                chunked_prefill_tokens=1,
+                specprefill_enabled=True,
+                specprefill_prepare=lambda *_args: None,
+            ),
+            "native_mtp_chunked_prefill_unsupported",
+        ),
+    ],
+)
+def test_standard_text_combined_startup_fails_before_prepare_for_incompatible_cb_knobs(
+    config, message
+):
+    engine = BatchedEngine("test", scheduler_config=config)
+    engine._model = object()
+    engine._tokenizer = object()
+
+    with pytest.raises(RuntimeError, match=message):
+        engine._prepare_llm_native_mtp_specprefill_runtime()
+    assert config.native_mtp_specprefill_runtime is None
+
+
+def test_standard_text_combined_startup_rejects_bundle_without_sparse_factory():
+    model, tokenizer = object(), object()
+    cleaned = []
+    bundle = _bundle(lambda: cleaned.append("cleanup"), model, tokenizer)
+    config = SchedulerConfig(
+        enable_mtp=True,
+        enable_prefix_cache=False,
+        specprefill_enabled=True,
+        specprefill_prepare=lambda *_args: bundle,
+    )
+    engine = BatchedEngine("test", scheduler_config=config)
+    engine._model = model
+    engine._tokenizer = tokenizer
+
+    with pytest.raises(ValueError, match="native MTP session factory missing"):
+        engine._prepare_llm_native_mtp_specprefill_runtime()
+    assert cleaned == ["cleanup"]
+    assert config.native_mtp_specprefill_runtime is None
+
+
+def test_standard_text_specprefill_only_remains_fail_closed_for_native_mtp_state():
+    config = SchedulerConfig(specprefill_enabled=True, enable_prefix_cache=False)
+    engine = BatchedEngine("test", scheduler_config=config)
+    engine._model = SimpleNamespace(mtp_capability=SimpleNamespace(supported=True))
+
+    assert (
+        engine.native_mtp_server_state().incompatibility
+        == "native_mtp_specprefill_composition_unsupported"
+    )
+
+
+def test_standard_text_combined_preflight_rejects_before_model_or_core_startup():
+    events = []
+    config = SchedulerConfig(
+        enable_mtp=True,
+        enable_prefix_cache=True,
+        specprefill_enabled=True,
+        specprefill_prepare=lambda *_args: events.append("prepare"),
+    )
+    engine = BatchedEngine("test", scheduler_config=config)
+    engine.prepare_for_start = lambda: events.append("model")
+
+    with pytest.raises(RuntimeError, match="native_mtp_prefix_reuse_unsupported"):
+        asyncio.run(engine.start())
+    assert events == []
+    assert engine._engine is None
+
+
+def test_standard_text_start_failure_closes_core_before_prepared_runtime(monkeypatch):
+    import vllm_mlx.engine_core as core_module
+
+    events = []
+    model, tokenizer = object(), object()
+    bundle = _bundle(
+        lambda: events.append("prepared_cleanup"),
+        model,
+        tokenizer,
+        native_mtp_session_factory=lambda *_args: None,
+    )
+    engine = BatchedEngine("test", scheduler_config=SchedulerConfig())
+    engine._model = model
+    engine._tokenizer = tokenizer
+    monkeypatch.setattr(
+        engine,
+        "_prepare_llm_native_mtp_specprefill_runtime",
+        lambda: bundle,
+    )
+
+    class _SchedulerCore:
+        async def start(self):
+            raise RuntimeError("core start failed")
+
+        def close(self):
+            events.append("core_close")
+
+    class _Core:
+        def __init__(self, **_kwargs):
+            self.engine = _SchedulerCore()
+
+        async def stop(self):
+            events.append("core_stop")
+
+    monkeypatch.setattr(core_module, "AsyncEngineCore", _Core)
+
+    with pytest.raises(RuntimeError, match="core start failed"):
+        asyncio.run(engine._start_llm())
+    assert events == ["core_stop", "core_close", "prepared_cleanup"]
+    assert engine._engine is None
+    assert engine._prepared_specprefill_runtime is None
+
+
+def test_standard_text_stop_closes_core_before_prepared_runtime():
+    events = []
+    engine = BatchedEngine("test", scheduler_config=SchedulerConfig())
+    engine._engine = SimpleNamespace(
+        stop=lambda: _async_event(events, "core_stop"),
+        engine=SimpleNamespace(close=lambda: events.append("core_close")),
+    )
+    engine._prepared_specprefill_runtime = SimpleNamespace(
+        cleanup=lambda: events.append("prepared_cleanup")
+    )
+
+    asyncio.run(engine.stop())
+
+    assert events == ["core_stop", "core_close", "prepared_cleanup"]
+
+
+def test_standard_text_stop_defers_prepared_cleanup_until_core_retry_succeeds():
+    events = []
+    attempts = 0
+
+    async def _stop_core():
+        nonlocal attempts
+        attempts += 1
+        events.append(f"core_stop_{attempts}")
+        if attempts == 1:
+            raise RuntimeError("core stop failed")
+
+    engine = BatchedEngine("test", scheduler_config=SchedulerConfig())
+    engine._engine = SimpleNamespace(
+        stop=_stop_core,
+        engine=SimpleNamespace(close=lambda: events.append("core_close")),
+    )
+    engine._prepared_specprefill_runtime = SimpleNamespace(
+        cleanup=lambda: events.append("prepared_cleanup")
+    )
+
+    with pytest.raises(RuntimeError, match="core stop failed"):
+        asyncio.run(engine.stop())
+    assert events == ["core_stop_1", "core_close"]
+    assert engine._engine is not None
+    assert engine._prepared_specprefill_runtime is not None
+
+    asyncio.run(engine.stop())
+    assert events == [
+        "core_stop_1",
+        "core_close",
+        "core_stop_2",
+        "core_close",
+        "prepared_cleanup",
+    ]
+    assert engine._engine is None
+    assert engine._prepared_specprefill_runtime is None
+
+
+def test_standard_text_retry_start_waits_for_prior_core_before_runtime_or_replacement(
+    monkeypatch,
+):
+    import vllm_mlx.engine_core as core_module
+
+    events = []
+    prior_stop_attempts = 0
+    replacement_constructions = []
+
+    async def _stop_prior_core():
+        nonlocal prior_stop_attempts
+        prior_stop_attempts += 1
+        events.append(f"prior_stop_{prior_stop_attempts}")
+        if prior_stop_attempts == 1:
+            raise RuntimeError("prior core still live")
+
+    class _ReplacementScheduler:
+        async def start(self):
+            events.append("replacement_start")
+
+        def close(self):
+            events.append("replacement_close")
+
+    class _ReplacementCore:
+        def __init__(self, **_kwargs):
+            replacement_constructions.append("constructed")
+            self.engine = _ReplacementScheduler()
+
+        async def stop(self):
+            events.append("replacement_stop")
+
+    engine = BatchedEngine("test", scheduler_config=SchedulerConfig())
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._engine = SimpleNamespace(
+        stop=_stop_prior_core,
+        engine=SimpleNamespace(close=lambda: events.append("prior_close")),
+    )
+    engine._prepared_specprefill_runtime = SimpleNamespace(
+        cleanup=lambda: events.append("prepared_cleanup")
+    )
+    monkeypatch.setattr(core_module, "AsyncEngineCore", _ReplacementCore)
+
+    with pytest.raises(RuntimeError, match="startup cleanup remains incomplete"):
+        asyncio.run(engine._start_llm())
+    assert events == ["prior_stop_1", "prior_close"]
+    assert replacement_constructions == []
+    assert engine._prepared_specprefill_runtime is not None
+
+    asyncio.run(engine._start_llm())
+    assert events == [
+        "prior_stop_1",
+        "prior_close",
+        "prior_stop_2",
+        "prior_close",
+        "prepared_cleanup",
+        "replacement_start",
+    ]
+    assert replacement_constructions == ["constructed"]
+
+
+async def _async_event(events, event):
+    events.append(event)
 
 
 def test_failed_start_cleans_prepared_runtime_and_retry_prepares_again(monkeypatch):
