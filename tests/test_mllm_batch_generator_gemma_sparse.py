@@ -42,7 +42,6 @@ from vllm_mlx.specprefill_gemma_cache import (
 )
 from vllm_mlx.specprefill_runtime import TargetProcessorAttestation
 
-
 _PROMPT = (10, 11, 12, 13)
 _TUNING = SparsePolicyTuning(0.5, 0.0, 0, 1, 2)
 
@@ -131,9 +130,7 @@ def _scalar_cache(*, physical=2):
         values = mx.arange(physical, dtype=mx.float32).reshape(1, 1, physical, 1)
         entry.update_and_fetch(values, values + 100)
         cache.append(entry)
-    mx.eval(
-        *(tensor for entry in cache for tensor in (entry.keys, entry.values))
-    )
+    mx.eval(*(tensor for entry in cache for tensor in (entry.keys, entry.values)))
     return cache
 
 
@@ -345,8 +342,7 @@ def test_gemma_extend_wrapper_restores_both_operands_on_failure():
     destination = _batch(1, "destination")
     source = _batch(2, "source")
     destination_before = tuple(
-        batch_cache_cursor(entry, logical_positions=(4,))
-        for entry in destination.cache
+        batch_cache_cursor(entry, logical_positions=(4,)) for entry in destination.cache
     )
     source_before = tuple(
         batch_cache_cursor(entry, logical_positions=(4,)) for entry in source.cache
@@ -361,13 +357,19 @@ def test_gemma_extend_wrapper_restores_both_operands_on_failure():
     with pytest.raises(RuntimeError, match="extend failed"):
         destination.extend(source)
 
-    assert tuple(
-        batch_cache_cursor(entry, logical_positions=(4,))
-        for entry in destination.cache
-    ) == destination_before
-    assert tuple(
-        batch_cache_cursor(entry, logical_positions=(4,)) for entry in source.cache
-    ) == source_before
+    assert (
+        tuple(
+            batch_cache_cursor(entry, logical_positions=(4,))
+            for entry in destination.cache
+        )
+        == destination_before
+    )
+    assert (
+        tuple(
+            batch_cache_cursor(entry, logical_positions=(4,)) for entry in source.cache
+        )
+        == source_before
+    )
     assert destination.uids == [1]
     assert source.uids == [2]
 
@@ -401,9 +403,11 @@ def test_gemma_active_adoption_cancellation_restores_extended_cache(cancel_at):
 
     generator._sampling_for_request = lambda _request: (
         [cancel_processor] if cancel_at == "processor" else None,
-        cancel_sampler
-        if cancel_at == "sampler"
-        else (lambda logprobs: mx.argmax(logprobs, axis=-1)),
+        (
+            cancel_sampler
+            if cancel_at == "sampler"
+            else (lambda logprobs: mx.argmax(logprobs, axis=-1))
+        ),
     )
 
     with pytest.raises(asyncio.CancelledError):

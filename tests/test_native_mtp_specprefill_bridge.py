@@ -97,7 +97,9 @@ def test_build_failure_cancels_unadopted_session(monkeypatch):
 
 
 def test_mark_adopt_failure_abandons_bootstrap_and_session(monkeypatch):
-    bridge, session = _bridge(monkeypatch, session=_Session(ready_after=1, fail_adoption=True))
+    bridge, session = _bridge(
+        monkeypatch, session=_Session(ready_after=1, fail_adoption=True)
+    )
     bridge.step()
     with pytest.raises(RuntimeError, match="adoption_failed"):
         bridge.mark_adopted()

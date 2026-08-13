@@ -485,9 +485,7 @@ def test_failed_start_cleans_prepared_runtime_and_retry_prepares_again(monkeypat
     def prepare(_model, _processor):
         attempt = len(prepare_calls) + 1
         prepare_calls.append(attempt)
-        return _bundle(
-            lambda: cleanup_calls.append(attempt), _model, _processor
-        )
+        return _bundle(lambda: cleanup_calls.append(attempt), _model, _processor)
 
     engine = _engine(
         SchedulerConfig(specprefill_enabled=True, specprefill_prepare=prepare)
@@ -790,9 +788,7 @@ def test_server_enable_switch_copies_scheduler_launch_config(monkeypatch):
 def test_batched_stats_promote_exact_specprefill_status():
     engine = _engine(SchedulerConfig())
     exact = {"enabled": False, "advertisable": False, "diagnostic": True}
-    engine._mllm_scheduler = SimpleNamespace(
-        get_stats=lambda: {"specprefill": exact}
-    )
+    engine._mllm_scheduler = SimpleNamespace(get_stats=lambda: {"specprefill": exact})
 
     stats = engine.get_stats()
 
@@ -1031,7 +1027,8 @@ def test_explicit_media_bit_survives_empty_extraction_arrays():
 
 
 def test_real_runtime_builder_eagerly_installs_and_builds_request_sessions(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     from contextlib import contextmanager
 
@@ -1196,9 +1193,7 @@ def test_real_runtime_builder_eagerly_installs_and_builds_request_sessions(
     prepared.cleanup()
     assert events[-1] == "loader_cleanup"
     with pytest.raises(runtime.SpecPrefillRuntimePreparationError, match="closed"):
-        prepared.session_factory(
-            SimpleNamespace(request_id="later"), (1,), config
-        )
+        prepared.session_factory(SimpleNamespace(request_id="later"), (1,), config)
 
 
 def test_real_runtime_builder_cleanup_is_fail_atomic_on_hook_failure(
@@ -1296,9 +1291,7 @@ def test_scorer_artifact_manifest_rejects_symlinks(tmp_path, symlink_kind):
     else:
         artifact = tmp_path / "artifact"
         artifact.mkdir()
-        (artifact / "weights.safetensors").symlink_to(
-            real / "weights.safetensors"
-        )
+        (artifact / "weights.safetensors").symlink_to(real / "weights.safetensors")
 
     with pytest.raises(
         runtime.SpecPrefillRuntimePreparationError,
@@ -1397,7 +1390,11 @@ def test_real_runtime_builder_eager_cache_probe_fails_and_cleans(
         language_model=SimpleNamespace(layers=[SimpleNamespace(is_linear=False)])
     )
 
-    expected = RuntimeError if cache_failure == "raise" else runtime.SpecPrefillRuntimePreparationError
+    expected = (
+        RuntimeError
+        if cache_failure == "raise"
+        else runtime.SpecPrefillRuntimePreparationError
+    )
     with pytest.raises(expected):
         prepare(target, object())
 
@@ -1450,7 +1447,8 @@ def test_real_runtime_builder_rejects_qwen_vlm_adapter(monkeypatch, tmp_path):
 
 
 def test_runtime_builder_requires_certification_and_marks_diagnostic_nonadvertisable(
-    monkeypatch, tmp_path,
+    monkeypatch,
+    tmp_path,
 ):
     from dataclasses import replace
 

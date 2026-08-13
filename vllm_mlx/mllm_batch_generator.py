@@ -234,9 +234,7 @@ class GemmaPreparedTargetAttestation:
 
     @property
     def canonical_target_id(self) -> str:
-        return (
-            f"{self.artifact.artifact_id}@sha256:{self.target_artifact_hash}"
-        )
+        return f"{self.artifact.artifact_id}@sha256:{self.target_artifact_hash}"
 
     def validate_cache(self, cache: Sequence[Any]) -> None:
         validate_gemma_cache_topology(
@@ -473,9 +471,10 @@ class _GemmaBatchMetadataCheckpoint:
         states = []
         tensors = []
         for entry in cache:
-            if getattr(entry, "_right_padding", None) is not None or getattr(
-                entry, "_lengths", None
-            ) is not None:
+            if (
+                getattr(entry, "_right_padding", None) is not None
+                or getattr(entry, "_lengths", None) is not None
+            ):
                 raise SparseBatchError(
                     "Gemma sparse decode requires finalized batch caches"
                 )
@@ -1296,14 +1295,11 @@ class MLLMBatchGenerator:
 
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
-        if (
-            expected_gemma_sparse_config is not None
-            and (
-                expected_gemma_sparse_config.attestation.target_model is not model
-                or expected_gemma_sparse_config.attestation.text_model
-                is not self.language_model
-                or expected_gemma_sparse_config.attestation.processor is not processor
-            )
+        if expected_gemma_sparse_config is not None and (
+            expected_gemma_sparse_config.attestation.target_model is not model
+            or expected_gemma_sparse_config.attestation.text_model
+            is not self.language_model
+            or expected_gemma_sparse_config.attestation.processor is not processor
         ):
             raise SparseBatchCompatibilityError(
                 "Gemma prepared identity does not match generator-owned objects"
@@ -1658,9 +1654,7 @@ class MLLMBatchGenerator:
             )
         self._expected_sparse_execution_config = config
 
-    def set_expected_gemma_sparse_config(
-        self, config: GemmaSparseBatchConfig
-    ) -> None:
+    def set_expected_gemma_sparse_config(self, config: GemmaSparseBatchConfig) -> None:
         """Install an exact Gemma foundation contract before sparse ownership."""
         if not isinstance(config, GemmaSparseBatchConfig):
             raise TypeError("config must be GemmaSparseBatchConfig")
@@ -1801,21 +1795,17 @@ class MLLMBatchGenerator:
             raise SparseBatchCompatibilityError(
                 "Gemma sparse target decode cannot compose with MTP"
             )
-        if (
-            gemma_config is not None
-            and (
-                gemma_config.attestation.target_model is not self.model
-                or gemma_config.attestation.text_model is not self.language_model
-                or gemma_config.attestation.processor is not self.processor
-            )
+        if gemma_config is not None and (
+            gemma_config.attestation.target_model is not self.model
+            or gemma_config.attestation.text_model is not self.language_model
+            or gemma_config.attestation.processor is not self.processor
         ):
             raise SparseBatchCompatibilityError(
                 "prepared Gemma identity does not match generator-owned objects"
             )
         if (
             gemma_config is not None
-            and gemma_config.execution_config
-            != row_state.identity.execution_config
+            and gemma_config.execution_config != row_state.identity.execution_config
         ):
             raise SparseBatchCompatibilityError(
                 "prepared Gemma topology does not match the sparse profile"
@@ -2997,9 +2987,7 @@ class MLLMBatchGenerator:
                     )
                 active_batch.gemma_sparse_config.validate_cache(cache)
                 _validate_gemma_cache_rows(cache, sparse_rows)
-                gemma_metadata_checkpoint = _GemmaBatchMetadataCheckpoint.capture(
-                    cache
-                )
+                gemma_metadata_checkpoint = _GemmaBatchMetadataCheckpoint.capture(cache)
                 gemma_transaction = GemmaOneTokenTransaction(
                     cache,
                     logical_positions=tuple(
@@ -3553,9 +3541,8 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
-        sparse_rows_bypass = (
-            batch_gen.active_batch is not None
-            and getattr(batch_gen.active_batch, "has_sparse_rows", False)
+        sparse_rows_bypass = batch_gen.active_batch is not None and getattr(
+            batch_gen.active_batch, "has_sparse_rows", False
         )
         if (
             prefill_bypass

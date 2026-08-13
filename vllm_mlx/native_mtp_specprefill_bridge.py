@@ -46,7 +46,9 @@ class NativeMTPSpecPrefillBridge:
     forwards; ordinary SpecPrefill sessions deliberately remain unusable here.
     """
 
-    def __init__(self, prepared: Any, request: Any, config: CooperativeSpecPrefillConfig):
+    def __init__(
+        self, prepared: Any, request: Any, config: CooperativeSpecPrefillConfig
+    ):
         factory = getattr(prepared, "native_mtp_session_factory", None)
         if not callable(factory):
             raise NativeMTPSpecPrefillBridgeError(
@@ -83,16 +85,25 @@ class NativeMTPSpecPrefillBridge:
         if self._state is NativeMTPSpecPrefillBridgeState.BOOTSTRAP_READY:
             return NativeMTPSpecPrefillBridgeProgress(self._state)
         if self._state is NativeMTPSpecPrefillBridgeState.ADOPTED:
-            raise NativeMTPSpecPrefillBridgeError("native_mtp_sparse_bootstrap_already_adopted")
+            raise NativeMTPSpecPrefillBridgeError(
+                "native_mtp_sparse_bootstrap_already_adopted"
+            )
         self._state = NativeMTPSpecPrefillBridgeState.PREFILLING
         progress = self._session.step()
         if progress.busy:
             return NativeMTPSpecPrefillBridgeProgress(self._state, busy=True)
-        if self._session.outcome is not CooperativeSpecPrefillOutcome.READY_FOR_ADOPTION:
+        if (
+            self._session.outcome
+            is not CooperativeSpecPrefillOutcome.READY_FOR_ADOPTION
+        ):
             if self._session.outcome is not CooperativeSpecPrefillOutcome.ACTIVE:
-                self._fallback_reason = self._session.fallback_reason or "sparse_prefill_failed"
+                self._fallback_reason = (
+                    self._session.fallback_reason or "sparse_prefill_failed"
+                )
                 self._state = NativeMTPSpecPrefillBridgeState.TERMINAL
-            return NativeMTPSpecPrefillBridgeProgress(self._state, fallback_reason=self._fallback_reason)
+            return NativeMTPSpecPrefillBridgeProgress(
+                self._state, fallback_reason=self._fallback_reason
+            )
         try:
             self._bootstrap = self._build_bootstrap()
             self._state = NativeMTPSpecPrefillBridgeState.BOOTSTRAP_READY
@@ -151,7 +162,9 @@ class NativeMTPSpecPrefillBridge:
             raise NativeMTPSpecPrefillBridgeError("native_mtp_sparse_result_invalid")
         positions = tuple(plan.selected_indices)
         if not positions or positions[-1] != len(self._tokens) - 1:
-            raise NativeMTPSpecPrefillBridgeError("native_mtp_sparse_final_anchor_missing")
+            raise NativeMTPSpecPrefillBridgeError(
+                "native_mtp_sparse_final_anchor_missing"
+            )
         selected = tuple(self._tokens[position] for position in positions)
         successors = tuple(self._tokens[position + 1] for position in positions[:-1])
         receipts = tuple(result.forward_receipts)

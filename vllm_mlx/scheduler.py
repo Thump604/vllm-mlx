@@ -2412,6 +2412,7 @@ class Scheduler:
         if not bridges or self._native_mtp_specprefill_queue:
             return False
         from .native_mtp_specprefill_bridge import NativeMTPSpecPrefillBridgeState
+
         if any(
             bridge.state is not NativeMTPSpecPrefillBridgeState.BOOTSTRAP_READY
             for bridge in bridges.values()

@@ -40,7 +40,6 @@ from vllm_mlx.specprefill_target_hooks import (
     TargetPositionSession,
 )
 
-
 _CASES = (
     (GEMMA4_E2B, GEMMA4_DENSE_TARGET, False),
     (GEMMA4_31B, GEMMA4_DENSE_TARGET, False),
@@ -235,9 +234,7 @@ def test_real_proportional_rope_hook_matches_independent_native_offsets(backend)
     )
     rope = attention.rope
     positions = (0, 3, 7)
-    x = mx.random.normal((1, 2, len(positions), attention.head_dim)).astype(
-        mx.bfloat16
-    )
+    x = mx.random.normal((1, 2, len(positions), attention.head_dim)).astype(mx.bfloat16)
     expected = mx.concatenate(
         [
             rope(x[:, :, index : index + 1], offset=logical)

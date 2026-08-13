@@ -2898,7 +2898,9 @@ class TestSimpleEngineConcurrency:
         assert captured["continuation"]["repetition_penalty"] == 1.0
 
     @pytest.mark.anyio
-    async def test_direct_sparse_clean_exhaustion_keeps_telemetry_in_stop_epilogue(self):
+    async def test_direct_sparse_clean_exhaustion_keeps_telemetry_in_stop_epilogue(
+        self,
+    ):
         """Sparse producer exhaustion appends one telemetry-preserving stop frame."""
         from vllm_mlx.engine.simple import SimpleEngine
 
@@ -2959,7 +2961,9 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert [(chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs] == [
+        assert [
+            (chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs
+        ] == [
             ("A", False, None),
             ("B", False, None),
             ("", True, "stop"),
@@ -3185,7 +3189,9 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert [(chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs] == [
+        assert [
+            (chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs
+        ] == [
             ("A", False, None),
             ("B", False, None),
             ("", True, "stop"),
@@ -3276,7 +3282,9 @@ class TestSimpleEngineConcurrency:
                 )
             ]
 
-        assert [(chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs] == [
+        assert [
+            (chunk.new_text, chunk.finished, chunk.finish_reason) for chunk in outputs
+        ] == [
             ("A", False, None),
             ("B", True, "length"),
         ]

@@ -132,8 +132,12 @@ class MLLMSchedulerConfig:
     specprefill_advertisable: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.specprefill_profile_registry, SpecPrefillProfileRegistry):
-            raise TypeError("specprefill_profile_registry must be SpecPrefillProfileRegistry")
+        if not isinstance(
+            self.specprefill_profile_registry, SpecPrefillProfileRegistry
+        ):
+            raise TypeError(
+                "specprefill_profile_registry must be SpecPrefillProfileRegistry"
+            )
         key = self.specprefill_profile_key
         if key is not None and (
             key.engine is not SpecPrefillEngine.CONTINUOUS_BATCHING
@@ -183,8 +187,7 @@ class MLLMSchedulerConfig:
             )
         if gemma_config is not None and (
             capability is None
-            or capability.layout
-            != gemma_config.attestation.artifact.artifact_id
+            or capability.layout != gemma_config.attestation.artifact.artifact_id
             or capability.backend != "mlx_vlm"
             or not capability.rotating
             or not capability.homogeneous_rows_only
@@ -192,8 +195,10 @@ class MLLMSchedulerConfig:
             raise ValueError(
                 "Gemma CB SpecPrefill requires exact rotating mlx-vlm capability"
             )
-        if key is not None and capability is not None and (
-            capability.adapter_id != key.adapter_id
+        if (
+            key is not None
+            and capability is not None
+            and (capability.adapter_id != key.adapter_id)
         ):
             raise ValueError("SpecPrefill capability adapter must match profile key")
         for name in (
@@ -661,9 +666,7 @@ class MLLMScheduler:
             sampling_params=sampling_params,
             specprefill_policy=specprefill_policy,
             specprefill_coverage=specprefill_coverage,
-            specprefill_control_token_indices=tuple(
-                sorted(set(control_token_indices))
-            ),
+            specprefill_control_token_indices=tuple(sorted(set(control_token_indices))),
             specprefill_has_media=specprefill_has_media,
         )
 
@@ -976,14 +979,9 @@ class MLLMScheduler:
             request = self.waiting.popleft()
 
             batch_req = self._batch_request_for(request)
-            cooperative_config, fallback_reason = self._cooperative_config_for(
-                request
-            )
-            cooperative = (
-                cooperative_config is not None
-                and self._admit_cooperative(
-                    request, batch_req, cooperative_config
-                )
+            cooperative_config, fallback_reason = self._cooperative_config_for(request)
+            cooperative = cooperative_config is not None and self._admit_cooperative(
+                request, batch_req, cooperative_config
             )
             if not cooperative:
                 request.specprefill_effective_policy = SpecPrefillPolicy.DENSE
@@ -1152,9 +1150,7 @@ class MLLMScheduler:
             "specprefill_total_tokens": request.specprefill_total_tokens,
             "specprefill_selected_tokens": request.specprefill_selected_tokens,
             "specprefill_scorer_ms": request.specprefill_scorer_ms,
-            "specprefill_target_prefill_ms": (
-                request.specprefill_target_prefill_ms
-            ),
+            "specprefill_target_prefill_ms": (request.specprefill_target_prefill_ms),
         }
 
     @staticmethod
@@ -1362,9 +1358,7 @@ class MLLMScheduler:
         request.batch_uid = uid
         return True
 
-    def _adoption_is_compatible(
-        self, session: CooperativeSpecPrefillSession
-    ) -> bool:
+    def _adoption_is_compatible(self, session: CooperativeSpecPrefillSession) -> bool:
         assert self.batch_generator is not None
         active = self.batch_generator.active_batch
         if active is None:
@@ -1397,9 +1391,10 @@ class MLLMScheduler:
                 self.batch_generator.set_expected_sparse_execution_config(
                     execution_config
                 )
-            elif getattr(
-                self.batch_generator, "_expected_sparse_execution_config", None
-            ) != execution_config:
+            elif (
+                getattr(self.batch_generator, "_expected_sparse_execution_config", None)
+                != execution_config
+            ):
                 return False
             result = session.prepared_result
             cache = session.prepared_cache
@@ -1476,9 +1471,7 @@ class MLLMScheduler:
         self._specprefill_batch_requests.pop(request_id, None)
         return True
 
-    def _run_one_cooperative_quantum(
-        self, output: MLLMSchedulerOutput
-    ) -> None:
+    def _run_one_cooperative_quantum(self, output: MLLMSchedulerOutput) -> None:
         while self._specprefill_queue:
             request_id = self._specprefill_queue.popleft()
             admission = self._specprefill_admissions.get(request_id)
@@ -1489,9 +1482,7 @@ class MLLMScheduler:
             if session.outcome is CooperativeSpecPrefillOutcome.CANCELLED:
                 self.abort_request(request_id)
             elif session.ready_for_adoption:
-                adopted_or_fallback = self._adopt_ready_cooperative(
-                    request_id, output
-                )
+                adopted_or_fallback = self._adopt_ready_cooperative(request_id, output)
                 if not adopted_or_fallback:
                     self._specprefill_queue.append(request_id)
             elif session.outcome is CooperativeSpecPrefillOutcome.ACTIVE:
@@ -1529,8 +1520,8 @@ class MLLMScheduler:
             request = self.requests.get(request_id)
             if request is not None:
                 self._update_request_specprefill(request, session)
-            output.specprefill_progress[request_id] = (
-                self._specprefill_step_telemetry(session, progress)
+            output.specprefill_progress[request_id] = self._specprefill_step_telemetry(
+                session, progress
             )
             output.has_work = True
             return

@@ -175,7 +175,9 @@ class NativeMTPContinuousBatchAdapter:
             raise RuntimeError("native_mtp_penalty_processors_unsupported")
 
     @staticmethod
-    def _validate_sparse_bootstrap(model: Any, request: Any, bootstrap: Any) -> tuple[int, ...]:
+    def _validate_sparse_bootstrap(
+        model: Any, request: Any, bootstrap: Any
+    ) -> tuple[int, ...]:
         """Bind one bootstrap to this exact request/model before claim.
 
         mlx-lm repeats these provenance checks while atomically claiming the
@@ -202,13 +204,16 @@ class NativeMTPContinuousBatchAdapter:
             or len(successors) != len(positions) - 1
         ):
             raise RuntimeError("native_mtp_sparse_request_cursor_mismatch")
-        if any(
-            isinstance(position, bool)
-            or not isinstance(position, int)
-            or position < 0
-            or position >= len(prompt)
-            for position in positions
-        ) or tuple(sorted(set(positions))) != positions:
+        if (
+            any(
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 0
+                or position >= len(prompt)
+                for position in positions
+            )
+            or tuple(sorted(set(positions))) != positions
+        ):
             raise RuntimeError("native_mtp_sparse_positions_invalid")
         if selected != tuple(prompt[position] for position in positions):
             raise RuntimeError("native_mtp_sparse_request_tokens_mismatch")

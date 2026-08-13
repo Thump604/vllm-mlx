@@ -172,7 +172,9 @@ def build_qwen_cb_specprefill_prepare(
                 attestation.target_model is not target_model
                 or attestation.processor is not processor
             ):
-                raise ValueError("target attestation is not bound to the loaded objects")
+                raise ValueError(
+                    "target attestation is not bound to the loaded objects"
+                )
             if (
                 attestation.target_artifact_hash != target_artifact_hash
                 or attestation.tokenizer_artifact_hash != tokenizer_artifact_hash
@@ -595,7 +597,9 @@ class _QwenCBRuntimeOwner:
                         "attested sparse target requires B=1"
                     )
                 successors = tuple(
-                    tokens[position + 1] for position in positions if position < len(tokens) - 1
+                    tokens[position + 1]
+                    for position in positions
+                    if position < len(tokens) - 1
                 )
                 active_plan = plan
                 try:
@@ -906,9 +910,7 @@ def _reject_symlink_components(path: Path) -> None:
             )
 
 
-def _qwen_cache_topology(
-    target_model: Any, cache: Sequence[Any]
-) -> _QwenCacheTopology:
+def _qwen_cache_topology(target_model: Any, cache: Sequence[Any]) -> _QwenCacheTopology:
     layers = tuple(getattr(target_model, "layers", ()))
     if not layers or len(cache) != len(layers):
         raise SpecPrefillRuntimePreparationError(
@@ -929,7 +931,12 @@ def _qwen_cache_topology(
                 )
             entries.append((ArraysCache, len(entry.cache)))
         elif type(entry) is KVCache:
-            if linear or entry.offset != 0 or entry.keys is not None or entry.values is not None:
+            if (
+                linear
+                or entry.offset != 0
+                or entry.keys is not None
+                or entry.values is not None
+            ):
                 raise SpecPrefillRuntimePreparationError(
                     "Qwen attention layers require fresh nonrotating KVCache entries"
                 )

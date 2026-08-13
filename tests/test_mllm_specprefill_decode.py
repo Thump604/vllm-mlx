@@ -437,9 +437,10 @@ def test_pre_sampling_restore_failure_poison_active_sparse_batch(monkeypatch):
         failure.value._rollback_succeeded = True
     assert processor_calls == []
     assert generator.active_batch is None
-    assert [(item.uid, item.request_id, item.finish_reason) for item in generator._pending_error_responses] == [
-        (0, "request-1", "error")
-    ]
+    assert [
+        (item.uid, item.request_id, item.finish_reason)
+        for item in generator._pending_error_responses
+    ] == [(0, "request-1", "error")]
     assert request.uid == -1
 
 
@@ -448,9 +449,7 @@ def test_post_sampling_restore_failure_poison_active_sparse_batch(monkeypatch):
     _adopt(generator)
     request = _request(request_id="post-rollback-failure")
     request.logits_processors = [
-        lambda _tokens, _logits: (_ for _ in ()).throw(
-            RuntimeError("sampling failed")
-        )
+        lambda _tokens, _logits: (_ for _ in ()).throw(RuntimeError("sampling failed"))
     ]
 
     def fail_restore(_checkpoint):
@@ -465,9 +464,10 @@ def test_post_sampling_restore_failure_poison_active_sparse_batch(monkeypatch):
     assert failure.value.rollback_succeeded is False
     assert failure.value.replay_safe is False
     assert generator.active_batch is None
-    assert [(item.uid, item.request_id, item.finish_reason) for item in generator._pending_error_responses] == [
-        (0, "request-1", "error")
-    ]
+    assert [
+        (item.uid, item.request_id, item.finish_reason)
+        for item in generator._pending_error_responses
+    ] == [(0, "request-1", "error")]
     assert request.uid == -1
 
 

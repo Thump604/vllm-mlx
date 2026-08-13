@@ -410,7 +410,9 @@ def test_adoption_replay_obeys_typed_sampling_boundary(
     assert bool(scheduler.batch_generator.inserted) is dense_replay
     if dense_replay:
         assert output.outputs == []
-        assert scheduler.running["boundary"].specprefill_fallback_reason == expected_reason
+        assert (
+            scheduler.running["boundary"].specprefill_fallback_reason == expected_reason
+        )
     else:
         assert output.outputs[0].finished is True
         assert output.outputs[0].specprefill_fallback_reason == expected_reason
@@ -633,9 +635,7 @@ def test_mtp_composition_fails_closed_to_dense():
     assert factory.sessions == {}
 
 
-@pytest.mark.parametrize(
-    "layout", ("gemma4_dense", "gemma4_a4b", "mixed_rotating")
-)
+@pytest.mark.parametrize("layout", ("gemma4_dense", "gemma4_a4b", "mixed_rotating"))
 def test_unqualified_adapter_cache_layouts_fail_closed_to_dense(layout):
     factory = _AdmissionFactory()
     scheduler = _scheduler(factory, cache_layout=layout)

@@ -362,9 +362,7 @@ class MLXLanguageModel:
             # rejected before the request can claim its sparse bootstrap.
             # Keep forwarding explicit contexts for legacy/custom models and
             # for ordinary generation, where mlx-lm does not auto-select one.
-            canonical_context = getattr(
-                self.model, "generation_forward_context", None
-            )
+            canonical_context = getattr(self.model, "generation_forward_context", None)
             if not (sparse_bootstrap is not None and callable(canonical_context)):
                 mtp_kwargs["model_forward_context"] = model_forward_context
 

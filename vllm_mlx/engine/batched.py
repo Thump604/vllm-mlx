@@ -516,10 +516,9 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm:
                 await self._start_mllm()
             else:
-                if (
-                    getattr(self._scheduler_config, "specprefill_enabled", False)
-                    and not getattr(self._scheduler_config, "enable_mtp", False)
-                ):
+                if getattr(
+                    self._scheduler_config, "specprefill_enabled", False
+                ) and not getattr(self._scheduler_config, "enable_mtp", False):
                     raise RuntimeError(
                         "continuous-batching SpecPrefill requires the MLLM scheduler"
                     )
@@ -850,9 +849,12 @@ class BatchedEngine(BaseEngine):
                 failures.append(exc)
             else:
                 self._prepared_specprefill_runtime = None
-                if getattr(
-                    self._scheduler_config, "native_mtp_specprefill_runtime", None
-                ) is prepared:
+                if (
+                    getattr(
+                        self._scheduler_config, "native_mtp_specprefill_runtime", None
+                    )
+                    is prepared
+                ):
                     self._scheduler_config.native_mtp_specprefill_runtime = None
         return failures
 

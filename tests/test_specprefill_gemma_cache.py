@@ -34,7 +34,6 @@ from vllm_mlx.specprefill_gemma_cache import (
     validate_homogeneous_batch_lane,
 )
 
-
 # Minimal snapshots of the installed config.json text_config sections.  The
 # hashes identify the complete source configs without making tests depend on a
 # workstation path.  No model weights are represented or loaded here.
@@ -45,8 +44,7 @@ _CONFIG_SNAPSHOTS = (
         "num_hidden_layers": 35,
         "num_kv_shared_layers": 20,
         "sliding_window": 512,
-        "layer_types": tuple(
-            """
+        "layer_types": tuple("""
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
@@ -54,8 +52,7 @@ _CONFIG_SNAPSHOTS = (
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention full_attention
-            """.split()
-        ),
+            """.split()),
     },
     {
         "artifact_id": "gemma4-31b",
@@ -63,8 +60,7 @@ _CONFIG_SNAPSHOTS = (
         "num_hidden_layers": 60,
         "num_kv_shared_layers": 0,
         "sliding_window": 1024,
-        "layer_types": tuple(
-            """
+        "layer_types": tuple("""
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
@@ -75,8 +71,7 @@ _CONFIG_SNAPSHOTS = (
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
-            """.split()
-        ),
+            """.split()),
     },
     {
         "artifact_id": "gemma4-26b-a4b",
@@ -84,15 +79,13 @@ _CONFIG_SNAPSHOTS = (
         "num_hidden_layers": 30,
         "num_kv_shared_layers": 0,
         "sliding_window": 1024,
-        "layer_types": tuple(
-            """
+        "layer_types": tuple("""
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
             sliding_attention sliding_attention sliding_attention sliding_attention sliding_attention full_attention
-            """.split()
-        ),
+            """.split()),
     },
 )
 
@@ -136,9 +129,7 @@ def _artifact_cache(spec, *, batch=False, backend=GemmaCacheBackend.MLX_VLM):
                 BatchKVCache([0])
                 if batch
                 else (
-                    MlxLmKVCache()
-                    if backend is GemmaCacheBackend.MLX_LM
-                    else KVCache()
+                    MlxLmKVCache() if backend is GemmaCacheBackend.MLX_LM else KVCache()
                 )
             )
         else:
@@ -519,9 +510,7 @@ def test_atomic_filter_keeps_selected_rows_and_rolls_back_mid_failure(monkeypatc
     rotating = BatchRotatingKVCache(4, [0, 0])
     _append(full, [1], rows=2)
     _append(rotating, [1], rows=2)
-    selected = atomic_batch_filter(
-        [full, rotating], [1], logical_positions=[4, 4]
-    )
+    selected = atomic_batch_filter([full, rotating], [1], logical_positions=[4, 4])
     assert selected == (4,)
     assert full.keys.shape[0] == rotating.keys.shape[0] == 1
 

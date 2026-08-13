@@ -105,9 +105,7 @@ def _target():
             model_type="gemma4_text",
             layer_types=list(GEMMA4_E2B.layer_types),
             num_hidden_layers=GEMMA4_E2B.layer_count,
-            num_kv_shared_layers=(
-                GEMMA4_E2B.layer_count - GEMMA4_E2B.owner_count
-            ),
+            num_kv_shared_layers=(GEMMA4_E2B.layer_count - GEMMA4_E2B.owner_count),
             sliding_window=GEMMA4_E2B.sliding_window,
         ),
         model=SimpleNamespace(previous_kvs=list(GEMMA4_E2B.previous_kvs)),
@@ -222,7 +220,9 @@ def _real_prepare(
     processor = _Processor()
     monkeypatch.setattr(runtime.SpecPrefillScorer, "for_model", lambda _model: object())
     monkeypatch.setattr(
-        runtime, "SpecPrefillScorerSession", lambda *_a, **_k: _OneQuantumScorerSession()
+        runtime,
+        "SpecPrefillScorerSession",
+        lambda *_a, **_k: _OneQuantumScorerSession(),
     )
     factory = cache_factory or (lambda model: model.make_cache())
     prepare = runtime.build_gemma_cb_specprefill_prepare(
@@ -401,9 +401,9 @@ def test_real_gemma_scheduler_runs_one_quantum_to_adoption_then_decode_first(
     assert events[:2] == ["decode", "quantum"]
     assert first.specprefill_progress["integrated"].scorer_quanta == 1
     assert first.specprefill_progress["integrated"].target_quanta == 0
-    assert second.specprefill_progress["integrated"].target_quanta == 1, (
-        admissions[0].session.failure
-    )
+    assert second.specprefill_progress["integrated"].target_quanta == 1, admissions[
+        0
+    ].session.failure
     assert third.specprefill_progress["integrated"].target_quanta == 2
     assert scheduler.request_id_to_uid["integrated"] == 0
     active = scheduler.batch_generator.active_batch
@@ -488,9 +488,12 @@ def test_batched_engine_start_propagates_identical_gemma_config_to_generator(
         "advertisable": False,
         "diagnostic": True,
     }
-    assert _specprefill_capabilities(
-        {"state": "diagnostic", **engine.get_stats()["specprefill"]}
-    ) == []
+    assert (
+        _specprefill_capabilities(
+            {"state": "diagnostic", **engine.get_stats()["specprefill"]}
+        )
+        == []
+    )
     assert asyncio.run(engine._cleanup_mllm_runtime_ownership()) == []
 
 
@@ -616,9 +619,7 @@ def test_diagnostic_gemma_runtime_prepares_real_cache_and_scheduler_bridge(
     assert cooperative.rotating_tail_requirement == RotatingTailRequirement(
         GEMMA4_E2B.sliding_window
     )
-    admission = prepared.session_factory(
-        request, request.prompt_token_ids, cooperative
-    )
+    admission = prepared.session_factory(request, request.prompt_token_ids, cooperative)
     assert admission.session.config is cooperative
     scheduler.model = target
     scheduler.processor = processor

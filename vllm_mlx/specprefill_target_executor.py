@@ -401,9 +401,7 @@ class SparseTargetPrefillSession:
 
         transaction: GemmaOneTokenTransaction | GemmaCacheCheckpoint
         transaction = (
-            GemmaOneTokenTransaction(
-                self.cache, logical_positions=(physical_start,)
-            )
+            GemmaOneTokenTransaction(self.cache, logical_positions=(physical_start,))
             if chunk_size == 1 and _gemma_one_token_guardable(self.cache)
             else GemmaCacheCheckpoint(self.cache)
         )
@@ -411,9 +409,7 @@ class SparseTargetPrefillSession:
         try:
             with self._hooks.session_for_plan(plan):
                 output = self.model(
-                    self._token_rows[
-                        :, self._processed : self._processed + chunk_size
-                    ],
+                    self._token_rows[:, self._processed : self._processed + chunk_size],
                     cache=self.cache,
                 )
                 logits = _normalize_gemma_logits(output, self._gemma.backend)
@@ -431,9 +427,11 @@ class SparseTargetPrefillSession:
                 transaction.seal()
             return logits
         except BaseException:
-            transaction.rollback() if isinstance(
-                transaction, GemmaOneTokenTransaction
-            ) else transaction.restore()
+            (
+                transaction.rollback()
+                if isinstance(transaction, GemmaOneTokenTransaction)
+                else transaction.restore()
+            )
             raise
 
     def _finalize_gemma_sparse_boundary(self) -> None:
@@ -504,8 +502,7 @@ def _gemma_one_token_guardable(cache: Sequence[Any]) -> bool:
     """Use the overwrite journal only from a normalized rotating boundary."""
 
     return all(
-        type(entry)
-        not in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
+        type(entry) not in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
         or entry.keys is None
         or entry.keys.shape[2] <= entry.max_size
         for entry in cache
@@ -518,8 +515,7 @@ def _gemma_chunk_cursors(cache: Sequence[Any]) -> tuple[_GemmaChunkCursor, ...]:
             offset=entry.offset,
             circular_index=(
                 entry._idx
-                if type(entry)
-                in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
+                if type(entry) in (LmGemmaRotatingKVCache, VlmGemmaRotatingKVCache)
                 else None
             ),
             allocated_tokens=(entry.keys.shape[2] if entry.keys is not None else 0),
@@ -669,9 +665,7 @@ def _resolve_gemma_scalar_execution(
             "Gemma target config is not one of the bounded E2B/31B/A4B layouts"
         )
     spec = matches[0]
-    if (spec is GEMMA4_26B_A4B) != (
-        adapter.family is TargetPositionFamily.GEMMA4_A4B
-    ):
+    if (spec is GEMMA4_26B_A4B) != (adapter.family is TargetPositionFamily.GEMMA4_A4B):
         raise SparseTargetPrefillError(
             "Gemma target position adapter disagrees with cache architecture"
         )

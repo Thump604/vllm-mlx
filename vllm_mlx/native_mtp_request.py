@@ -76,9 +76,7 @@ class NativeMTPRequestConfig:
         try:
             from mlx_lm.generate import NativeMTPSamplingConfig
         except ImportError as exc:
-            raise NativeMTPRequestError(
-                "native_mtp_consumer_contract_missing"
-            ) from exc
+            raise NativeMTPRequestError("native_mtp_consumer_contract_missing") from exc
         return {
             "mtp": True,
             "mtp_sampling_config": NativeMTPSamplingConfig(

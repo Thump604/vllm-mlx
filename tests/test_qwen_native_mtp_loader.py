@@ -37,9 +37,7 @@ class _FakeTextModel:
         if not self.num_layers:
             return _Capability(False, "native_mtp_head_not_configured", 0)
         if not self._loaded:
-            return _Capability(
-                False, "native_mtp_weights_not_loaded", self.num_layers
-            )
+            return _Capability(False, "native_mtp_weights_not_loaded", self.num_layers)
         return _Capability(True, "supported", self.num_layers)
 
     def train(self, mode=True):
@@ -70,9 +68,7 @@ class _FakeQwenWrapper:
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("model.language_model.mtp."):
-                key = key.replace(
-                    "model.language_model.", "language_model.", 1
-                )
+                key = key.replace("model.language_model.", "language_model.", 1)
             sanitized[key] = value
         self._handshake = tuple(
             sorted((key, id(value)) for key, value in sanitized.items())
@@ -195,9 +191,7 @@ def test_qwen_vlm_extraction_uses_outer_one_shot_handshake(
 def test_qwen_configured_mtp_missing_subtree_fails_closed(
     tmp_path, monkeypatch, fake_qwen_loader
 ):
-    model_path, _ = _write_config(
-        tmp_path, model_type="qwen3_5_text", mtp_layers=1
-    )
+    model_path, _ = _write_config(tmp_path, model_type="qwen3_5_text", mtp_layers=1)
     vlm = SimpleNamespace(
         language_model=_FakeVLMLanguageModel({"model.weight": object()})
     )
@@ -238,9 +232,7 @@ def test_qwen_malformed_mtp_sanitize_never_partially_loads(
 def test_qwen_base_checkpoint_remains_ordinary_without_injected_head(
     tmp_path, monkeypatch, fake_qwen_loader
 ):
-    model_path, _ = _write_config(
-        tmp_path, model_type="qwen3_5_text", mtp_layers=0
-    )
+    model_path, _ = _write_config(tmp_path, model_type="qwen3_5_text", mtp_layers=0)
     vlm = SimpleNamespace(
         language_model=_FakeVLMLanguageModel({"model.weight": object()})
     )
@@ -283,9 +275,7 @@ def test_qwen_quantization_precedes_single_strict_load(
         quantizable = SimpleNamespace(to_quantized=lambda: None)
         assert kwargs["group_size"] == 64
         assert kwargs["bits"] == 4
-        assert kwargs["class_predicate"](
-            "language_model.mtp.fc", quantizable
-        ) is True
+        assert kwargs["class_predicate"]("language_model.mtp.fc", quantizable) is True
 
     monkeypatch.setattr(extraction.nn, "quantize", fake_quantize)
 
@@ -374,9 +364,7 @@ def test_qwen_checkpoint_sanitation_convention_comes_from_raw_headers(tmp_path):
 def test_qwen_checkpoint_rejects_mixed_conv_conventions(tmp_path):
     raw = "model.language_model.layers.0.linear_attn.conv1d.weight"
     native = "model.language_model.layers.1.linear_attn.conv1d.weight"
-    index = {
-        "weight_map": {raw: "model-1.safetensors", native: "model-2.safetensors"}
-    }
+    index = {"weight_map": {raw: "model-1.safetensors", native: "model-2.safetensors"}}
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     _write_header_only_safetensors(
         tmp_path / "model-1.safetensors",
@@ -419,7 +407,9 @@ def test_legacy_post_load_injection_is_explicitly_qwen3_next_only(
     module = types.ModuleType("vllm_mlx.patches.qwen3_next_mtp")
     module.inject_mtp_support = lambda *args: calls.append(args)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(tokenizer_utils, "_try_inject_mtp", lambda *args: calls.append(args))
+    monkeypatch.setattr(
+        tokenizer_utils, "_try_inject_mtp", lambda *args: calls.append(args)
+    )
     monkeypatch.setattr("mlx_lm.utils._download", lambda _name: tmp_path)
 
     (tmp_path / "config.json").write_text(
@@ -518,8 +508,7 @@ def test_extracted_mtp_matches_official_full_raw_sanitize_and_load(moe):
     mx.eval(source.parameters())
     raw = _raw_checkpoint_from_model(source)
     assert any(
-        "conv1d.weight" in key and value.shape[-1] != 1
-        for key, value in raw.items()
+        "conv1d.weight" in key and value.shape[-1] != 1 for key, value in raw.items()
     )
 
     reference = module.Model(args)
@@ -580,7 +569,5 @@ def test_official_qwen_sanitizer_rejects_malformed_mtp(mutation, match):
         raw_mtp["language_model.mtp.fc.scales"] = mx.zeros((1,))
 
     with pytest.raises(ValueError, match=match):
-        extraction._sanitize_raw_qwen_mtp(
-            wrapper, raw_mtp, shift_norm_weights=True
-        )
+        extraction._sanitize_raw_qwen_mtp(wrapper, raw_mtp, shift_norm_weights=True)
     assert wrapper.language_model.mtp_capability.supported is False

@@ -394,10 +394,7 @@ def test_configured_native_default_keeps_intent_when_head_is_missing():
     request = CompletionRequest(model="m", prompt="hi")
     kwargs = _kwargs()
     _attach_native_mtp_request_kwargs(_Engine(state), request, kwargs)
-    assert (
-        kwargs["_native_mtp_bypass_reason"]
-        == "native_mtp_model_capability_missing"
-    )
+    assert kwargs["_native_mtp_bypass_reason"] == "native_mtp_model_capability_missing"
     assert kwargs["_native_mtp_disabled"] is True
 
 
@@ -477,9 +474,7 @@ async def test_mllm_text_selected_forwards_exact_native_mtp_kwargs(monkeypatch):
 
     sample_utils = importlib.import_module("mlx_lm.sample_utils")
     monkeypatch.setattr(sample_utils, "make_sampler", lambda **kwargs: object())
-    monkeypatch.setattr(
-        sample_utils, "make_logits_processors", lambda **kwargs: []
-    )
+    monkeypatch.setattr(sample_utils, "make_logits_processors", lambda **kwargs: [])
     tokenizer = SimpleNamespace(
         apply_chat_template=lambda messages, **kwargs: "rendered",
         bos_token=None,
@@ -682,7 +677,9 @@ async def test_completion_preflight_rejection_finishes_metrics(monkeypatch):
     monkeypatch.setattr(server._metrics, "track_inference", lambda *a, **k: tracker)
     monkeypatch.setattr(server, "_acquire_default_engine_for_request", acquire)
     monkeypatch.setattr(server, "_release_engine_for_request", release)
-    monkeypatch.setattr(server, "_validate_cb_specprefill_request_tuning", lambda *a: None)
+    monkeypatch.setattr(
+        server, "_validate_cb_specprefill_request_tuning", lambda *a: None
+    )
 
     request = CompletionRequest(model="m", prompt="hi", stream=True, mtp=True)
     with pytest.raises(HTTPException) as exc:
@@ -707,7 +704,9 @@ async def test_chat_preparation_rejection_finishes_metrics(monkeypatch):
     monkeypatch.setattr(server._metrics, "track_inference", lambda *a, **k: tracker)
     monkeypatch.setattr(server, "_acquire_default_engine_for_request", acquire)
     monkeypatch.setattr(server, "_release_engine_for_request", release)
-    monkeypatch.setattr(server, "_validate_cb_specprefill_request_tuning", lambda *a: None)
+    monkeypatch.setattr(
+        server, "_validate_cb_specprefill_request_tuning", lambda *a: None
+    )
     monkeypatch.setattr(
         server,
         "_prepare_chat_completion_invocation",

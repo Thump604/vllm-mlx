@@ -48,9 +48,7 @@ def _import_text_model_classes(model_type: str):
     return _import_qwen_model_classes(model_type)
 
 
-def _safetensors_shapes(
-    shard_path: Path, keys: set[str]
-) -> dict[str, tuple[int, ...]]:
+def _safetensors_shapes(shard_path: Path, keys: set[str]) -> dict[str, tuple[int, ...]]:
     """Read selected shapes from a safetensors header without loading arrays."""
 
     with shard_path.open("rb") as shard:
@@ -278,9 +276,7 @@ def _build_qwen_text_model(
         capability is not None and capability.supported is True
     ):
         reason = (
-            "native_mtp_capability_missing"
-            if capability is None
-            else capability.reason
+            "native_mtp_capability_missing" if capability is None else capability.reason
         )
         raise ValueError(f"Native Qwen MTP load did not activate capability: {reason}")
     return text_model
@@ -331,9 +327,7 @@ def build_text_model(vlm_model: Any, model_path: str | Path) -> Any | None:
         model_type = text_config.get("model_type") or config.get("model_type", "")
         vlm_lm = vlm_model.language_model
         if _is_native_qwen_model_type(model_type):
-            text_model = _build_qwen_text_model(
-                vlm_lm, model_path, config, text_config
-            )
+            text_model = _build_qwen_text_model(vlm_lm, model_path, config, text_config)
             capability = text_model.mtp_capability
             logger.info(
                 "Built native Qwen TextModel (MTP=%s, reason=%s)",

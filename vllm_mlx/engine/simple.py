@@ -2000,7 +2000,9 @@ class SimpleEngine(BaseEngine):
                             finish_reason = getattr(chunk, "finish_reason", None)
                             if finish_reason is None:
                                 finish_reason = (
-                                    "length" if completion_tokens >= max_tokens else "stop"
+                                    "length"
+                                    if completion_tokens >= max_tokens
+                                    else "stop"
                                 )
 
                         yield GenerationOutput(

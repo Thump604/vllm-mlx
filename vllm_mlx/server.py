@@ -793,9 +793,7 @@ def _preflight_streaming_completion_native_mtp(
     }
     _attach_native_mtp_request_kwargs(engine, request, kwargs)
     return {
-        name: value
-        for name, value in kwargs.items()
-        if name.startswith("_native_mtp_")
+        name: value for name, value in kwargs.items() if name.startswith("_native_mtp_")
     }
 
 
@@ -817,9 +815,7 @@ def _configure_batched_specprefill(
     else:
         configured = copy.copy(scheduler_config)
         configured.specprefill_enabled = True
-    builder_inputs = getattr(
-        configured, "specprefill_runtime_builder_inputs", None
-    )
+    builder_inputs = getattr(configured, "specprefill_runtime_builder_inputs", None)
     if configured.specprefill_prepare is None and builder_inputs is not None:
         from .specprefill_runtime import build_qwen_cb_specprefill_prepare
 

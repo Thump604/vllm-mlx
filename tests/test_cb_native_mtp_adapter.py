@@ -251,7 +251,10 @@ class _Model:
 class _SparseBootstrap:
     def __init__(self, model, request):
         self.selected_logical_positions = (0, 2)
-        self.selected_token_ids = (request.prompt_token_ids[0], request.prompt_token_ids[2])
+        self.selected_token_ids = (
+            request.prompt_token_ids[0],
+            request.prompt_token_ids[2],
+        )
         self.immediate_successor_token_ids = (request.prompt_token_ids[1],)
         self.target_cache = [object()]
         self.next_logical_position = len(request.prompt_token_ids)
@@ -324,7 +327,9 @@ class _PinnedSparseModel:
             (inputs.shape[0], 1, inputs.shape[1], 8),
         )
         cache[0].update_and_fetch(values, values)
-        hidden = mx.stack((inputs.astype(mx.float32), inputs.astype(mx.float32)), axis=-1)
+        hidden = mx.stack(
+            (inputs.astype(mx.float32), inputs.astype(mx.float32)), axis=-1
+        )
         logits = self._logits(inputs)
         return (logits, hidden) if return_hidden else logits
 
@@ -548,7 +553,9 @@ def test_sparse_bootstrap_count_mismatch_fails_before_fresh_cache_creation():
     from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
 
     model = _Model()
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_count_mismatch"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_count_mismatch"
+    ):
         NativeMTPContinuousBatchAdapter.create(
             model,
             [_request(1), _request(2)],
@@ -568,7 +575,10 @@ def test_sparse_bootstrap_cannot_be_reordered_or_reused_before_admission():
             model,
             [first, second],
             lifecycle=_lifecycle(),
-            sparse_bootstraps=(_SparseBootstrap(model, second), _SparseBootstrap(model, first)),
+            sparse_bootstraps=(
+                _SparseBootstrap(model, second),
+                _SparseBootstrap(model, first),
+            ),
         )
     bootstrap = _SparseBootstrap(model, first)
     with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_reused"):
@@ -597,7 +607,9 @@ def test_pinned_sparse_admission_uses_selected_prompt_without_target_replay(moe)
     assert [item.uid for item in emissions] == [7]
     assert model.target_calls == target_calls
     assert model.mtp_calls > 0
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         from mlx_lm.generate import NativeMTPAdmission, NativeMTPRowSpec
 
         NativeMTPAdmission.create_from_sparse_bootstraps(
@@ -614,7 +626,9 @@ def test_pinned_bootstrap_forgery_is_rejected_before_claim_and_original_survives
     request.prompt_token_ids = [0, 1, 2, 3, 4]
     bootstrap = _pinned_bootstrap(model, request.prompt_token_ids, (0, 2, 4))
     forged = replace(bootstrap, target_cache=[object()])
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_receipt_provenance_mismatch"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_receipt_provenance_mismatch"
+    ):
         NativeMTPContinuousBatchAdapter.create(
             model, [request], sparse_bootstraps=(forged,)
         )
@@ -630,7 +644,9 @@ def test_pinned_bootstrap_close_abandons_authority_before_downstream_claim():
     model = _PinnedSparseModel()
     bootstrap = _pinned_bootstrap(model, (0, 1, 2, 3, 4), (0, 2, 4))
     bootstrap.close()
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         NativeMTPAdmission.create_from_sparse_bootstraps(
             model, (NativeMTPRowSpec(1, (0, 2, 4), 2),), (bootstrap,)
         )
@@ -654,7 +670,9 @@ def test_partial_sparse_admission_failure_consumes_every_bootstrap_authority():
             ),
             (first, malformed),
         )
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         NativeMTPAdmission.create_from_sparse_bootstraps(
             model, (NativeMTPRowSpec(3, first.selected_token_ids, 2),), (first,)
         )
@@ -912,11 +930,15 @@ def test_scheduler_claims_combined_sparse_cohort_only_after_every_bridge_ready(
     scheduler._schedule_waiting()
     assert len(calls) == 1
     assert len(calls[0]["sparse_bootstraps"]) == 2
-    assert all(not bridge.adopted for bridge in scheduler._native_mtp_specprefill_bridges.values())
+    assert all(
+        not bridge.adopted
+        for bridge in scheduler._native_mtp_specprefill_bridges.values()
+    )
 
 
 def test_scheduler_cancels_unclaimed_combined_bridge_before_adapter_start():
     from vllm_mlx.request import RequestStatus
+
     request = _real_request(1)
     scheduler = _bare_scheduler(request)
     bridge = SimpleNamespace(cancelled=False)
@@ -995,7 +1017,9 @@ def test_combined_bridge_failure_cancels_and_errors_every_cohort_member_no_subse
         first.request_id: _Bridge(fails=True),
         second.request_id: _Bridge(),
     }
-    scheduler._native_mtp_specprefill_queue.extend((first.request_id, second.request_id))
+    scheduler._native_mtp_specprefill_queue.extend(
+        (first.request_id, second.request_id)
+    )
     scheduler._native_mtp_specprefill_cohort_ids = (first.request_id, second.request_id)
     monkeypatch.setattr(
         adapter_mod.NativeMTPContinuousBatchAdapter,

@@ -248,11 +248,16 @@ def scalar_cache_cursor(cache: Any, *, logical_position: int) -> ScalarCacheCurs
     if logical_position < 0:
         raise GemmaCacheError("logical position must be non-negative")
     if type(cache) in _SCALAR_FULL:
-        return ScalarCacheCursor(cache.offset, cache.offset, cache.offset, logical_position)
+        return ScalarCacheCursor(
+            cache.offset, cache.offset, cache.offset, logical_position
+        )
     if type(cache) in _SCALAR_ROTATING:
         _validate_scalar_rotating(cache, allow_oversized=True)
         return ScalarCacheCursor(
-            cache.offset, min(cache.offset, cache.max_size), cache._idx, logical_position
+            cache.offset,
+            min(cache.offset, cache.max_size),
+            cache._idx,
+            logical_position,
         )
     raise GemmaCacheError(f"unsupported scalar cache: {type(cache).__name__}")
 
@@ -290,7 +295,9 @@ def validate_homogeneous_batch_lane(
 ) -> None:
     logical = tuple(int(value) for value in logical_positions)
     if not logical or len(set(logical)) != 1:
-        raise GemmaCacheError("Gemma sparse cache lane requires equal logical positions")
+        raise GemmaCacheError(
+            "Gemma sparse cache lane requires equal logical positions"
+        )
     reference: tuple[int, ...] | None = None
     physical: int | None = None
     rotating_state: tuple[int, int, bool] | None = None
@@ -315,7 +322,9 @@ def validate_homogeneous_batch_lane(
             if rotating_state is None:
                 rotating_state = state
             elif state != rotating_state:
-                raise GemmaCacheError("Gemma rotating owners disagree on resident state")
+                raise GemmaCacheError(
+                    "Gemma rotating owners disagree on resident state"
+                )
 
 
 def validate_aligned_scalar_cache(
@@ -389,7 +398,9 @@ class GemmaCacheCheckpoint:
         if not self._active:
             return
         if tuple(self._cache) != tuple(snapshot.cache for snapshot in self._snapshots):
-            raise GemmaCacheTransactionError("cache topology changed during transaction")
+            raise GemmaCacheTransactionError(
+                "cache topology changed during transaction"
+            )
         for snapshot in self._snapshots:
             snapshot.restore()
         self._active = False
@@ -437,9 +448,7 @@ class GemmaCachePairCheckpoint:
         self.source.restore()
 
 
-def _validate_scalar_rotating(
-    cache: Any, *, allow_oversized: bool = False
-) -> None:
+def _validate_scalar_rotating(cache: Any, *, allow_oversized: bool = False) -> None:
     if cache.offset < 0 or cache._idx < 0 or cache.max_size <= 0 or cache.keep != 0:
         raise GemmaCacheError("invalid scalar rotating-cache metadata")
     if (cache.keys is None) != (cache.values is None):
@@ -492,9 +501,7 @@ def normalize_scalar_rotating(cache: Any) -> None:
         raise
 
 
-def _validate_batch_rotating(
-    cache: Any, *, allow_oversized: bool = False
-) -> None:
+def _validate_batch_rotating(cache: Any, *, allow_oversized: bool = False) -> None:
     if cache.max_size <= 0 or cache._offset < 0 or cache._idx < 0:
         raise GemmaCacheError("invalid batch rotating-cache metadata")
     if (cache.keys is None) != (cache.values is None):
@@ -589,14 +596,18 @@ class GemmaOneTokenTransaction:
         )
         self._batch = type(cache[0]) in _BATCH
         if self._batch:
-            validate_homogeneous_batch_lane(cache, logical_positions=self.logical_before)
+            validate_homogeneous_batch_lane(
+                cache, logical_positions=self.logical_before
+            )
             self.before = tuple(
                 batch_cache_cursor(entry, logical_positions=self.logical_before)
                 for entry in cache
             )
         else:
             if len(self.logical_before) != 1:
-                raise GemmaCacheError("scalar transaction requires one logical position")
+                raise GemmaCacheError(
+                    "scalar transaction requires one logical position"
+                )
             validate_aligned_scalar_cache(
                 cache, logical_position=self.logical_before[0]
             )
@@ -689,9 +700,7 @@ class GemmaOneTokenTransaction:
 
     def commit(self, *, logical_positions: Sequence[int]) -> None:
         if self._state != "active":
-            raise GemmaCacheTransactionError(
-                f"transaction is already {self._state}"
-            )
+            raise GemmaCacheTransactionError(f"transaction is already {self._state}")
         logical_after = tuple(int(value) for value in logical_positions)
         if logical_after != tuple(value + 1 for value in self.logical_before):
             self.rollback()
@@ -720,7 +729,9 @@ class GemmaOneTokenTransaction:
                     for entry in self.cache
                 )
                 for entry, old, new in zip(self.cache, self.before, after):
-                    if new.total_writes != tuple(value + 1 for value in old.total_writes):
+                    if new.total_writes != tuple(
+                        value + 1 for value in old.total_writes
+                    ):
                         raise GemmaCacheTransactionError(
                             "batch physical writes did not advance by one"
                         )
@@ -858,9 +869,7 @@ def run_atomic_one_token(
 ) -> Any:
     """Run/evaluate one lazy forward and publish cache mutation atomically."""
 
-    transaction = GemmaOneTokenTransaction(
-        cache, logical_positions=logical_positions
-    )
+    transaction = GemmaOneTokenTransaction(cache, logical_positions=logical_positions)
     try:
         result = forward()
         evaluate(result)
