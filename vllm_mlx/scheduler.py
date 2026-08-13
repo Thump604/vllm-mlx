@@ -206,6 +206,9 @@ class SchedulerConfig:
     specprefill_enabled: bool = False
     specprefill_prepare: Optional[Callable[[Any, Any], Any]] = None
     specprefill_runtime_builder_inputs: Optional[Dict[str, Any]] = None
+    # Combined native-MTP SpecPrefill is an opt-in, already-prepared owner.
+    # Scheduler never loads artifacts or constructs a sparse target session.
+    native_mtp_specprefill_runtime: Any = None
 
     def __post_init__(self) -> None:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
@@ -1407,6 +1410,12 @@ class Scheduler:
         self._native_cancelled_ids: Set[str] = set()
         self._native_zero_token_ids: Set[str] = set()
         self._native_admission_errors: Dict[str, str] = {}
+        # These bridges own attested sparse target cache only until the public
+        # native-MTP cohort claims every receipt.  They intentionally never
+        # share a lifetime with an ordinary BatchGenerator.
+        self._native_mtp_specprefill_bridges: Dict[str, Any] = {}
+        self._native_mtp_specprefill_queue: deque[str] = deque()
+        self._native_mtp_specprefill_cohort_ids: tuple[str, ...] = ()
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -1750,6 +1759,7 @@ class Scheduler:
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
         self._cancel_native_mtp_adapter()
+        self._cancel_native_mtp_specprefill_bridges()
         if self.batch_generator is not None:
             try:
                 if hasattr(self.batch_generator, "close"):
@@ -2144,6 +2154,21 @@ class Scheduler:
         if request_id in self._native_cancelled_ids:
             return True
 
+        bridge = self._native_mtp_specprefill_bridges.pop(request_id, None)
+        if bridge is not None:
+            try:
+                bridge.cancel()
+            except Exception:
+                logger.exception(
+                    "Failed to cancel native MTP SpecPrefill bridge for %s",
+                    request_id,
+                )
+            self._native_mtp_specprefill_queue = deque(
+                queued
+                for queued in self._native_mtp_specprefill_queue
+                if queued != request_id
+            )
+
         request = self.requests.get(request_id)
         if self.native_mtp_adapter is not None and request_id in self.request_id_to_uid:
             # Public native lifecycle supports only cohort cancellation.  Do
@@ -2246,9 +2271,193 @@ class Scheduler:
             request.sampling_params.stop_token_ids or ()
         )
 
+    def _native_mtp_specprefill_config(self, request: Request) -> Any | None:
+        """Build the exact attested sparse config, or keep normal MTP intact."""
+        prepared = self.config.native_mtp_specprefill_runtime
+        if prepared is None:
+            return None
+        if request.images or request.videos or request.is_multimodal:
+            return None
+        if not self.config.specprefill_enabled:
+            return None
+        try:
+            from .cooperative_specprefill import CooperativeSpecPrefillConfig
+            from .specprefill_cache import SparsePolicyTuning
+
+            key = prepared.profile_key
+            profile = prepared.profile_registry.resolve(
+                key,
+                prompt_tokens=len(request.prompt_token_ids),
+                residency_bytes=prepared.estimated_residency_bytes,
+                diagnostic=False,
+            )
+            tuning = profile.tuning if profile.eligible else None
+            if tuning is None:
+                return None
+            return CooperativeSpecPrefillConfig(
+                target_id=f"{key.target_artifact_id}@sha256:{key.target_artifact_hash}",
+                tokenizer_id=f"tokenizer@sha256:{key.tokenizer_artifact_hash}",
+                scorer_id=f"{key.scorer_artifact_id}@sha256:{key.scorer_artifact_hash}",
+                tuning=SparsePolicyTuning(
+                    keep_pct=tuning.keep_pct,
+                    backbone_pct=tuning.backbone_pct,
+                    halo_chunks=tuning.halo_chunks,
+                    anchor_chunks=tuning.anchor_chunks,
+                    chunk_size=tuning.chunk_size,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Native MTP SpecPrefill admission unavailable: %s", exc)
+            return None
+
+    def _start_native_mtp_specprefill_bridges(self) -> List[Request]:
+        """Move one contiguous combined cohort into request-owned prefill."""
+        if self._native_mtp_specprefill_bridges or not self.waiting:
+            return []
+        first = self.waiting[0]
+        if first.native_mtp_config is None:
+            return []
+        config = self._native_mtp_specprefill_config(first)
+        if config is None:
+            return []
+        from .native_mtp_specprefill_bridge import NativeMTPSpecPrefillBridge
+
+        cohort = []
+        for request in self.waiting:
+            if (
+                request.native_mtp_config is None
+                or request.sampling_params.max_tokens == 0
+                or len(cohort) >= self.config.max_num_seqs
+                or self._native_mtp_specprefill_config(request) != config
+            ):
+                break
+            cohort.append(request)
+        bridges = {}
+        try:
+            for request in cohort:
+                bridges[request.request_id] = NativeMTPSpecPrefillBridge(
+                    self.config.native_mtp_specprefill_runtime, request, config
+                )
+        except Exception as exc:
+            for bridge in bridges.values():
+                try:
+                    bridge.cancel()
+                except Exception:
+                    logger.exception("Failed to cancel partial native MTP bridge")
+            reason = str(exc) or "native_mtp_specprefill_admission_failed"
+            for _ in cohort:
+                self.waiting.popleft()
+            for request in cohort:
+                request.status = RequestStatus.RUNNING
+                self.running[request.request_id] = request
+                self._native_admission_errors[request.request_id] = reason
+            return cohort
+        for _ in cohort:
+            self.waiting.popleft()
+        self._native_mtp_specprefill_bridges = bridges
+        self._native_mtp_specprefill_queue.extend(bridges)
+        self._native_mtp_specprefill_cohort_ids = tuple(bridges)
+        for request in cohort:
+            request.status = RequestStatus.RUNNING
+            self.running[request.request_id] = request
+            self.total_prompt_tokens += request.num_prompt_tokens
+        return cohort
+
+    def _cancel_native_mtp_specprefill_bridges(self) -> None:
+        bridges, self._native_mtp_specprefill_bridges = (
+            self._native_mtp_specprefill_bridges,
+            {},
+        )
+        self._native_mtp_specprefill_cohort_ids = ()
+        self._native_mtp_specprefill_queue.clear()
+        for bridge in bridges.values():
+            try:
+                bridge.cancel()
+            except Exception:
+                logger.exception("Failed to cancel native MTP SpecPrefill bridge")
+
+    def _fail_native_mtp_specprefill_cohort(self, reason: str) -> None:
+        """Fail every request that shared one unclaimed bridge cohort."""
+        request_ids = self._native_mtp_specprefill_cohort_ids
+        self._cancel_native_mtp_specprefill_bridges()
+        for request_id in request_ids:
+            request = self.running.get(request_id)
+            if request is not None:
+                self._native_admission_errors[request_id] = reason
+
+    def _advance_native_mtp_specprefill_bridge(self) -> None:
+        """Commit at most one cooperative quantum before sparse cohort claim."""
+        if not self._native_mtp_specprefill_queue:
+            return
+        request_id = self._native_mtp_specprefill_queue.popleft()
+        bridge = self._native_mtp_specprefill_bridges.get(request_id)
+        if bridge is None:
+            return
+        try:
+            progress = bridge.step()
+        except Exception as exc:
+            reason = str(exc) or "native_mtp_specprefill_step_failed"
+            self._fail_native_mtp_specprefill_cohort(reason)
+            return
+        if progress.state.value == "terminal":
+            self._fail_native_mtp_specprefill_cohort(
+                progress.fallback_reason or "native_mtp_specprefill_failed"
+            )
+        elif progress.state.value != "bootstrap_ready":
+            self._native_mtp_specprefill_queue.append(request_id)
+
+    def _start_ready_native_mtp_specprefill_cohort(self) -> bool:
+        """Atomically transfer an all-ready bridge cohort to public MTP."""
+        bridges = self._native_mtp_specprefill_bridges
+        if not bridges or self._native_mtp_specprefill_queue:
+            return False
+        from .native_mtp_specprefill_bridge import NativeMTPSpecPrefillBridgeState
+        if any(
+            bridge.state is not NativeMTPSpecPrefillBridgeState.BOOTSTRAP_READY
+            for bridge in bridges.values()
+        ):
+            return False
+        from .native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+        requests = [self.running[request_id] for request_id in bridges]
+        original_uids = tuple(request.batch_uid for request in requests)
+        next_uid = self._next_native_mtp_uid
+        try:
+            for offset, request in enumerate(requests):
+                request.batch_uid = next_uid + offset
+            adapter = NativeMTPContinuousBatchAdapter.create(
+                self.model,
+                requests,
+                prefill_step_size=self.config.prefill_step_size,
+                sparse_bootstraps=[bridge.bootstrap for bridge in bridges.values()],
+                sparse_adopted=lambda: tuple(
+                    bridge.record_public_claim() for bridge in bridges.values()
+                ),
+            )
+        except Exception as exc:
+            for request, uid in zip(requests, original_uids):
+                request.batch_uid = uid
+                self._native_admission_errors[request.request_id] = (
+                    str(exc) or "native_mtp_sparse_adoption_failed"
+                )
+            self._fail_native_mtp_specprefill_cohort(
+                str(exc) or "native_mtp_sparse_adoption_failed"
+            )
+            return False
+        self._next_native_mtp_uid = next_uid + len(requests)
+        self.native_mtp_adapter = adapter
+        for request in requests:
+            self.request_id_to_uid[request.request_id] = request.batch_uid
+            self.uid_to_request_id[request.batch_uid] = request.request_id
+        return True
+
     def _start_native_mtp_cohort(self) -> List[Request]:
         """Admit one contiguous fresh native-MTP cohort without BatchGenerator."""
-        if self.native_mtp_adapter is not None or not self.waiting:
+        if (
+            self.native_mtp_adapter is not None
+            or self._native_mtp_specprefill_bridges
+            or not self.waiting
+        ):
             return []
         first = self.waiting[0]
         if first.native_mtp_config is None:
@@ -2464,6 +2673,9 @@ class Scheduler:
                 )
             else:
                 logger.warning("Native MTP cleanup failed: %s", cleanup_reason)
+        # Before the adapter reaches ``start_sparse``, it has not claimed the
+        # bridge receipts.  The bridge is still the only cleanup owner.
+        self._cancel_native_mtp_specprefill_bridges()
 
     def _schedule_waiting(self) -> List[Request]:
         """
@@ -2479,6 +2691,10 @@ class Scheduler:
             self._try_promote_ssd_pending()
 
         if self.native_mtp_adapter is not None:
+            return []
+        if self._native_mtp_specprefill_bridges:
+            self._advance_native_mtp_specprefill_bridge()
+            self._start_ready_native_mtp_specprefill_cohort()
             return []
         if (
             self.waiting
@@ -2500,6 +2716,9 @@ class Scheduler:
             and self.running
         ):
             return []
+        combined = self._start_native_mtp_specprefill_bridges()
+        if combined:
+            return combined
         native = self._start_native_mtp_cohort()
         if native:
             return native
@@ -3070,6 +3289,14 @@ class Scheduler:
                 # Run generation step if we have running requests
                 if self.native_mtp_adapter is not None and self.running:
                     emissions = self.native_mtp_adapter.step()
+                    if self._native_mtp_specprefill_bridges and all(
+                        bridge.state.value == "adopted"
+                        for bridge in self._native_mtp_specprefill_bridges.values()
+                    ):
+                        # Receipt claim has completed and bridge cleanup must
+                        # no longer touch cache now owned by the adapter.
+                        self._native_mtp_specprefill_bridges = {}
+                        self._native_mtp_specprefill_cohort_ids = ()
                     output.has_work = True
                     if emissions:
                         outputs, finished_ids = self._process_native_mtp_emissions(

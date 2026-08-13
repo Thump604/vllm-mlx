@@ -112,6 +112,20 @@ class NativeMTPSpecPrefillBridge:
         self._state = NativeMTPSpecPrefillBridgeState.ADOPTED
         return self._bootstrap
 
+    def record_public_claim(self) -> None:
+        """Record an already-committed sparse claim without new fallible work.
+
+        ``NativeMTPAdmission.create_from_sparse_bootstraps`` has consumed the
+        receipts before invoking its scheduler callback.  At that point the
+        bridge must not perform another operation that can reject ownership:
+        the native cohort is the cache owner and dropping these references is
+        sufficient.  The normal ``mark_adopted`` method remains available for
+        standalone cooperative consumers which cross their own decode seam.
+        """
+        self._bootstrap = None
+        self._session = None
+        self._state = NativeMTPSpecPrefillBridgeState.ADOPTED
+
     def cancel(self) -> None:
         if self._state is NativeMTPSpecPrefillBridgeState.TERMINAL:
             return

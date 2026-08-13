@@ -429,8 +429,15 @@ def _bare_scheduler(*requests):
     scheduler._native_zero_token_ids = set()
     scheduler._native_cancelled_ids = set()
     scheduler._native_admission_errors = {}
+    scheduler._native_mtp_specprefill_bridges = {}
+    scheduler._native_mtp_specprefill_queue = deque()
     scheduler._pending_abort_ids = set()
-    scheduler.config = SimpleNamespace(max_num_seqs=8, prefill_step_size=4)
+    scheduler.config = SimpleNamespace(
+        max_num_seqs=8,
+        prefill_step_size=4,
+        native_mtp_specprefill_runtime=None,
+        specprefill_enabled=False,
+    )
     scheduler.model = _Model()
     scheduler.total_prompt_tokens = 0
     scheduler.total_completion_tokens = 0
@@ -822,6 +829,242 @@ def test_scheduler_native_admission_failure_is_one_terminal_error_per_row_and_qu
         (output.request_id, output.finish_reason) for output in second_step.outputs
     ] == [(next_zero.request_id, "length")]
     assert len(calls) == 1
+
+
+def test_scheduler_claims_combined_sparse_cohort_only_after_every_bridge_ready(
+    monkeypatch,
+):
+    """The adapter receives attested bootstraps, never a partial cohort."""
+    import vllm_mlx.native_mtp_cb_adapter as adapter_mod
+    import vllm_mlx.native_mtp_specprefill_bridge as bridge_mod
+
+    first, second = _real_request(1), _real_request(2)
+    scheduler = _bare_scheduler(first, second)
+    key = SimpleNamespace(
+        target_artifact_id="target",
+        target_artifact_hash="a" * 64,
+        tokenizer_artifact_hash="b" * 64,
+        scorer_artifact_id="scorer",
+        scorer_artifact_hash="c" * 64,
+    )
+    tuning = SimpleNamespace(
+        keep_pct=0.5,
+        backbone_pct=0.0,
+        halo_chunks=0,
+        anchor_chunks=1,
+        chunk_size=2,
+    )
+    scheduler.config = SimpleNamespace(
+        max_num_seqs=8,
+        prefill_step_size=4,
+        specprefill_enabled=True,
+        native_mtp_specprefill_runtime=SimpleNamespace(
+            profile_key=key,
+            profile_registry=SimpleNamespace(
+                resolve=lambda *_args, **_kwargs: SimpleNamespace(
+                    eligible=True, tuning=tuning
+                )
+            ),
+            estimated_residency_bytes=1,
+        ),
+    )
+
+    states = SimpleNamespace(
+        BOOTSTRAP_READY=SimpleNamespace(value="bootstrap_ready"),
+    )
+
+    class _Bridge:
+        def __init__(self, _prepared, request, _config):
+            self.request_id = request.request_id
+            self.state = SimpleNamespace(value="waiting")
+            self.bootstrap = object()
+            self.adopted = 0
+            self.cancelled = False
+
+        def step(self):
+            self.state = states.BOOTSTRAP_READY
+            return SimpleNamespace(state=self.state, fallback_reason=None)
+
+        def mark_adopted(self):
+            self.adopted += 1
+            self.state = SimpleNamespace(value="adopted")
+
+        def cancel(self):
+            self.cancelled = True
+
+    calls = []
+    monkeypatch.setattr(bridge_mod, "NativeMTPSpecPrefillBridge", _Bridge)
+    monkeypatch.setattr(
+        bridge_mod,
+        "NativeMTPSpecPrefillBridgeState",
+        states,
+    )
+    monkeypatch.setattr(
+        adapter_mod.NativeMTPContinuousBatchAdapter,
+        "create",
+        classmethod(lambda _cls, *_args, **kwargs: calls.append(kwargs) or object()),
+    )
+
+    assert scheduler._schedule_waiting() == [first, second]
+    assert calls == []
+    scheduler._schedule_waiting()
+    assert calls == []
+    scheduler._schedule_waiting()
+    assert len(calls) == 1
+    assert len(calls[0]["sparse_bootstraps"]) == 2
+    assert all(not bridge.adopted for bridge in scheduler._native_mtp_specprefill_bridges.values())
+
+
+def test_scheduler_cancels_unclaimed_combined_bridge_before_adapter_start():
+    from vllm_mlx.request import RequestStatus
+    request = _real_request(1)
+    scheduler = _bare_scheduler(request)
+    bridge = SimpleNamespace(cancelled=False)
+    bridge.cancel = lambda: setattr(bridge, "cancelled", True)
+    scheduler._native_mtp_specprefill_bridges[request.request_id] = bridge
+    scheduler._native_mtp_specprefill_queue.append(request.request_id)
+    request.status = RequestStatus.RUNNING
+    scheduler.running[request.request_id] = request
+
+    assert scheduler._do_abort_request(request.request_id)
+    assert bridge.cancelled is True
+    assert request.request_id not in scheduler._native_mtp_specprefill_bridges
+    assert not scheduler._native_mtp_specprefill_queue
+
+
+def test_combined_bridge_construction_failure_cancels_prior_and_errors_cohort_once(
+    monkeypatch,
+):
+    import vllm_mlx.native_mtp_specprefill_bridge as bridge_mod
+
+    first, second = _real_request(1), _real_request(2)
+    scheduler = _bare_scheduler(first, second)
+    scheduler.config.specprefill_enabled = True
+    scheduler.config.native_mtp_specprefill_runtime = object()
+    bridge_config = object()
+    monkeypatch.setattr(
+        scheduler, "_native_mtp_specprefill_config", lambda _r: bridge_config
+    )
+    built = []
+
+    class _Bridge:
+        def __init__(self, _prepared, request, _config):
+            if request is second:
+                raise RuntimeError("later_bridge_failed")
+            self.cancelled = False
+            built.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(bridge_mod, "NativeMTPSpecPrefillBridge", _Bridge)
+    assert scheduler._start_native_mtp_specprefill_bridges() == [first, second]
+    assert built[0].cancelled is True
+    assert scheduler._native_mtp_specprefill_bridges == {}
+    assert scheduler._native_admission_errors == {
+        first.request_id: "later_bridge_failed",
+        second.request_id: "later_bridge_failed",
+    }
+
+
+def test_combined_bridge_failure_cancels_and_errors_every_cohort_member_no_subset_adapter(
+    monkeypatch,
+):
+    import vllm_mlx.native_mtp_cb_adapter as adapter_mod
+
+    first, second = _real_request(1), _real_request(2)
+    scheduler = _bare_scheduler(first, second)
+    scheduler.waiting.clear()
+    cancelled = []
+
+    class _Bridge:
+        def __init__(self, *, fails=False):
+            self.state = SimpleNamespace(value="prefilling")
+            self.fails = fails
+
+        def step(self):
+            if self.fails:
+                raise RuntimeError("bridge_quantum_failed")
+            return SimpleNamespace(state=self.state, fallback_reason=None)
+
+        def cancel(self):
+            cancelled.append(self)
+
+    scheduler.running = {first.request_id: first, second.request_id: second}
+    scheduler._native_mtp_specprefill_bridges = {
+        first.request_id: _Bridge(fails=True),
+        second.request_id: _Bridge(),
+    }
+    scheduler._native_mtp_specprefill_queue.extend((first.request_id, second.request_id))
+    scheduler._native_mtp_specprefill_cohort_ids = (first.request_id, second.request_id)
+    monkeypatch.setattr(
+        adapter_mod.NativeMTPContinuousBatchAdapter,
+        "create",
+        classmethod(lambda *_args, **_kwargs: pytest.fail("subset adapter forbidden")),
+    )
+
+    scheduler._advance_native_mtp_specprefill_bridge()
+    assert len(cancelled) == 2
+    assert scheduler._native_mtp_specprefill_bridges == {}
+    assert scheduler._native_admission_errors == {
+        first.request_id: "bridge_quantum_failed",
+        second.request_id: "bridge_quantum_failed",
+    }
+
+
+def test_combined_claim_callback_records_exact_ready_cohort_without_fallible_adoption(
+    monkeypatch,
+):
+    import vllm_mlx.native_mtp_cb_adapter as adapter_mod
+    import vllm_mlx.native_mtp_specprefill_bridge as bridge_mod
+
+    first, second = _real_request(1), _real_request(2)
+    scheduler = _bare_scheduler(first, second)
+    scheduler.waiting.clear()
+    ready = SimpleNamespace(BOOTSTRAP_READY=object())
+    records = []
+
+    class _Bridge:
+        state = ready.BOOTSTRAP_READY
+
+        def __init__(self, token):
+            self.bootstrap = token
+
+        def record_public_claim(self):
+            records.append(self.bootstrap)
+            self.bootstrap = None
+            self.state = SimpleNamespace(value="adopted")
+
+        def cancel(self):
+            pytest.fail("claimed bridge must not be cancelled")
+
+    first_bridge, second_bridge = _Bridge("one"), _Bridge("two")
+    scheduler.running = {first.request_id: first, second.request_id: second}
+    scheduler._native_mtp_specprefill_bridges = {
+        first.request_id: first_bridge,
+        second.request_id: second_bridge,
+    }
+    scheduler._native_mtp_specprefill_cohort_ids = (first.request_id, second.request_id)
+    captured = {}
+    monkeypatch.setattr(bridge_mod, "NativeMTPSpecPrefillBridgeState", ready)
+    monkeypatch.setattr(
+        adapter_mod.NativeMTPContinuousBatchAdapter,
+        "create",
+        classmethod(
+            lambda _cls, _model, requests, **kwargs: (
+                captured.update(requests=tuple(requests), **kwargs) or object()
+            )
+        ),
+    )
+
+    assert scheduler._start_ready_native_mtp_specprefill_cohort() is True
+    assert tuple(item.request_id for item in captured["requests"]) == (
+        first.request_id,
+        second.request_id,
+    )
+    assert captured["sparse_bootstraps"] == ["one", "two"]
+    captured["sparse_adopted"]()
+    assert records == ["one", "two"]
 
 
 def test_scheduler_zero_budget_head_finishes_same_step_before_adapter_and_keeps_next_row(
