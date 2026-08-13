@@ -48,6 +48,7 @@ class NativeMTPContinuousBatchAdapter:
         self._mixed_accepted = ()
         self._mixed_rejected = ()
         self._closed = False
+        self._cleanup_error_reason = None
 
     @classmethod
     def create(
@@ -155,6 +156,11 @@ class NativeMTPContinuousBatchAdapter:
     @property
     def active_uids(self) -> tuple[int, ...]:
         return () if self._closed else self._active_uids
+
+    @property
+    def cleanup_error_reason(self) -> str | None:
+        """Return a non-primary terminal cleanup failure, if one occurred."""
+        return self._cleanup_error_reason
 
     def telemetry_for(self, uid: int) -> dict[str, int]:
         return self._telemetry[uid].snapshot()
@@ -270,7 +276,20 @@ class NativeMTPContinuousBatchAdapter:
         if self._closed:
             return ()
         affected = self.active_uids
-        if self._epoch is not None:
-            self._epoch.cancel()
+        # A lifecycle operation can consume its epoch and poison/close the
+        # generator before its exception reaches the scheduler.  That stale
+        # handle is not an actionable cleanup owner: calling ``cancel`` on it
+        # raises ``native_mtp_epoch_moved`` and used to hide the model error.
+        # Mark this adapter closed first so repeated terminal cleanup is also
+        # harmless.  A live epoch is still cancelled normally.
         self._closed = True
+        if self._epoch is None or getattr(self._generator, "closed", False):
+            return affected
+        try:
+            self._epoch.cancel()
+        except Exception as error:
+            # Cancellation has no replacement primary failure of its own.
+            # Keep it observable to scheduler-owned cleanup without allowing
+            # it to replace a model/admission failure already in flight.
+            self._cleanup_error_reason = str(error) or type(error).__name__
         return affected

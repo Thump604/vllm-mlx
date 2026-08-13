@@ -155,6 +155,38 @@ class _RejectGenerator(_Generator):
         return emissions, _RejectInitial(tuple(row.uid for row in self.admission.rows))
 
 
+class _PoisonedInitial(_Epoch):
+    """A consumed public epoch whose model call has already closed its owner."""
+
+    def __init__(self, active_uids, generator):
+        super().__init__(active_uids)
+        self._generator = generator
+
+    def resume(self):
+        self._generator.closed = True
+        self._generator.cohort.poisoned = True
+        raise RuntimeError("forced_mtp_failure")
+
+    def cancel(self):
+        raise AssertionError("stale poisoned epoch must not be cancelled")
+
+
+class _PoisoningGenerator(_Generator):
+    def __init__(self, admission):
+        super().__init__(admission)
+        self.closed = False
+        self.cohort = SimpleNamespace(poisoned=False)
+
+    def prefill(self, *, prefill_step_size):
+        emissions = tuple(
+            _Emission(row.uid, row.uid + 1, object(), False)
+            for row in self.admission.rows
+        )
+        return emissions, _PoisonedInitial(
+            tuple(row.uid for row in self.admission.rows), self
+        )
+
+
 @dataclass(frozen=True)
 class _Row:
     uid: int
@@ -181,6 +213,12 @@ def _lifecycle(*, reject=False):
         NativeMTPBatchGenerator=_RejectGenerator if reject else _Generator,
         NativeMTPSamplingConfig=lambda **kwargs: SimpleNamespace(**kwargs),
     )
+
+
+def _poisoning_lifecycle():
+    lifecycle = _lifecycle()
+    lifecycle.NativeMTPBatchGenerator = _PoisoningGenerator
+    return lifecycle
 
 
 class _Model:
@@ -661,6 +699,61 @@ def test_scheduler_native_prefill_failure_is_one_terminal_error_without_retry_ha
     )
     second = scheduler.step()
     assert second.outputs == []
+
+
+def test_scheduler_preserves_primary_mtp_failure_when_public_epoch_is_already_poisoned(
+    monkeypatch,
+):
+    """Terminal cleanup must not call a consumed public epoch a second time."""
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    request = _real_request(1)
+    request.batch_uid = 1
+    scheduler = _bare_scheduler(request)
+    scheduler.waiting.clear()
+    scheduler.running = {request.request_id: request}
+    scheduler.request_id_to_uid = {request.request_id: request.batch_uid}
+    scheduler.uid_to_request_id = {request.batch_uid: request.request_id}
+    _install_minimal_step_cleanup(monkeypatch, scheduler)
+    detokenizer = SimpleNamespace(
+        last_segment="x",
+        text="x",
+        add_token=lambda _token_id: None,
+        finalize=lambda: None,
+    )
+    monkeypatch.setattr(scheduler, "_get_detokenizer", lambda _request_id: detokenizer)
+    adapter = NativeMTPContinuousBatchAdapter.create(
+        scheduler.model,
+        [request],
+        lifecycle=_poisoning_lifecycle(),
+        prefill_step_size=4,
+    )
+    scheduler.native_mtp_adapter = adapter
+
+    first = scheduler.step()
+    assert first.outputs[0].finish_reason is None
+    generator = adapter._generator
+    assert generator.closed is False
+    assert generator.cohort.poisoned is False
+
+    error = scheduler.step()
+    assert [
+        (item.request_id, item.finish_reason, item.native_mtp_error_reason)
+        for item in error.outputs
+    ] == [(request.request_id, "error", "forced_mtp_failure")]
+    assert adapter.closed is True
+    assert generator.closed is True
+    assert generator.cohort.poisoned is True
+    assert scheduler.native_mtp_adapter is None
+    assert (
+        scheduler.running
+        == scheduler.request_id_to_uid
+        == scheduler.uid_to_request_id
+        == {}
+    )
+
+    retry = scheduler.step()
+    assert retry.outputs == []
 
 
 def test_inactive_scheduler_keeps_ordinary_constructor_and_insert_call_shapes():

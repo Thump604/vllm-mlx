@@ -1749,9 +1749,7 @@ class Scheduler:
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
-        if self.native_mtp_adapter is not None:
-            self.native_mtp_adapter.cancel()
-            self.native_mtp_adapter = None
+        self._cancel_native_mtp_adapter()
         if self.batch_generator is not None:
             try:
                 if hasattr(self.batch_generator, "close"):
@@ -2150,8 +2148,7 @@ class Scheduler:
         if self.native_mtp_adapter is not None and request_id in self.request_id_to_uid:
             # Public native lifecycle supports only cohort cancellation.  Do
             # not mutate hidden cache owners to remove one row mid-epoch.
-            self.native_mtp_adapter.cancel()
-            self.native_mtp_adapter = None
+            self._cancel_native_mtp_adapter()
             for active_id, active_request in self.running.items():
                 active_request.set_finished(RequestStatus.FINISHED_ABORTED)
                 self._native_cancelled_ids.add(active_id)
@@ -2419,9 +2416,7 @@ class Scheduler:
         self, reason: str
     ) -> tuple[List[RequestOutput], Set[str]]:
         """Close a failed public owner once and retain its primary reason."""
-        if self.native_mtp_adapter is not None:
-            self.native_mtp_adapter.cancel()
-            self.native_mtp_adapter = None
+        self._cancel_native_mtp_adapter(primary_reason=reason)
         failed_ids = set(self.running)
         outputs = []
         for request_id in failed_ids:
@@ -2439,6 +2434,36 @@ class Scheduler:
             )
         self._cleanup_finished(failed_ids)
         return outputs, failed_ids
+
+    def _cancel_native_mtp_adapter(self, *, primary_reason: str | None = None) -> None:
+        """Release a native cohort without allowing cleanup to replace failure.
+
+        Native epochs are move-only.  The public generator can therefore have
+        already consumed and poisoned an epoch when the Scheduler begins
+        terminal cleanup.  The adapter makes that state a no-op; any remaining
+        cleanup problem is recorded on the adapter and logged here.  Abort
+        outputs deliberately remain aborts rather than being reclassified as
+        model errors.
+        """
+        adapter = self.native_mtp_adapter
+        if adapter is None:
+            return
+        self.native_mtp_adapter = None
+        try:
+            adapter.cancel()
+        except Exception as error:
+            cleanup_reason = str(error) or type(error).__name__
+        else:
+            cleanup_reason = getattr(adapter, "cleanup_error_reason", None)
+        if cleanup_reason:
+            if primary_reason:
+                logger.warning(
+                    "Native MTP cleanup failed after terminal error %s: %s",
+                    primary_reason,
+                    cleanup_reason,
+                )
+            else:
+                logger.warning("Native MTP cleanup failed: %s", cleanup_reason)
 
     def _schedule_waiting(self) -> List[Request]:
         """
@@ -3054,8 +3079,7 @@ class Scheduler:
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
                     if not self.native_mtp_adapter.active_uids:
-                        self.native_mtp_adapter.cancel()
-                        self.native_mtp_adapter = None
+                        self._cancel_native_mtp_adapter()
                 elif self.batch_generator is not None and self.running:
                     _sanitize_batch_generator_logits_processors(self.batch_generator)
                     result = self.batch_generator.next()

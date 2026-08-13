@@ -1015,3 +1015,299 @@ async def test_public_vlm_text_noncontiguous_sparse_native_mtp_matches_oracle(
     assert all(output.logprobs is not None for output in outputs)
     assert all(mx.all(mx.isfinite(output.logprobs)).item() for output in outputs)
     _assert_requests_closed(requests)
+
+
+# These are intentionally scheduler-level tests rather than direct adapter tests.
+# The adapter-only contract is covered in test_cb_native_mtp_adapter.py; this
+# slice proves that standard-text CB neither bypasses its public lifecycle nor
+# loses output accounting when it drives actual Qwen caches.
+def _cb_scheduler(model, tokenizer):
+    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+
+    return Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            enable_mtp=True,
+            enable_prefix_cache=False,
+            max_num_seqs=4,
+            prefill_step_size=2,
+        ),
+    )
+
+
+def _cb_request(request_id, prompt, *, max_tokens=2, seed=17):
+    from vllm_mlx.request import Request, SamplingParams
+
+    request = Request(
+        request_id=request_id,
+        prompt=list(prompt),
+        sampling_params=SamplingParams(max_tokens=max_tokens, temperature=0.0),
+    )
+    request.native_mtp_config = _request(seed=seed)
+    return request
+
+
+def _run_scheduler_to_terminal(scheduler):
+    outputs = []
+    # Every native-MTP epoch is one scheduler step.  A small fixed guard makes
+    # a broken public lifecycle visible instead of masking it with an endless
+    # test loop.
+    for _ in range(32):
+        result = scheduler.step()
+        outputs.extend(result.outputs)
+        if not scheduler.has_requests():
+            return outputs
+    raise AssertionError("native MTP scheduler did not reach a terminal state")
+
+
+def _live_native_cohort(scheduler):
+    """Return the adapter's sole live owner after source-cache consumption."""
+    adapter = scheduler.native_mtp_adapter
+    assert adapter is not None
+    generator = adapter._generator
+    assert generator is not None
+    cohort = generator._cohort
+    assert adapter.closed is False
+    assert generator.closed is False
+    assert cohort.poisoned is False
+    assert cohort._checkpoint is None
+    return adapter, generator, cohort
+
+
+def _direct_native_b1_oracle(model, prompt, *, max_tokens, seed):
+    """Collect the two observable boundaries from upstream's public API."""
+    from mlx_lm.generate import (
+        NativeMTPAdmission,
+        NativeMTPBatchGenerator,
+        NativeMTPRowSpec,
+        NativeMTPSamplingConfig,
+    )
+
+    row = NativeMTPRowSpec(
+        uid=1,
+        prompt=tuple(prompt),
+        max_tokens=max_tokens,
+        seed=seed,
+        eos_token_ids=frozenset(),
+        sampling_config=NativeMTPSamplingConfig(temperature=0.0),
+    )
+    cache = model.make_mtp_request_cache(prompt_cache=None)
+    generator = NativeMTPBatchGenerator(
+        NativeMTPAdmission.create(model, (row,), (cache,))
+    )
+    initial, epoch = generator.prefill(prefill_step_size=2)
+    ready = epoch.resume()
+    decision = ready.decide()
+    if decision.accepted_uids:
+        emitted, terminal_epoch = decision.accept()
+    else:
+        emitted, terminal_epoch = decision.reject()
+    # max_tokens=2 means this epoch cannot own a surviving row.  Still consume
+    # its public cancellation to prove that the direct oracle leaves no cache.
+    terminal_epoch.cancel()
+    return tuple(initial) + tuple(emitted), cache
+
+
+def _force_cb_second_token(monkeypatch, model, wanted_by_batch_row, *, prompt_tokens):
+    """Force the first post-head MTP draft without changing target logits."""
+    original = model.mtp_forward
+
+    def controlled(hidden_states, next_token_ids, mtp_cache):
+        logits = original(hidden_states, next_token_ids, mtp_cache)
+        # Prompt-pair MTP prefill can have any width.  The first width-one MTP
+        # call after it is the public Initial -> Ready draft boundary.  The
+        # cohort may split and join its cache owner while pre-filling, so use
+        # the actual MTP cursor rather than Python object identity or calls.
+        width = int(next_token_ids.shape[1])
+        offset = mtp_cache[0].offset
+        cursor = int(mx.min(offset).item()) if isinstance(offset, mx.array) else offset
+        if width != 1 or cursor < prompt_tokens:
+            return logits
+        values = [wanted_by_batch_row[index] for index in range(logits.shape[0])]
+        forced = mx.full(logits.shape, -100.0, dtype=logits.dtype)
+        for index, token in enumerate(values):
+            forced[index, -1, token] = 100.0
+        return forced
+
+    monkeypatch.setattr(model, "mtp_forward", controlled)
+
+
+@pytest.mark.parametrize("moe", (False, True), ids=("dense", "recurrent_kv_moe"))
+@pytest.mark.parametrize("accept", (False, True), ids=("all_reject", "all_accept"))
+def test_actual_qwen_standard_cb_b1_forced_decision_matches_public_oracle(
+    monkeypatch, moe, accept
+):
+    model = _native_model(moe=moe).language_model
+    requests = _track_requests(monkeypatch, model)
+    prompt = (3, 5, 7, 11)
+    wrapper = _language_model(model, _tokenizer(tokens=prompt))
+    dense = _tokens(
+        list(wrapper.stream_generate(list(prompt), max_tokens=2, temperature=0.0))
+    )
+    wanted = (
+        dense[1]
+        if accept
+        else (dense[1] + 1) % _config(moe=moe)["text_config"]["vocab_size"]
+    )
+    _force_cb_second_token(monkeypatch, model, (wanted,), prompt_tokens=len(prompt))
+
+    oracle, oracle_cache = _direct_native_b1_oracle(
+        model, prompt, max_tokens=2, seed=17
+    )
+    scheduler = _cb_scheduler(model, _tokenizer(tokens=prompt))
+    request = _cb_request("b1", prompt, max_tokens=2, seed=17)
+    scheduler.add_request(request)
+    outputs = _run_scheduler_to_terminal(scheduler)
+
+    assert [token for output in outputs for token in output.new_token_ids] == [
+        item.token for item in oracle
+    ]
+    assert [output.logprobs is not None for output in outputs] == [True, True]
+    assert outputs[-1].finish_reason == "length"
+    assert outputs[-1].completion_tokens == 2
+    assert (outputs[-1].mtp_drafts, outputs[-1].mtp_accepted) == (1, int(accept))
+    assert scheduler.total_prompt_tokens == len(prompt)
+    assert scheduler.total_completion_tokens == 2
+    assert scheduler.num_requests_processed == 1
+    assert oracle_cache.closed is True
+    _assert_requests_closed(requests)
+
+
+@pytest.mark.parametrize("moe", (False, True), ids=("dense", "recurrent_kv_moe"))
+def test_actual_qwen_standard_cb_batched_mixed_decision_is_uid_local(monkeypatch, moe):
+    model = _native_model(moe=moe).language_model
+    requests = _track_requests(monkeypatch, model)
+    prompts = ((2, 3, 5, 7), (11, 13, 17, 19))
+    wrapper = _language_model(model)
+    dense = [
+        _tokens(
+            list(wrapper.stream_generate(list(prompt), max_tokens=2, temperature=0.0))
+        )
+        for prompt in prompts
+    ]
+    vocab = _config(moe=moe)["text_config"]["vocab_size"]
+    wanted = (dense[0][1], (dense[1][1] + 1) % vocab)
+    # Build independent B=1 public-lifecycle oracles under exactly the same
+    # forced decision.  This is the regression guard for UID-local state: a
+    # batched mixed cohort must not borrow its neighbour's outcome or cache.
+    expected = {}
+    oracle_caches = []
+    for uid, (prompt, token) in enumerate(zip(prompts, wanted), start=1):
+        with monkeypatch.context() as direct_patch:
+            _force_cb_second_token(
+                direct_patch, model, (token,), prompt_tokens=len(prompt)
+            )
+            expected[uid], cache = _direct_native_b1_oracle(
+                model, prompt, max_tokens=2, seed=(19, 23)[uid - 1]
+            )
+            oracle_caches.append(cache)
+    _force_cb_second_token(
+        monkeypatch,
+        model,
+        wanted,
+        prompt_tokens=len(prompts[0]),
+    )
+
+    scheduler = _cb_scheduler(model, _tokenizer())
+    first = _cb_request("accepted", prompts[0], max_tokens=2, seed=19)
+    second = _cb_request("rejected", prompts[1], max_tokens=2, seed=23)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    outputs = _run_scheduler_to_terminal(scheduler)
+    by_request = {}
+    for output in outputs:
+        by_request.setdefault(output.request_id, []).extend(output.new_token_ids)
+
+    assert set(by_request) == {"accepted", "rejected"}
+    assert all(len(tokens) == 2 for tokens in by_request.values())
+    assert by_request["accepted"] == [item.token for item in expected[1]]
+    assert by_request["rejected"] == [item.token for item in expected[2]]
+    assert all(output.logprobs is not None for output in outputs)
+    final = {output.request_id: output for output in outputs if output.finished}
+    assert {key: value.finish_reason for key, value in final.items()} == {
+        "accepted": "length",
+        "rejected": "length",
+    }
+    assert final["accepted"].mtp_accepted == 1
+    assert final["rejected"].mtp_accepted == 0
+    assert final["accepted"].mtp_drafts == final["rejected"].mtp_drafts == 1
+    assert scheduler.total_prompt_tokens == sum(map(len, prompts))
+    assert scheduler.total_completion_tokens == 4
+    assert scheduler.num_requests_processed == 2
+    assert all(cache.closed is True for cache in oracle_caches)
+    _assert_requests_closed(requests)
+
+
+@pytest.mark.parametrize("moe", (False, True), ids=("dense", "recurrent_kv_moe"))
+def test_actual_qwen_standard_cb_cancellation_and_error_close_request_caches(
+    monkeypatch, moe
+):
+    model = _native_model(moe=moe).language_model
+    prompt = (3, 5, 7, 11)
+
+    # A queued cancellation must not create a fresh native request cache.
+    before = _track_requests(monkeypatch, model)
+    scheduler = _cb_scheduler(model, _tokenizer())
+    queued = _cb_request("queued", prompt)
+    scheduler.add_request(queued)
+    scheduler.abort_request("queued")
+    queued_abort = scheduler.step()
+    assert queued_abort.outputs == []
+    assert queued_abort.finished_request_ids == set()
+    assert scheduler.has_requests() is False
+    assert before == []
+
+    # Once initial prefill owns the cache, cancellation is cohort-scoped and
+    # produces one abort output while closing the request-local owner.
+    after = _track_requests(monkeypatch, model)
+    scheduler = _cb_scheduler(model, _tokenizer())
+    active = _cb_request("active", prompt)
+    scheduler.add_request(active)
+    first = scheduler.step()
+    assert first.outputs
+    # Admission transfers B=1 source ownership into a merged cohort, closing
+    # the source wrappers before the first public emission is returned.
+    _assert_requests_closed(after)
+    adapter, generator, cohort = _live_native_cohort(scheduler)
+    scheduler.abort_request("active")
+    cancelled = scheduler.step()
+    assert [
+        (item.request_id, item.finished, item.finish_reason, item.completion_tokens)
+        for item in cancelled.outputs
+    ] == [("active", True, "abort", 1)]
+    assert cancelled.finished_request_ids == {"active"}
+    assert scheduler.has_requests() is False
+    assert scheduler.running == {}
+    assert scheduler.request_id_to_uid == scheduler.uid_to_request_id == {}
+    assert adapter.closed is True
+    assert generator.closed is True
+    assert cohort.poisoned is True
+    assert cohort._checkpoint is None
+
+    # A lifecycle error after initial prefill must turn into a terminal error,
+    # not an ordinary BatchGenerator fallback or a leaked cache owner.
+    failed = _track_requests(monkeypatch, model)
+    scheduler = _cb_scheduler(model, _tokenizer())
+    request = _cb_request("failed", prompt)
+    scheduler.add_request(request)
+    scheduler.step()
+    _assert_requests_closed(failed)
+    adapter, generator, cohort = _live_native_cohort(scheduler)
+    monkeypatch.setattr(
+        model,
+        "mtp_forward",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced_mtp_failure")
+        ),
+    )
+    error = scheduler.step()
+    assert [
+        (item.request_id, item.finish_reason, item.native_mtp_error_reason)
+        for item in error.outputs
+    ] == [("failed", "error", "forced_mtp_failure")]
+    assert scheduler.batch_generator is None
+    assert adapter.closed is True
+    assert generator.closed is True
+    assert cohort.poisoned is True
+    assert cohort._checkpoint is None
