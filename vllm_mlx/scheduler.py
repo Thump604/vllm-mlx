@@ -2139,10 +2139,14 @@ class Scheduler:
                 # corrupted context (measured: same prompt, different output).
                 # Entries stored post-prefill cover the full key, so drop the
                 # cache and prefill instead of guessing which kind this is.
-                if getattr(request, "cache_hit_type", None) == "exact":
+                if getattr(request, "cache_hit_type", None) in {
+                    "exact",
+                    "supersequence",
+                }:
                     logger.debug(
-                        "[cache] exact match on a full-coverage entry; "
-                        "prefilling to avoid duplicating the last token"
+                        "[cache] %s match on a full-coverage entry; "
+                        "prefilling to avoid duplicating the last token",
+                        request.cache_hit_type,
                     )
                     cache_to_use = None
                     request.prompt_cache = None
