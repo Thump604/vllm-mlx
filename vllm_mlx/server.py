@@ -1154,7 +1154,11 @@ def _prepare_openai_stream_reasoning_state(
 ) -> tuple[object | None, bool]:
     """Return request-local reasoning state and the legacy Nemotron marker state."""
     parser = _prepare_streaming_reasoning_parser(engine, request, chat_kwargs)
-    is_thinking_model = "nemotron" in (engine.model_name or "").lower() and not parser
+    is_thinking_model = (
+        "nemotron" in (engine.model_name or "").lower()
+        and not parser
+        and not _thinking_disabled(request, chat_kwargs)
+    )
     return parser, is_thinking_model
 
 
