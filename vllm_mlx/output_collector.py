@@ -149,6 +149,10 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            mtp_drafts=new.mtp_drafts,
+            mtp_accepted=new.mtp_accepted,
+            logprobs=new.logprobs,
+            native_mtp_error_reason=new.native_mtp_error_reason,
         )
 
     def clear(self) -> None:

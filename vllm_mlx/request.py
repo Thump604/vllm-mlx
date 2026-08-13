@@ -141,6 +141,10 @@ class Request:
     cache_hit_type: Optional[str] = (
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )
+    # Native-MTP CB is a request sidecar, never part of generic sampling
+    # parameters or the upstream BatchGenerator insert contract.
+    native_mtp_config: Any = None
+    native_mtp_eos_token_ids: set[int] = field(default_factory=set)
 
     @property
     def num_output_tokens(self) -> int:
@@ -216,6 +220,11 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Present only for native-MTP public emissions; ordinary paths retain None.
+    logprobs: Any = None
+    # A native cohort admission failure is terminal and retains its stable
+    # fail-closed reason without overloading normal finish reasons.
+    native_mtp_error_reason: Optional[str] = None
     # Request-local sparse-prefill diagnostics.  These fields are deliberately
     # independent of MTP counters because the two features occupy different
     # generation phases and may engage separately.

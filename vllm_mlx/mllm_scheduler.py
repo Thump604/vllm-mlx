@@ -492,9 +492,9 @@ class MLLMScheduler:
         if self.batch_generator is None:
             if self.config.enable_mtp:
                 lm = getattr(self.model, "language_model", self.model)
-                from .scheduler import _continuous_batching_mtp_capability
+                from .scheduler import _reject_native_mtp_mllm
 
-                _continuous_batching_mtp_capability(lm, enabled=True)
+                _reject_native_mtp_mllm(lm, enabled=True)
 
             from mlx_lm.sample_utils import make_sampler
 

@@ -64,11 +64,11 @@ def _native_qwen_model_type(model: Any) -> str:
 
 
 def _continuous_batching_mtp_capability(model: Any, *, enabled: bool) -> Any | None:
-    """Fail closed for native Qwen MTP until a batched transaction core exists."""
+    """Return native capability; retain legacy gates for unsupported targets."""
     capability = _native_mtp_capability(model)
     if enabled and capability is not None:
         if capability.supported:
-            raise RuntimeError(NATIVE_MTP_CONTINUOUS_BATCHING_UNSUPPORTED)
+            return capability
         reason = getattr(capability, "reason", None)
         raise RuntimeError(
             reason if isinstance(reason, str) and reason else "native_mtp_unsupported"
@@ -77,6 +77,24 @@ def _continuous_batching_mtp_capability(model: Any, *, enabled: bool) -> Any | N
     if enabled and ("qwen3_5" in model_type or "qwen3_6" in model_type):
         raise RuntimeError("native_mtp_capability_missing")
     return capability
+
+
+def _reject_native_mtp_mllm(model: Any, *, enabled: bool) -> None:
+    """Keep native-MTP continuous batching out of every MLLM owner.
+
+    The public native lifecycle is admitted only by the standard-text
+    scheduler.  Qwen3-Next has no loader-owned native capability and retains
+    its existing legacy MLLM route.
+    """
+    if not enabled:
+        return
+    model_type = _native_qwen_model_type(model)
+    if (
+        _native_mtp_capability(model) is not None
+        or "qwen3_5" in model_type
+        or "qwen3_6" in model_type
+    ):
+        raise RuntimeError("native_mtp_mllm_unsupported")
 
 
 # Enable MambaCache batching support for models like Nemotron
@@ -1382,6 +1400,13 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
+        # Separate public lifecycle owner for native-Qwen standard-text CB.
+        # It never shares ownership with mlx-lm's ordinary BatchGenerator.
+        self.native_mtp_adapter = None
+        self._next_native_mtp_uid = 1
+        self._native_cancelled_ids: Set[str] = set()
+        self._native_zero_token_ids: Set[str] = set()
+        self._native_admission_errors: Dict[str, str] = {}
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -1520,8 +1545,11 @@ class Scheduler:
         self, sampling_params: SamplingParams
     ) -> BatchGenerator:
         """Create a BatchGenerator with the given sampling parameters."""
+        native_capability = None
         if self.config.enable_mtp:
-            _continuous_batching_mtp_capability(self.model, enabled=True)
+            native_capability = _continuous_batching_mtp_capability(
+                self.model, enabled=True
+            )
 
         sampler = make_sampler(
             temp=sampling_params.temperature,
@@ -1586,7 +1614,7 @@ class Scheduler:
                 _install_prompt_cache_save(bg, prompt_cache_cb)
 
         # Install MTP if the model supports it
-        if self.config.enable_mtp:
+        if self.config.enable_mtp and native_capability is None:
             if hasattr(self.model, "mtp") and self.model.mtp is not None:
                 _install_mtp(
                     bg,
@@ -1721,6 +1749,9 @@ class Scheduler:
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
+        if self.native_mtp_adapter is not None:
+            self.native_mtp_adapter.cancel()
+            self.native_mtp_adapter = None
         if self.batch_generator is not None:
             try:
                 if hasattr(self.batch_generator, "close"):
@@ -1968,6 +1999,16 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        if request.native_mtp_config is not None:
+            self._validate_native_mtp_request(request)
+            # Native MTP owns fresh request caches at first prefill.  Do not
+            # consult or retain any generic prefix-cache state.
+            request.cache_hit_type = "miss"
+            request.remaining_tokens = request.prompt_token_ids
+            self.requests[request.request_id] = request
+            self.waiting.append(request)
+            return
+
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
@@ -2098,7 +2139,23 @@ class Scheduler:
         Returns:
             True if any cleanup was performed, False otherwise
         """
+        # Cohort cancellation is drained once from ``step()``.  A second
+        # pending abort for another UID in that same owner must not fall
+        # through to ordinary BatchGenerator removal and steal its terminal
+        # output before the cohort drain runs.
+        if request_id in self._native_cancelled_ids:
+            return True
+
         request = self.requests.get(request_id)
+        if self.native_mtp_adapter is not None and request_id in self.request_id_to_uid:
+            # Public native lifecycle supports only cohort cancellation.  Do
+            # not mutate hidden cache owners to remove one row mid-epoch.
+            self.native_mtp_adapter.cancel()
+            self.native_mtp_adapter = None
+            for active_id, active_request in self.running.items():
+                active_request.set_finished(RequestStatus.FINISHED_ABORTED)
+                self._native_cancelled_ids.add(active_id)
+            return True
         was_waiting = False
         was_running = False
         removed_from_batch = False
@@ -2163,6 +2220,226 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
+    def _validate_native_mtp_request(self, request: Request) -> None:
+        """Reject every standard-CB composition outside fresh text-only MTP."""
+        if not self.config.enable_mtp:
+            raise RuntimeError("native_mtp_continuous_batching_disabled")
+        if self.config.enable_prefix_cache:
+            raise RuntimeError("native_mtp_prefix_reuse_unsupported")
+        if self.config.chunked_prefill_tokens:
+            raise RuntimeError("native_mtp_chunked_prefill_unsupported")
+        if self.config.kv_cache_quantization:
+            raise RuntimeError("native_mtp_quantized_cache_unsupported")
+        if self.config.max_kv_size:
+            raise RuntimeError("native_mtp_max_kv_unsupported")
+        if request.images or request.videos or request.is_multimodal:
+            raise RuntimeError("native_mtp_media_unsupported")
+        if getattr(request, "external_draft", False):
+            raise RuntimeError("native_mtp_external_draft_unsupported")
+        if request.prompt_cache is not None or request.cached_tokens:
+            raise RuntimeError("native_mtp_prefix_reuse_unsupported")
+        if request.sampling_params.logits_processors:
+            raise RuntimeError("native_mtp_logits_processors_unsupported")
+        if (
+            request.sampling_params.presence_penalty != 0.0
+            or request.sampling_params.repetition_penalty != 1.0
+        ):
+            raise RuntimeError("native_mtp_penalty_processors_unsupported")
+        request.native_mtp_eos_token_ids = self._get_stop_tokens().union(
+            request.sampling_params.stop_token_ids or ()
+        )
+
+    def _start_native_mtp_cohort(self) -> List[Request]:
+        """Admit one contiguous fresh native-MTP cohort without BatchGenerator."""
+        if self.native_mtp_adapter is not None or not self.waiting:
+            return []
+        first = self.waiting[0]
+        if first.native_mtp_config is None:
+            return []
+        if self.batch_generator is not None:
+            # An idle ordinary generator can retain cache ownership even with
+            # no running rows.  Close it before native fresh-cache admission.
+            self._close_batch_generator()
+        cohort = []
+        for request in self.waiting:
+            if (
+                request.native_mtp_config is None
+                or request.sampling_params.max_tokens == 0
+                or len(cohort) >= self.config.max_num_seqs
+            ):
+                break
+            cohort.append(request)
+        from .native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+        original_uids = tuple(request.batch_uid for request in cohort)
+        next_uid = self._next_native_mtp_uid
+        try:
+            for offset, request in enumerate(cohort):
+                request.batch_uid = next_uid + offset
+            adapter = NativeMTPContinuousBatchAdapter.create(
+                self.model,
+                cohort,
+                prefill_step_size=self.config.prefill_step_size,
+            )
+        except BaseException as exc:
+            for request, original_uid in zip(cohort, original_uids):
+                request.batch_uid = original_uid
+            # Admission is all-or-nothing: convert this exact fresh cohort to
+            # one terminal error each.  Retrying an unchanged create failure
+            # would strand the queue forever.
+            for _ in cohort:
+                self.waiting.popleft()
+            reason = str(exc) or "native_mtp_cohort_admission_failed"
+            for request in cohort:
+                request.status = RequestStatus.RUNNING
+                self.running[request.request_id] = request
+                self._native_admission_errors[request.request_id] = reason
+            return cohort
+        self._next_native_mtp_uid = next_uid + len(cohort)
+        for _ in cohort:
+            self.waiting.popleft()
+        self.native_mtp_adapter = adapter
+        for request in cohort:
+            uid = request.batch_uid
+            self.request_id_to_uid[request.request_id] = uid
+            self.uid_to_request_id[uid] = request.request_id
+            request.status = RequestStatus.RUNNING
+            self.running[request.request_id] = request
+            self.total_prompt_tokens += request.num_prompt_tokens
+        return cohort
+
+    def _process_native_mtp_emissions(
+        self, emissions: List[Any]
+    ) -> Tuple[List[RequestOutput], Set[str]]:
+        """Translate immutable public MTP emissions into ordinary scheduler output."""
+        outputs: List[RequestOutput] = []
+        finished_ids: Set[str] = set()
+        for emission in emissions:
+            request_id = self.uid_to_request_id.get(emission.uid)
+            request = self.running.get(request_id) if request_id else None
+            if request is None:
+                continue
+            request.append_output_token(emission.token)
+            if emission.finish_reason == "eos":
+                finish_reason = "stop"
+            else:
+                finish_reason = emission.finish_reason
+            detok = self._get_detokenizer(request_id)
+            if finish_reason == "stop":
+                new_text = ""
+            else:
+                detok.add_token(emission.token)
+                new_text = detok.last_segment
+            telemetry = self.native_mtp_adapter.telemetry_for(emission.uid)
+            output = RequestOutput(
+                request_id=request_id,
+                new_token_ids=[emission.token],
+                new_text=new_text,
+                output_token_ids=request.output_token_ids,
+                prompt_tokens=request.num_prompt_tokens,
+                completion_tokens=request.num_output_tokens,
+                mtp_drafts=telemetry["draft_tokens"],
+                mtp_accepted=telemetry["accepted_tokens"],
+                logprobs=emission.logprobs,
+            )
+            if finish_reason is not None:
+                request.set_finished(
+                    (
+                        RequestStatus.FINISHED_STOPPED
+                        if finish_reason == "stop"
+                        else RequestStatus.FINISHED_LENGTH_CAPPED
+                    ),
+                    finish_reason,
+                )
+                output.finished = True
+                output.finish_reason = finish_reason
+                detok.finalize()
+                output.output_text = detok.text
+                request.output_text = output.output_text
+                self._cleanup_detokenizer(request_id)
+                self.total_completion_tokens += request.num_output_tokens
+                self.num_requests_processed += 1
+                finished_ids.add(request_id)
+            outputs.append(output)
+        return outputs, finished_ids
+
+    def _drain_native_zero_token_requests(self) -> SchedulerOutput | None:
+        """Return zero-budget terminal outputs without creating an MTP owner."""
+        if not self._native_zero_token_ids:
+            return None
+        output = SchedulerOutput()
+        zero_token_ids = set(self._native_zero_token_ids)
+        self._native_zero_token_ids.clear()
+        for request_id in zero_token_ids:
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+            request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED, "length")
+            output.outputs.append(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="length",
+                    prompt_tokens=request.num_prompt_tokens,
+                    completion_tokens=0,
+                )
+            )
+        output.finished_request_ids = zero_token_ids
+        self._cleanup_finished(zero_token_ids)
+        return output
+
+    def _drain_native_admission_errors(self) -> SchedulerOutput | None:
+        """Emit each failed native admission once, before scheduler retries."""
+        if not self._native_admission_errors:
+            return None
+        output = SchedulerOutput()
+        errors = dict(self._native_admission_errors)
+        self._native_admission_errors.clear()
+        finished_ids = set(errors)
+        for request_id, reason in errors.items():
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+            request.set_finished(RequestStatus.FINISHED_ABORTED, "error")
+            output.outputs.append(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    prompt_tokens=request.num_prompt_tokens,
+                    completion_tokens=request.num_output_tokens,
+                    native_mtp_error_reason=reason,
+                )
+            )
+        output.finished_request_ids = finished_ids
+        self._cleanup_finished(finished_ids)
+        return output
+
+    def _terminal_native_cohort_error(
+        self, reason: str
+    ) -> tuple[List[RequestOutput], Set[str]]:
+        """Close a failed public owner once and retain its primary reason."""
+        if self.native_mtp_adapter is not None:
+            self.native_mtp_adapter.cancel()
+            self.native_mtp_adapter = None
+        failed_ids = set(self.running)
+        outputs = []
+        for request_id in failed_ids:
+            request = self.running[request_id]
+            request.set_finished(RequestStatus.FINISHED_ABORTED, "error")
+            outputs.append(
+                RequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    finish_reason="error",
+                    prompt_tokens=request.num_prompt_tokens,
+                    completion_tokens=request.num_output_tokens,
+                    native_mtp_error_reason=reason,
+                )
+            )
+        self._cleanup_finished(failed_ids)
+        return outputs, failed_ids
+
     def _schedule_waiting(self) -> List[Request]:
         """
         Move requests from waiting queue to running.
@@ -2175,6 +2452,32 @@ class Scheduler:
         # avoiding engine modifications.
         if self._ssd_tier is not None:
             self._try_promote_ssd_pending()
+
+        if self.native_mtp_adapter is not None:
+            return []
+        if (
+            self.waiting
+            and self.waiting[0].native_mtp_config is not None
+            and self.waiting[0].sampling_params.max_tokens == 0
+        ):
+            # This precedes cohort admission: no public lifecycle import,
+            # UID allocation, cache construction, or model mutation occurs.
+            request = self.waiting.popleft()
+            request.status = RequestStatus.RUNNING
+            self.running[request.request_id] = request
+            self._native_zero_token_ids.add(request.request_id)
+            return [request]
+        # The public lifecycle has a single move-only cohort owner.  Never
+        # interleave it with an ordinary BatchGenerator cohort.
+        if (
+            self.waiting
+            and self.waiting[0].native_mtp_config is not None
+            and self.running
+        ):
+            return []
+        native = self._start_native_mtp_cohort()
+        if native:
+            return native
 
         scheduled = []
 
@@ -2690,6 +2993,31 @@ class Scheduler:
 
         # Process pending aborts FIRST (in executor thread, safe for MLX)
         self._process_pending_aborts()
+        zero_output = self._drain_native_zero_token_requests()
+        if zero_output is not None:
+            return zero_output
+        admission_error_output = self._drain_native_admission_errors()
+        if admission_error_output is not None:
+            return admission_error_output
+        if self._native_cancelled_ids:
+            cancelled = set(self._native_cancelled_ids)
+            self._native_cancelled_ids.clear()
+            for request_id in cancelled:
+                request = self.running.get(request_id)
+                if request is None:
+                    continue
+                output.outputs.append(
+                    RequestOutput(
+                        request_id=request_id,
+                        finished=True,
+                        finish_reason="abort",
+                        prompt_tokens=request.num_prompt_tokens,
+                        completion_tokens=request.num_output_tokens,
+                    )
+                )
+            output.finished_request_ids = cancelled
+            self._cleanup_finished(cancelled)
+            return output
 
         for attempt in range(max_retries + 1):
             try:
@@ -2699,9 +3027,36 @@ class Scheduler:
                 output.num_scheduled_tokens = sum(
                     r.num_prompt_tokens for r in scheduled
                 )
+                zero_output = self._drain_native_zero_token_requests()
+                if zero_output is not None:
+                    zero_output.scheduled_request_ids = output.scheduled_request_ids
+                    zero_output.num_scheduled_tokens = output.num_scheduled_tokens
+                    return zero_output
+                admission_error_output = self._drain_native_admission_errors()
+                if admission_error_output is not None:
+                    admission_error_output.scheduled_request_ids = (
+                        output.scheduled_request_ids
+                    )
+                    admission_error_output.num_scheduled_tokens = (
+                        output.num_scheduled_tokens
+                    )
+                    return admission_error_output
 
                 # Run generation step if we have running requests
-                if self.batch_generator is not None and self.running:
+                if self.native_mtp_adapter is not None and self.running:
+                    emissions = self.native_mtp_adapter.step()
+                    output.has_work = True
+                    if emissions:
+                        outputs, finished_ids = self._process_native_mtp_emissions(
+                            list(emissions)
+                        )
+                        output.outputs = outputs
+                        output.finished_request_ids = finished_ids
+                        self._cleanup_finished(finished_ids)
+                    if not self.native_mtp_adapter.active_uids:
+                        self.native_mtp_adapter.cancel()
+                        self.native_mtp_adapter = None
+                elif self.batch_generator is not None and self.running:
                     _sanitize_batch_generator_logits_processors(self.batch_generator)
                     result = self.batch_generator.next()
                     output.has_work = True
@@ -2723,6 +3078,13 @@ class Scheduler:
                 break
 
             except TypeError as e:
+                if self.native_mtp_adapter is not None:
+                    output.outputs, output.finished_request_ids = (
+                        self._terminal_native_cohort_error(
+                            str(e) or "native_mtp_cohort_failed"
+                        )
+                    )
+                    break
                 # Catch the NoneType error specifically
                 if self._is_cache_corruption_error(e):
                     if attempt < max_retries:
@@ -2743,6 +3105,13 @@ class Scheduler:
                 else:
                     raise
             except Exception as e:
+                if self.native_mtp_adapter is not None:
+                    output.outputs, output.finished_request_ids = (
+                        self._terminal_native_cohort_error(
+                            str(e) or "native_mtp_cohort_failed"
+                        )
+                    )
+                    break
                 if self._is_stream_thread_error(e):
                     raise
                 import traceback

@@ -441,6 +441,39 @@ class BatchedEngine(BaseEngine):
             return getattr(self._processor, "tokenizer", self._processor)
         return self._tokenizer
 
+    def native_mtp_server_state(self, *, has_media: bool = False):
+        """Admission facts for fresh standard-text native-MTP CB only."""
+        from ..native_mtp_request import NativeMTPServerState
+
+        incompatibility = None
+        if self._is_mllm or has_media:
+            incompatibility = "native_mtp_media_unsupported"
+        elif getattr(self._scheduler_config, "specprefill_enabled", False):
+            incompatibility = "native_mtp_specprefill_composition_unsupported"
+        elif getattr(self._scheduler_config, "enable_prefix_cache", True):
+            incompatibility = "native_mtp_prefix_reuse_unsupported"
+        elif getattr(self._scheduler_config, "chunked_prefill_tokens", 0):
+            incompatibility = "native_mtp_chunked_prefill_unsupported"
+        elif getattr(self._scheduler_config, "kv_cache_quantization", False):
+            incompatibility = "native_mtp_quantized_cache_unsupported"
+        elif getattr(self._scheduler_config, "max_kv_size", 0):
+            incompatibility = "native_mtp_max_kv_unsupported"
+        capability = getattr(self._model, "mtp_capability", None)
+        capable = bool(capability is not None and capability.supported)
+        if incompatibility is None and not capable:
+            incompatibility = (
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+        return NativeMTPServerState(
+            server_default=bool(getattr(self._scheduler_config, "enable_mtp", False)),
+            capable=capable,
+            num_draft_tokens=1,
+            supports_penalty_processors=False,
+            incompatibility=incompatibility,
+        )
+
     def prepare_for_start(self) -> None:
         """Load heavyweight model state off the serving event loop."""
         if self._model is not None:
@@ -472,9 +505,7 @@ class BatchedEngine(BaseEngine):
             if self._is_mllm:
                 await self._start_mllm()
             else:
-                if getattr(
-                    self._scheduler_config, "specprefill_enabled", False
-                ):
+                if getattr(self._scheduler_config, "specprefill_enabled", False):
                     raise RuntimeError(
                         "continuous-batching SpecPrefill requires the MLLM scheduler"
                     )
@@ -508,9 +539,9 @@ class BatchedEngine(BaseEngine):
         processor = mllm_instance.processor
 
         if self._scheduler_config and self._scheduler_config.enable_mtp:
-            from ..scheduler import _continuous_batching_mtp_capability
+            from ..scheduler import _reject_native_mtp_mllm
 
-            _continuous_batching_mtp_capability(model, enabled=True)
+            _reject_native_mtp_mllm(model, enabled=True)
 
         self._mllm_instance = mllm_instance
         self._model = model
@@ -560,9 +591,7 @@ class BatchedEngine(BaseEngine):
             or self._prepared_specprefill_runtime is not None
         ):
             with suspend_cancellation():
-                prior_cleanup_failures = (
-                    await self._cleanup_mllm_runtime_ownership()
-                )
+                prior_cleanup_failures = await self._cleanup_mllm_runtime_ownership()
             if prior_cleanup_failures:
                 raise RuntimeError(
                     "previous MLLM startup cleanup remains incomplete"
@@ -571,9 +600,9 @@ class BatchedEngine(BaseEngine):
         if self._model is None or self._processor is None:
             self._prepare_mllm_model()
         if getattr(self._scheduler_config, "enable_mtp", False):
-            from ..scheduler import _continuous_batching_mtp_capability
+            from ..scheduler import _reject_native_mtp_mllm
 
-            _continuous_batching_mtp_capability(self._model, enabled=True)
+            _reject_native_mtp_mllm(self._model, enabled=True)
 
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
@@ -632,22 +661,16 @@ class BatchedEngine(BaseEngine):
         if prepared_specprefill is not None:
             specprefill_config = {
                 "specprefill_enabled": True,
-                "specprefill_profile_registry": (
-                    prepared_specprefill.profile_registry
-                ),
+                "specprefill_profile_registry": (prepared_specprefill.profile_registry),
                 "specprefill_profile_key": prepared_specprefill.profile_key,
                 "specprefill_estimated_residency_bytes": (
                     prepared_specprefill.estimated_residency_bytes
                 ),
-                "specprefill_session_factory": (
-                    prepared_specprefill.session_factory
-                ),
+                "specprefill_session_factory": (prepared_specprefill.session_factory),
                 "specprefill_target_forward_context": (
                     prepared_specprefill.target_forward_context
                 ),
-                "specprefill_cache_capability": (
-                    prepared_specprefill.cache_capability
-                ),
+                "specprefill_cache_capability": (prepared_specprefill.cache_capability),
                 "specprefill_gemma_batch_config": (
                     prepared_specprefill.gemma_batch_config
                 ),
@@ -713,9 +736,7 @@ class BatchedEngine(BaseEngine):
     def _prepare_mllm_specprefill_runtime(
         self,
     ) -> PreparedMLLMSpecPrefillRuntime | None:
-        enabled = bool(
-            getattr(self._scheduler_config, "specprefill_enabled", False)
-        )
+        enabled = bool(getattr(self._scheduler_config, "specprefill_enabled", False))
         if not enabled:
             return None
         if getattr(self._scheduler_config, "enable_mtp", False):
@@ -724,15 +745,11 @@ class BatchedEngine(BaseEngine):
             raise RuntimeError("rotating-cache CB SpecPrefill is not admitted")
         prepare = getattr(self._scheduler_config, "specprefill_prepare", None)
         if not callable(prepare):
-            raise RuntimeError(
-                "enabled CB SpecPrefill requires specprefill_prepare"
-            )
+            raise RuntimeError("enabled CB SpecPrefill requires specprefill_prepare")
         try:
             candidate = prepare(self._model, self._processor)
         except BaseException as failure:
-            retained_cleanup = getattr(
-                failure, "specprefill_retained_cleanup", None
-            )
+            retained_cleanup = getattr(failure, "specprefill_retained_cleanup", None)
             if callable(retained_cleanup):
                 self._prepared_specprefill_runtime = _RetainedSpecPrefillCleanup(
                     retained_cleanup
@@ -810,10 +827,10 @@ class BatchedEngine(BaseEngine):
 
         from mlx_lm.utils import _download
 
-        from ..scheduler import _continuous_batching_mtp_capability
+        from ..scheduler import _reject_native_mtp_mllm
 
         model = self._model
-        _continuous_batching_mtp_capability(model, enabled=True)
+        _reject_native_mtp_mllm(model, enabled=True)
         model_path = Path(_download(self._model_name))
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -1168,6 +1185,9 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
+        native_mtp_config = kwargs.pop("_native_mtp_request_config", None)
+        kwargs.pop("_native_mtp_disabled", None)
+        kwargs.pop("_native_mtp_bypass_reason", None)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1183,6 +1203,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            native_mtp_config=native_mtp_config,
         )
 
         text = clean_output_text(output.output_text)
@@ -1193,6 +1214,14 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            mtp_drafts=output.mtp_drafts,
+            mtp_accepted=output.mtp_accepted,
+            logprobs=output.logprobs if native_mtp_config is not None else None,
+            mtp_bypass_reason=(
+                output.native_mtp_error_reason
+                if native_mtp_config is not None
+                else None
+            ),
         )
 
     async def stream_generate(
@@ -1264,6 +1293,9 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only
         from ..request import SamplingParams
 
+        native_mtp_config = kwargs.pop("_native_mtp_request_config", None)
+        kwargs.pop("_native_mtp_disabled", None)
+        kwargs.pop("_native_mtp_bypass_reason", None)
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1281,6 +1313,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            native_mtp_config=native_mtp_config,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -1293,6 +1326,14 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                mtp_drafts=output.mtp_drafts,
+                mtp_accepted=output.mtp_accepted,
+                logprobs=output.logprobs if native_mtp_config is not None else None,
+                mtp_bypass_reason=(
+                    output.native_mtp_error_reason
+                    if native_mtp_config is not None
+                    else None
+                ),
             )
 
     async def chat(

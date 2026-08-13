@@ -26,7 +26,7 @@ def _model(
         (
             "qwen3_5",
             SimpleNamespace(supported=True, reason=None),
-            "native_mtp_continuous_batching_unsupported",
+            None,
         ),
         (
             "qwen3_6_moe",
@@ -49,11 +49,12 @@ def test_native_qwen_cb_gate_has_stable_fail_closed_reasons(
 ):
     from vllm_mlx.scheduler import _continuous_batching_mtp_capability
 
-    with pytest.raises(RuntimeError, match=f"^{expected}$"):
-        _continuous_batching_mtp_capability(
-            _model(model_type, capability=capability),
-            enabled=True,
-        )
+    model = _model(model_type, capability=capability)
+    if expected is None:
+        assert _continuous_batching_mtp_capability(model, enabled=True) is capability
+    else:
+        with pytest.raises(RuntimeError, match=f"^{expected}$"):
+            _continuous_batching_mtp_capability(model, enabled=True)
 
 
 def test_native_qwen_cb_gate_rejects_malformed_capability():
@@ -74,7 +75,9 @@ def test_qwen3_next_without_native_capability_retains_legacy_gate_result():
     assert _continuous_batching_mtp_capability(model, enabled=True) is None
 
 
-def test_standard_scheduler_never_installs_native_qwen_mtp(monkeypatch):
+def test_standard_scheduler_selects_native_admission_without_legacy_install(
+    monkeypatch,
+):
     import vllm_mlx.scheduler as scheduler_mod
 
     model = _model(
@@ -108,16 +111,13 @@ def test_standard_scheduler_never_installs_native_qwen_mtp(monkeypatch):
         scheduler_mod.SchedulerConfig(
             enable_prefix_cache=False,
             enable_mtp=True,
-            chunked_prefill_tokens=32,
+            chunked_prefill_tokens=0,
         ),
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="^native_mtp_continuous_batching_unsupported$",
-    ):
-        scheduler._create_batch_generator(scheduler_mod.SamplingParams())
-    assert constructed == []
+    batch_generator = scheduler._create_batch_generator(scheduler_mod.SamplingParams())
+    assert isinstance(batch_generator, FakeBatchGenerator)
+    assert len(constructed) == 1
     assert hooked == []
     assert installed == []
     assert scheduler.batch_generator is None
@@ -174,6 +174,7 @@ def test_standard_scheduler_preserves_qwen3_next_legacy_install(monkeypatch):
 
 def test_preloaded_mllm_startup_fails_before_injection_or_scheduler(monkeypatch):
     from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
     from vllm_mlx.scheduler import SchedulerConfig
 
     model = _model(
@@ -194,17 +195,21 @@ def test_preloaded_mllm_startup_fails_before_injection_or_scheduler(monkeypatch)
         "_inject_mtp_mllm",
         lambda: injected.append(True),
     )
+    adapter_creates = []
+    monkeypatch.setattr(
+        NativeMTPContinuousBatchAdapter,
+        "create",
+        lambda *args, **kwargs: adapter_creates.append((args, kwargs)),
+    )
 
-    with pytest.raises(
-        RuntimeError,
-        match="^native_mtp_continuous_batching_unsupported$",
-    ):
+    with pytest.raises(RuntimeError, match="^native_mtp_mllm_unsupported$"):
         asyncio.run(engine._start_mllm())
     assert injected == []
+    assert adapter_creates == []
     assert engine._mllm_scheduler is None
 
 
-def test_preloaded_mllm_startup_propagates_unsupported_capability_reason():
+def test_preloaded_mllm_startup_hard_closes_any_native_capability():
     from vllm_mlx.engine.batched import BatchedEngine
     from vllm_mlx.scheduler import SchedulerConfig
 
@@ -223,7 +228,7 @@ def test_preloaded_mllm_startup_propagates_unsupported_capability_reason():
     engine._model = model
     engine._processor = object()
 
-    with pytest.raises(RuntimeError, match="^native_mtp_aux_head_missing$"):
+    with pytest.raises(RuntimeError, match="^native_mtp_mllm_unsupported$"):
         asyncio.run(engine._start_mllm())
     assert engine._mllm_scheduler is None
 
@@ -231,6 +236,7 @@ def test_preloaded_mllm_startup_propagates_unsupported_capability_reason():
 def test_lazy_mllm_native_gate_does_not_publish_loaded_ownership(monkeypatch):
     import vllm_mlx.models.mllm as model_mod
     from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
     from vllm_mlx.scheduler import SchedulerConfig
 
     instances = []
@@ -249,16 +255,19 @@ def test_lazy_mllm_native_gate_does_not_publish_loaded_ownership(monkeypatch):
             return None
 
     monkeypatch.setattr(model_mod, "MLXMultimodalLM", FakeMLXMultimodalLM)
+    adapter_creates = []
+    monkeypatch.setattr(
+        NativeMTPContinuousBatchAdapter,
+        "create",
+        lambda *args, **kwargs: adapter_creates.append((args, kwargs)),
+    )
     engine = BatchedEngine(
         model_name="fixture-qwen3.5",
         scheduler_config=SchedulerConfig(enable_mtp=True),
         force_mllm=True,
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="^native_mtp_continuous_batching_unsupported$",
-    ):
+    with pytest.raises(RuntimeError, match="^native_mtp_mllm_unsupported$"):
         asyncio.run(engine.start())
 
     assert len(instances) == 1
@@ -267,6 +276,7 @@ def test_lazy_mllm_native_gate_does_not_publish_loaded_ownership(monkeypatch):
     assert engine._processor is None
     assert engine._mllm_scheduler is None
     assert engine._loaded is False
+    assert adapter_creates == []
 
 
 def _bare_mllm_scheduler(monkeypatch, language_model):
@@ -298,6 +308,7 @@ def _bare_mllm_scheduler(monkeypatch, language_model):
 
 def test_mllm_scheduler_never_installs_native_qwen_mtp(monkeypatch):
     import vllm_mlx.mllm_batch_generator as batch_generator_mod
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
 
     language_model = _model(
         "qwen3_5",
@@ -320,6 +331,12 @@ def test_mllm_scheduler_never_installs_native_qwen_mtp(monkeypatch):
         "install_chunked_prefill_mllm",
         lambda *args, **kwargs: hooked.append((args, kwargs)),
     )
+    adapter_creates = []
+    monkeypatch.setattr(
+        NativeMTPContinuousBatchAdapter,
+        "create",
+        lambda *args, **kwargs: adapter_creates.append((args, kwargs)),
+    )
 
     class UnexpectedSSDTier:
         def __init__(self, *args, **kwargs):
@@ -329,15 +346,13 @@ def test_mllm_scheduler_never_installs_native_qwen_mtp(monkeypatch):
 
     monkeypatch.setattr(ssd_cache_mod, "SSDCacheTier", UnexpectedSSDTier)
 
-    with pytest.raises(
-        RuntimeError,
-        match="^native_mtp_continuous_batching_unsupported$",
-    ):
+    with pytest.raises(RuntimeError, match="^native_mtp_mllm_unsupported$"):
         scheduler._ensure_batch_generator()
     assert constructed == []
     assert hooked == []
     assert ssd_started == []
     assert installed == []
+    assert adapter_creates == []
     assert scheduler.batch_generator is None
 
 

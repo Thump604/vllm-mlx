@@ -341,6 +341,7 @@ class EngineCore:
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
         prefix_boundary: int = 0,
+        native_mtp_config: Any = None,
     ) -> str:
         """
         Add a request for processing.
@@ -369,6 +370,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            native_mtp_config=native_mtp_config,
         )
 
         # Setup output collector with stream_interval from config
