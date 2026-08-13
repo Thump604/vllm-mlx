@@ -38,6 +38,7 @@ class NativeMTPContinuousBatchAdapter:
     def __init__(self, *, start: Any, requests: Iterable[Any], prefill_step_size: int):
         self._start = start
         self._generator = None
+        self._sparse_start = False
         self._requests = {request.batch_uid: request for request in requests}
         self._telemetry = {uid: _Telemetry() for uid in self._requests}
         self._prefill_step_size = prefill_step_size
@@ -58,6 +59,8 @@ class NativeMTPContinuousBatchAdapter:
         *,
         lifecycle: Any | None = None,
         prefill_step_size: int = 512,
+        sparse_bootstraps: Iterable[Any] | None = None,
+        sparse_adopted: Any | None = None,
     ) -> "NativeMTPContinuousBatchAdapter":
         requests = tuple(requests)
         if not requests:
@@ -75,18 +78,33 @@ class NativeMTPContinuousBatchAdapter:
                 if capability is None
                 else getattr(capability, "reason", "native_mtp_unsupported")
             )
+        bootstraps = None if sparse_bootstraps is None else tuple(sparse_bootstraps)
         make_cache = getattr(model, "make_mtp_request_cache", None)
-        if not callable(make_cache):
+        if bootstraps is None and not callable(make_cache):
             raise RuntimeError("native_mtp_request_cache_factory_missing")
 
+        if bootstraps is not None and len(bootstraps) != len(requests):
+            raise RuntimeError("native_mtp_sparse_bootstrap_count_mismatch")
+        if bootstraps is not None and len({id(item) for item in bootstraps}) != len(
+            bootstraps
+        ):
+            raise RuntimeError("native_mtp_sparse_bootstrap_reused")
+        if sparse_adopted is not None and not callable(sparse_adopted):
+            raise TypeError("native_mtp_sparse_adopted_callback_invalid")
+
         rows = []
-        for request in requests:
+        for index, request in enumerate(requests):
             cls._validate_request(request)
+            prompt = tuple(request.prompt_token_ids)
+            if bootstraps is not None:
+                prompt = cls._validate_sparse_bootstrap(
+                    model, request, bootstraps[index]
+                )
             sampling = request.native_mtp_config.sampling
             rows.append(
                 lifecycle.NativeMTPRowSpec(
                     uid=request.batch_uid,
-                    prompt=tuple(request.prompt_token_ids),
+                    prompt=prompt,
                     max_tokens=request.sampling_params.max_tokens,
                     seed=sampling.seed,
                     eos_token_ids=frozenset(request.native_mtp_eos_token_ids),
@@ -101,6 +119,13 @@ class NativeMTPContinuousBatchAdapter:
             )
 
         def _start():
+            if bootstraps is not None:
+                admission = lifecycle.NativeMTPAdmission.create_from_sparse_bootstraps(
+                    model, rows, bootstraps
+                )
+                if sparse_adopted is not None:
+                    sparse_adopted()
+                return lifecycle.NativeMTPBatchGenerator(admission), True
             # Delay fresh-cache ownership until the first prefill boundary so a
             # queued request can be cancelled before any model/cache mutation.
             request_caches = [make_cache(prompt_cache=None) for _ in rows]
@@ -116,7 +141,7 @@ class NativeMTPContinuousBatchAdapter:
                 kv_bits=None,
                 max_kv_size=None,
             )
-            return lifecycle.NativeMTPBatchGenerator(admission)
+            return lifecycle.NativeMTPBatchGenerator(admission), False
 
         return cls(
             start=_start,
@@ -148,6 +173,58 @@ class NativeMTPContinuousBatchAdapter:
             or getattr(request.sampling_params, "repetition_penalty", 1.0) != 1.0
         ):
             raise RuntimeError("native_mtp_penalty_processors_unsupported")
+
+    @staticmethod
+    def _validate_sparse_bootstrap(model: Any, request: Any, bootstrap: Any) -> tuple[int, ...]:
+        """Bind one bootstrap to this exact request/model before claim.
+
+        mlx-lm repeats these provenance checks while atomically claiming the
+        receipts.  The adapter checks the scheduler-side association first so
+        a misordered cohort cannot consume another request's authority.
+        """
+        prompt = tuple(request.prompt_token_ids)
+        try:
+            positions = tuple(bootstrap.selected_logical_positions)
+            selected = tuple(bootstrap.selected_token_ids)
+            successors = tuple(bootstrap.immediate_successor_token_ids)
+            receipts = tuple(bootstrap.receipts)
+            target_cache = bootstrap.target_cache
+            cursor = bootstrap.next_logical_position
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError("native_mtp_sparse_bootstrap_invalid") from exc
+        if not positions or len(selected) != len(positions):
+            raise RuntimeError("native_mtp_sparse_bootstrap_invalid")
+        if not isinstance(target_cache, list) or not target_cache:
+            raise RuntimeError("native_mtp_sparse_target_cache_invalid")
+        if (
+            positions[-1] != len(prompt) - 1
+            or cursor != len(prompt)
+            or len(successors) != len(positions) - 1
+        ):
+            raise RuntimeError("native_mtp_sparse_request_cursor_mismatch")
+        if any(
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+            or position >= len(prompt)
+            for position in positions
+        ) or tuple(sorted(set(positions))) != positions:
+            raise RuntimeError("native_mtp_sparse_positions_invalid")
+        if selected != tuple(prompt[position] for position in positions):
+            raise RuntimeError("native_mtp_sparse_request_tokens_mismatch")
+        if successors != tuple(prompt[position + 1] for position in positions[:-1]):
+            raise RuntimeError("native_mtp_sparse_request_successors_mismatch")
+        if not receipts:
+            raise RuntimeError("native_mtp_sparse_receipts_missing")
+        cache_ids = tuple(id(entry) for entry in target_cache)
+        for receipt in receipts:
+            if (
+                getattr(receipt, "model_id", None) != id(model)
+                or getattr(receipt, "cache_container_id", None) != id(target_cache)
+                or getattr(receipt, "cache_entry_ids", None) != cache_ids
+            ):
+                raise RuntimeError("native_mtp_sparse_receipt_provenance_mismatch")
+        return selected
 
     @property
     def closed(self) -> bool:
@@ -194,10 +271,13 @@ class NativeMTPContinuousBatchAdapter:
         if self._closed:
             return ()
         if self._phase == "new":
-            self._generator = self._start()
-            emissions, epoch = self._generator.prefill(
-                prefill_step_size=self._prefill_step_size
-            )
+            self._generator, self._sparse_start = self._start()
+            if self._sparse_start:
+                emissions, epoch = self._generator.start_sparse()
+            else:
+                emissions, epoch = self._generator.prefill(
+                    prefill_step_size=self._prefill_step_size
+                )
             self._set_epoch(epoch)
             self._add_target((item.uid for item in emissions), 1)
             self._phase = "initial"

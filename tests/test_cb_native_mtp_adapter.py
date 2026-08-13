@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import asyncio
 from collections import deque
+from contextlib import contextmanager
 import importlib
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 
@@ -144,6 +146,13 @@ class _Generator:
         )
         return emissions, _Initial(tuple(row.uid for row in self.admission.rows))
 
+    def start_sparse(self):
+        emissions = tuple(
+            _Emission(row.uid, row.uid + 1, object(), False)
+            for row in self.admission.rows
+        )
+        return emissions, _Initial(tuple(row.uid for row in self.admission.rows))
+
 
 class _RejectGenerator(_Generator):
     def prefill(self, *, prefill_step_size):
@@ -205,6 +214,11 @@ class _Admission:
         cls.calls.append((model, tuple(rows), tuple(request_caches), kwargs))
         return SimpleNamespace(rows=tuple(rows))
 
+    @classmethod
+    def create_from_sparse_bootstraps(cls, model, rows, bootstraps):
+        cls.calls.append((model, tuple(rows), tuple(bootstraps), "sparse"))
+        return SimpleNamespace(rows=tuple(rows))
+
 
 def _lifecycle(*, reject=False):
     return SimpleNamespace(
@@ -234,10 +248,128 @@ class _Model:
         return cache
 
 
+class _SparseBootstrap:
+    def __init__(self, model, request):
+        self.selected_logical_positions = (0, 2)
+        self.selected_token_ids = (request.prompt_token_ids[0], request.prompt_token_ids[2])
+        self.immediate_successor_token_ids = (request.prompt_token_ids[1],)
+        self.target_cache = [object()]
+        self.next_logical_position = len(request.prompt_token_ids)
+        self.receipts = (
+            SimpleNamespace(
+                model_id=id(model),
+                cache_container_id=id(self.target_cache),
+                cache_entry_ids=tuple(id(item) for item in self.target_cache),
+            ),
+        )
+
+
 class _FreshCacheFailureModel(_Model):
     def make_mtp_request_cache(self, *, prompt_cache=None):
         assert prompt_cache is None
         raise RuntimeError("fresh_cache_failed")
+
+
+class _PinnedSparseModel:
+    """Real cache-writing target/MTP double for pinned sparse admission."""
+
+    mtp_capability = SimpleNamespace(supported=True, reason="")
+    vocab_size = 11
+
+    def __init__(self, *, moe=False):
+        from mlx_lm.models.cache import KVCache
+
+        self._cache_type = KVCache
+        self.layers = [type("_Attention", (), {"is_linear": False})()]
+        self.mtp = type("_MTP", (), {"layers": [object()]})()
+        self.moe = moe
+        self.target_calls = 0
+        self.mtp_calls = 0
+        self._forward = None
+
+    def make_cache(self):
+        return [self._cache_type()]
+
+    def make_mtp_cache(self):
+        return [self._cache_type()]
+
+    @contextmanager
+    def generation_forward_context(self, forward):
+        prior, self._forward = self._forward, forward
+        try:
+            yield
+        finally:
+            self._forward = prior
+
+    def _ack(self):
+        if self._forward is not None:
+            self._forward.logical_position_ack.acknowledge(
+                self._forward.logical_positions
+            )
+
+    def _logits(self, inputs):
+        delta = mx.where(inputs % 2 == 0, 1, self.vocab_size - 1) if self.moe else 1
+        ids = (inputs.astype(mx.int32) + delta) % self.vocab_size
+        logits = mx.full((*inputs.shape, self.vocab_size), -20.0)
+        for row in range(inputs.shape[0]):
+            for column in range(inputs.shape[1]):
+                logits[row, column, ids[row, column]] = 20.0
+        return logits
+
+    def __call__(self, inputs, *, cache, return_hidden=False):
+        self.target_calls += 1
+        self._ack()
+        values = mx.broadcast_to(
+            inputs.astype(mx.float32)[:, None, :, None],
+            (inputs.shape[0], 1, inputs.shape[1], 8),
+        )
+        cache[0].update_and_fetch(values, values)
+        hidden = mx.stack((inputs.astype(mx.float32), inputs.astype(mx.float32)), axis=-1)
+        logits = self._logits(inputs)
+        return (logits, hidden) if return_hidden else logits
+
+    def mtp_forward(self, hidden, next_tokens, cache):
+        self.mtp_calls += 1
+        self._ack()
+        values = mx.broadcast_to(
+            next_tokens.astype(mx.float32)[:, None, :, None],
+            (next_tokens.shape[0], 1, next_tokens.shape[1], 8),
+        )
+        cache[0].update_and_fetch(values, values)
+        return self._logits(next_tokens)
+
+
+def _pinned_bootstrap(model, prompt, positions):
+    from mlx_lm.generate import (
+        GenerationForwardPhase,
+        NativeMTPSparseBootstrap,
+        attested_target_forward,
+    )
+
+    cache = model.make_cache()
+    selected = tuple(prompt[position] for position in positions)
+    successors = tuple(prompt[position + 1] for position in positions[:-1])
+    receipts = []
+    for index, token in enumerate(selected):
+        successor = () if index == len(selected) - 1 else (successors[index],)
+        (_, _), receipt = attested_target_forward(
+            model,
+            (token,),
+            cache,
+            phase=GenerationForwardPhase.PREFILL,
+            logical_positions=(positions[index],),
+            immediate_successor_token_ids=successor,
+            model_forward_context=model.generation_forward_context,
+        )
+        receipts.append(receipt)
+    return NativeMTPSparseBootstrap(
+        receipts=tuple(receipts),
+        selected_logical_positions=tuple(positions),
+        selected_token_ids=selected,
+        immediate_successor_token_ids=successors,
+        target_cache=cache,
+        next_logical_position=len(prompt),
+    )
 
 
 def _request(uid, *, seed=None):
@@ -364,6 +496,166 @@ def test_uniform_reject_exposes_target_logprobs_and_finish_reason():
         (1, False, "length")
     ]
     assert emissions[0].logprobs is not None
+
+
+def test_sparse_bootstraps_are_atomically_adopted_and_start_from_sparse_head():
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _Model()
+    requests = [_request(1), _request(2)]
+    bootstraps = tuple(_SparseBootstrap(model, request) for request in requests)
+    adapter = NativeMTPContinuousBatchAdapter.create(
+        model,
+        requests,
+        lifecycle=_lifecycle(),
+        sparse_bootstraps=bootstraps,
+    )
+    emissions = adapter.step()
+    assert [item.uid for item in emissions] == [1, 2]
+    assert model.created == []
+    _, rows, received, kind = _Admission.calls[-1]
+    assert kind == "sparse"
+    assert [(row.uid, row.prompt) for row in rows] == [(1, (1, 1)), (2, (1, 2))]
+    assert received == bootstraps
+
+
+def test_sparse_adopted_callback_runs_only_after_public_admission():
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _Model()
+    request = _request(1)
+    called = []
+    adapter = NativeMTPContinuousBatchAdapter.create(
+        model,
+        [request],
+        lifecycle=_lifecycle(),
+        sparse_bootstraps=(_SparseBootstrap(model, request),),
+        sparse_adopted=lambda: called.append("claimed"),
+    )
+    assert called == []
+    adapter.step()
+    assert called == ["claimed"]
+
+
+def test_sparse_bootstrap_count_mismatch_fails_before_fresh_cache_creation():
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _Model()
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_count_mismatch"):
+        NativeMTPContinuousBatchAdapter.create(
+            model,
+            [_request(1), _request(2)],
+            lifecycle=_lifecycle(),
+            sparse_bootstraps=(_SparseBootstrap(model, _request(1)),),
+        )
+    assert model.created == []
+
+
+def test_sparse_bootstrap_cannot_be_reordered_or_reused_before_admission():
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _Model()
+    first, second = _request(1), _request(2)
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_request_tokens_mismatch"):
+        NativeMTPContinuousBatchAdapter.create(
+            model,
+            [first, second],
+            lifecycle=_lifecycle(),
+            sparse_bootstraps=(_SparseBootstrap(model, second), _SparseBootstrap(model, first)),
+        )
+    bootstrap = _SparseBootstrap(model, first)
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_reused"):
+        NativeMTPContinuousBatchAdapter.create(
+            model,
+            [first, second],
+            lifecycle=_lifecycle(),
+            sparse_bootstraps=(bootstrap, bootstrap),
+        )
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_pinned_sparse_admission_uses_selected_prompt_without_target_replay(moe):
+    """Exercise real receipt authority through the adapter's public path."""
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _PinnedSparseModel(moe=moe)
+    request = _request(7, seed=3)
+    request.prompt_token_ids = [0, 1, 2, 3, 4]
+    bootstrap = _pinned_bootstrap(model, request.prompt_token_ids, (0, 2, 4))
+    target_calls = model.target_calls
+    adapter = NativeMTPContinuousBatchAdapter.create(
+        model, [request], sparse_bootstraps=(bootstrap,)
+    )
+    emissions = adapter.step()
+    assert [item.uid for item in emissions] == [7]
+    assert model.target_calls == target_calls
+    assert model.mtp_calls > 0
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        from mlx_lm.generate import NativeMTPAdmission, NativeMTPRowSpec
+
+        NativeMTPAdmission.create_from_sparse_bootstraps(
+            model, (NativeMTPRowSpec(8, (0, 2, 4), 2),), (bootstrap,)
+        )
+
+
+def test_pinned_bootstrap_forgery_is_rejected_before_claim_and_original_survives():
+    from mlx_lm.generate import NativeMTPAdmission, NativeMTPRowSpec
+    from vllm_mlx.native_mtp_cb_adapter import NativeMTPContinuousBatchAdapter
+
+    model = _PinnedSparseModel()
+    request = _request(1)
+    request.prompt_token_ids = [0, 1, 2, 3, 4]
+    bootstrap = _pinned_bootstrap(model, request.prompt_token_ids, (0, 2, 4))
+    forged = replace(bootstrap, target_cache=[object()])
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_receipt_provenance_mismatch"):
+        NativeMTPContinuousBatchAdapter.create(
+            model, [request], sparse_bootstraps=(forged,)
+        )
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model, (NativeMTPRowSpec(1, (0, 2, 4), 2),), (bootstrap,)
+    )
+    assert admission.rows[0].prompt == (0, 2, 4)
+
+
+def test_pinned_bootstrap_close_abandons_authority_before_downstream_claim():
+    from mlx_lm.generate import NativeMTPAdmission, NativeMTPRowSpec
+
+    model = _PinnedSparseModel()
+    bootstrap = _pinned_bootstrap(model, (0, 1, 2, 3, 4), (0, 2, 4))
+    bootstrap.close()
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        NativeMTPAdmission.create_from_sparse_bootstraps(
+            model, (NativeMTPRowSpec(1, (0, 2, 4), 2),), (bootstrap,)
+        )
+
+
+def test_partial_sparse_admission_failure_consumes_every_bootstrap_authority():
+    from mlx_lm.generate import NativeMTPAdmission, NativeMTPRowSpec
+
+    model = _PinnedSparseModel()
+    first = _pinned_bootstrap(model, (0, 1, 2, 3, 4), (0, 2, 4))
+    second = _pinned_bootstrap(model, (5, 6, 7, 8, 9), (0, 2, 4))
+    # The second bootstrap presents a receipt owned by the first target cache;
+    # the first claim has already been made when this one fails validation.
+    malformed = replace(second, receipts=(first.receipts[0],))
+    with pytest.raises(RuntimeError):
+        NativeMTPAdmission.create_from_sparse_bootstraps(
+            model,
+            (
+                NativeMTPRowSpec(1, (0, 2, 4), 2),
+                NativeMTPRowSpec(2, (5, 7, 9), 2),
+            ),
+            (first, malformed),
+        )
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        NativeMTPAdmission.create_from_sparse_bootstraps(
+            model, (NativeMTPRowSpec(3, first.selected_token_ids, 2),), (first,)
+        )
+    # The untouched original second authority was never passed or reserved.
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model, (NativeMTPRowSpec(4, second.selected_token_ids, 2),), (second,)
+    )
+    assert admission.rows[0].uid == 4
 
 
 def test_b_gt_1_mixed_resolution_filters_terminal_and_tracks_uid_local_telemetry():

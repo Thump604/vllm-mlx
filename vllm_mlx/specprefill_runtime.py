@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -233,6 +233,7 @@ def build_qwen_cb_specprefill_prepare(
                 tokenizer_artifact_hash=tokenizer_artifact_hash,
                 scorer_artifact_hash=scorer_artifact_hash,
                 cleanup=owner.close,
+                native_mtp_session_factory=owner.native_mtp_session_factory,
                 diagnostic=diagnostic,
                 advertisable=not diagnostic,
             )
@@ -516,6 +517,119 @@ class _QwenCBRuntimeOwner:
             )
         state = SparseCacheState(tuple(row.clone() for row in rows if row is not None))
         return self.hooks.session_for_plan(decode_plan(self.adapter, state))
+
+    def native_mtp_session_factory(
+        self,
+        request: Any,
+        tokens: tuple[int, ...],
+        config: CooperativeSpecPrefillConfig,
+    ) -> CooperativeSpecPrefillSession:
+        """Create one B=1 cooperative session with public target receipts.
+
+        The returned session is intentionally not an MTP cohort.  Its caller
+        must convert its completed attested result into a public sparse
+        bootstrap and atomically admit that bootstrap with peer rows.
+        """
+        self._require_open()
+        if (
+            config.tuning != self.sparse_tuning
+            or config.target_id != self.target_id
+            or config.tokenizer_id != self.tokenizer_id
+            or config.scorer_id != self.scorer_id
+        ):
+            raise SpecPrefillRuntimePreparationError(
+                "request artifacts/tuning do not match the prepared profile"
+            )
+        try:
+            from mlx_lm.generate import (
+                GenerationForwardPhase,
+                attested_target_forward,
+                abandon_native_mtp_sparse_receipts,
+            )
+        except ImportError as exc:
+            raise SpecPrefillRuntimePreparationError(
+                "mlx-lm attested sparse target API is unavailable"
+            ) from exc
+        scorer_session = SpecPrefillScorerSession(
+            self.scorer, tokens, prefill_step_size=self.scorer_prefill_step_size
+        )
+
+        def target_factory(selected_tokens, sparse_state):
+            self._require_open()
+            cache = list(self._fresh_target_cache())
+            active_plan = None
+
+            @contextmanager
+            def position_context(forward):
+                if forward.model is not self.target_model or forward.cache is not cache:
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target identity changed"
+                    )
+                if forward.phase is not GenerationForwardPhase.PREFILL:
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target phase changed"
+                    )
+                if active_plan is None:
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target plan is unavailable"
+                    )
+                if tuple(forward.logical_positions) != active_plan.logical_positions[0]:
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target positions changed"
+                    )
+                with self.hooks.session_for_plan(
+                    active_plan, logical_position_ack=forward.logical_position_ack
+                ):
+                    yield
+
+            def target_forward(token_rows, target_cache, plan):
+                nonlocal active_plan
+                if target_cache is not cache:
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target cache changed"
+                    )
+                positions = tuple(plan.logical_positions[0])
+                token_ids = tuple(tokens[position] for position in positions)
+                if tuple(token_rows.shape) != (1, len(token_ids)):
+                    raise SpecPrefillRuntimePreparationError(
+                        "attested sparse target requires B=1"
+                    )
+                successors = tuple(
+                    tokens[position + 1] for position in positions if position < len(tokens) - 1
+                )
+                active_plan = plan
+                try:
+                    (logits, _hidden), receipt = attested_target_forward(
+                        self.target_model,
+                        token_ids,
+                        cache,
+                        phase=GenerationForwardPhase.PREFILL,
+                        logical_positions=positions,
+                        immediate_successor_token_ids=successors,
+                        model_forward_context=position_context,
+                    )
+                    return logits, receipt
+                finally:
+                    active_plan = None
+
+            return SparseTargetPrefillSession(
+                self.target_model,
+                selected_tokens,
+                cache,
+                sparse_state,
+                self.adapter,
+                step_size=self.target_prefill_step_size,
+                target_forward=target_forward,
+                receipt_abandon=abandon_native_mtp_sparse_receipts,
+            )
+
+        return CooperativeSpecPrefillSession(
+            request.request_id,
+            tokens,
+            scorer_session,
+            target_factory,
+            config,
+        )
 
     def _fresh_target_cache(self) -> tuple[Any, ...]:
         cache = tuple(self.cache_factory(self.target_model))

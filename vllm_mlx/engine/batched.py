@@ -50,6 +50,9 @@ class PreparedMLLMSpecPrefillRuntime:
     tokenizer_artifact_hash: str
     scorer_artifact_hash: str
     cleanup: Any
+    # Optional combined native-MTP entry point.  Standard-text scheduling owns
+    # its queueing; this callable supplies only an attested sparse session.
+    native_mtp_session_factory: Any = None
     gemma_batch_config: Any = None
     diagnostic: bool = False
     advertisable: bool = True
@@ -86,6 +89,10 @@ class PreparedMLLMSpecPrefillRuntime:
             raise TypeError("target_forward_context must be callable")
         if not callable(self.cleanup):
             raise TypeError("cleanup must be callable")
+        if self.native_mtp_session_factory is not None and not callable(
+            self.native_mtp_session_factory
+        ):
+            raise TypeError("native_mtp_session_factory must be callable or None")
         if self.cache_capability.adapter_id != self.profile_key.adapter_id:
             raise ValueError("prepared cache adapter must match the profile key")
         gemma_layouts = {
