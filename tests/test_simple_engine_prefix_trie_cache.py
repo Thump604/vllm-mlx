@@ -2,6 +2,7 @@
 """Tests for SimpleEngine's optional mlx-lm prompt trie cache."""
 
 import hashlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -56,6 +57,24 @@ class NoFetchTrie:
 
     def insert_cache(self, *_args, **_kwargs):
         return None
+
+
+class ThreadRecordingTrie:
+    nbytes = 0
+
+    def __init__(self):
+        self.fetch_threads = []
+        self.insert_threads = []
+
+    def __len__(self):
+        return 0
+
+    def fetch_nearest_cache(self, _model, tokens):
+        self.fetch_threads.append(threading.get_ident())
+        return None, tokens
+
+    def insert_cache(self, *_args, **_kwargs):
+        self.insert_threads.append(threading.get_ident())
 
 
 def _engine(**kwargs):
@@ -132,6 +151,40 @@ async def test_prefix_trie_cache_reuses_growing_conversation_prefix():
     )
 
 
+async def test_prefix_trie_cache_reuses_prefix_without_system_message():
+    engine = _engine(prefix_trie_cache=True, prefix_trie_cache_size=8)
+    fake_stream_generate = _responses([ord("X")])
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", return_value=[FakeCache()]),
+        patch("mlx_lm.stream_generate", side_effect=fake_stream_generate),
+    ):
+        await _collect(engine, [{"role": "user", "content": "first"}])
+        await _collect(
+            engine,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "X"},
+                {"role": "user", "content": "second"},
+            ],
+        )
+
+    stats = engine.get_stats()["prefix_trie_cache"]
+    assert stats["hits"] == 1
+    assert stats["inserts"] == 2
+    assert len(fake_stream_generate.seen_prompts[1]) < len(
+        FakeTokenizer().encode(
+            FakeTokenizer().apply_chat_template(
+                [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "X"},
+                    {"role": "user", "content": "second"},
+                ]
+            )
+        )
+    )
+
+
 async def test_existing_exact_snapshot_hit_wins_before_prefix_trie_lookup():
     tokenizer = FakeTokenizer()
     engine = _engine(prefix_trie_cache=True)
@@ -153,11 +206,12 @@ async def test_existing_exact_snapshot_hit_wins_before_prefix_trie_lookup():
     )
     boundary = next(i for i, (a, b) in enumerate(zip(rendered_a, rendered_b)) if a != b)
     prefix = rendered_a[:boundary]
-    engine._system_kv_hash = hashlib.sha256(prefix.encode()).hexdigest()[:16]
-    engine._system_kv_token_count = len(
-        tokenizer.encode(prefix, add_special_tokens=True)
+    system_hash = hashlib.sha256(prefix.encode()).hexdigest()[:16]
+    system_token_count = len(tokenizer.encode(prefix, add_special_tokens=True))
+    engine._system_kv_cache[system_hash] = (
+        [FakeCache().state],
+        system_token_count,
     )
-    engine._system_kv_snapshot = [FakeCache().state]
     engine._prefix_trie_cache = NoFetchTrie()
 
     with (
@@ -210,3 +264,40 @@ async def test_prefix_trie_cache_honors_entry_bound():
         )
 
     assert engine.get_stats()["prefix_trie_cache"]["entries"] == 1
+
+
+async def test_prefix_trie_cache_stays_on_generation_owner_thread():
+    engine = _engine(prefix_trie_cache=True)
+    trie = ThreadRecordingTrie()
+    engine._prefix_trie_cache = trie
+    event_loop_thread = threading.get_ident()
+
+    with (
+        patch("mlx_lm.models.cache.make_prompt_cache", return_value=[FakeCache()]),
+        patch("mlx_lm.stream_generate", side_effect=_responses([ord("X")])),
+    ):
+        await _collect(
+            engine,
+            [
+                {"role": "system", "content": "Rules"},
+                {"role": "user", "content": "first"},
+            ],
+        )
+
+    assert trie.fetch_threads
+    assert trie.insert_threads
+    owner_threads = set(trie.fetch_threads + trie.insert_threads)
+    assert len(owner_threads) == 1
+    assert event_loop_thread not in owner_threads
+
+
+async def test_prefix_trie_cache_is_cleared_on_stop():
+    engine = _engine(prefix_trie_cache=True)
+    engine._prefix_trie_cache = ThreadRecordingTrie()
+    engine._prefix_trie_cache_stats["hits"] = 2
+
+    await engine.stop()
+
+    stats = engine.get_stats()["prefix_trie_cache"]
+    assert stats["entries"] == 0
+    assert stats["hits"] == 0
