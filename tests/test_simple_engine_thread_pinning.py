@@ -171,6 +171,16 @@ def _make_engine(engine_module, model=None):
         "evictions": 0,
     }
     engine._supports_system_kv_cache = False
+    engine._prefix_trie_cache = None
+    engine._prefix_trie_cache_lock = threading.Lock()
+    engine._prefix_trie_cache_stats = {
+        "lookups": 0,
+        "hits": 0,
+        "misses": 0,
+        "inserts": 0,
+        "skips": 0,
+        "tokens_saved": 0,
+    }
 
     @asynccontextmanager
     async def _slot(request_id: str):
