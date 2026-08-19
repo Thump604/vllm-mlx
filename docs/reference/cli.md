@@ -37,6 +37,9 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
+| `--prefix-trie-cache` | Enable conversation-prefix reuse in pure-LLM SimpleEngine mode | False |
+| `--prefix-trie-cache-size` | Maximum SimpleEngine prompt-trie entries | 32 |
+| `--prefix-trie-cache-memory-mb` | Optional SimpleEngine prompt-trie memory cap in MB | None |
 | `--max-tokens` | Default max tokens | 32768 |
 | `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--stream-interval` | Tokens per stream chunk | 1 |

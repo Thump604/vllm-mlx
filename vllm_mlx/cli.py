@@ -16,7 +16,11 @@ import argparse
 import json
 import sys
 
-from .cli_arg_types import make_json_object_arg_parser, make_positive_int_arg_parser
+from .cli_arg_types import (
+    make_auto_or_positive_int_arg_parser,
+    make_json_object_arg_parser,
+    make_positive_int_arg_parser,
+)
 
 
 def serve_command(args):
@@ -97,6 +101,8 @@ def serve_command(args):
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
     server._max_request_tokens = max_request_tokens
+    server._embedding_max_length = args.embedding_max_length
+    server._embedding_overflow_policy = args.embedding_overflow_policy
     if args.rate_limit > 0:
         server._rate_limiter = RateLimiter(
             requests_per_minute=args.rate_limit, enabled=True
@@ -335,6 +341,16 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%, "
                 f"backbone={specprefill_backbone_pct*100:.0f}%)"
             )
+        if args.prefix_trie_cache:
+            memory = (
+                f", memory={args.prefix_trie_cache_memory_mb}MB"
+                if args.prefix_trie_cache_memory_mb is not None
+                else ""
+            )
+            print(
+                "Prefix trie cache: enabled "
+                f"(max_entries={args.prefix_trie_cache_size}{memory})"
+            )
         if mllm_draft_model:
             print(
                 "MLLM draft model: enabled "
@@ -353,6 +369,9 @@ def serve_command(args):
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             gpu_memory_utilization=args.gpu_memory_utilization,
             scheduler_config=scheduler_config,
@@ -380,6 +399,9 @@ def serve_command(args):
             specprefill_keep_pct=args.specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=args.specprefill_draft_model,
+            prefix_trie_cache=args.prefix_trie_cache,
+            prefix_trie_cache_size=args.prefix_trie_cache_size,
+            prefix_trie_cache_memory_mb=args.prefix_trie_cache_memory_mb,
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
@@ -1259,6 +1281,27 @@ Examples:
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
     )
+    serve_parser.add_argument(
+        "--prefix-trie-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable mlx-lm LRUPromptCache for pure-LLM SimpleEngine chat. "
+            "Default off; exact system-prefix snapshots still take precedence."
+        ),
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-size",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-size"),
+        default=32,
+        help="Maximum prompt-cache trie entries for --prefix-trie-cache.",
+    )
+    serve_parser.add_argument(
+        "--prefix-trie-cache-memory-mb",
+        type=make_positive_int_arg_parser("--prefix-trie-cache-memory-mb"),
+        default=None,
+        help="Optional prompt-cache trie memory cap in MB.",
+    )
     # MLLM speculative draft/assistant model
     serve_parser.add_argument(
         "--mllm-draft-model",
@@ -1466,6 +1509,28 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    serve_parser.add_argument(
+        "--embedding-max-length",
+        type=make_auto_or_positive_int_arg_parser("--embedding-max-length"),
+        default=None,
+        help=(
+            "Ceiling on embedding input tokens: 'auto' (default) uses the "
+            "model-aware default (from the model's own context window), or "
+            "a positive integer to cap it lower for memory-constrained "
+            "deployments"
+        ),
+    )
+    serve_parser.add_argument(
+        "--embedding-overflow-policy",
+        type=str,
+        default="truncate",
+        choices=["truncate", "error"],
+        help=(
+            "What to do when an embedding input exceeds the effective max "
+            "length: 'truncate' (default, observable via a warning + metric) "
+            "or 'error' (reject with a structured 400 response)"
+        ),
     )
     # Reranker model option
     serve_parser.add_argument(

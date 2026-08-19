@@ -9,7 +9,7 @@ Available parsers:
 - auto: Auto-detecting parser that tries all formats (default)
 - mistral: Mistral models ([TOOL_CALLS] format)
 - qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
-- llama/llama3/llama4: Llama models (<function=name> format)
+- llama/llama3/llama4: Llama models (python-tag JSON, bare JSON, and legacy XML)
 - gemma4/gemma_4: Google Gemma 4 models (<|tool_call>call:name{} format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
@@ -57,6 +57,7 @@ from .llama_tool_parser import LlamaToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
+from .poolside_v1_tool_parser import PoolsideV1ToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
@@ -99,6 +100,7 @@ __all__ = [
     "Gemma4ToolParser",
     "MistralToolParser",
     "QwenToolParser",
+    "PoolsideV1ToolParser",
     "Qwen3XMLToolParser",
     "LlamaToolParser",
     "HermesToolParser",
