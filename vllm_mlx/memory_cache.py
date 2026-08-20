@@ -88,6 +88,23 @@ def _array_memory(arr) -> int:
     return 0
 
 
+def _nested_array_memory(value: Any) -> int:
+    """Sum ``_array_memory`` over an arbitrarily nested state structure.
+
+    Cache ``state`` payloads are not always a flat ``(keys, values)`` pair:
+    CacheList yields a list of sub-cache states and PoolingCache yields
+    ``(buf_kv, buf_gate, pooled)`` with possible ``None`` members. Unpacking
+    those as two values raised, was swallowed, and the entry was accounted as
+    zero bytes — so the dashboard showed 0% cache memory and, far worse, the
+    byte-based LRU eviction never fired for such models.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_nested_array_memory(v) for v in value)
+    return _array_memory(value)
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -125,11 +142,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(arr)
             continue
         elif hasattr(layer_cache, "state") and not isinstance(layer_cache, dict):
-            # Cache with state property returning (keys, values)
+            # Cache with a state property. Walk it recursively: the payload may
+            # be a plain (keys, values) pair, but CacheList/PoolingCache nest
+            # further, and the old two-way unpack silently measured those as 0.
             try:
-                keys, values = layer_cache.state
-                total_bytes += _array_memory(keys)
-                total_bytes += _array_memory(values)
+                total_bytes += _nested_array_memory(layer_cache.state)
             except (TypeError, ValueError):
                 pass
         elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
@@ -262,6 +279,33 @@ class _CacheEntry:
             cache=cache,
             memory_bytes=memory,
         )
+
+
+def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
+    """Return whether a cache layer can safely be rewound for partial reuse."""
+    if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if "max_size" in layer_cache.orig_attrs:
+            return False
+        return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
+
+    # _trim_cache_offset does not currently rewind container children.
+    if hasattr(layer_cache, "caches"):
+        return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            logger.debug(
+                "Failed to check cache layer trimmability for %s",
+                type(layer_cache).__name__,
+                exc_info=True,
+            )
+            return False
+
+    # Compatibility fallback for simple KV-like cache implementations.
+    return hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")
 
 
 def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
@@ -792,8 +836,7 @@ class MemoryAwarePrefixCache:
             excess = n_cached - n_requested
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_super.cache
             )
 
             if excess > 0 and has_non_trimmable:
@@ -886,8 +929,7 @@ class MemoryAwarePrefixCache:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
             has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
+                not _is_cache_layer_trimmable(lc) for lc in best_lcp_entry.cache
             )
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
