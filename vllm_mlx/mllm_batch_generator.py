@@ -1095,18 +1095,6 @@ class MLLMBatchGenerator:
                 yield cache
 
     @classmethod
-    def _cache_storage_is_accounted(cls, cache_list) -> bool:
-        """Return whether MemoryAwarePrefixCache can account this topology.
-
-        Its current estimator treats each top-level layer state as one KV pair
-        and does not recurse through CacheList. Until shared recursive
-        accounting lands, storing a nested container would bypass the byte cap.
-        Reads remain supported so existing entries can be handled safely.
-        """
-        cache_lists, _, _ = cls._cache_class_families()
-        return not any(isinstance(cache, cache_lists) for cache in cache_list)
-
-    @classmethod
     def _has_empty_rotating_cache(cls, cache_list):
         """Check if any RotatingKVCache layer has no data (keys=None).
 
@@ -2108,14 +2096,6 @@ class MLLMBatchGenerator:
     ) -> bool:
         """Store an isolated, key-aligned cache snapshot when rewind is safe."""
         if self.prefix_cache is None:
-            return False
-        if not self._cache_storage_is_accounted(cache):
-            logger.debug(
-                "Skipping %s prefix cache store for %s: nested cache "
-                "memory is not recursively accounted",
-                source,
-                request_id,
-            )
             return False
         snapshot = self._rewind_prefix_cache(cache, trim_by)
         if snapshot is None:

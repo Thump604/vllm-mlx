@@ -638,7 +638,7 @@ class TestMLLMCompletionCacheStore:
 
         generator.prefix_cache.store.assert_not_called()
 
-    def test_plain_nested_cache_is_not_stored_without_recursive_accounting(self):
+    def test_plain_nested_cache_is_stored_with_recursive_accounting(self):
         from types import SimpleNamespace
 
         mx = pytest.importorskip("mlx.core")
@@ -647,6 +647,7 @@ class TestMLLMCompletionCacheStore:
         KVCache = mlx_lm_cache.KVCache
 
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+        from vllm_mlx.memory_cache import estimate_kv_cache_memory
 
         children = [self._filled(KVCache(), 4, mx) for _ in range(2)]
         extracted = CacheList(*children)
@@ -662,7 +663,10 @@ class TestMLLMCompletionCacheStore:
 
         generator._maybe_store_prefix_cache(batch, [0])
 
-        generator.prefix_cache.store.assert_not_called()
+        generator.prefix_cache.store.assert_called_once()
+        _, stored = generator.prefix_cache.store.call_args.args
+        assert estimate_kv_cache_memory(stored) > 0
+        assert [child.offset for child in stored[0].caches] == [3, 3]
 
     def test_zero_trim_flat_snapshot_does_not_alias_live_cache(self):
         mx = pytest.importorskip("mlx.core")
