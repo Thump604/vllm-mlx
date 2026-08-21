@@ -649,7 +649,7 @@ PyObject* py_paged_decode(PyObject* self, PyObject* args, PyObject* kwargs) {
   if (!PyArg_ParseTupleAndKeywords(
           args,
           kwargs,
-          "OOOOOiff:paged_decode",
+          "OOOOOiif:paged_decode",
           const_cast<char**>(keywords),
           &query_object,
           &key_object,
