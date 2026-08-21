@@ -66,11 +66,7 @@ def _extensions() -> list[Extension]:
     return [
         Extension(
             "vllm_mlx._metal_context",
-            sources=[
-                os.fspath(
-                    ROOT / "native" / "metal_context" / "src" / "python_module.mm"
-                )
-            ],
+            sources=["native/metal_context/src/python_module.mm"],
             language="objc++",
             extra_compile_args=[
                 "-std=c++17",
