@@ -101,5 +101,13 @@ class MetalBuildExt(build_ext):
         destination_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(output, destination_dir / "_metal_context.metallib")
 
+    def build_extensions(self) -> None:
+        # distutils does not list Objective-C++ as a recognized source suffix,
+        # even though Apple's clang handles it correctly.  Register it before
+        # setuptools asks the compiler to classify extension sources.
+        if ".mm" not in self.compiler.src_extensions:
+            self.compiler.src_extensions.append(".mm")
+        super().build_extensions()
+
 
 setup(ext_modules=_extensions(), cmdclass={"build_ext": MetalBuildExt})

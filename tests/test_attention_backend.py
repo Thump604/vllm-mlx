@@ -333,8 +333,17 @@ class TestNumpyOracle:
 
 
 class TestMlxOracle:
-    def test_sdpa_matches_numpy_for_gqa_and_noncontiguous_pages(self):
+    @staticmethod
+    def _real_mlx():
         mx = pytest.importorskip("mlx.core")
+        if not hasattr(mx, "fast") or not hasattr(
+            mx.fast, "scaled_dot_product_attention"
+        ):
+            pytest.skip("real MLX SDPA is unavailable")
+        return mx
+
+    def test_sdpa_matches_numpy_for_gqa_and_noncontiguous_pages(self):
+        mx = self._real_mlx()
         rng = np.random.default_rng(23)
         block_size = 16
         query = rng.normal(size=(2, 4, 8)).astype(np.float32)
@@ -368,7 +377,7 @@ class TestMlxOracle:
         )
 
     def test_sdpa_decodes_uint16_bf16_bits_before_attention(self):
-        mx = pytest.importorskip("mlx.core")
+        mx = self._real_mlx()
         rng = np.random.default_rng(29)
         block_size = 16
         query = rng.normal(size=(2, 4, 8)).astype(np.float32)
