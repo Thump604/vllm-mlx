@@ -2,15 +2,23 @@
 """Regression tests for the versioned capacity-envelope evidence contract."""
 
 import pytest
+import httpx
 
 from vllm_mlx.bench_serve import (
     CapacityConfig,
     CapacityThresholds,
     _capacity_hardware_fingerprint,
+    _capacity_baseline_identity,
+    _capacity_cache_stats_are_empty,
     _capacity_memory_from_status,
+    _capacity_provenance,
+    _capacity_reset_state_verified,
     _capacity_telemetry_delta,
+    _run_capacity_request,
+    _verify_capacity_cache_mode,
     classify_capacity_error,
     compare_capacity_outputs,
+    parse_metrics_text,
     parse_sse_line,
     run_capacity_envelope,
     sha256_json,
@@ -66,6 +74,74 @@ def test_unavailable_observations_remain_null(monkeypatch):
     assert hardware["memory_gb"] is None
     assert _capacity_memory_from_status({}) == {"source": "unavailable"}
     assert _capacity_telemetry_delta({}, {})["available"] is False
+
+
+def test_telemetry_delta_never_invents_missing_series():
+    delta = _capacity_telemetry_delta(
+        {"telemetry": {"shared": 4.0, "gone": 9.0}},
+        {"telemetry": {"shared": 7.0, "new": 2.0}},
+    )
+    assert delta["values"] == {"shared": 3.0}
+    assert delta["missing_before"] == ["new"]
+    assert delta["missing_after"] == ["gone"]
+
+
+def test_actual_vllm_mlx_cache_metrics_are_retained():
+    parsed = parse_metrics_text("vllm_mlx_cache_hits 4\nvllm_mlx_cache_misses 2\n")
+    assert parsed["telemetry"] == {
+        "vllm_mlx_cache_hits": 4.0,
+        "vllm_mlx_cache_misses": 2.0,
+    }
+
+
+def test_cache_stats_distinguish_missing_from_explicit_no_cache():
+    assert _capacity_cache_stats_are_empty({}) is None
+    assert _capacity_cache_stats_are_empty({"engine_cache": None}) is True
+
+
+def test_explicit_no_cache_cannot_override_nonempty_post_reset_stats():
+    event = {
+        "ok": True,
+        "response": {"status": "cleared", "engine_cache": None},
+    }
+    assert _capacity_reset_state_verified(event, False) is False
+
+
+def test_prefix_cache_verification_requires_observed_counter_direction():
+    hit = _verify_capacity_cache_mode(
+        "prefix-hit",
+        {
+            "available": True,
+            "values": {
+                "vllm_prefix_cache_hits_total": 1.0,
+                "vllm_prefix_cache_misses_total": 0.0,
+            },
+        },
+    )
+    assert hit["status"] == "verified"
+    assert _verify_capacity_cache_mode("prefix-hit", {})["status"] == "unavailable"
+
+
+def test_capacity_provenance_preserves_nested_mtp_status(monkeypatch):
+    monkeypatch.setattr("vllm_mlx.bench_serve._capacity_source_commit", lambda: "abc")
+    provenance = _capacity_provenance(
+        url="http://localhost:8000",
+        model_id="model",
+        runtime={},
+        status={"mtp": {"enabled": True, "accepted_tokens": 12}},
+        hardware={},
+    )
+    assert provenance["runtime"]["mtp_enabled"] is True
+    assert provenance["runtime"]["mtp"]["accepted_tokens"] == 12
+    assert provenance["client"]["source_commit"] == "abc"
+
+
+def test_baseline_identity_requires_revision_and_quantization():
+    partial = {
+        "runtime": {"model_id": "model"},
+        "model": {"revision": None, "quantization": None},
+    }
+    assert _capacity_baseline_identity(partial, partial)["verified"] is False
 
 
 def test_sse_timing_inputs_are_explicitly_chunks_with_optional_token_ids():
@@ -141,6 +217,10 @@ async def test_cold_cell_requires_verified_reset(monkeypatch):
         lambda *args: _async_value({}),
     )
     monkeypatch.setattr(
+        "vllm_mlx.bench_serve._fetch_capacity_cache_stats",
+        lambda *args: _async_value(None),
+    )
+    monkeypatch.setattr(
         "vllm_mlx.bench_serve.clear_runtime_cache",
         lambda *args: _async_value({"ok": False, "status_code": 404, "error": ""}),
     )
@@ -174,6 +254,10 @@ async def test_cold_cell_never_warms_after_reset(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "vllm_mlx.bench_serve.scrape_metrics",
         lambda *args: _async_value({}),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve._fetch_capacity_cache_stats",
+        lambda *args: _async_value({"engine_cache": {"hits": 0, "entry_count": 0}}),
     )
     monkeypatch.setattr(
         "vllm_mlx.bench_serve._capacity_hardware_fingerprint",
@@ -219,5 +303,158 @@ async def test_cold_cell_never_warms_after_reset(monkeypatch, tmp_path):
     assert result["cells"][0]["cache_actions"][0]["warmup_requests"] == 0
 
 
+@pytest.mark.anyio
+async def test_unsupported_prefix_cache_is_unavailable_not_an_abort(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("vllm_mlx.bench_serve.httpx.AsyncClient", _DummyClient)
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve.auto_detect_runtime",
+        lambda *args: _async_value({"model_id": "test-model"}),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve._fetch_post_run_status",
+        lambda *args: _async_value({}),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve._capacity_hardware_fingerprint",
+        lambda: {"memory_gb": None, "source": {}},
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve._fetch_capacity_cache_stats",
+        lambda *args: _async_value({"engine_cache": None}),
+    )
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve.clear_runtime_cache",
+        lambda *args: _async_value(
+            {
+                "ok": True,
+                "status_code": 200,
+                "response": {"status": "cleared", "engine_cache": None},
+            }
+        ),
+    )
+    result = await run_capacity_envelope(
+        model="test-model",
+        output_path=str(tmp_path / "capacity.json"),
+        config=CapacityConfig(
+            concurrencies=(1,),
+            prompt_tokens=(8,),
+            output_tokens=(4,),
+            cache_modes=("prefix-hit",),
+            repetitions=1,
+        ),
+    )
+    assert result["cells"][0]["cache_verification"]["status"] == "unavailable"
+    assert result["cells"][0]["sustainable"] is False
+
+
 async def _async_value(value):
     return value
+
+
+@pytest.mark.anyio
+async def test_capacity_request_accepts_configured_length_completion(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve.stream_chat_completion",
+        lambda **kwargs: _async_value(
+            {
+                "finish_reason": "length",
+                "content": "bounded output",
+                "tool_calls": [],
+                "usage_available": True,
+                "prompt_tokens": 8,
+                "completion_tokens": 4,
+                "ttft_ms": 1.0,
+                "tpot_ms": 2.0,
+                "e2e_latency_ms": 3.0,
+                "queue_time_ms": None,
+                "token_ids": [],
+            }
+        ),
+    )
+    sample = await _run_capacity_request(
+        object(),
+        "http://test",
+        messages=[{"role": "user", "content": "x"}],
+        model="test",
+        max_tokens=4,
+        extra_body=None,
+        request_timeout_s=1,
+    )
+    assert sample["error"] == ""
+    assert sample["validated"] is True
+    assert sample["chunk_gap_ms"] == 2.0
+
+
+@pytest.mark.anyio
+async def test_capacity_request_rejects_missing_usage(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_mlx.bench_serve.stream_chat_completion",
+        lambda **kwargs: _async_value(
+            {
+                "finish_reason": "stop",
+                "content": "output",
+                "tool_calls": [],
+                "usage_available": False,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "ttft_ms": 1.0,
+                "tpot_ms": 2.0,
+                "e2e_latency_ms": 3.0,
+                "queue_time_ms": None,
+                "token_ids": [],
+            }
+        ),
+    )
+    sample = await _run_capacity_request(
+        object(),
+        "http://test",
+        messages=[{"role": "user", "content": "x"}],
+        model="test",
+        max_tokens=4,
+        extra_body=None,
+        request_timeout_s=1,
+    )
+    assert sample["error"] == "token usage unavailable"
+    assert sample["validated"] is False
+
+
+@pytest.mark.anyio
+async def test_capacity_request_classifies_oom_from_http_response_body(monkeypatch):
+    request = httpx.Request("POST", "http://test/v1/chat/completions")
+    response = httpx.Response(500, request=request, text="Metal out of memory")
+
+    async def fail(**kwargs):
+        raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    monkeypatch.setattr("vllm_mlx.bench_serve.stream_chat_completion", fail)
+    sample = await _run_capacity_request(
+        object(),
+        "http://test",
+        messages=[{"role": "user", "content": "x"}],
+        model="test",
+        max_tokens=4,
+        extra_body=None,
+        request_timeout_s=1,
+    )
+    assert sample["error_kind"] == "oom"
+
+
+@pytest.mark.anyio
+async def test_capacity_request_reads_streaming_http_error_body_before_classifying():
+    async def handler(request):
+        return httpx.Response(500, content=b"Metal out of memory")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sample = await _run_capacity_request(
+            client,
+            "http://test",
+            messages=[{"role": "user", "content": "x"}],
+            model="test",
+            max_tokens=4,
+            extra_body=None,
+            request_timeout_s=1,
+        )
+    assert sample["error_kind"] == "oom"
+    assert "Metal out of memory" in sample["error"]

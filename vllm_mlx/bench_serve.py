@@ -235,6 +235,9 @@ def classify_sustainable_capacity(
         reasons.append("correctness failure")
     if summary.get("correctness_unavailable_count", 0):
         reasons.append("correctness unavailable")
+    cache_status = summary.get("cache_verification", {}).get("status")
+    if cache_status != "verified":
+        reasons.append(f"cache state {cache_status or 'unavailable'}")
 
     for field_name, limit, label in (
         ("ttft_ms", thresholds.max_p95_ttft_ms, "p95 TTFT"),
@@ -262,6 +265,7 @@ def summarize_capacity_cell(
     thresholds: CapacityThresholds,
     telemetry_delta: Optional[dict] = None,
     cache_actions: Optional[list[dict]] = None,
+    cache_verification: Optional[dict] = None,
 ) -> dict:
     """Aggregate request samples into one classified capacity cell."""
     errors = [sample for sample in samples if sample.get("error")]
@@ -305,6 +309,8 @@ def summarize_capacity_cell(
         ),
         "telemetry_delta": telemetry_delta or {},
         "cache_actions": cache_actions or [],
+        "cache_verification": cache_verification
+        or {"status": "unavailable", "source": None},
         "memory": {
             "active_gb": _metric_stats(
                 [
@@ -339,6 +345,14 @@ def summarize_capacity_cell(
                 "unavailable",
             ),
         },
+        "mtp_status": next(
+            (
+                sample.get("mtp_status")
+                for sample in reversed(valid)
+                if sample.get("mtp_status") is not None
+            ),
+            None,
+        ),
     }
     sustainable, reasons = classify_sustainable_capacity(summary, thresholds)
     summary["sustainable"] = sustainable
@@ -848,6 +862,7 @@ def parse_metrics_text(text: str) -> dict:
             "mtp" in lower_name
             or "spec" in lower_name
             or "prefix_cache" in lower_name
+            or lower_name.startswith("vllm_mlx_cache_")
             or "queue" in lower_name
         ):
             try:
@@ -1024,6 +1039,52 @@ async def clear_runtime_cache(client: httpx.AsyncClient, base_url: str) -> dict:
     except Exception as exc:
         event["error"] = str(exc)
     return event
+
+
+async def _fetch_capacity_cache_stats(
+    client: httpx.AsyncClient, base_url: str
+) -> Optional[dict]:
+    try:
+        response = await client.get(f"{base_url}/v1/cache/stats")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def _capacity_cache_stats_are_empty(stats: Optional[dict]) -> Optional[bool]:
+    if stats is None:
+        return None
+    if "engine_cache" not in stats:
+        return None
+    engine = stats.get("engine_cache")
+    if engine is None:
+        return True
+    if not isinstance(engine, dict) or "error" in engine:
+        return None
+    activity_keys = {
+        "hits",
+        "misses",
+        "tokens_saved",
+        "entry_count",
+        "current_memory_bytes",
+        "current_memory_mb",
+        "dropped_entries",
+    }
+    observed: list[float] = []
+
+    def _walk(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        for key, nested in value.items():
+            if key in activity_keys and isinstance(nested, (int, float)):
+                observed.append(float(nested))
+            elif isinstance(nested, dict):
+                _walk(nested)
+
+    _walk(engine)
+    return all(value == 0 for value in observed) if observed else None
 
 
 def _normalize_cache_policy(value: Optional[str]) -> str:
@@ -1316,6 +1377,8 @@ async def stream_chat_completion(
         async with client.stream(
             "POST", f"{base_url}/v1/chat/completions", json=body
         ) as response:
+            if getattr(response, "status_code", 200) >= 400:
+                await response.aread()
             response.raise_for_status()
             async for raw_line in response.aiter_lines():
                 parsed = parse_sse_line(raw_line)
@@ -1376,6 +1439,11 @@ async def stream_chat_completion(
 
     return {
         **metrics,
+        "usage_available": bool(
+            isinstance(usage, dict)
+            and "prompt_tokens" in usage
+            and "completion_tokens" in usage
+        ),
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
         "finish_reason": finish_reason,
@@ -2095,7 +2163,7 @@ async def run_bench_serve_workload(
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         runtime = await auto_detect_runtime(client, url)
-        hardware = _capacity_hardware_fingerprint()
+        hardware = detect_hardware_fingerprint()
         model_id = model or runtime.get("model_id", "")
         if not model_id:
             raise ValueError("could not determine model ID; pass --model")
@@ -3044,25 +3112,70 @@ def _capacity_telemetry_delta(before: dict, after: dict) -> dict:
     after_values = after.get("telemetry") or {}
     if not before_values or not after_values:
         return {"available": False, "source": "/metrics", "values": None}
+    shared_keys = sorted(set(before_values) & set(after_values))
+    if not shared_keys:
+        return {"available": False, "source": "/metrics", "values": None}
     delta: dict[str, float] = {}
-    for key in sorted(set(before_values) | set(after_values)):
-        value = float(after_values.get(key, 0.0)) - float(before_values.get(key, 0.0))
+    for key in shared_keys:
+        value = float(after_values[key]) - float(before_values[key])
         if value:
             delta[key] = value
-    return {"available": True, "source": "/metrics", "values": delta}
+    return {
+        "available": True,
+        "source": "/metrics",
+        "values": delta,
+        "missing_before": sorted(set(after_values) - set(before_values)),
+        "missing_after": sorted(set(before_values) - set(after_values)),
+    }
 
 
-def _verified_capacity_cache_reset(event: dict) -> bool:
+def _verified_capacity_cache_reset(
+    event: dict, *, require_engine_cache: bool = False
+) -> bool:
     """Require the vllm-mlx cache endpoint's explicit engine acknowledgement."""
     response = event.get("response") or {}
+    if "engine_cache" not in response:
+        return False
     engine_cache = response.get("engine_cache")
-    return bool(
-        event.get("ok")
-        and response.get("status") == "cleared"
-        and isinstance(engine_cache, dict)
-        and engine_cache
-        and "error" not in engine_cache
-    )
+    acknowledged = bool(event.get("ok") and response.get("status") == "cleared")
+    if not acknowledged or (isinstance(engine_cache, dict) and "error" in engine_cache):
+        return False
+    if require_engine_cache:
+        return isinstance(engine_cache, dict) and bool(engine_cache)
+    return True
+
+
+def _capacity_reset_state_verified(
+    event: dict, post_reset_empty: Optional[bool]
+) -> bool:
+    if not _verified_capacity_cache_reset(event):
+        return False
+    engine_cache = (event.get("response") or {}).get("engine_cache")
+    if post_reset_empty is False:
+        return False
+    if engine_cache is not None and post_reset_empty is not True:
+        return False
+    return True
+
+
+def _verify_capacity_cache_mode(cache_mode: str, telemetry: dict) -> dict:
+    if cache_mode not in {"prefix-hit", "prefix-miss"}:
+        return {"status": "verified", "source": "controlled reset/warmup"}
+    if not telemetry.get("available"):
+        return {"status": "unavailable", "source": "/metrics"}
+    values = telemetry.get("values") or {}
+    hits = sum(value for key, value in values.items() if "cache_hits" in key)
+    misses = sum(value for key, value in values.items() if "cache_misses" in key)
+    if cache_mode == "prefix-hit":
+        verified = hits > 0
+    else:
+        verified = misses > 0 and hits == 0
+    return {
+        "status": "verified" if verified else "mismatch",
+        "source": "/metrics",
+        "cache_hits": hits,
+        "cache_misses": misses,
+    }
 
 
 def _capacity_hardware_fingerprint() -> dict:
@@ -3102,18 +3215,20 @@ def _capacity_hardware_fingerprint() -> dict:
 def _capacity_provenance(
     *,
     url: str,
-    model_id: str,
+    model_id: Optional[str],
     runtime: dict,
     status: dict,
     hardware: dict,
 ) -> dict:
     """Collect explicit provenance, leaving unknown values as null."""
+    mtp = status.get("mtp") if isinstance(status.get("mtp"), dict) else None
     return {
         "client": {
             "package": "vllm-mlx",
             "package_version": _capacity_package_version("vllm-mlx"),
             "python_version": platform.python_version(),
             "platform": platform.platform(),
+            "source_commit": _capacity_source_commit(),
         },
         "server": {
             "url": url,
@@ -3125,7 +3240,8 @@ def _capacity_provenance(
             "model_id": model_id,
             "model_type": runtime.get("model_type") or None,
             "engine_type": runtime.get("engine_type") or None,
-            "mtp_enabled": runtime.get("mtp_enabled"),
+            "mtp": mtp,
+            "mtp_enabled": mtp.get("enabled") if mtp else None,
             "specprefill": runtime.get("specprefill"),
             "kv_quant": runtime.get("kv_quant") or None,
             "cache_type": runtime.get("cache_type") or None,
@@ -3141,6 +3257,22 @@ def _capacity_provenance(
             for name in ("mlx", "mlx-lm", "mlx-vlm")
         },
     }
+
+
+def _capacity_source_commit() -> Optional[str]:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def compare_capacity_outputs(candidate: dict, baseline: dict) -> dict:
@@ -3223,17 +3355,23 @@ async def _run_capacity_request(
         )
         error = ""
     except Exception as exc:
+        response = getattr(exc, "response", None)
+        try:
+            response_text = response.text if response is not None else ""
+        except httpx.ResponseNotRead:
+            response_text = ""
         result = {
             "ttft_ms": None,
             "tpot_ms": None,
             "e2e_latency_ms": None,
             "queue_time_ms": None,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "usage_available": False,
             "content": "",
             "token_ids": [],
         }
-        error = str(exc)
+        error = " — ".join(part for part in (str(exc), response_text) if part)
     sample = {
         **result,
         "error": error,
@@ -3243,12 +3381,13 @@ async def _run_capacity_request(
     if error:
         sample["validated"] = False
     else:
-        valid, reason = validate_response(
-            result.get("finish_reason"),
-            result.get("content", ""),
-            200,
-            tool_calls=result.get("tool_calls") or [],
-        )
+        finish_reason = result.get("finish_reason")
+        has_output = bool(result.get("content") or result.get("tool_calls"))
+        valid = finish_reason in {"stop", "length", "tool_calls"} and has_output
+        reason = "" if valid else "invalid or empty capacity response"
+        if not result.get("usage_available"):
+            valid = False
+            reason = "token usage unavailable"
         sample["validated"] = valid
         if not valid:
             sample["error"] = reason
@@ -3309,7 +3448,7 @@ async def run_capacity_envelope(
             baseline_status = await _fetch_post_run_status(client, baseline_url)
             baseline_provenance = _capacity_provenance(
                 url=baseline_url,
-                model_id=baseline_runtime.get("model_id") or model_id,
+                model_id=baseline_runtime.get("model_id"),
                 runtime=baseline_runtime,
                 status=baseline_status,
                 hardware={"scope": "not_collected"},
@@ -3329,7 +3468,16 @@ async def run_capacity_envelope(
             "config": config.to_dict(),
             "request_template": {
                 "role": "user",
-                "generator": "capacity envelope repeated-token-v1",
+                "generator": "capacity-envelope-token-bucket-v2",
+                "extra_body": request_extra,
+                "baseline_enabled": baseline_url is not None,
+            },
+            "prompt_material_sha256": {
+                f"{tokens}:{variant}": sha256_json(
+                    build_capacity_messages(tokens, variant=variant)
+                )
+                for tokens in config.prompt_tokens
+                for variant in ("base", "warm", "miss")
             },
         }
         workload_hash = sha256_json(workload_descriptor)
@@ -3343,6 +3491,7 @@ async def run_capacity_envelope(
                         telemetry_values: dict[str, float] = {}
                         telemetry_available = True
                         cache_actions: list[dict] = []
+                        cache_mode_available = True
                         for repetition in range(config.repetitions):
                             measured_variant = (
                                 "miss" if cache_mode == "prefix-miss" else "base"
@@ -3361,8 +3510,16 @@ async def run_capacity_envelope(
                                 "warmup_requests": 0,
                             }
                             reset = await clear_runtime_cache(client, url)
+                            post_reset_stats = await _fetch_capacity_cache_stats(
+                                client, url
+                            )
+                            post_reset_empty = _capacity_cache_stats_are_empty(
+                                post_reset_stats
+                            )
                             actions["reset_before_measured"] = True
                             actions["reset_event"] = reset
+                            actions["post_reset_stats"] = post_reset_stats
+                            actions["post_reset_empty"] = post_reset_empty
                             cache_events.append(
                                 {
                                     "prompt_tokens": prompt_tokens,
@@ -3373,11 +3530,23 @@ async def run_capacity_envelope(
                                     "event": reset,
                                 }
                             )
-                            if not _verified_capacity_cache_reset(reset):
+                            if not _capacity_reset_state_verified(
+                                reset, post_reset_empty
+                            ):
                                 raise RuntimeError(
                                     f"{cache_mode} cache state could not be verified: "
                                     f"{reset.get('error') or reset.get('status_code')}"
                                 )
+                            if cache_mode in {
+                                "prefix-hit",
+                                "prefix-miss",
+                            } and not _verified_capacity_cache_reset(
+                                reset, require_engine_cache=True
+                            ):
+                                actions["availability"] = "unsupported"
+                                cache_actions.append(actions)
+                                cache_mode_available = False
+                                continue
                             warmup_count = 0 if cache_mode == "cold" else config.warmup
                             if cache_mode in {"warm", "prefix-hit", "prefix-miss"}:
                                 warmup_count = max(1, warmup_count)
@@ -3436,19 +3605,31 @@ async def run_capacity_envelope(
                                         "timing_semantics": "content_chunk_gap",
                                         "memory": batch_memory,
                                         "telemetry_delta": batch_telemetry,
+                                        "mtp_status": (
+                                            status_after.get("mtp")
+                                            if isinstance(status_after.get("mtp"), dict)
+                                            else None
+                                        ),
                                     }
                                 )
                             if baseline_url and batch:
-                                baseline_sample = await _run_capacity_request(
-                                    client,
-                                    baseline_url,
-                                    messages=measured_messages,
-                                    model=model_id,
-                                    max_tokens=output_tokens,
-                                    extra_body=request_extra,
-                                    request_timeout_s=config.request_timeout_s,
+                                baseline_batch = await asyncio.gather(
+                                    *[
+                                        _run_capacity_request(
+                                            client,
+                                            baseline_url,
+                                            messages=measured_messages,
+                                            model=model_id,
+                                            max_tokens=output_tokens,
+                                            extra_body=request_extra,
+                                            request_timeout_s=config.request_timeout_s,
+                                        )
+                                        for _ in batch
+                                    ]
                                 )
-                                for sample in batch:
+                                for sample, baseline_sample in zip(
+                                    batch, baseline_batch
+                                ):
                                     if (
                                         not baseline_identity["verified"]
                                         or sample.get("error")
@@ -3479,6 +3660,20 @@ async def run_capacity_envelope(
                                         telemetry_values.get(key, 0.0) + value
                                     )
 
+                        cell_telemetry = {
+                            "available": telemetry_available,
+                            "source": "/metrics",
+                            "values": telemetry_values if telemetry_available else None,
+                        }
+                        cache_verification = (
+                            _verify_capacity_cache_mode(cache_mode, cell_telemetry)
+                            if cache_mode_available
+                            else {
+                                "status": "unavailable",
+                                "source": "DELETE /v1/cache",
+                                "reason": "engine cache unsupported",
+                            }
+                        )
                         cell = summarize_capacity_cell(
                             prompt_tokens=prompt_tokens,
                             output_tokens=output_tokens,
@@ -3487,14 +3682,9 @@ async def run_capacity_envelope(
                             samples=cell_samples,
                             batch_durations_ms=batch_durations_ms,
                             thresholds=config.thresholds,
-                            telemetry_delta={
-                                "available": telemetry_available,
-                                "source": "/metrics",
-                                "values": (
-                                    telemetry_values if telemetry_available else None
-                                ),
-                            },
+                            telemetry_delta=cell_telemetry,
                             cache_actions=cache_actions,
+                            cache_verification=cache_verification,
                         )
                         cells.append(cell)
                         print(
