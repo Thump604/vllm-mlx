@@ -176,7 +176,13 @@ jobs:
           assert platform.machine() == "arm64"
           capabilities = _metal_context.capabilities()
           assert capabilities.get("compiled") is True, capabilities
-          assert capabilities.get("available") is True, capabilities
+          # GitHub's arm64 macOS hosts expose the Apple toolchain but may not
+          # expose a Metal device to jobs.  Compilation is mandatory here;
+          # dispatch tests run when a device is actually present and otherwise
+          # must report the precise fail-closed reason.
+          if not capabilities.get("available"):
+              assert capabilities.get("metal_device") is False, capabilities
+              assert "no GPU" in capabilities.get("reason", ""), capabilities
           print("Metal Context native capability:", capabilities)
           PY
 
