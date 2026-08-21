@@ -44,10 +44,19 @@ jobs:
           required = {
               "native/metal_context/kernels/paged_decode.metal",
               "native/metal_context/src/python_module.mm",
+              "native/metal_context/src/page_runtime.hpp",
+              "native/metal_context/src/page_runtime.mm",
+              "native/metal_context/src/page_runtime_python.mm",
+              "native/metal_context/tests/page_runtime_offset_test.mm",
+              "native/metal_context/tests/page_runtime_fork_stress_test.mm",
+              "native/metal_context/tests/page_runtime_concurrency_test.mm",
               "native/metal_context/README.md",
               "scripts/build_metal_context.py",
+              "docs/metal-context-page-runtime.md",
               "tests/test_attention_backend.py",
               "tests/test_metal_context_native.py",
+              "tests/test_metal_context_page_runtime.py",
+              "vllm_mlx/metal_context_runtime.py",
           }
           missing = {
               path for path in required if not any(name.endswith(path) for name in names)
@@ -186,12 +195,54 @@ jobs:
           print("Metal Context native capability:", capabilities)
           PY
 
+      - name: Verify native page-runtime metadata offset helper
+        run: |
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          xcrun --sdk macosx clang++ \
+            -std=c++17 -fobjc-arc -mmacosx-version-min=11.0 \
+            -isysroot "$SDK" \
+            -Inative/metal_context/src \
+            native/metal_context/src/page_runtime.mm \
+            native/metal_context/tests/page_runtime_offset_test.mm \
+            -framework Metal -framework Foundation \
+            -o /tmp/vllm-mlx-page-runtime-offset-test
+          /tmp/vllm-mlx-page-runtime-offset-test
+
+      - name: Run native prefix fork ASAN stress harness
+        run: |
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          xcrun --sdk macosx clang++ \
+            -std=c++17 -fobjc-arc -fsanitize=address \
+            -fno-omit-frame-pointer -mmacosx-version-min=11.0 \
+            -isysroot "$SDK" \
+            -Inative/metal_context/src \
+            native/metal_context/src/page_runtime.mm \
+            native/metal_context/tests/page_runtime_fork_stress_test.mm \
+            -framework Metal -framework Foundation \
+            -o /tmp/vllm-mlx-page-runtime-fork-stress
+          ASAN_OPTIONS=detect_leaks=0 /tmp/vllm-mlx-page-runtime-fork-stress
+
+      - name: Run native PageRuntime lock-order ASAN stress harness
+        run: |
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          xcrun --sdk macosx clang++ \
+            -std=c++17 -fobjc-arc -fsanitize=address \
+            -fno-omit-frame-pointer -mmacosx-version-min=11.0 \
+            -isysroot "$SDK" \
+            -Inative/metal_context/src \
+            native/metal_context/src/page_runtime.mm \
+            native/metal_context/tests/page_runtime_concurrency_test.mm \
+            -framework Metal -framework Foundation \
+            -o /tmp/vllm-mlx-page-runtime-concurrency
+          ASAN_OPTIONS=detect_leaks=0 /tmp/vllm-mlx-page-runtime-concurrency
+
       - name: Run MLX-dependent tests
         run: |
           pytest \
             tests/test_platform.py \
             tests/test_attention_backend.py \
             tests/test_metal_context_native.py \
+            tests/test_metal_context_page_runtime.py \
             tests/test_llm.py \
             tests/test_mllm.py \
             tests/test_server.py \

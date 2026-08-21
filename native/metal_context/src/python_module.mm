@@ -17,14 +17,26 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <mutex>
 #include <string>
+
+namespace metal_context {
+// Defined in page_runtime_python.mm.  Keep the existing kernel bridge's
+// module definition as the single extension entry point while registering
+// the optional page-runtime type from its companion translation unit.
+int add_page_runtime_type(PyObject* module);
+// Keep module-level shutdown from resetting shared kernel state while a
+// native PageRuntime instance is still alive in another adapter.
+void shutdown_kernel_if_unused();
+}
 
 namespace {
 
@@ -70,6 +82,9 @@ struct BufferGuard {
 
 struct Runtime {
   std::mutex mutex;
+  std::condition_variable dispatch_cv;
+  uint32_t active_dispatches = 0;
+  bool stopping = false;
   bool attempted = false;
   bool available = false;
   std::string path;
@@ -80,6 +95,78 @@ struct Runtime {
 };
 
 Runtime g_runtime;
+
+class LegacyDispatchLease {
+ public:
+  explicit LegacyDispatchLease(Runtime* runtime) : runtime_(runtime) {}
+
+  bool acquire() {
+    std::unique_lock<std::mutex> lock(runtime_->mutex);
+    if (runtime_->stopping || runtime_->device == nil ||
+        runtime_->queue == nil || runtime_->pipeline == nil) {
+      return false;
+    }
+    ++runtime_->active_dispatches;
+    acquired_ = true;
+    return true;
+  }
+
+  ~LegacyDispatchLease() noexcept {
+    if (!acquired_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(runtime_->mutex);
+    if (runtime_->active_dispatches > 0) {
+      --runtime_->active_dispatches;
+    }
+    runtime_->dispatch_cv.notify_all();
+  }
+
+ private:
+  Runtime* runtime_;
+  bool acquired_ = false;
+};
+
+// All exported legacy callbacks are C ABI entry points.  Keep native
+// allocation/Objective-C++ failures inside this translation unit and convert
+// them to Python exceptions rather than allowing C++ unwinding through
+// CPython.
+void set_native_exception(const std::bad_alloc& exception) {
+  const char* message = exception.what();
+  PyErr_SetString(
+      PyExc_MemoryError,
+      message == nullptr || message[0] == '\0'
+          ? "native Metal Context allocation failed"
+          : message);
+}
+
+void set_native_exception(const std::exception& exception) {
+  const char* message = exception.what();
+  PyErr_SetString(
+      PyExc_RuntimeError,
+      message == nullptr || message[0] == '\0'
+          ? "native Metal Context operation failed"
+          : message);
+}
+
+void set_unknown_native_exception() {
+  PyErr_SetString(
+      PyExc_RuntimeError,
+      "unknown native Metal Context exception");
+}
+
+#define METAL_CONTEXT_PY_TRY try {
+#define METAL_CONTEXT_PY_CATCH                                                  \
+  } catch (const std::bad_alloc& exception) {                                  \
+    set_native_exception(exception);                                            \
+    return nullptr;                                                             \
+  } catch (const std::exception& exception) {                                   \
+    set_native_exception(exception);                                             \
+    return nullptr;                                                             \
+  } catch (...) {                                                               \
+    set_unknown_native_exception();                                              \
+    return nullptr;                                                             \
+  }
 
 bool set_dict_item(PyObject* dict, const char* key, PyObject* value) {
   if (value == nullptr) {
@@ -184,6 +271,13 @@ bool ensure_runtime(const std::string& path) {
   std::lock_guard<std::mutex> lock(g_runtime.mutex);
   if (g_runtime.attempted && g_runtime.path == path) {
     return g_runtime.available;
+  }
+  if (g_runtime.active_dispatches != 0 && g_runtime.attempted &&
+      g_runtime.path != path) {
+    g_runtime.error =
+        "native Metal Context callbacks must share one metallib path while "
+        "dispatches are active";
+    return false;
   }
 
   g_runtime.attempted = true;
@@ -534,6 +628,8 @@ bool validate_inputs(
   const long double max_dot =
       static_cast<long double>(max_abs_bf16(q)) *
       static_cast<long double>(max_abs_bf16(k)) * kHeadDim;
+  const long double max_value =
+      static_cast<long double>(max_abs_bf16(v));
   if (max_dot > kFloat32SafeMagnitude) {
     *error =
         "finite BF16 query/key magnitudes may overflow the float32 dot "
@@ -551,12 +647,15 @@ bool validate_inputs(
 
   const auto* table_data = static_cast<const int32_t*>(table.buf);
   const auto* length_data = static_cast<const int32_t*>(lengths.buf);
+  uint64_t max_sequence_length = 0;
   for (Py_ssize_t request = 0; request < batch; ++request) {
     const int32_t length = length_data[request];
     if (length < 0 || static_cast<uint64_t>(length) > max_sequence) {
       *error = "sequence_lengths must be in [0, max_blocks * block_size]";
       return false;
     }
+    max_sequence_length = std::max(
+        max_sequence_length, static_cast<uint64_t>(length));
     const Py_ssize_t needed_blocks =
         (static_cast<Py_ssize_t>(length) + block_size - 1) / block_size;
     for (Py_ssize_t logical_block = 0; logical_block < needed_blocks;
@@ -568,6 +667,14 @@ bool validate_inputs(
         return false;
       }
     }
+  }
+  const long double max_value_accumulation =
+      max_value * static_cast<long double>(max_sequence_length);
+  if (max_value_accumulation > kFloat32SafeMagnitude) {
+    *error =
+        "finite BF16 value magnitudes and sequence length may overflow the "
+        "float32 value accumulation; reduce values or context length";
+    return false;
   }
 
   params->batch_size = static_cast<uint32_t>(batch);
@@ -585,6 +692,7 @@ bool validate_inputs(
 }
 
 PyObject* py_capabilities(PyObject* self, PyObject*) {
+  METAL_CONTEXT_PY_TRY
   const std::string path = py_object_path(self);
   const bool available = ensure_runtime(path);
   std::lock_guard<std::mutex> lock(g_runtime.mutex);
@@ -632,9 +740,11 @@ PyObject* py_capabilities(PyObject* self, PyObject*) {
   Py_DECREF(block_sizes);
   Py_DECREF(head_dims);
   return result;
+  METAL_CONTEXT_PY_CATCH
 }
 
 PyObject* py_paged_decode(PyObject* self, PyObject* args, PyObject* kwargs) {
+  METAL_CONTEXT_PY_TRY
   static const char* keywords[] = {
       "query", "key_pages", "value_pages", "page_table",
       "sequence_lengths", "num_kv_heads", "block_size", "scale", nullptr};
@@ -718,14 +828,23 @@ PyObject* py_paged_decode(PyObject* self, PyObject* args, PyObject* kwargs) {
   }
   const size_t output_bytes = static_cast<size_t>(output_elements) * sizeof(float);
 
-  @autoreleasepool {
-    // Serialize the first low-level bridge while ownership is still host
-    // backed.  The future page runtime will replace these copies with
-    // allocator-owned GPU buffers and keep the command queue asynchronous.
+  LegacyDispatchLease dispatch_lease(&g_runtime);
+  if (!dispatch_lease.acquire()) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "metal-context runtime is shutting down or lost its pipeline");
+    return nullptr;
+  }
+  id<MTLDevice> device = nil;
+  id<MTLCommandQueue> queue = nil;
+  id<MTLComputePipelineState> pipeline = nil;
+  {
     std::lock_guard<std::mutex> lock(g_runtime.mutex);
-    id<MTLDevice> device = g_runtime.device;
-    id<MTLCommandQueue> queue = g_runtime.queue;
-    id<MTLComputePipelineState> pipeline = g_runtime.pipeline;
+    device = g_runtime.device;
+    queue = g_runtime.queue;
+    pipeline = g_runtime.pipeline;
+  }
+  @autoreleasepool {
     if (device == nil || queue == nil || pipeline == nil) {
       PyErr_SetString(PyExc_RuntimeError, "metal-context runtime lost its pipeline");
       return nullptr;
@@ -785,8 +904,21 @@ PyObject* py_paged_decode(PyObject* self, PyObject* args, PyObject* kwargs) {
     const MTLSize group = MTLSizeMake(kThreadsPerThreadgroup, 1, 1);
     [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
     [encoder endEncoding];
-    [command_buffer commit];
-    [command_buffer waitUntilCompleted];
+    // Keep Python available to unrelated requests while this synchronous
+    // command waits.  The lease above pins the global Metal objects until the
+    // command has completed and the GIL is reacquired.
+    std::exception_ptr no_gil_failure;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+      [command_buffer commit];
+      [command_buffer waitUntilCompleted];
+    } catch (...) {
+      no_gil_failure = std::current_exception();
+    }
+    Py_END_ALLOW_THREADS
+    if (no_gil_failure) {
+      std::rethrow_exception(no_gil_failure);
+    }
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
       std::string error = ns_error_description(
@@ -799,24 +931,52 @@ PyObject* py_paged_decode(PyObject* self, PyObject* args, PyObject* kwargs) {
         static_cast<const char*>(output_buffer.contents),
         static_cast<Py_ssize_t>(output_bytes));
   }
+  METAL_CONTEXT_PY_CATCH
 }
 
 PyObject* py_shutdown(PyObject*, PyObject*) {
-  std::lock_guard<std::mutex> lock(g_runtime.mutex);
-  g_runtime.device = nil;
-  g_runtime.queue = nil;
-  g_runtime.pipeline = nil;
-  g_runtime.attempted = false;
-  g_runtime.available = false;
-  g_runtime.path.clear();
-  g_runtime.error.clear();
+  METAL_CONTEXT_PY_TRY
+  {
+    std::lock_guard<std::mutex> lock(g_runtime.mutex);
+    g_runtime.stopping = true;
+  }
+  // A dispatch lease is released after its command wait reacquires the GIL.
+  // Do not hold the GIL while waiting here or shutdown would deadlock with a
+  // concurrent py_paged_decode that is already inside Py_BEGIN_ALLOW_THREADS.
+  std::exception_ptr no_gil_failure;
+  Py_BEGIN_ALLOW_THREADS
+  try {
+    std::unique_lock<std::mutex> lock(g_runtime.mutex);
+    g_runtime.dispatch_cv.wait(
+        lock, [] { return g_runtime.active_dispatches == 0; });
+  } catch (...) {
+    no_gil_failure = std::current_exception();
+  }
+  Py_END_ALLOW_THREADS
+  if (no_gil_failure) {
+    std::rethrow_exception(no_gil_failure);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_runtime.mutex);
+    g_runtime.device = nil;
+    g_runtime.queue = nil;
+    g_runtime.pipeline = nil;
+    g_runtime.attempted = false;
+    g_runtime.available = false;
+    g_runtime.path.clear();
+    g_runtime.error.clear();
+    g_runtime.stopping = false;
+    g_runtime.dispatch_cv.notify_all();
+  }
+  metal_context::shutdown_kernel_if_unused();
   Py_RETURN_NONE;
+  METAL_CONTEXT_PY_CATCH
 }
 
 PyMethodDef kMethods[] = {
     {"capabilities", py_capabilities, METH_NOARGS,
      "Return the compiled Metal Context Engine capability record."},
-    {"paged_decode", reinterpret_cast<PyCFunction>(py_paged_decode),
+    {"paged_decode", _PyCFunction_CAST(py_paged_decode),
      METH_VARARGS | METH_KEYWORDS,
      "Run BF16 paged decode attention from contiguous host buffers."},
     {"shutdown", py_shutdown, METH_NOARGS,
@@ -830,10 +990,27 @@ PyModuleDef kModule = {
     "Optional native Metal Context Engine kernel bridge.",
     -1,
     kMethods,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 }  // namespace
 
 PyMODINIT_FUNC PyInit__metal_context() {
-  return PyModule_Create(&kModule);
+  METAL_CONTEXT_PY_TRY
+  PyObject* module = PyModule_Create(&kModule);
+  if (module == nullptr) {
+    return nullptr;
+  }
+  if (metal_context::add_page_runtime_type(module) < 0) {
+    Py_DECREF(module);
+    return nullptr;
+  }
+  return module;
+  METAL_CONTEXT_PY_CATCH
 }
+
+#undef METAL_CONTEXT_PY_TRY
+#undef METAL_CONTEXT_PY_CATCH

@@ -486,6 +486,11 @@ class ContextBackend(Protocol):
     ) -> None:
         pass
 
+    def create_prefix(
+        self, request: RequestHandle, *, token_count: int | None = None
+    ) -> PrefixHandle:
+        pass
+
     def paged_decode_attention(
         self, request: RequestHandle, layer: int, query: Any
     ) -> Any:
@@ -497,7 +502,13 @@ class ContextBackend(Protocol):
     def fork_prefix(self, prefix: PrefixHandle) -> PrefixHandle:
         pass
 
+    def release_prefix(self, prefix: PrefixHandle) -> None:
+        pass
+
     def release(self, request: RequestHandle) -> None:
+        pass
+
+    def cancel(self, request: RequestHandle) -> None:
         pass
 
     def evict(self, *, target_pages: int | None = None) -> int:
@@ -690,9 +701,9 @@ def numpy_paged_decode_attention(
                 logits = (keys[:, kv_head] @ query_row[query_head]) * scale_value
             if not np.isfinite(logits).all():
                 raise ValueError("attention logits overflow for finite float32 inputs")
-            max_logit = np.max(logits)
+            max_logit: np.float32 = np.max(logits)
             weights = np.exp(logits - max_logit)
-            denominator = np.sum(weights, dtype=np.float64)
+            denominator: np.float64 = np.sum(weights, dtype=np.float64)
             if not np.isfinite(denominator) or denominator <= 0:
                 raise ValueError("attention softmax denominator is not finite")
             weights /= denominator
