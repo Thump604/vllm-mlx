@@ -72,8 +72,18 @@ def _extensions() -> list[Extension]:
                 )
             ],
             language="objc++",
-            extra_compile_args=["-std=c++17", "-fobjc-arc"],
-            extra_link_args=["-framework", "Metal", "-framework", "Foundation"],
+            extra_compile_args=[
+                "-std=c++17",
+                "-fobjc-arc",
+                "-mmacosx-version-min=11.0",
+            ],
+            extra_link_args=[
+                "-mmacosx-version-min=11.0",
+                "-framework",
+                "Metal",
+                "-framework",
+                "Foundation",
+            ],
         )
     ]
 
