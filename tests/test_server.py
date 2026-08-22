@@ -266,6 +266,81 @@ class TestCompletionRequest:
             )
 
 
+class TestCompletionMllmDraft:
+    """Test completion assistant-drafter overrides."""
+
+    @pytest.mark.anyio
+    async def test_nonstream_completion_forwards_mllm_draft_opt_out(self, monkeypatch):
+        from vllm_mlx.server import CompletionRequest, create_completion
+        import vllm_mlx.server as server
+
+        captured = {}
+
+        class DummyEngine:
+            async def generate(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    text="ok",
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_model_manager", None)
+        monkeypatch.setattr(server, "_residency_manager", None)
+        monkeypatch.setattr(server, "_default_model_key", None)
+        monkeypatch.setattr(server, "get_engine", lambda: DummyEngine())
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            mllm_draft=False,
+        )
+        response = await create_completion(request, raw_request=None)
+
+        assert response.choices[0].text == "ok"
+        assert captured["mllm_draft"] is False
+
+    @pytest.mark.anyio
+    async def test_stream_completion_forwards_mllm_draft_opt_out(self):
+        from vllm_mlx.api.models import CompletionRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import stream_completion
+
+        captured = {}
+
+        class DummyEngine:
+            async def stream_generate(self, **kwargs):
+                captured.update(kwargs)
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    completion_tokens=1,
+                    prompt_tokens=1,
+                )
+
+        request = CompletionRequest(
+            model="test-model",
+            prompt="hello",
+            mllm_draft=False,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_completion(
+                DummyEngine(),
+                "hello",
+                request,
+                max_tokens=8,
+            )
+        ]
+
+        assert chunks
+        assert captured["mllm_draft"] is False
+
+
 class TestSamplingDefaults:
     """Test server-wide sampling default resolution."""
 
@@ -799,6 +874,33 @@ class TestLoadModelTrustRemoteCode:
         ):
             server.load_model(
                 "gemma4",
+                force_mllm=True,
+                mllm_draft_model="assistant",
+                mllm_draft_kind="mtp",
+                default_mllm_draft=True,
+            )
+
+        assert mock_engine.call_args.kwargs["default_mllm_draft"] is True
+
+    def test_load_model_forwards_default_mllm_draft_to_batched_engine(
+        self, monkeypatch
+    ):
+        """Batched assistant drafters should honor the configured default."""
+        from vllm_mlx import server
+
+        monkeypatch.setattr(server, "_model_name", server._model_name)
+
+        fake_engine = MagicMock()
+
+        with (
+            patch.object(
+                server, "BatchedEngine", return_value=fake_engine
+            ) as mock_engine,
+            patch.object(server, "_detect_native_tool_support", return_value=False),
+        ):
+            server.load_model(
+                "gemma4",
+                use_batching=True,
                 force_mllm=True,
                 mllm_draft_model="assistant",
                 mllm_draft_kind="mtp",
@@ -3288,6 +3390,155 @@ class TestStreamChatCompletion:
         assert json.loads(delta["content"]) == {"ok": True}
         assert "reasoning_content" not in delta
         assert payloads[1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
+    async def test_response_format_stream_rejects_schema_invalid_completion(
+        self,
+    ):
+        """A stream must not complete successfully with schema-invalid JSON."""
+        from fastapi import HTTPException
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text='{"sc": [4, "p"]}',
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=8,
+                )
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return scores")],
+            stream=True,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "scores",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "sc": {
+                                "type": "array",
+                                "prefixItems": [
+                                    {"type": "integer", "minimum": 1, "maximum": 5},
+                                    {"type": "integer", "minimum": 1, "maximum": 5},
+                                ],
+                                "minItems": 2,
+                                "maxItems": 2,
+                            }
+                        },
+                        "required": ["sc"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        )
+
+        with pytest.raises(HTTPException) as excinfo:
+            _ = [
+                chunk
+                async for chunk in stream_chat_completion(
+                    FakeEngine(), request.messages, request
+                )
+            ]
+
+        assert excinfo.value.status_code == 422
+        assert excinfo.value.detail["error"] == "invalid_response_format_output"
+
+    @pytest.mark.anyio
+    async def test_response_format_endpoint_buffers_before_stream_success(
+        self, monkeypatch
+    ):
+        """The HTTP boundary must validate before returning StreamingResponse."""
+        from fastapi import HTTPException
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            PreparedChatInvocation,
+            create_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text='{"sc": [4, "p"]}',
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=8,
+                )
+
+        fake_engine = FakeEngine()
+
+        async def fake_acquire(*_args, **_kwargs):
+            return fake_engine
+
+        async def fake_release(*_args, **_kwargs):
+            return None
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "scores",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sc": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        }
+                    },
+                    "required": ["sc"],
+                },
+            },
+        }
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return scores")],
+            stream=True,
+            response_format=response_format,
+        )
+        prepared = PreparedChatInvocation(
+            messages=[{"role": "user", "content": "return scores"}],
+            chat_kwargs={},
+            response_format=response_format,
+            json_logits_processor=object(),
+        )
+
+        monkeypatch.setattr(server, "_validate_model_name", lambda _model: None)
+        monkeypatch.setattr(server, "_acquire_default_engine_for_request", fake_acquire)
+        monkeypatch.setattr(server, "_release_engine_for_request", fake_release)
+        monkeypatch.setattr(
+            server, "_prepare_chat_completion_invocation", lambda *_args: prepared
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+
+        with pytest.raises(HTTPException) as excinfo:
+            await create_chat_completion(request, raw_request=None)
+
+        assert excinfo.value.status_code == 422
 
     @pytest.mark.anyio
     async def test_streaming_chat_no_stream_thread_error_after_residency_preload(

@@ -22,7 +22,7 @@ from typing import Any, Literal
 
 from .api.utils import is_mllm_model
 from .cli_arg_types import parse_positive_finite_float
-from .engine.base import BaseEngine
+from .engine.base import BaseEngine, suspend_cancellation
 from .engine.batched import BatchedEngine
 from .engine.simple import SimpleEngine
 from .scheduler import SchedulerConfig
@@ -127,6 +127,7 @@ class RegistryServeDefaults:
     scheduler_config: SchedulerConfig | None
     max_tokens: int
     download_config: DownloadConfig
+    auto_unload_idle_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ class RegistryManagerConfig:
 
     memory_budget_bytes: int
     policy: ContentionPolicy
+    idle_unload_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -581,6 +583,7 @@ def load_registry_config(
     }:
         raise ValueError(f"Unsupported contention strategy: {policy.strategy}")
 
+    idle_unload_seconds = manager_raw.get("idle_unload_seconds")
     manager = RegistryManagerConfig(
         memory_budget_bytes=_parse_memory_budget_bytes(
             memory_budget_gb
@@ -588,6 +591,11 @@ def load_registry_config(
             else manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
         ),
         policy=policy,
+        idle_unload_seconds=(
+            float(idle_unload_seconds)
+            if idle_unload_seconds is not None
+            else defaults.auto_unload_idle_seconds
+        ),
     )
 
     registry: dict[str, RegisteredModel] = {}
@@ -676,6 +684,10 @@ class ModelManager:
         return self._config.memory_budget_bytes
 
     @property
+    def idle_unload_seconds(self) -> float:
+        return self._config.idle_unload_seconds
+
+    @property
     def registered_model_names(self) -> list[str]:
         """Return sorted list of all registered model names."""
         return sorted(self._registry.keys())
@@ -719,6 +731,7 @@ class ModelManager:
                     "owned_by": "vllm-mlx",
                     "source": entry.source,
                     "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
+                    "last_used_at": loaded.last_used_at if loaded is not None else None,
                 }
             )
         return data
@@ -866,6 +879,55 @@ class ModelManager:
         if unload is not None:
             await self._run_unloads([unload])
 
+    async def unload_idle(self) -> list[str]:
+        """Unload every loaded model idle past ``idle_unload_seconds``.
+
+        No-op (returns an empty list) if idle-unload is disabled
+        (``idle_unload_seconds <= 0``). Unlike memory-budget eviction, this
+        proactively frees models even when no other model is being requested.
+        Returns the names of models that were unloaded.
+        """
+        idle_seconds = self._config.idle_unload_seconds
+        if idle_seconds <= 0:
+            return []
+
+        now = time.time()
+        async with self._condition:
+            stale = [
+                loaded
+                for loaded in self._idle_candidates_locked()
+                if now - loaded.last_used_at >= idle_seconds
+            ]
+            unloads = [
+                self._begin_unload_locked(loaded.config.entry.name) for loaded in stale
+            ]
+            self._condition.notify_all()
+
+        if unloads:
+            await self._run_unloads(unloads)
+
+        return [loaded.config.entry.name for loaded in unloads]
+
+    async def run_idle_reaper(self) -> None:
+        """Background loop that proactively unloads idle models.
+
+        Mirrors the single-model residency lifecycle loop: sleeps at half the
+        configured idle timeout (bounded to 5s) so short timeouts stay
+        responsive, and a failed pass is logged rather than killing the loop.
+        """
+        idle_seconds = self._config.idle_unload_seconds
+        if idle_seconds <= 0:
+            return
+
+        while True:
+            await asyncio.sleep(min(idle_seconds / 2, 5.0))
+            try:
+                await self.unload_idle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle unload pass failed")
+
     def _claim_loaded_locked(
         self,
         model_name: str,
@@ -947,13 +1009,22 @@ class ModelManager:
             await asyncio.wait_for(self._condition.wait(), timeout=timeout)
 
     async def _run_unloads(self, unloads: list[LoadedModel]) -> None:
-        for loaded in unloads:
-            try:
-                await loaded.engine.stop()
-            finally:
-                async with self._condition:
-                    self._unloading.pop(loaded.config.entry.name, None)
-                    self._condition.notify_all()
+        async def _stop_engines() -> None:
+            for loaded in unloads:
+                try:
+                    await loaded.engine.stop()
+                finally:
+                    async with self._condition:
+                        self._unloading.pop(loaded.config.entry.name, None)
+                        self._condition.notify_all()
+
+        unload_task = asyncio.create_task(_stop_engines())
+        try:
+            await asyncio.shield(unload_task)
+        except asyncio.CancelledError:
+            with suspend_cancellation():
+                await unload_task
+            raise
 
     def _reserve_load_locked(self, model_name: str, required_bytes: int) -> PendingLoad:
         future: asyncio.Future[LoadedModel] = asyncio.get_running_loop().create_future()
@@ -970,19 +1041,25 @@ class ModelManager:
         self._unloading[model_name] = loaded
         return loaded
 
+    def _idle_candidates_locked(
+        self, *, exclude: str | None = None
+    ) -> list[LoadedModel]:
+        """Loaded, non-busy models eligible for eviction, oldest-used first."""
+        return sorted(
+            (
+                loaded
+                for name, loaded in self._loaded.items()
+                if name != exclude and loaded.active_requests == 0
+            ),
+            key=lambda item: item.last_used_at,
+        )
+
     def _collect_idle_unloads_locked(
         self, requested_model: str, required_bytes: int
     ) -> list[LoadedModel]:
         selected: list[LoadedModel] = []
         projected_bytes = self._committed_bytes_locked()
-        candidates = sorted(
-            (
-                loaded
-                for name, loaded in self._loaded.items()
-                if name != requested_model and loaded.active_requests == 0
-            ),
-            key=lambda item: item.last_used_at,
-        )
+        candidates = self._idle_candidates_locked(exclude=requested_model)
 
         for loaded in candidates:
             if projected_bytes + required_bytes <= self._config.memory_budget_bytes:

@@ -205,9 +205,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_backbone_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
-    # MLLM assistant-drafter path: opt in to using a configured drafter.
-    # Text-only requests also use this flag to leave the default TextModel route
-    # and run through the MLLM path where the drafter can participate.
+    # MLLM assistant-drafter per-request override (None = server default).
+    # Text-only requests use true to leave the default TextModel route and run
+    # through the MLLM path where the drafter can participate.
     mllm_draft: bool | None = None
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
@@ -309,6 +309,8 @@ class CompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # SpecPrefill: per-request evenly spaced backbone percentage.
     specprefill_backbone_pct: float | None = None
+    # MLLM assistant-drafter per-request override (None = server default).
+    mllm_draft: bool | None = None
 
 
 class CompletionChoice(BaseModel):

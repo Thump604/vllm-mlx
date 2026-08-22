@@ -281,7 +281,7 @@ def test_simple_engine_reports_configured_mllm_drafter_status():
         "draft_kind": "mtp",
         "draft_block_size": 4,
         "default_enabled": True,
-        "continuous_batching_supported": False,
+        "continuous_batching_supported": True,
     }
 
 
@@ -305,6 +305,18 @@ def test_chat_request_passes_mllm_draft_opt_in():
     prepared = _prepare_chat_completion_invocation(Engine(), request, 16)
 
     assert prepared.chat_kwargs["mllm_draft"] is True
+
+
+def test_completion_request_preserves_mllm_draft_opt_out():
+    from vllm_mlx.api.models import CompletionRequest
+
+    request = CompletionRequest(
+        model="gemma4",
+        prompt="hello",
+        mllm_draft=False,
+    )
+
+    assert request.mllm_draft is False
 
 
 @pytest.mark.anyio
@@ -349,3 +361,56 @@ async def test_simple_engine_forwards_mllm_draft_opt_in_to_mllm_path():
     assert captured["kwargs"]["mllm_draft"] is True
     assert outputs[-1].mtp_drafts == 2
     assert outputs[-1].mtp_accepted == 1
+
+
+@pytest.mark.anyio
+async def test_simple_engine_forwards_mllm_draft_opt_out_to_media_path():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    captured = {}
+
+    class FakeMLLM:
+        def stream_chat(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            yield SimpleNamespace(
+                text="ok",
+                finish_reason="stop",
+                prompt_tokens=3,
+                mtp_drafts=0,
+                mtp_accepted=0,
+            )
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        default_mllm_draft=True,
+    )
+    engine._loaded = True
+    engine._text_model = object()
+    engine._model = FakeMLLM()
+
+    outputs = [
+        output
+        async for output in engine.stream_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=8,
+            temperature=0.0,
+            mllm_draft=False,
+        )
+    ]
+
+    assert captured["kwargs"]["mllm_draft"] is False
+    assert outputs[-1].text == "ok"

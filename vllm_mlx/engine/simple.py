@@ -40,8 +40,12 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    shield_task,
 )
-from .chat_template_safety import normalize_messages_for_chat_template
+from .chat_template_safety import (
+    build_system_prompt_cache_prefix,
+    normalize_messages_for_chat_template,
+)
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -252,6 +256,8 @@ class SimpleEngine(BaseEngine):
         # Per-request routing state (MLLM+MTP mode)
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_init_lock = asyncio.Lock()
+        self._text_model_initialization_attempted = False
 
         # SpecPrefill draft model (loaded at start if enabled)
         self._draft_model = None
@@ -550,9 +556,13 @@ class SimpleEngine(BaseEngine):
         return self._prefix_trie_cache
 
     def _fetch_prefix_trie_cache(
-        self, model: Any, tokens: list[int]
+        self,
+        model: Any,
+        tokens: list[int],
+        *,
+        minimum_tokens_saved: int = 0,
     ) -> tuple[Any | None, list[int] | None, int]:
-        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        """Fetch a trie entry only when it beats the existing cached prefix."""
         prefix_trie = self._ensure_prefix_trie_cache()
         if prefix_trie is None:
             return None, None, 0
@@ -560,6 +570,18 @@ class SimpleEngine(BaseEngine):
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
+                if minimum_tokens_saved > 0:
+                    candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
+                        prefix_trie,
+                        model,
+                        tokens,
+                    )
+                    if (
+                        candidate_tokens_saved is None
+                        or candidate_tokens_saved <= minimum_tokens_saved
+                    ):
+                        self._prefix_trie_cache_stats["skips"] += 1
+                        return None, None, 0
                 trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
@@ -574,6 +596,9 @@ class SimpleEngine(BaseEngine):
                 trie_rest = [tokens[-1]]
 
             tokens_saved = len(tokens) - len(trie_rest)
+            if tokens_saved <= minimum_tokens_saved:
+                self._prefix_trie_cache_stats["skips"] += 1
+                return None, None, 0
             self._prefix_trie_cache_stats["hits"] += 1
             self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
             return trie_cache, list(trie_rest), tokens_saved
@@ -581,6 +606,58 @@ class SimpleEngine(BaseEngine):
             self._prefix_trie_cache_stats["skips"] += 1
             logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
             return None, None, 0
+
+    @staticmethod
+    def _peek_prefix_trie_tokens_saved(
+        prefix_trie: Any,
+        model: Any,
+        tokens: list[int],
+    ) -> int | None:
+        """Return reusable tokens without copying the matched prompt cache.
+
+        mlx-lm 0.31.3+ exposes no public non-copying lookup. Its LRUPromptCache
+        keeps the search metadata on ``_trie``; feature-detect that stable shape
+        and safely prefer the existing system snapshot if it changes upstream.
+        """
+        trie = getattr(prefix_trie, "_trie", None)
+        search = getattr(trie, "search", None)
+        if not callable(search):
+            return None
+
+        result = search(model, tokens)
+
+        def _entry_is_trimmable(cache_key: list[int]) -> bool | None:
+            get_entry = getattr(trie, "get", None)
+            if not callable(get_entry):
+                return None
+
+            from mlx_lm.models.cache import can_trim_prompt_cache
+
+            entry = get_entry(result.model, cache_key)
+            prompt_cache = getattr(entry, "prompt_cache", None)
+            if prompt_cache is None:
+                return None
+            return can_trim_prompt_cache(prompt_cache)
+
+        exact = getattr(result, "exact", None)
+        if exact is not None:
+            exact_is_trimmable = _entry_is_trimmable(exact)
+            if exact_is_trimmable is None:
+                return None
+            return max(0, len(tokens) - 1) if exact_is_trimmable else 0
+
+        shorter = getattr(result, "shorter", None)
+        shorter_length = len(shorter) if shorter is not None else 0
+        longer = getattr(result, "longer", None)
+        common_prefix = getattr(result, "common_prefix", 0)
+        if longer is not None and common_prefix > shorter_length:
+            longer_is_trimmable = _entry_is_trimmable(longer)
+            if longer_is_trimmable is None:
+                return None
+            if longer_is_trimmable:
+                return min(len(tokens) - 1, common_prefix)
+
+        return shorter_length
 
     def _insert_prefix_trie_cache(
         self, model: Any, cache_key: list[int], prompt_cache: Any
@@ -762,92 +839,15 @@ class SimpleEngine(BaseEngine):
                     "stream_chat",
                 )
 
-            # Build parallel mlx_lm TextModel for text-only routing.
-            # Even when MTP is disabled, text-only requests should not be trapped
-            # on the slower mlx_vlm multimodal path.
-            if self._is_mllm and self._should_route_text_through_text_model():
-                try:
-
-                    def build_text_route():
-                        from ..text_model_from_vlm import build_text_model
-
-                        text_model = build_text_model(
-                            self._model.model, self._model_name
-                        )
-                        if text_model is None:
-                            return None, None
-                        return text_model, self._model.get_tokenizer()
-
-                    (
-                        self._text_model,
-                        self._text_tokenizer,
-                    ) = await self._run_blocking_serialized(build_text_route)
-
-                    if self._text_model is not None:
-                        # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load)
-                        if "qwen3" in self._model_name.lower():
-                            self._text_tokenizer.eos_token = "<|im_end|>"
-                            self._text_tokenizer.eos_token_id = (
-                                self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
-                            )
-
-                        # Probe the derived TextModel's prompt cache for snapshot-safety
-                        # (same gate stream_chat uses for the pure-LLM path).
-                        # _stream_generate_text only enters the system-KV cache branch
-                        # when this flag is True, so sliding-window text models won't
-                        # desynchronize on restore.
-                        #
-                        # Probe args must match the runtime constructor in
-                        # _stream_generate_text (max_kv_size=self._max_kv_size or None).
-                        # Under bounded-KV serving (max_kv_size > 0) make_prompt_cache
-                        # returns RotatingKVCache for models without a custom
-                        # make_cache; probing with default args would mis-classify that
-                        # path as snapshot-safe.
-                        try:
-                            from mlx_lm.models.cache import KVCache, make_prompt_cache
-
-                            probe_cache = make_prompt_cache(
-                                self._text_model, max_kv_size=self._max_kv_size or None
-                            )
-                            self._supports_system_kv_cache = bool(probe_cache) and all(
-                                isinstance(c, KVCache) for c in probe_cache
-                            )
-                            if not self._supports_system_kv_cache:
-                                cache_types = sorted(
-                                    {type(c).__name__ for c in probe_cache}
-                                )
-                                logger.info(
-                                    "System KV cache snapshot disabled for MLLM "
-                                    "text routing: TextModel returned non-KVCache "
-                                    "entries (%s); _stream_generate_text will use "
-                                    "the uncached path",
-                                    cache_types,
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                "MLLM TextModel KV cache support probe failed "
-                                "(%s); disabling snapshot path",
-                                e,
-                            )
-                            self._supports_system_kv_cache = False
-
-                        has_mtp = (
-                            hasattr(self._text_model, "mtp")
-                            and self._text_model.mtp is not None
-                        )
-                        logger.info(
-                            "MLLM text routing: text-only -> mlx_lm TextModel "
-                            "(MTP=%s), media -> mlx_vlm",
-                            has_mtp and self._mtp,
-                        )
-                    else:
-                        self._text_model = None
-                        self._text_tokenizer = None
-
-                except Exception as e:
-                    logger.error("MLLM text routing setup failed: %s", e)
-                    self._text_model = None
-                    self._text_tokenizer = None
+            # A configured MLLM speculative drafter routes those requests directly
+            # through mlx_vlm. Do not also allocate a parallel TextModel at startup;
+            # build it lazily only if a later request opts out of the drafter path.
+            if self._is_mllm and self._mllm_draft_model_path is None:
+                await self._run_blocking_serialized(self._initialize_text_model)
+            elif self._is_mllm:
+                logger.info(
+                    "Deferring MLLM TextModel construction until a non-draft request"
+                )
 
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
@@ -931,6 +931,7 @@ class SimpleEngine(BaseEngine):
         self._model = None
         self._text_model = None
         self._text_tokenizer = None
+        self._text_model_initialization_attempted = False
         self._draft_model = None
         self._loaded = False
         self._system_kv_cache.clear()
@@ -972,6 +973,7 @@ class SimpleEngine(BaseEngine):
                 executor.shutdown(wait=False, cancel_futures=True)
                 if pre_bind is not None:
                     restore_generation_streams(pre_bind)
+        mx.clear_cache()
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -979,6 +981,95 @@ class SimpleEngine(BaseEngine):
     ) -> bool:
         """Return whether text-only MLLM requests may use mlx_lm TextModel."""
         return not (mllm_draft_requested and self._mllm_draft_model_path is not None)
+
+    def _initialize_text_model(self) -> None:
+        """Build the optional text-only MLLM route from already-loaded weights."""
+        self._text_model_initialization_attempted = True
+        try:
+            from ..text_model_from_vlm import build_text_model
+
+            self._text_model = build_text_model(
+                self._model.model,
+                self._model_name,
+                enable_mtp=self._mtp,
+            )
+
+            if self._text_model is None:
+                self._text_tokenizer = None
+                return
+
+            self._text_tokenizer = self._model.get_tokenizer()
+            self._supports_system_kv_cache = self._probe_system_kv_cache_support(
+                self._text_model,
+                "mllm_text",
+            )
+
+            # Apply Qwen3.5 eos_token fix (matches MLXLanguageModel.load).
+            if "qwen3" in self._model_name.lower():
+                self._text_tokenizer.eos_token = "<|im_end|>"
+                self._text_tokenizer.eos_token_id = (
+                    self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
+                )
+
+            # Probe the derived TextModel's prompt cache for snapshot-safety.
+            # Probe args match _stream_generate_text's cache construction so a
+            # bounded-KV route cannot be misclassified as snapshot-safe.
+            try:
+                from mlx_lm.models.cache import KVCache, make_prompt_cache
+
+                probe_cache = make_prompt_cache(
+                    self._text_model, max_kv_size=self._max_kv_size or None
+                )
+                self._supports_system_kv_cache = bool(probe_cache) and all(
+                    isinstance(cache, KVCache) for cache in probe_cache
+                )
+                if not self._supports_system_kv_cache:
+                    cache_types = sorted(
+                        {type(cache).__name__ for cache in probe_cache}
+                    )
+                    logger.info(
+                        "System KV cache snapshot disabled for MLLM text routing: "
+                        "TextModel returned non-KVCache entries (%s); "
+                        "_stream_generate_text will use the uncached path",
+                        cache_types,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "MLLM TextModel KV cache support probe failed (%s); "
+                    "disabling snapshot path",
+                    e,
+                )
+                self._supports_system_kv_cache = False
+
+            has_mtp = (
+                hasattr(self._text_model, "mtp") and self._text_model.mtp is not None
+            )
+            logger.info(
+                "MLLM text routing: text-only -> mlx_lm TextModel (MTP=%s), "
+                "media -> mlx_vlm",
+                has_mtp and self._mtp,
+            )
+        except Exception as e:
+            logger.error("MLLM text routing setup failed: %s", e)
+            self._text_model = None
+            self._text_tokenizer = None
+
+    async def _ensure_text_model_for_request(
+        self, *, mllm_draft_requested: bool
+    ) -> None:
+        """Initialize the optional text route only when the request needs it."""
+        if (
+            not self._is_mllm
+            or mllm_draft_requested
+            or self._mllm_draft_model_path is None
+            or self._text_model is not None
+            or self._text_model_initialization_attempted
+        ):
+            return
+
+        async with self._text_model_init_lock:
+            if not self._text_model_initialization_attempted:
+                await self._run_blocking_serialized(self._initialize_text_model)
 
     async def _run_blocking_serialized(
         self,
@@ -1030,8 +1121,8 @@ class SimpleEngine(BaseEngine):
                     self._generation_abort_hooks[request_id] = on_cancel
                 task = asyncio.create_task(_run_on_generation_worker())
                 try:
-                    return await asyncio.shield(task)
-                except asyncio.CancelledError:
+                    return await shield_task(task)
+                except asyncio.CancelledError as cancelled_error:
                     if on_cancel is not None:
                         try:
                             on_cancel()
@@ -1044,7 +1135,7 @@ class SimpleEngine(BaseEngine):
                         await task
                     except BaseException:
                         pass
-                    raise
+                    raise cancelled_error
                 finally:
                     self._generation_abort_hooks.pop(request_id, None)
                     self._active_requests.pop(request_id, None)
@@ -1638,6 +1729,10 @@ class SimpleEngine(BaseEngine):
         mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
         has_media = has_media_content(messages)
 
+        await self._ensure_text_model_for_request(
+            mllm_draft_requested=mllm_draft_requested
+        )
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -1671,8 +1766,7 @@ class SimpleEngine(BaseEngine):
             local_kwargs = dict(kwargs)
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
-            if mllm_draft_requested:
-                local_kwargs["mllm_draft"] = True
+            local_kwargs["mllm_draft"] = mllm_draft_requested
             return local_kwargs
 
         # Build prompt using tokenizer
@@ -1817,6 +1911,7 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
+        safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
             # Per-request enable_thinking override; default: True unless coder model.
             enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1980,25 +2075,6 @@ class SimpleEngine(BaseEngine):
                 cache_blocking_controls,
             )
 
-        # Normalize messages to plain dicts. The public stream_chat signature
-        # types messages as list[dict], but internal callers (server.py,
-        # tests) sometimes pass Pydantic Message objects directly; those
-        # don't expose a dict-style .get() interface.
-        def _to_msg_dict(m: Any) -> dict[str, Any]:
-            if isinstance(m, dict):
-                return m
-            if hasattr(m, "model_dump"):
-                return m.model_dump()
-            if hasattr(m, "dict"):
-                return m.dict()
-            return {
-                "role": getattr(m, "role", None),
-                "content": getattr(m, "content", ""),
-            }
-
-        messages_for_cache = [_to_msg_dict(m) for m in messages]
-        has_system = any(m.get("role") == "system" for m in messages_for_cache)
-
         if (
             self._prefix_trie_cache_enabled
             and not cache_blocking_controls
@@ -2010,93 +2086,59 @@ class SimpleEngine(BaseEngine):
             full_token_count = len(full_tokens_list)
             prefix_trie_eligible = bool(full_tokens_list)
 
-        if (
-            has_system
-            and not cache_blocking_controls
-            and hasattr(tokenizer, "apply_chat_template")
-        ):
+        system_prefix_text = None
+        if not cache_blocking_controls and hasattr(tokenizer, "apply_chat_template"):
+            system_prefix_text = build_system_prompt_cache_prefix(
+                tokenizer,
+                messages,
+                template_kwargs=template_kwargs,
+                normalized_messages=safe_messages,
+            )
 
-            def _with_user(user_content: str) -> list[dict[str, Any]]:
-                msgs = [dict(m) for m in messages_for_cache]
-                if msgs and msgs[-1].get("role") == "user":
-                    msgs[-1] = {**msgs[-1], "content": user_content}
+        if system_prefix_text is not None:
+            system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[:16]
+
+            add_special = tokenizer.bos_token is None or not prompt.startswith(
+                tokenizer.bos_token
+            )
+            if full_tokens_list is None:
+                full_tokens_list = tokenizer.encode(
+                    prompt, add_special_tokens=add_special
+                )
+            system_tokens_list = tokenizer.encode(
+                system_prefix_text, add_special_tokens=add_special
+            )
+            full_token_count = len(full_tokens_list)
+            system_token_count = len(system_tokens_list)
+
+            if (
+                len(full_tokens_list) > system_token_count
+                and full_tokens_list[:system_token_count] == system_tokens_list
+            ):
+                system_tokens = system_tokens_list
+                suffix_tokens = full_tokens_list[system_token_count:]
+                kv_cache_eligible = True
+                # Read the snapshot reference once. If we promote to HIT,
+                # ``hit_snapshot`` is the exact list the dict lookup returned.
+                candidate = self._system_kv_cache.get(system_hash)
+                if candidate is not None and system_token_count == candidate[1]:
+                    cache_hit = True
+                    hit_snapshot = candidate[0]
+                    logger.info(
+                        "System KV cache HIT (stream_chat): reusing %d "
+                        "tokens, prefilling %d new (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
+                    )
                 else:
-                    msgs = [*msgs, {"role": "user", "content": user_content}]
-                return msgs
-
-            rendered_a: Any = None
-            rendered_b: Any = None
-            try:
-                rendered_a = tokenizer.apply_chat_template(
-                    _with_user("Alpha"), **template_kwargs
-                )
-                rendered_b = tokenizer.apply_chat_template(
-                    _with_user("Bravo"), **template_kwargs
-                )
-            except Exception:
-                pass
-
-            if isinstance(rendered_a, str) and isinstance(rendered_b, str):
-                boundary = 0
-                diverged = False
-                for i in range(min(len(rendered_a), len(rendered_b))):
-                    if rendered_a[i] != rendered_b[i]:
-                        diverged = True
-                        break
-                    boundary = i + 1
-
-                if diverged and boundary >= 16:
-                    system_prefix_text = rendered_a[:boundary]
-                    system_hash = hashlib.sha256(
-                        system_prefix_text.encode()
-                    ).hexdigest()[:16]
-
-                    add_special = tokenizer.bos_token is None or not prompt.startswith(
-                        tokenizer.bos_token
+                    logger.info(
+                        "System KV cache MISS (stream_chat): will "
+                        "prefill %d system + %d suffix tokens (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
                     )
-                    if full_tokens_list is None:
-                        full_tokens_list = tokenizer.encode(
-                            prompt, add_special_tokens=add_special
-                        )
-                    system_tokens_list = tokenizer.encode(
-                        system_prefix_text, add_special_tokens=add_special
-                    )
-                    full_token_count = len(full_tokens_list)
-                    system_token_count = len(system_tokens_list)
-
-                    if (
-                        len(full_tokens_list) > system_token_count
-                        and full_tokens_list[:system_token_count] == system_tokens_list
-                    ):
-                        system_tokens = system_tokens_list
-                        suffix_tokens = full_tokens_list[system_token_count:]
-                        kv_cache_eligible = True
-                        # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the dict
-                        # lookup just returned. A later concurrent MISS that
-                        # mutates ``self._system_kv_cache`` before our
-                        # serialized worker restores it cannot alias what we
-                        # captured here — dict.get is atomic under the GIL
-                        # and returns a reference to an immutable tuple.
-                        candidate = self._system_kv_cache.get(system_hash)
-                        if candidate is not None and system_token_count == candidate[1]:
-                            cache_hit = True
-                            hit_snapshot = candidate[0]
-                            logger.info(
-                                "System KV cache HIT (stream_chat): reusing %d "
-                                "tokens, prefilling %d new (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
-                        else:
-                            logger.info(
-                                "System KV cache MISS (stream_chat): will "
-                                "prefill %d system + %d suffix tokens (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
 
         if kv_cache_eligible or prefix_trie_eligible:
             # Cache-aware path: drive mlx-lm directly with a prompt cache.
@@ -2131,13 +2173,25 @@ class SimpleEngine(BaseEngine):
                 prefix_trie_rest_tokens: list[int] | None = None
                 local_hit_snapshot = hit_snapshot
 
+                # A system snapshot can coexist with a longer conversation-prefix
+                # entry. Preserve the empty-trie fast path, otherwise let them
+                # compete by tokens saved.
+                with self._prefix_trie_cache_lock:
+                    prefix_trie_has_entries = bool(self._prefix_trie_cache)
+
                 # The model, prompt caches, and MLX streams belong to the pinned
                 # generation worker. LRUPromptCache.fetch_nearest_cache deep-copies
                 # cache arrays, so looking up on the event-loop thread would cross
                 # the same ownership boundary that worker pinning protects.
-                if prefix_trie_eligible and not cache_hit:
+                if prefix_trie_eligible and (not cache_hit or prefix_trie_has_entries):
                     trie_cache, trie_rest, trie_tokens_saved = (
-                        self._fetch_prefix_trie_cache(model, cache_key)
+                        self._fetch_prefix_trie_cache(
+                            model,
+                            cache_key,
+                            minimum_tokens_saved=(
+                                system_token_count if cache_hit else 0
+                            ),
+                        )
                     )
                     if trie_cache is not None and trie_rest is not None:
                         prefix_trie_hit = True
@@ -3363,7 +3417,7 @@ class SimpleEngine(BaseEngine):
                 "draft_kind": self._mllm_draft_kind,
                 "draft_block_size": self._mllm_draft_block_size,
                 "default_enabled": self._default_mllm_draft,
-                "continuous_batching_supported": False,
+                "continuous_batching_supported": True,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)

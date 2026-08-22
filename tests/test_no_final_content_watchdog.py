@@ -118,6 +118,18 @@ def test_generation_metadata_includes_mllm_mtp_counters_without_thinking_process
     assert metadata.mtp_accepted == 4
 
 
+def test_generation_metadata_preserves_zero_mllm_mtp_acceptance():
+    from vllm_mlx import server
+
+    metadata = server._generation_metadata(
+        None, SimpleNamespace(mtp_drafts=6, mtp_accepted=0)
+    )
+
+    assert metadata is not None
+    assert metadata.mtp_drafts == 6
+    assert metadata.mtp_accepted == 0
+
+
 def test_build_thinking_processor_warns_when_watchdog_cannot_fire(monkeypatch, caplog):
     from vllm_mlx import server
 

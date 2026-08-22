@@ -114,13 +114,14 @@ def serve_command(args):
     if default_mllm_draft and not mllm_draft_model:
         print("Error: --default-mllm-draft requires --mllm-draft-model")
         sys.exit(1)
+    if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
+        print(
+            "Error: --mllm-draft-model with --continuous-batching "
+            "requires --mllm-draft-kind mtp"
+        )
+        sys.exit(1)
     if mllm_draft_block_size is not None and mllm_draft_block_size <= 0:
         print("Error: --mllm-draft-block-size must be a positive integer")
-        sys.exit(1)
-    if mllm_draft_model and args.continuous_batching:
-        print(
-            "Error: --mllm-draft-model is supported only without --continuous-batching"
-        )
         sys.exit(1)
     if mllm_draft_model and (args.auto_unload_idle_seconds > 0 or args.lazy_load_model):
         print("Error: --mllm-draft-model is not supported with lifecycle residency yet")
@@ -409,6 +410,7 @@ def serve_command(args):
             scheduler_config=scheduler_config,
             max_tokens=args.max_tokens,
             download_config=download_config,
+            auto_unload_idle_seconds=args.auto_unload_idle_seconds,
         )
         load_model_registry(
             models_config,
@@ -1413,7 +1415,7 @@ Examples:
         "--auto-unload-idle-seconds",
         type=float,
         default=0.0,
-        help="Unload the main model after this many idle seconds (0 = disabled)",
+        help="Unload idle models after this many seconds (0 = disabled)",
     )
     serve_parser.add_argument(
         "--lazy-load-model",

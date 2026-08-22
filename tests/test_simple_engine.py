@@ -1469,8 +1469,9 @@ class TestSimpleEngineConcurrency:
         mock_mllm.model = MagicMock()
         mock_mllm.get_tokenizer.return_value = tokenizer
 
-        def build_text_model(*_args, **_kwargs):
+        def build_text_model(*_args, **kwargs):
             captured["build_thread"] = threading.get_ident()
+            captured["enable_mtp"] = kwargs["enable_mtp"]
             return text_model
 
         with (
@@ -1494,8 +1495,11 @@ class TestSimpleEngineConcurrency:
                 assert engine._text_tokenizer is tokenizer
                 assert captured["build_thread"] == worker_thread
                 assert captured["build_thread"] != event_loop_thread
+                assert captured["enable_mtp"] is False
             finally:
                 await engine.stop()
+
+        assert engine._text_model_initialization_attempted is False
 
     @pytest.mark.anyio
     async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
@@ -1734,6 +1738,78 @@ class TestSimpleEngineConcurrency:
         assert loop_delay < 0.1
         assert worker_thread != owner_thread
         assert outputs[-1].text == "video described"
+
+    @pytest.mark.anyio
+    async def test_start_defers_text_model_when_mllm_draft_is_configured(
+        self, monkeypatch
+    ):
+        """Draft-backed MLLM startup must not build an unused TextModel."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            def __init__(self):
+                self.model = object()
+                self.loaded = False
+
+            def load(self):
+                self.loaded = True
+
+        model = FakeMllmModel()
+
+        monkeypatch.setattr(
+            "vllm_mlx.models.mllm.MLXMultimodalLM", lambda *args, **kwargs: model
+        )
+
+        def unexpected_text_model_build(*args, **kwargs):
+            raise AssertionError(
+                "draft-backed startup must defer TextModel construction"
+            )
+
+        monkeypatch.setattr(
+            "vllm_mlx.text_model_from_vlm.build_text_model",
+            unexpected_text_model_build,
+        )
+
+        engine = SimpleEngine(
+            "laguna-test",
+            force_mllm=True,
+            mllm_draft_model="/models/laguna-dflash",
+            mllm_draft_kind="dflash",
+            mllm_draft_block_size=8,
+        )
+        await engine.start()
+
+        assert model.loaded is True
+        assert engine._text_model is None
+
+    @pytest.mark.anyio
+    async def test_non_draft_request_lazily_initializes_mllm_text_model(self):
+        """An explicit draft opt-out retains the existing text-only route."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "laguna-test",
+            force_mllm=True,
+            mllm_draft_model="/models/laguna-dflash",
+        )
+        owner_thread = threading.get_ident()
+        initialized: list[int] = []
+
+        def initialize_text_model():
+            initialized.append(threading.get_ident())
+
+        engine._initialize_text_model = initialize_text_model  # type: ignore[method-assign]
+
+        await engine._ensure_text_model_for_request(mllm_draft_requested=True)
+        assert initialized == []
+
+        await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+        assert len(initialized) == 1
+        assert initialized[0] != owner_thread
+
+        engine._text_model_initialization_attempted = True
+        await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+        assert len(initialized) == 1
 
     @pytest.mark.anyio
     async def test_mllm_nonstream_text_only_routes_without_mtp(self):
@@ -3074,3 +3150,30 @@ class TestSimpleEngineClearRuntimeCaches:
 
         # Non-MLLM, empty LRU, zeroed counters → nothing to report.
         assert result is None
+
+
+class TestSimpleEngineStop:
+    """stop() must actually release MLX's Metal buffer cache, not just drop
+    Python references — otherwise idle-unload frees objects but not memory.
+    """
+
+    async def test_stop_calls_mx_clear_cache(self, monkeypatch):
+        from vllm_mlx.engine import simple as simple_mod
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        calls = {"count": 0}
+        monkeypatch.setattr(
+            simple_mod.mx,
+            "clear_cache",
+            lambda: calls.__setitem__("count", calls["count"] + 1),
+        )
+
+        engine = SimpleEngine("test-model")
+        engine._model = object()
+        engine._loaded = True
+
+        await engine.stop()
+
+        assert calls["count"] == 1
+        assert engine._model is None
+        assert engine._loaded is False
