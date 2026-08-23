@@ -119,6 +119,40 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25
 
 
+def test_serve_command_wires_prefill_step_size_into_batched_scheduler(monkeypatch):
+    from vllm_mlx import cli, server
+    from vllm_mlx.utils import download
+
+    loaded = {}
+    monkeypatch.setattr(
+        download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
+    )
+    monkeypatch.setattr(
+        server,
+        "load_model",
+        lambda *args, **kwargs: loaded.update({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    args = cli.create_parser().parse_args(
+        [
+            "serve",
+            "local-test-model",
+            "--continuous-batching",
+            "--prefill-step-size",
+            "512",
+            "--mllm-prefill-step-size",
+            "256",
+            "--offline",
+        ]
+    )
+    cli.serve_command(args)
+
+    scheduler_config = loaded["kwargs"]["scheduler_config"]
+    assert scheduler_config.prefill_step_size == 512
+    assert scheduler_config.mllm_prefill_step_size == 256
+
+
 def test_serve_parser_accepts_registered_step3p5_tool_parser():
     from vllm_mlx import cli
 
