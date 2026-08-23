@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ def _serve_args(**overrides):
         "cache_memory_mb": None,
         "cache_memory_percent": 0.2,
         "chunked_prefill_tokens": 0,
+        "completion_batch_size": 32,
         "continuous_batching": False,
         "default_min_p": None,
         "default_presence_penalty": None,
@@ -70,6 +72,76 @@ def _serve_args(**overrides):
     }
     args.update(overrides)
     return SimpleNamespace(**args)
+
+
+def test_continuous_batching_forwards_prefill_step_size_to_scheduler_config(
+    monkeypatch,
+):
+    """Serve passes the LLM and MLLM prefill controls to SchedulerConfig."""
+    import vllm_mlx
+
+    pytest.importorskip("transformers")
+    from vllm_mlx import cli
+
+    captured = {}
+
+    class SchedulerConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            captured["scheduler_config"] = self
+
+    server = ModuleType("vllm_mlx.server")
+    server._metrics = SimpleNamespace(configure=lambda **kwargs: None)
+    server.RateLimiter = lambda **kwargs: SimpleNamespace(**kwargs)
+    server.app = object()
+    server.load_model = lambda *args, **kwargs: captured.update(load_model=kwargs)
+    server.load_model_registry = lambda *args, **kwargs: None
+
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda *args, **kwargs: None
+
+    model_registry = ModuleType("vllm_mlx.model_registry")
+    model_registry.RegistryServeDefaults = lambda **kwargs: SimpleNamespace(**kwargs)
+
+    scheduler = ModuleType("vllm_mlx.scheduler")
+    scheduler.SchedulerConfig = SchedulerConfig
+
+    api = ModuleType("vllm_mlx.api")
+    api_utils = ModuleType("vllm_mlx.api.utils")
+    api_utils.is_mllm_model = lambda model: False
+
+    utils = ModuleType("vllm_mlx.utils")
+    download = ModuleType("vllm_mlx.utils.download")
+    download.DownloadConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    download.ensure_model_downloaded = lambda *args, **kwargs: None
+
+    for name, module in {
+        "uvicorn": uvicorn,
+        "vllm_mlx.server": server,
+        "vllm_mlx.model_registry": model_registry,
+        "vllm_mlx.scheduler": scheduler,
+        "vllm_mlx.api": api,
+        "vllm_mlx.api.utils": api_utils,
+        "vllm_mlx.utils": utils,
+        "vllm_mlx.utils.download": download,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    monkeypatch.setattr(vllm_mlx, "server", server, raising=False)
+    monkeypatch.setattr(vllm_mlx, "model_registry", model_registry, raising=False)
+    monkeypatch.setattr(vllm_mlx, "scheduler", scheduler, raising=False)
+    monkeypatch.setattr(vllm_mlx, "api", api, raising=False)
+    monkeypatch.setattr(vllm_mlx, "utils", utils, raising=False)
+    cli.serve_command(
+        _serve_args(
+            continuous_batching=True,
+            mllm_prefill_step_size=256,
+            prefill_step_size=512,
+        )
+    )
+
+    assert captured["scheduler_config"].prefill_step_size == 512
+    assert captured["scheduler_config"].mllm_prefill_step_size == 256
 
 
 def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
