@@ -7,7 +7,7 @@ Status: initial primary-source reconstruction and correctness slice, 2026-08-26.
 - Official model revision: `Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c`
 - Transformers: `huggingface/transformers@36bc98ef9dd009569366f5e253ec1876ecafd925`
 - mlx-lm: `ml-explore/mlx-lm@74e7cf9` (current upstream HEAD inspected)
-- mlx-vlm: `Blaizzy/mlx-vlm@2b31570b` (current upstream HEAD inspected)
+- mlx-vlm: `Blaizzy/mlx-vlm@4857a6b0` (includes merged Qwen4-Exp PR #2032)
 - llama.cpp: `ggml-org/llama.cpp@4d19b287691e8f47fc303be420f630c40ec45684`
 - Unsloth: `unslothai/unsloth@60d2a636ba0332e3faac78cdcc091f815ca72c6f`
 - Unsloth GGUF artifact:
@@ -131,9 +131,18 @@ selection can change this accounting.
 - **mlx-lm:** no `qwen4_exp` implementation or active source reference at the
   inspected HEAD. Its loader calls `mx.load` for every shard, constructs one
   weight dictionary, and evaluates all parameters unless `lazy=True`.
-- **mlx-vlm:** no `qwen4_exp` implementation at the inspected HEAD. Because the
-  released artifact includes vision and uses `ForConditionalGeneration`, this
-  is the natural primary integration boundary.
+- **mlx-vlm:** Qwen4-Exp support merged in PR #2032 while this investigation
+  was active. It implements config parsing, the Qwen3 vision encoder, gated
+  residuals, DeltaNet, QSA and its auxiliary cache, MoE, sharded PLE lookup,
+  text/multimodal generation, and checkpoint sanitization. Its documented
+  boundary excludes MTP and continuous batching for QSA. Static intake found
+  two conversion defects in the merged implementation: the official FP8
+  artifact's expanded per-expert tensors and per-tensor FP8 PLE scale were not
+  handled, and a model-owned PLE group-32 override was evaluated after the
+  converter's default group-64 divisibility rejection. Both are corrected and
+  covered offline on local isolated mlx-vlm branch
+  `604/qwen38-flash-next-upstream-intake` at `127d943e`; no upstream PR has
+  been opened.
 - **MLX:** `mx.load` is lazy, but there is no public external-row-backed
   embedding abstraction. Deferring evaluation is not proof that a gather can
   avoid materializing the complete source array.
