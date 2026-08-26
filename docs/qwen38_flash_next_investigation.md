@@ -317,6 +317,53 @@ implementation, and upstream documents that the QSA cache is not wired into
 continuous batching. Neither feature is claimed from the single-request
 results.
 
+An exclusive-process, unquantized-KV context sweep on the 128 GiB Mac now
+measures the all-resident Q4 envelope through 16,384 input tokens. Each level
+used chunked prefill (`prefill_step_size=2048`), the vendor instruct sampling
+tuple, and one generated token. The evaluated warm model occupied 96.56 GiB of
+MLX active memory before a request.
+
+| Input tokens | MLX peak | Increment over warm model | Prompt throughput |
+|---:|---:|---:|---:|
+| 128 | 97.07 GiB | 0.51 GiB | 177.4 tok/s |
+| 1,024 | 98.78 GiB | 2.22 GiB | 411.0 tok/s |
+| 4,096 | 103.30 GiB | 6.74 GiB | 435.7 tok/s |
+| 8,192 | 107.63 GiB | 11.07 GiB | 364.5 tok/s |
+| 16,384 | 116.36 GiB | 19.80 GiB | 299.7 tok/s |
+
+The sweep recorded zero throttled pages and no process-attributed swap. System
+memory pressure ended at 17 percent free. A 32K run was deliberately not
+attempted: the measured growth projects beyond physical memory and would test
+macOS compression/OOM behavior rather than establish a safe operating
+contract. Consequently, 16K is a measured very-tight single-request point,
+not a recommended service maximum, and the model's native 262K configuration
+is not a claim that this artifact reaches 262K on this machine. Raw evidence is
+`/Volumes/Lexar/qwen38-flash-next/mlx/Qwen3.8-Flash-Next-Q4-MLX/MEMORY_CONTEXT_SWEEP.jsonl`.
+
+### Day-one Unsloth/llama.cpp comparison (2026-08-26)
+
+The implementations are not at complete feature parity. Both implement the
+base Qwen4-Exp architecture, PLE n-gram addressing, QSA, vision, text
+generation, and quantized loading. This MLX path has direct single-request
+text, streaming, native-tool, thinking-separation, and vision evidence on the
+local Q4. The Unsloth llama.cpp PR additionally reports validated multi-stream
+QSA batching at batch sizes 1, 4, and 16, plus a single contiguous GGUF PLE
+table that can remain mmap-backed and be offloaded to RAM or disk. The current
+MLX QSA cache is not wired into continuous batching, and the experimental MLX
+mmap PLE backend is not qualified.
+
+Unsloth now publishes seven Dynamic 3.0 GGUF policies from 67.56 GiB
+(`UD-IQ1_S`) through 103.69 GiB (`UD-Q4_K_XL`). MLX currently has one measured
+96.54 GiB mixed-Q4 policy. Nominal Q4 is not a parity statement: the block
+formats and family-specific assignments differ, and comparative quality has
+not been measured. The llama.cpp PR reports reference comparisons for its
+architecture path, including WikiText-2 perplexity and QSA selection checks;
+those are not transferable quality evidence for the MLX Q4 artifact.
+
+MTP is not a parity gap today: it remains work in progress in the Unsloth
+llama.cpp PR and unsupported in the current mlx-vlm Qwen4-Exp implementation.
+It remains unqualified on both paths.
+
 The first vllm-mlx SimpleEngine attempt exposed a serving-specific correctness
 bug: `qwen4_exp_text` was not a registered extracted-text family, so
 `text_model_from_vlm` silently constructed the generic Qwen3.5 TextModel. The
