@@ -311,11 +311,10 @@ decoded it without residual content or duplication. The vision path correctly
 counted two cats in the 640×480 mlx-vlm fixture at a 448×448 resize. Peak MLX
 memory across these probes ranged from 103.87 GB to 104.74 GB.
 
-Long-context growth, sustained throughput, and model-quality comparison remain
-unqualified. MTP remains unsupported by the current upstream model
-implementation, and upstream documents that the QSA cache is not wired into
-continuous batching. Neither feature is claimed from the single-request
-results.
+Long-context growth beyond the measured envelope, sustained throughput, and
+model-quality comparison remain unqualified. The QSA cache is not wired into
+continuous batching, so that combination remains fail-closed rather than being
+claimed from single-request results.
 
 An exclusive-process, unquantized-KV context sweep on the 128 GiB Mac now
 measures the all-resident Q4 envelope through 16,384 input tokens. Each level
@@ -360,9 +359,30 @@ not been measured. The llama.cpp PR reports reference comparisons for its
 architecture path, including WikiText-2 perplexity and QSA selection checks;
 those are not transferable quality evidence for the MLX Q4 artifact.
 
-MTP is not a parity gap today: it remains work in progress in the Unsloth
-llama.cpp PR and unsupported in the current mlx-vlm Qwen4-Exp implementation.
-It remains unqualified on both paths.
+The local MLX intake now goes beyond the initial upstream boundary with a
+Qwen4-Exp-specific native MTP drafter. It consumes the target's 10,240-wide
+pre-mixer residual, preserves the four-stream residual between draft rounds,
+uses the checkpoint's QSA/MoE/hyper-connection layer, and owns serialized
+recurrent-state verification and rollback. This does not imply continuous-
+batching support; the drafter advertises that boundary as false and the batched
+engine rejects it before scheduling.
+
+The standalone Q4/group-64 MTP artifact is 1,468,479,046 weight bytes at
+`/Volumes/Lexar/qwen38-flash-next/mlx/Qwen3.8-Flash-Next-MTP-Q4-MLX`.
+Direct generation returned `READY` with 2/2 drafts accepted at a combined
+target-plus-drafter MLX peak of 105,336,489,248 bytes. vllm-mlx SimpleEngine
+then passed an instruct response, a native `get_weather(city=Chicago)` call,
+tool-result continuation, and streaming thinking/final separation. The tool
+turn exercised rejection and rollback (24 drafted / 15 accepted); continuation
+used the returned weather result (18 / 6); streaming thinking ended normally
+with final `READY` and 61/31/92 usage. No duplicate call, parser failure,
+protocol leakage, or lost tool result was observed.
+
+The implementation commits are mlx-vlm `374aa186` and vllm-mlx `d0d76e3`.
+The drafter manifest pins config SHA-256
+`53f8553e12f86b225dcb84ebc5d79f7e038cc15ff2dc84bb6126a6efc33dd104`
+and weight SHA-256
+`49ec25f890c9c13b75e07b5043bf2b3349e297cb309a8292f5a22e35ca5f0e54`.
 
 The first vllm-mlx SimpleEngine attempt exposed a serving-specific correctness
 bug: `qwen4_exp_text` was not a registered extracted-text family, so
@@ -393,6 +413,6 @@ were disabled and remain unqualified.
 6. If external PLE remains justified, measure cold/warm decode, prefill, page
    faults, bytes/token, and batch scaling for page-cache-only and bounded-LRU
    mmap backends.
-7. Add MTP only through a Qwen4-specific draft splitter and architecture; the
-   current upstream implementation explicitly excludes MTP, so no support is
-   claimed from the presence of MTP tensors in the official checkpoint.
+7. Extend Qwen4 MTP to continuous batching only after QSA auxiliary caches and
+   four-stream drafter state have batch-aware merge/extract/filter/rollback
+   evidence. The current serialized path must remain the default until then.
