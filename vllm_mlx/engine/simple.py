@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, asynccontextmanager
 from typing import Any
@@ -1206,10 +1206,10 @@ class SimpleEngine(BaseEngine):
 
     async def _track_request_stream(
         self,
-        source_gen: AsyncIterator[GenerationOutput],
+        source_gen: AsyncGenerator[GenerationOutput, None],
         *,
         max_tokens: int = 0,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Yield-through wrapper that records per-request live state and
         final ``prompt_tokens``/``completion_tokens`` counters.
 
@@ -1304,7 +1304,7 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-generate wrapper with request stats tracking."""
         tracked_stream = self._track_request_stream(
             self._stream_generate_impl(
@@ -1329,7 +1329,7 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream generation token by token.
 
@@ -1687,7 +1687,7 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-chat wrapper with request stats tracking."""
         tracked_stream = self._track_request_stream(
             self._stream_chat_impl(
@@ -1716,7 +1716,7 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream chat completion token by token.
 
@@ -2418,7 +2418,7 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
 
         Scores token importance with the draft model, sparse-prefills the target
@@ -2621,7 +2621,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         tools: list | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Text-only generation via mlx_lm TextModel.
 
         Used when text-only MLLM routing is active and the request has no media.
