@@ -266,8 +266,36 @@ all-resident MLX Q4 is the required baseline and may fit comfortably on this
 exact 128 GiB machine. Special handling is justified only if measured peak
 memory, context envelope, throughput, or quality shows a material advantage.
 B and C remain hypotheses until those measurements are available. The generic
-converter's current behavior of silently leaving the PLE n-gram tables in BF16
-is a separate conversion defect.
+converter's prior behavior of silently leaving the PLE n-gram tables in BF16
+was a separate conversion defect; local intake commit `127d943e` addresses it.
+
+## Offline conversion result
+
+The pinned official FP8 snapshot at revision
+`bcd9f01ddc9cff2316eb84281bebcd5b058bddce` was downloaded to Lexar and
+verified byte-for-byte: 144 files, 185,563,783,127 bytes, and 133 LFS SHA-256
+objects with no mismatches. All 152,089 indexed source tensors reconcile with
+the 131 safetensors shard headers.
+
+Using mlx-vlm intake commit `9c538470`, the verified source converted to an
+all-resident affine MLX artifact with Q4/group-64 as the global policy,
+Q4/group-32 for all 128 PLE shards, and Q8/group-64 for all 96 router gates.
+The converter reported 4.675 effective bits per weight. The output contains 20
+weight shards with 103,664,015,352 indexed bytes (approximately 96.5 GiB), and
+all 3,767 indexed output tensors reconcile with their shard headers.
+
+A strict lazy load binds all 3,767 parameter leaves to
+`mlx_vlm.models.qwen4_exp.qwen4_exp.Model`. This validates architecture
+construction, quantized-module reconstruction, and weight-key accounting only;
+it does not evaluate weights or run a forward pass. The artifact is published
+at `/Volumes/Lexar/qwen38-flash-next/mlx/Qwen3.8-Flash-Next-Q4-MLX`, with
+machine-readable evidence in `CONVERSION_VERIFICATION.json` and file hashes in
+`MANIFEST.sha256`. MTP extraction remains disabled because no Qwen4-specific
+draft splitter exists upstream.
+
+Inference qualification is still intentionally not run. Component parity,
+deterministic generation, memory high-water measurement, streaming, tool use,
+multimodal behavior, and throughput remain behind the explicit inference gate.
 
 ## Next falsifiable experiments
 
