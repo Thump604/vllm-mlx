@@ -317,6 +317,22 @@ implementation, and upstream documents that the QSA cache is not wired into
 continuous batching. Neither feature is claimed from the single-request
 results.
 
+The first vllm-mlx SimpleEngine attempt exposed a serving-specific correctness
+bug: `qwen4_exp_text` was not a registered extracted-text family, so
+`text_model_from_vlm` silently constructed the generic Qwen3.5 TextModel. The
+weights loaded mechanically, but the route emitted garbled text, reported zero
+prompt tokens, and stopped by length. Local routing now fails closed for the
+Qwen4-Exp family and keeps text requests on the correct loaded mlx-vlm model.
+
+With that fix, SimpleEngine single-request serving passes streaming instruct,
+streaming native tools, and thinking separation. Instruct returned `READY`
+with correct 17/3/20 usage. The tool request returned one `get_weather` call
+with `city=Chicago`, a `tool_calls` finish, and correct 287/27/314 usage. The
+thinking response separated reasoning content and returned final content
+`READY` with a normal stop. Warm-server generation measured 10.4 tok/s for the
+tool call and 15.3 tok/s for the thinking probe. Continuous batching and MTP
+were disabled and remain unqualified.
+
 ## Next falsifiable experiments
 
 1. Finish and hash-verify the pinned official FP8 snapshot on Lexar.
