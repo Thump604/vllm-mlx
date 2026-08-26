@@ -303,9 +303,19 @@ swap during prefill, but neither run reported throttled pages, an OOM, or a
 child-process swap, and memory recovered after exit. This is a tight but
 working 128 GiB envelope, not yet a comfortable concurrent-service envelope.
 
-Streaming, tool use, multimodal behavior, long-context growth, sustained
-throughput, and model-quality comparison remain unqualified. MTP remains
-unsupported by the current upstream model implementation.
+Single-request streaming, native tool generation, and a minimal multimodal
+probe also pass. Streaming emitted two incremental events and reconstructed
+`READY` with a normal stop. A native `get_weather` call produced one complete
+Qwen XML call with `city=Chicago`; the existing vllm-mlx `qwen3_xml` parser
+decoded it without residual content or duplication. The vision path correctly
+counted two cats in the 640×480 mlx-vlm fixture at a 448×448 resize. Peak MLX
+memory across these probes ranged from 103.87 GB to 104.74 GB.
+
+Long-context growth, sustained throughput, and model-quality comparison remain
+unqualified. MTP remains unsupported by the current upstream model
+implementation, and upstream documents that the QSA cache is not wired into
+continuous batching. Neither feature is claimed from the single-request
+results.
 
 ## Next falsifiable experiments
 
