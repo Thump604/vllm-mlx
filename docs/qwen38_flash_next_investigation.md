@@ -202,14 +202,30 @@ Transformers' vectorized shift/gather formulation. It changes no serving
 behavior and provides a parity primitive for an upstream model and a cold-table
 prototype.
 
-The isolated `mlx-vlm` branch `604/qwen38-flash-next` now contains the matching
-Qwen4-Exp config parser plus the first model-owned PLE storage interface.
-Resident MLX and read-only mmap row backends return identical synthetic rows.
+The original isolated `mlx-vlm` branch `604/qwen38-flash-next` is preserved as
+an early prototype. Upstream subsequently merged its own complete base Qwen4-Exp
+architecture in PR #2032. Active intake therefore moved to
+`604/qwen38-flash-next-upstream-intake`, based on upstream commit `4857a6b0`,
+instead of duplicating the merged model.
+
+Static checkpoint inspection found two conversion defects in that upstream
+implementation. First, the official FP8 artifact stores each routed expert as
+separate per-expert gate/up/down tensors with inverse scales, while the model
+expects packed expert tensors. Second, the generic quantizer checked the global
+group size before the model-specific predicate, so the 160-wide PLE rows were
+silently left unquantized when the requested global group size was 64. Local
+commit `127d943e` restores and packs the official FP8 layout and permits the
+model predicate to select Q4/group-32 for PLE while retaining Q4/group-64 for
+ordinary tensors. Four focused synthetic tests pass; this is conversion-path
+evidence, not full-model or generation qualification.
+
+Local commit `9c538470` adds the first model-owned read-only mmap PLE storage
+experiment. Resident MLX and mmap row lookups return identical synthetic rows.
 The mmap backend validates its versioned manifest and exact file size, confines
 the data file beside the manifest, supports a bounded row LRU, and reports
-lookups, hits, misses, bytes read, and elapsed lookup time. It is not registered
-as a complete model and cannot affect normal loading or serving. Six focused
-tests pass, including deserialization of the exact released config shape.
+lookups, hits, misses, bytes read, and elapsed lookup time. It is deliberately
+not integrated into model loading and cannot affect normal serving. Two focused
+storage tests pass.
 
 ## Cold n-gram feasibility
 
@@ -255,17 +271,17 @@ is a separate conversion defect.
 
 ## Next falsifiable experiments
 
-1. Compare the local n-gram IDs against Transformers for randomized sequences,
-   EOS boundaries, prefill, and one-token continuation.
-2. Ask mlx-vlm maintainers whether a Qwen4-Exp implementation is already in an
-   unpublished branch before duplicating it.
-3. Implement the smallest mlx-vlm PLE embedding and compare BF16 outputs against
-   Transformers using synthetic weights small enough for CI.
-4. Measure `mx.load(..., stream=mx.cpu)` evaluation and RSS for gather-only use;
-   prove whether MLX materializes the entire embedding.
-5. Build an mmap BF16 row reader using a synthetic 128-split table. Measure
-   cold/warm decode, prefill, page faults, bytes/token, and batch scaling.
-6. Only after parity, run tensor-family sensitivity tests for experts, PLE,
-   routers/QSA, recurrent components, embeddings/head, vision, and MTP.
-7. Convert a complete artifact only after projected peak disk and resident
-   memory fit the machine with a documented safety margin.
+1. Finish and hash-verify the pinned official FP8 snapshot on Lexar.
+2. Convert one complete all-resident MLX baseline with ordinary tensors at
+   Q4/group-64 and PLE at Q4/group-32; retain complete weight-load accounting.
+3. Perform config, header, and load-only validation without generation.
+4. After the inference server is released, compare component outputs and short
+   deterministic generation against Transformers at declared tolerances.
+5. Measure resident baseline peak memory before deciding whether external PLE
+   storage is necessary.
+6. If external PLE remains justified, measure cold/warm decode, prefill, page
+   faults, bytes/token, and batch scaling for page-cache-only and bounded-LRU
+   mmap backends.
+7. Add MTP only through a Qwen4-specific draft splitter and architecture; the
+   current upstream implementation explicitly excludes MTP, so no support is
+   claimed from the presence of MTP tensors in the official checkpoint.
