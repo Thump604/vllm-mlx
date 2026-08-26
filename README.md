@@ -46,7 +46,7 @@ claude
 ### APIs
 - **OpenAI-compatible**: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`
 - **Anthropic-compatible**: `/v1/messages` (streaming, tool use, system prompts)
-- **MCP Tool Calling**: 12 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma, and more)
+- **MCP Tool Calling**: 19 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma, and more)
 - **Structured output**: JSON Schema via `response_format` (lm-format-enforcer)
 
 ### Throughput & memory
@@ -64,7 +64,7 @@ claude
 - **STT**: Whisper family with RTF up to 197x on M4 Max
 
 ### Reasoning & advanced
-- **Reasoning extraction**: Qwen3, DeepSeek-R1 (`--reasoning-parser`)
+- **Reasoning extraction**: Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
 - **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
 - **Speculative decoding**: `--mtp` for Qwen3-Next
 - **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction

@@ -514,6 +514,23 @@ class TestSSDCacheTierCore:
         finally:
             tier.close()
 
+    def test_remove_deletes_the_index_and_entry_directory(self, tmp_path):
+        tokens = (1, 2, 3)
+        config = SSDCacheConfig(cache_dir=str(tmp_path / "remove_test"))
+        tier = SSDCacheTier(config)
+        entry_hash = tier._entry_hash(tokens)
+        entry_dir = os.path.join(tier._data_dir, entry_hash)
+        os.makedirs(entry_dir)
+        tier._index.insert_entry(tokens, entry_hash, memory_bytes=128, num_tokens=3)
+
+        try:
+            assert tier.remove(tokens) is True
+            assert tier._index.lookup_exact(tokens) is None
+            assert not os.path.exists(entry_dir)
+            assert tier.remove(tokens) is False
+        finally:
+            tier.close()
+
     def test_close_idempotent(self, tmp_path):
         config = SSDCacheConfig(cache_dir=str(tmp_path / "close_test"))
         tier = SSDCacheTier(config)

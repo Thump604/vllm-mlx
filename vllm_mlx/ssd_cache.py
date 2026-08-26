@@ -966,6 +966,30 @@ class SSDCacheTier:
             return results[0]  # Already sorted by num_tokens DESC
         return None
 
+    def remove(self, tokens: tuple[int, ...]) -> bool:
+        """Remove an entry from both the SSD index and its data directory."""
+        import shutil
+
+        meta = self._index.lookup_exact(tokens)
+        if meta is None:
+            return False
+
+        # Remove the index first so a data-file cleanup failure cannot expose
+        # the rejected entry to another promotion. Reconciliation removes any
+        # orphaned directory left behind.
+        self._index.delete_entry(tokens)
+        entry_dir = os.path.join(self._data_dir, meta["file_path"])
+        try:
+            if os.path.exists(entry_dir):
+                shutil.rmtree(entry_dir)
+        except OSError:
+            logger.warning(
+                "[ssd_cache] failed to remove entry directory %s",
+                meta["file_path"],
+                exc_info=True,
+            )
+        return True
+
     async def async_promote(
         self,
         tokens: tuple[int, ...],

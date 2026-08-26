@@ -93,19 +93,24 @@ class _ThreadRecordingModel:
         *,
         chunks: int = 3,
         chunk_gate: threading.Event | None = None,
+        thread_instances: set[threading.Thread] | None = None,
     ) -> None:
         self._threads = threads
         self._chunks = chunks
         self._chunk_gate = chunk_gate
+        self._thread_instances = thread_instances
         self.closed = threading.Event()
         self.tokenizer = types.SimpleNamespace(encode=lambda s: [0] * len(s.split()))
         self.model = object()
 
     def _record(self, key: str) -> None:
-        # Name plus ident: a fresh ThreadPoolExecutor restarts its numbering, so
-        # two different threads both answer to "simple-generate_0".
+        # Keep the readable name/ident diagnostics, but retain Thread objects
+        # when a test must distinguish workers: executors restart their thread
+        # numbering and the OS may recycle an ident after the old thread exits.
         current = threading.current_thread()
         self._threads.setdefault(key, []).append(f"{current.name}/{current.ident}")
+        if self._thread_instances is not None:
+            self._thread_instances.add(current)
 
     def load(self) -> None:
         self._record("load")
@@ -450,8 +455,14 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
     thread has to join the old one before it loads anything.
     """
     threads: dict[str, list[str]] = {}
+    thread_instances: set[threading.Thread] = set()
     gate = threading.Event()
-    slow = _ThreadRecordingModel(threads, chunks=64, chunk_gate=gate)
+    slow = _ThreadRecordingModel(
+        threads,
+        chunks=64,
+        chunk_gate=gate,
+        thread_instances=thread_instances,
+    )
     engine = _make_engine(engine_module, slow)
 
     async def scenario() -> None:
@@ -473,7 +484,7 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
         # Restart: a new worker, whose first job is to wait the old one out.
         engine._stopping = False
         engine._loaded = True
-        fresh = _ThreadRecordingModel(threads)
+        fresh = _ThreadRecordingModel(threads, thread_instances=thread_instances)
         engine._model = fresh
         worker = engine._generation_worker()
         assert worker is not detached, "stop() must not hand back the dead worker"
@@ -489,7 +500,7 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
     asyncio.run(scenario())
 
     names = sorted(set(threads["stream_generate"]))
-    assert len(names) == 2, f"restart must not reuse the old thread, saw {names}"
+    assert len(thread_instances) == 2, f"restart must use a fresh thread, saw {names}"
     assert not any(t.startswith("MainThread") for t in names)
 
 
