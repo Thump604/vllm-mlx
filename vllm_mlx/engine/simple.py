@@ -3427,6 +3427,7 @@ class SimpleEngine(BaseEngine):
             }
 
         if self._mllm_draft_model_path is not None:
+            loaded_drafter = getattr(self._model, "_draft_model", None)
             stats["mtp"] = {
                 "enabled": True,
                 "implementation": "mlx_vlm_assistant",
@@ -3434,7 +3435,9 @@ class SimpleEngine(BaseEngine):
                 "draft_kind": self._mllm_draft_kind,
                 "draft_block_size": self._mllm_draft_block_size,
                 "default_enabled": self._default_mllm_draft,
-                "continuous_batching_supported": True,
+                "continuous_batching_supported": bool(
+                    getattr(loaded_drafter, "supports_continuous_batching", True)
+                ),
             }
 
         # System KV cache stats (LRU over multiple system prefixes)

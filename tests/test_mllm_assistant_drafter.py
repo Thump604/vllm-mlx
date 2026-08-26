@@ -2,9 +2,52 @@
 """Tests for MLLM assistant-drafter speculative wiring."""
 
 import sys
+import json
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_registered_non_gemma_mtp_drafter_uses_mlx_vlm_loader(
+    monkeypatch, tmp_path
+):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp_mtp"}), encoding="utf-8"
+    )
+    expected = object()
+    captured = {}
+
+    def fake_load(path, *, kind, lazy):
+        captured.update(path=path, kind=kind, lazy=lazy)
+        return expected, "mtp"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(load_drafter=fake_load),
+    )
+
+    assert load_mtp_drafter(str(tmp_path)) is expected
+    assert captured == {"path": str(tmp_path), "kind": "mtp", "lazy": False}
+
+
+def test_simple_engine_reports_drafter_batch_capability():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "qwen4-exp",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+    )
+    engine._loaded = True
+    engine._model = SimpleNamespace(
+        _draft_model=SimpleNamespace(supports_continuous_batching=False)
+    )
+
+    assert engine.get_stats()["mtp"]["continuous_batching_supported"] is False
 
 
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):

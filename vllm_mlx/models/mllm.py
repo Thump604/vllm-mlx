@@ -458,6 +458,33 @@ def load_gemma4_assistant_drafter(model_path: str):
     return model
 
 
+def load_mtp_drafter(model_path: str):
+    """Load a registered mlx-vlm MTP drafter without assuming Gemma layout."""
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"MTP drafter config not found: {config_path}")
+    model_type = json.loads(config_path.read_text(encoding="utf-8")).get(
+        "model_type", ""
+    )
+    if model_type in {"gemma4_assistant", "gemma4_unified_assistant"}:
+        return load_gemma4_assistant_drafter(model_path)
+
+    try:
+        from mlx_vlm.speculative.drafters import load_drafter
+    except ImportError as exc:
+        raise ImportError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+    logger.info("Loading registered MTP drafter model_type=%s from %s", model_type, model_path)
+    model, resolved_kind = load_drafter(model_path, kind="mtp", lazy=False)
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
+        )
+    return model
+
+
 _DRAFT_KWARG_NAMES = ("draft_model", "draft_kind", "draft_block_size")
 
 
@@ -1403,7 +1430,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_mtp_drafter(self.draft_model_path)
 
         from mlx_vlm.utils import load
 
