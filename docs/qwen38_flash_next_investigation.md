@@ -293,9 +293,19 @@ machine-readable evidence in `CONVERSION_VERIFICATION.json` and file hashes in
 `MANIFEST.sha256`. MTP extraction remains disabled because no Qwen4-specific
 draft splitter exists upstream.
 
-Inference qualification is still intentionally not run. Component parity,
-deterministic generation, memory high-water measurement, streaming, tool use,
-multimodal behavior, and throughput remain behind the explicit inference gate.
+The initial Q4 text inference gate now passes in both required Qwen modes. An
+instruct probe using the vendor sampling policy returned exactly `READY` in two
+generated tokens. A thinking probe using the vendor thinking policy emitted a
+complete reasoning block, closed `</think>`, and returned `READY` in 35 tokens.
+Measured MLX peaks were 103.87 GB and 103.99 GB respectively; peak process
+footprints were 104.59 GB and 104.81 GB. macOS used transient compression and
+swap during prefill, but neither run reported throttled pages, an OOM, or a
+child-process swap, and memory recovered after exit. This is a tight but
+working 128 GiB envelope, not yet a comfortable concurrent-service envelope.
+
+Streaming, tool use, multimodal behavior, long-context growth, sustained
+throughput, and model-quality comparison remain unqualified. MTP remains
+unsupported by the current upstream model implementation.
 
 ## Next falsifiable experiments
 
