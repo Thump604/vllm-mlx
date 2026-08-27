@@ -342,14 +342,13 @@ is not a claim that this artifact reaches 262K on this machine. Raw evidence is
 ### Day-one Unsloth/llama.cpp comparison (2026-08-26)
 
 The implementations are not at complete feature parity. Both implement the
-base Qwen4-Exp architecture, PLE n-gram addressing, QSA, vision, text
-generation, and quantized loading. This MLX path has direct single-request
-text, streaming, native-tool, thinking-separation, and vision evidence on the
-local Q4. The Unsloth llama.cpp PR additionally reports validated multi-stream
-QSA batching at batch sizes 1, 4, and 16, plus a single contiguous GGUF PLE
-table that can remain mmap-backed and be offloaded to RAM or disk. The current
-MLX QSA cache is not wired into continuous batching, and the experimental MLX
-mmap PLE backend is not qualified.
+base language architecture, PLE n-gram addressing, QSA, text generation, and
+quantized loading. This MLX path has direct single-request text, streaming,
+native-tool, thinking-separation, vision, and native MTP evidence on the local
+Q4. The released Unsloth GGUF omits vision and MTP tensors. Its Qwen4-Exp
+llama.cpp fork requires one server slot and F16 KV for this architecture. The
+current MLX QSA/MTP state is likewise not wired into continuous batching and
+fails closed rather than silently disabling MTP.
 
 Unsloth now publishes seven Dynamic 3.0 GGUF policies from 67.56 GiB
 (`UD-IQ1_S`) through 103.69 GiB (`UD-Q4_K_XL`). MLX currently has one measured
@@ -358,6 +357,65 @@ formats and family-specific assignments differ, and comparative quality has
 not been measured. The llama.cpp PR reports reference comparisons for its
 architecture path, including WikiText-2 perplexity and QSA selection checks;
 those are not transferable quality evidence for the MLX Q4 artifact.
+
+### External-PLE Q4 qualification (2026-08-26)
+
+mlx-vlm commit `fbc1449e` replaces the resident 29.80 GiB PLE parameter with a
+read-only interleaved affine-Q4 row store. The store has 320,001,536 rows, a
+160-element dequantized width, and one 100-byte packed record per row. It is on
+the internal PCIe SSD at
+`/Users/David/ai-models/ple/Qwen3.8-Flash-Next-Q4-MLX/ple-q4.rows`; the compact
+ordinary-weight artifact is 67 GiB at
+`/Users/David/ai-models/mlx/Qwen3.8-Flash-Next-Q4-MLX-External-PLE`. Thirty-two
+sampled rows, including storage boundaries, matched the original resident Q4
+checkpoint exactly after dequantization.
+
+The warm model uses 71,677,702,240 MLX-active bytes. A short text generation
+read 1,336 unique PLE rows (133,600 logical bytes), and total PLE lookup plus
+dequantization time was 0.297 seconds. A 4,096-token repeated-token prefill ran
+at 442.5 tok/s because only 40 rows missed the bounded cache. A deterministic
+varied-token 4,096-token prefill produced 65,545 misses, read 6,554,500 logical
+bytes, spent 9.683 seconds in PLE lookup/dequantization, and ran end-to-end at
+217.8 tok/s. These are measured best- and pessimistic-locality bounds, not
+representative-corpus quality evidence.
+
+Reducing `prefill_step_size` from 2,048 to 512 materially improves the memory
+envelope. The following repeated-token sweep generated one token at each level
+using the vendor instruct sampling tuple:
+
+| Input tokens | MLX peak | Prompt throughput | Wall time |
+|---:|---:|---:|---:|
+| 4,096 | 74.08 GB | 418.0 tok/s | 12.4 s |
+| 16,384 | 78.05 GB | 342.7 tok/s | 50.4 s |
+| 32,768 | 83.28 GB | 266.5 tok/s | 125.6 s |
+| 65,536 | 93.63 GB | 179.4 tok/s | 368.2 s |
+| 131,072 | 114.47 GB | 89.31 tok/s | 1,470.8 s |
+
+The 128K run completed with no throttled pages and no observed swap-out growth;
+the lowest sampled system memory availability was 11 percent. It proves the
+128K context/memory envelope on this 128 GiB Mac. The repeated prompt is a
+best-case PLE-locality workload and does not establish representative 128K
+prefill speed or model quality.
+
+The same artifact plus the Q4 MTP sidecar peaked at 73,707,907,026 MLX bytes.
+Thinking and instruct generation completed at 16.95 and 18.83 tok/s,
+respectively. vllm-mlx SimpleEngine returned exact instruct content with 8/6
+MTP drafts accepted and streamed thinking into `reasoning_content` with no
+protocol leakage. BatchedEngine rejected startup with the explicit
+`does not support continuous batching` error, preserving the known boundary.
+
+For a text-only engine comparison, Unsloth `UD-Q4_K_XL` (111,323,630,080 GGUF
+bytes) was served from Lexar by the isolated Qwen4-Exp llama.cpp fork at
+`ef9fa1ba`. With one 4K slot, PLE forced to CPU/mmap, Metal for the remaining
+layers, F16 KV, warmup disabled, and fit disabled, it loaded in 47.9 seconds,
+used 107,350,880 KiB RSS, and left 14 percent system memory available. It
+generated the exact instruct response at 25.07 tok/s and the exact thinking
+response at 25.05 tok/s with separated reasoning and no protocol leakage.
+This is faster short decode than the current MLX+MTP path, but uses roughly
+43 GiB more process RSS, loads about 5.5 times more slowly from Lexar, provides
+no vision or MTP from this GGUF, and is restricted to one slot. Storage location
+is a comparison caveat: the compact MLX artifact is internal while the GGUF is
+on the slower directly attached Lexar volume.
 
 The local MLX intake now goes beyond the initial upstream boundary with a
 Qwen4-Exp-specific native MTP drafter. It consumes the target's 10,240-wide
