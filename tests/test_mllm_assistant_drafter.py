@@ -8,9 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_registered_non_gemma_mtp_drafter_uses_mlx_vlm_loader(
-    monkeypatch, tmp_path
-):
+def test_registered_non_gemma_mtp_drafter_uses_mlx_vlm_loader(monkeypatch, tmp_path):
     from vllm_mlx.models.mllm import load_mtp_drafter
 
     (tmp_path / "config.json").write_text(

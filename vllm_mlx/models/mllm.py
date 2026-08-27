@@ -476,7 +476,9 @@ def load_mtp_drafter(model_path: str):
             "This MTP drafter requires an mlx-vlm build with the registered "
             f"{model_type!r} architecture."
         ) from exc
-    logger.info("Loading registered MTP drafter model_type=%s from %s", model_type, model_path)
+    logger.info(
+        "Loading registered MTP drafter model_type=%s from %s", model_type, model_path
+    )
     model, resolved_kind = load_drafter(model_path, kind="mtp", lazy=False)
     if resolved_kind != "mtp":
         raise ValueError(
