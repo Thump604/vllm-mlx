@@ -404,6 +404,26 @@ MTP drafts accepted and streamed thinking into `reasoning_content` with no
 protocol leakage. BatchedEngine rejected startup with the explicit
 `does not support continuous batching` error, preserving the known boundary.
 
+`mlx-vlm` PR #2045 now gathers distinct external-PLE rows in one storage
+operation and runs one batched MLX Q4 dequantization before restoring request
+order. A 65,536-row high-entropy microbenchmark on the internal SSD measured
+8.47 seconds from cold pages versus 9.0–9.8 seconds for the row-at-a-time path.
+With the pages resident, the batched path completed in 0.14 seconds. This is a
+lookup microbenchmark, not an end-to-end throughput claim.
+
+`mlx-vlm` PR #2046 makes a requested Qwen4-Exp MTP block size an adaptive
+ceiling. The controller starts at the checkpoint-native depth, expands only
+after eight rounds with at least 65% native-prefix acceptance, and backs down
+when acceptance falls. The serving candidate should request block size 4 so
+the measured 83.3% instruct profile can expand while the 52.9% thinking profile
+normally stays at the native depth.
+
+The existing vllm-mlx SSD tier stores evicted KV-prefix entries behind the
+memory-aware continuous-batching cache. It does not tier model weights or
+experts, and it is not available to this model's currently qualified serialized
+route. It can reduce repeat-request prefill after continuous-batching QSA/MTP
+support lands; it cannot reduce the current 71.68 GB resident model footprint.
+
 For a text-only engine comparison, Unsloth `UD-Q4_K_XL` (111,323,630,080 GGUF
 bytes) was served from Lexar by the isolated Qwen4-Exp llama.cpp fork at
 `ef9fa1ba`. With one 4K slot, PLE forced to CPU/mmap, Metal for the remaining
