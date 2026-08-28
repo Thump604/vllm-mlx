@@ -356,8 +356,8 @@ class TestMemoryAwarePrefixCache:
             commit_guard=lambda: False,
         )
 
-        assert small_cache.contains(base)
-        assert not small_cache.contains(candidate)
+        assert tuple(base) in small_cache._entries
+        assert tuple(candidate) not in small_cache._entries
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
         cache = MemoryAwarePrefixCache(

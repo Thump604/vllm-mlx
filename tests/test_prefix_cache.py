@@ -892,8 +892,8 @@ class TestMLLMHybridPrefillCheckpoint:
         request = self._request(np.array([[10, 11, 12, 13, 14]]))
         generator._run_chunked_text_prefill(request, cache)
 
-        assert prefix_cache.contains([10, 11])
-        assert prefix_cache.contains([10, 11, 12])
+        assert (10, 11) in prefix_cache._entries
+        assert (10, 11, 12) in prefix_cache._entries
 
         original_entry = prefix_cache._entries[(10, 11, 12)]
         second = self._request(np.array([[10, 11, 12, 13, 14]]))

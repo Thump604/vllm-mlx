@@ -1373,6 +1373,8 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._require_uniform_mllm_draft = True
         generator._allow_mid_batch_extend = False
         generator._pending_error_responses = []
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
         generator._process_prompts = MagicMock(side_effect=RuntimeError("failed"))
 
         responses = MLLMBatchGenerator._next(generator)
@@ -2330,7 +2332,7 @@ class TestChunkedPrefillCacheHandling:
         def language_model(tokens, cache):
             previous = 0 if cache[0][0] is None else int(cache[0][0].item())
             cache[0][0] = mx.array([[previous + tokens.shape[1]]])
-            start = cache[1].offset
+            start = int(cache[1].offset)
             values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
                 1, 1, -1, 1
             )
