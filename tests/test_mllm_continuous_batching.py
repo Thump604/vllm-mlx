@@ -455,9 +455,9 @@ class TestMLLMBatch:
 
         assert rope_deltas.tolist() == [[11]]
         assert request.prompt_position_ids.tolist() == [
-            [[0.0, 0.0, 0.0, 0.0]],
-            [[0.0, 0.0, 0.0, 0.0]],
-            [[0.0, 0.0, 0.0, 0.0]],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
         ]
         assert captured == {
             "input_ids": [[1, 2, 3, 4]],

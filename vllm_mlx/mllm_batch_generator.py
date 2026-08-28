@@ -1256,9 +1256,7 @@ class MLLMBatchGenerator:
             video_grid_thw,
             request.attention_mask,
         )
-        if position_ids.ndim == 2:
-            position_ids = position_ids[:, None, :]
-        elif position_ids.ndim != 3:
+        if position_ids.ndim not in (2, 3):
             raise RuntimeError(
                 f"position_ids must be rank 2 or 3, got rank {position_ids.ndim}"
             )
@@ -1290,7 +1288,10 @@ class MLLMBatchGenerator:
             and position_start is not None
             and position_end is not None
         ):
-            kwargs["position_ids"] = position_ids[:, :, position_start:position_end]
+            if position_ids.ndim == 2:
+                kwargs["position_ids"] = position_ids[:, position_start:position_end]
+            else:
+                kwargs["position_ids"] = position_ids[:, :, position_start:position_end]
         return kwargs
 
     @staticmethod
