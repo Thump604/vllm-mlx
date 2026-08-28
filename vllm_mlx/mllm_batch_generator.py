@@ -1415,8 +1415,11 @@ class MLLMBatchGenerator:
 
             if checkpoint_at is not None and processed == checkpoint_at:
                 # KVCache writes suffix tokens into preallocated arrays in
-                # place. Detach at the exact key boundary, but publish only
+                # place. Materialize the active state before detaching it so
+                # the cold continuation and the restored continuation start
+                # from the same realized recurrent/KV state. Publish only
                 # after the remaining prefill succeeds.
+                _eval_prompt_cache(cache)
                 checkpoint_snapshot = self._rewind_prefix_cache(cache, 0)
                 if checkpoint_snapshot is not None:
                     checkpoint_entry = self.prefix_cache.prepare_store(
