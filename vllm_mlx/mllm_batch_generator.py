@@ -1962,6 +1962,17 @@ class MLLMBatchGenerator:
                             )
                             if entry is not None:
                                 self._publish_prefill_checkpoint(req.request_id, entry)
+                                continuation = self._clone_prefix_for_replay(
+                                    entry.cache
+                                )
+                                if (
+                                    continuation is None
+                                    or not self._prepare_rotating_caches(continuation)
+                                ):
+                                    raise RuntimeError(
+                                        "Cannot continue from stored hybrid prompt state"
+                                    )
+                                request_cache[:] = continuation
 
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
@@ -3491,6 +3502,17 @@ def install_chunked_prefill_mllm(
                         batch_gen._publish_prefill_checkpoint(
                             req.request_id, checkpoint_entry
                         )
+                        continuation = batch_gen._clone_prefix_for_replay(
+                            checkpoint_entry.cache
+                        )
+                        if (
+                            continuation is None
+                            or not batch_gen._prepare_rotating_caches(continuation)
+                        ):
+                            raise RuntimeError(
+                                "Cannot continue from stored hybrid prompt state"
+                            )
+                        partial["cache"][:] = continuation
 
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
