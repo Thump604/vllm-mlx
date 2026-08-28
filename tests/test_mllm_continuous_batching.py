@@ -1092,6 +1092,90 @@ class TestMLLMBatchGeneratorMTPGuards:
         fallback_sampler.assert_not_called()
         assert sampler_calls == [{"temp": 0.3, "top_p": 0.8, "top_k": 0, "min_p": 0.0}]
 
+    def test_process_prompts_cold_and_prefix_hit_use_full_prompt_mrope(
+        self, monkeypatch
+    ):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            offset = 1
+
+            def is_trimmable(self):
+                return True
+
+            def merge(self, _caches):
+                return self
+
+        class PrefixCache:
+            warm = False
+
+            def fetch(self, _tokens):
+                return ([FakeCache()], [4]) if self.warm else (None, None)
+
+        class QwenLikeLanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def get_rope_index(self, input_ids, *_args):
+                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[13]])
+
+            def __call__(self, tokens, cache=None, rope_deltas=None):
+                del cache
+                self.calls.append((tokens.tolist(), rope_deltas.tolist()))
+                logits = mx.zeros((1, tokens.shape[1], 4))
+                logits[:, -1, 2] = 5.0
+                return logits
+
+        monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.language_model = QwenLikeLanguageModel()
+        generator.model = MagicMock()
+        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.prefix_cache = PrefixCache()
+        generator._preprocess_request = lambda _request: None
+        generator._prepare_rotating_caches = lambda _cache: True
+        generator._copy_prefix_cache = lambda cache: cache
+
+        def request(request_id):
+            req = MLLMBatchRequest(uid=1, request_id=request_id, prompt="prompt")
+            req.input_ids = mx.array([[1, 2, 3, 4]])
+            req.is_text_only = True
+            return req
+
+        cold = generator._process_prompts([request("cold")])
+        generator.prefix_cache.warm = True
+        warm = generator._process_prompts([request("warm")])
+
+        assert cold.y.tolist() == warm.y.tolist() == [2]
+        assert generator.language_model.calls == [
+            ([[1, 2, 3, 4]], [[13]]),
+            ([[4]], [[13]]),
+        ]
+
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatch,
@@ -1140,6 +1224,59 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert captured["input_tokens"] == [[7]]
         assert captured["output_tokens"] == [[5, 7]]
         assert request.output_tokens == [5, 7]
+
+    def test_next_reorders_request_local_mrope_after_filter(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        captured = []
+
+        def fake_step(*_args, rope_deltas=None, **_kwargs):
+            captured.append(rope_deltas.tolist())
+            size = rope_deltas.shape[0]
+            return mx.ones((size,), dtype=mx.int32), [mx.zeros((4,))] * size
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator.stop_tokens = set()
+        generator.unprocessed_requests = []
+        generator._pending_error_responses = []
+        generator._prefill_progress = {}
+        generator.prefix_cache = None
+        generator._maybe_store_prefix_cache = lambda *_args: None
+        generator._step = fake_step
+
+        requests = [
+            MLLMBatchRequest(
+                uid=i,
+                request_id=f"req-{i}",
+                prompt="prompt",
+                max_tokens=10,
+                rope_deltas=mx.array([[delta]]),
+            )
+            for i, delta in enumerate((4, 9))
+        ]
+        generator.active_batch = MLLMBatch(
+            uids=[0, 1],
+            request_ids=["req-0", "req-1"],
+            y=mx.array([1, 1]),
+            logprobs=[mx.zeros((4,)), mx.zeros((4,))],
+            max_tokens=[10, 10],
+            num_tokens=[0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        generator._next()
+        generator.active_batch.filter([1])
+        generator._next()
+
+        assert captured == [[[4], [9]], [[9]]]
 
     def test_install_mtp_mllm_disables_mtp_when_logits_processors_active(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -1248,6 +1385,48 @@ class TestMLLMBatchGeneratorMTPGuards:
         original_step.assert_called_once()
         language_model.assert_not_called()
         assert batch_gen.get_mtp_stats()["attempted"] == 0
+        assert (
+            batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
+        )
+
+    def test_external_media_mtp_bypass_preserves_target_mrope(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        rope_deltas = mx.array([[21]], dtype=mx.int32)
+        expected = (mx.array([2]), [mx.zeros((4,))])
+        original_step = MagicMock(return_value=expected)
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="prompt",
+            images=["image"],
+            mllm_draft=True,
+            rope_deltas=rope_deltas,
+        )
+        batch_gen = SimpleNamespace(
+            model=object(),
+            _step=original_step,
+            _next=lambda: [],
+            active_batch=SimpleNamespace(uids=[1], requests=[request]),
+            sampler=lambda scores: mx.argmax(scores, axis=-1),
+        )
+        language_model = MagicMock()
+        draft_model = MagicMock()
+        install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
+
+        result = batch_gen._step(
+            mx.array([[1]]),
+            [],
+            rope_deltas=rope_deltas,
+        )
+
+        assert result is expected
+        original_step.assert_called_once()
+        assert original_step.call_args.kwargs["rope_deltas"].tolist() == [[21]]
+        language_model.assert_not_called()
         assert (
             batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
         )
@@ -2496,17 +2675,25 @@ class TestChunkedPrefillCacheHandling:
             lambda *_args, **_kwargs: prompt_cache,
         )
 
-        def language_model(tokens, cache):
-            previous = 0 if cache[0][0] is None else int(cache[0][0].item())
-            cache[0][0] = mx.array([[previous + tokens.shape[1]]])
-            start = int(cache[1].offset)
-            values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
-                1, 1, -1, 1
-            )
-            cache[1].update_and_fetch(values, values + 100)
-            return mx.zeros((1, tokens.shape[1], 4))
+        class LanguageModel:
+            def __init__(self):
+                self.rope_calls = []
 
-        gen.language_model = language_model
+            def get_rope_index(self, input_ids, *_args):
+                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[17]])
+
+            def __call__(self, tokens, cache, rope_deltas=None):
+                self.rope_calls.append(rope_deltas.tolist())
+                previous = 0 if cache[0][0] is None else int(cache[0][0].item())
+                cache[0][0] = mx.array([[previous + tokens.shape[1]]])
+                start = int(cache[1].offset)
+                values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
+                    1, 1, -1, 1
+                )
+                cache[1].update_and_fetch(values, values + 100)
+                return mx.zeros((1, tokens.shape[1], 4))
+
+        gen.language_model = LanguageModel()
         gen._next = lambda: []
         install_chunked_prefill_mllm(gen, budget=4)
 
@@ -2520,6 +2707,8 @@ class TestChunkedPrefillCacheHandling:
         assert gen._next() == []
         assert gen._partial["checkpoint_entry"] is not None
         gen._next()
+
+        assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 
         stored, remaining = gen.prefix_cache.fetch([1, 2, 3, 4, 5, 6, 7, 8])
         assert remaining == []
