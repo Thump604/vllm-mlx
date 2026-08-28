@@ -2096,6 +2096,8 @@ class TestChunkedPrefillCacheHandling:
         gen._pending_error_responses = []
         gen._aborted_request_ids = set()
         gen._prefill_progress = {}
+        gen._prefix_checkpoint_lock = threading.Lock()
+        gen._request_prefix_checkpoints = {}
         gen.active_batch = None
         gen.stop_tokens = set()
         gen.unprocessed_requests = []
@@ -2300,6 +2302,103 @@ class TestChunkedPrefillCacheHandling:
         abort_responses = [r for r in responses if r.finish_reason == "abort"]
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
+
+    def test_interleaved_hybrid_publishes_boundary_checkpoint(self, monkeypatch):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen._think_suffix_len = 2
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen.stop_tokens = {0}
+
+        prompt_cache = [ArraysCache(size=1), KVCache()]
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda *_args, **_kwargs: prompt_cache,
+        )
+
+        def language_model(tokens, cache):
+            previous = 0 if cache[0][0] is None else int(cache[0][0].item())
+            cache[0][0] = mx.array([[previous + tokens.shape[1]]])
+            start = cache[1].offset
+            values = mx.arange(start + 1, start + 1 + tokens.shape[1]).reshape(
+                1, 1, -1, 1
+            )
+            cache[1].update_and_fetch(values, values + 100)
+            return mx.zeros((1, tokens.shape[1], 4))
+
+        gen.language_model = language_model
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+        req.is_text_only = True
+        gen.unprocessed_requests.append(req)
+        gen._preprocess_request = lambda _: None
+
+        assert gen._next() == []
+        assert gen._next() == []
+        assert gen._partial["checkpoint_entry"] is not None
+        gen._next()
+
+        stored, remaining = gen.prefix_cache.fetch([1, 2, 3, 4, 5, 6, 7, 8])
+        assert remaining == []
+        assert int(stored[0][0].item()) == 8
+        assert stored[1].offset == 8
+        assert stored[1].keys.shape[2] == 8
+        assert stored[1].keys.reshape(-1).tolist() == list(range(1, 9))
+
+    def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            PrefillAbortedError,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = lambda tokens, cache: mx.zeros((1, tokens.shape[1], 4))
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=6, request_id="abort-at-commit", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=3)],
+            "remaining_ids": mx.array([[4, 5]]),
+            "processed": 3,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": 3,
+            "checkpoint_key": [1, 2, 3],
+            "checkpoint_entry": SimpleNamespace(tokens=(1, 2, 3)),
+        }
+        gen._publish_prefill_checkpoint = MagicMock(
+            side_effect=PrefillAbortedError(req.request_id)
+        )
+
+        responses = gen._next()
+
+        assert gen._partial is None
+        assert len(responses) == 1
+        assert responses[0].request_id == req.request_id
+        assert responses[0].finish_reason == "abort"
 
     def test_short_prompt_falls_through_to_orig_next(self):
         """Short prompts (< budget) with no prefix cache must fall through

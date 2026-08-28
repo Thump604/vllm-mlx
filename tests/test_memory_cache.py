@@ -316,6 +316,49 @@ class TestMemoryAwarePrefixCache:
         assert result[0].values is kv[0].values
         assert remaining == []
 
+    def test_prepared_kv_entry_is_not_contaminated_by_live_suffix(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        KVCache = pytest.importorskip("mlx_lm.models.cache").KVCache
+
+        live = KVCache()
+        first_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        first_values = mx.array([[[[11.0], [12.0], [13.0]]]])
+        live.update_and_fetch(first_keys, first_values)
+
+        prepared = small_cache.prepare_store([1, 2, 3], [live])
+        assert prepared is not None
+
+        live.update_and_fetch(
+            mx.array([[[[4.0], [5.0]]]]),
+            mx.array([[[[14.0], [15.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0].offset == 3
+        assert stored[0].keys.shape[2] == 3
+        assert stored[0].keys.tolist() == first_keys.tolist()
+        assert stored[0].values.tolist() == first_values.tolist()
+
+    def test_commit_guard_rejects_before_prefix_eviction(
+        self, small_cache, mock_kv_cache
+    ):
+        base = [1, 2]
+        candidate = [1, 2, 3]
+        assert small_cache.store(base, mock_kv_cache(1000))
+
+        prepared = small_cache.prepare_store(candidate, mock_kv_cache(1000))
+        assert prepared is not None
+        assert not small_cache.commit_prepared(
+            prepared,
+            commit_lock=threading.Lock(),
+            commit_guard=lambda: False,
+        )
+
+        assert small_cache.contains(base)
+        assert not small_cache.contains(candidate)
+
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
         cache = MemoryAwarePrefixCache(
             model,
