@@ -454,6 +454,11 @@ class TestMLLMBatch:
         rope_deltas = generator._derive_request_rope_deltas(request)
 
         assert rope_deltas.tolist() == [[11]]
+        assert request.prompt_position_ids.tolist() == [
+            [[0.0, 0.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0, 0.0]],
+        ]
         assert captured == {
             "input_ids": [[1, 2, 3, 4]],
             "image_grid_thw": [[1, 2, 2]],
@@ -1121,11 +1126,21 @@ class TestMLLMBatchGeneratorMTPGuards:
                 self.calls = []
 
             def get_rope_index(self, input_ids, *_args):
-                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[13]])
+                positions = mx.broadcast_to(
+                    mx.arange(input_ids.shape[1])[None, None, :],
+                    (3, 1, input_ids.shape[1]),
+                )
+                return positions, mx.array([[13]])
 
-            def __call__(self, tokens, cache=None, rope_deltas=None):
+            def __call__(self, tokens, cache=None, rope_deltas=None, position_ids=None):
                 del cache
-                self.calls.append((tokens.tolist(), rope_deltas.tolist()))
+                self.calls.append(
+                    (
+                        tokens.tolist(),
+                        rope_deltas.tolist(),
+                        position_ids.tolist(),
+                    )
+                )
                 logits = mx.zeros((1, tokens.shape[1], 4))
                 logits[:, -1, 2] = 5.0
                 return logits
@@ -1172,8 +1187,12 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         assert cold.y.tolist() == warm.y.tolist() == [2]
         assert generator.language_model.calls == [
-            ([[1, 2, 3, 4]], [[13]]),
-            ([[4]], [[13]]),
+            (
+                [[1, 2, 3, 4]],
+                [[13]],
+                [[[0, 1, 2, 3]], [[0, 1, 2, 3]], [[0, 1, 2, 3]]],
+            ),
+            ([[4]], [[13]], [[[3]], [[3]], [[3]]]),
         ]
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
@@ -2682,7 +2701,7 @@ class TestChunkedPrefillCacheHandling:
             def get_rope_index(self, input_ids, *_args):
                 return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[17]])
 
-            def __call__(self, tokens, cache, rope_deltas=None):
+            def __call__(self, tokens, cache, rope_deltas=None, position_ids=None):
                 self.rope_calls.append(rope_deltas.tolist())
                 previous = 0 if cache[0][0] is None else int(cache[0][0].item())
                 cache[0][0] = mx.array([[previous + tokens.shape[1]]])

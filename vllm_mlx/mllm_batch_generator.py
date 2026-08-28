@@ -229,6 +229,7 @@ class MLLMBatchRequest:
     # keeps a process-global copy, but continuous batching cannot safely use
     # one request's value for another request or for a restored prefix.
     rope_deltas: Optional[mx.array] = None
+    prompt_position_ids: Optional[mx.array] = None
 
     # Vision state (populated after initial VLM forward pass)
     vision_encoded: bool = False
@@ -1248,7 +1249,7 @@ class MLLMBatchGenerator:
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
         video_grid_thw = request.extra_kwargs.get("video_grid_thw")
-        _position_ids, rope_deltas = get_rope_index(
+        position_ids, rope_deltas = get_rope_index(
             self.language_model,
             input_ids,
             request.image_grid_thw,
@@ -1266,14 +1267,25 @@ class MLLMBatchGenerator:
                 f"rope_deltas batch {rope_deltas.shape[0]} does not match "
                 f"request batch {input_ids.shape[0]}"
             )
+        request.prompt_position_ids = position_ids
         return rope_deltas
 
     @staticmethod
-    def _language_model_kwargs(request: MLLMBatchRequest) -> Dict[str, Any]:
+    def _language_model_kwargs(
+        request: MLLMBatchRequest,
+        position_start: Optional[int] = None,
+        position_end: Optional[int] = None,
+    ) -> Dict[str, Any]:
         rope_deltas = getattr(request, "rope_deltas", None)
-        if rope_deltas is None:
-            return {}
-        return {"rope_deltas": rope_deltas}
+        kwargs = {} if rope_deltas is None else {"rope_deltas": rope_deltas}
+        position_ids = getattr(request, "prompt_position_ids", None)
+        if (
+            position_ids is not None
+            and position_start is not None
+            and position_end is not None
+        ):
+            kwargs["position_ids"] = position_ids[:, :, position_start:position_end]
+        return kwargs
 
     @staticmethod
     def _batch_rope_deltas(
@@ -1387,7 +1399,9 @@ class MLLMBatchGenerator:
 
             chunk = input_ids[:, processed:end]
             output = self.language_model(
-                chunk, cache=cache, **self._language_model_kwargs(request)
+                chunk,
+                cache=cache,
+                **self._language_model_kwargs(request, processed, end),
             )
             processed = end
             chunk_count += 1
@@ -1741,7 +1755,9 @@ class MLLMBatchGenerator:
                             logits = self.language_model(
                                 remaining,
                                 cache=request_cache,
-                                **self._language_model_kwargs(req),
+                                **self._language_model_kwargs(
+                                    req, cached_count, total_tokens
+                                ),
                             )
                         else:
                             # Chunked prefill on remaining tokens
@@ -1765,7 +1781,11 @@ class MLLMBatchGenerator:
                                 self.language_model(
                                     chunk,
                                     cache=request_cache,
-                                    **self._language_model_kwargs(req),
+                                    **self._language_model_kwargs(
+                                        req,
+                                        cached_count + processed,
+                                        cached_count + processed + chunk.shape[1],
+                                    ),
                                 )
                                 # Eval ALL cache types (see _run_chunked_text_prefill)
                                 _eval_prompt_cache(request_cache)
@@ -1782,7 +1802,11 @@ class MLLMBatchGenerator:
                             logits = self.language_model(
                                 remaining,
                                 cache=request_cache,
-                                **self._language_model_kwargs(req),
+                                **self._language_model_kwargs(
+                                    req,
+                                    cached_count + processed,
+                                    total_tokens,
+                                ),
                             )
                             self._prefill_progress[req.request_id] = (
                                 total_tokens,
@@ -1825,7 +1849,9 @@ class MLLMBatchGenerator:
                         logits = self.language_model(
                             last_token,
                             cache=request_cache,
-                            **self._language_model_kwargs(req),
+                            **self._language_model_kwargs(
+                                req, total_tokens - 1, total_tokens
+                            ),
                         )
                         if hasattr(logits, "logits"):
                             logits = logits.logits
@@ -1964,6 +1990,7 @@ class MLLMBatchGenerator:
             req.attention_mask = None
             req.image_grid_thw = None
             req.extra_kwargs.clear()
+            req.prompt_position_ids = None
 
         return MLLMBatch(
             uids=[req.uid for req in requests],
@@ -3272,7 +3299,9 @@ def install_chunked_prefill_mllm(
                 batch_gen.language_model(
                     remaining[:, :take],
                     cache=partial["cache"],
-                    **batch_gen._language_model_kwargs(req),
+                    **batch_gen._language_model_kwargs(
+                        req, current_position, current_position + take
+                    ),
                 )
                 _eval_prompt_cache(partial["cache"])
                 partial["remaining_ids"] = remaining[:, take:]
@@ -3355,7 +3384,9 @@ def install_chunked_prefill_mllm(
                 logits = batch_gen.language_model(
                     remaining,
                     cache=partial["cache"],
-                    **batch_gen._language_model_kwargs(req),
+                    **batch_gen._language_model_kwargs(
+                        req, current_position, current_position + remaining_count
+                    ),
                 )
                 if hasattr(logits, "logits"):
                     logits = logits.logits
@@ -3513,6 +3544,7 @@ def install_chunked_prefill_mllm(
                     f"for {req.request_id[:12]}: "
                     f"{partial['total']} tokens in {partial['chunk_count']} chunks"
                 )
+                req.prompt_position_ids = None
                 batch_gen._partial = None
                 mx.clear_cache()
                 return _generation_step()
@@ -3662,7 +3694,9 @@ def install_chunked_prefill_mllm(
                     batch_gen.language_model(
                         remaining[:, :take],
                         cache=request_cache,
-                        **batch_gen._language_model_kwargs(text_only_req),
+                        **batch_gen._language_model_kwargs(
+                            text_only_req, cached_count, cached_count + take
+                        ),
                     )
                     _eval_prompt_cache(request_cache)
                     batch_gen._partial["remaining_ids"] = remaining[:, take:]
