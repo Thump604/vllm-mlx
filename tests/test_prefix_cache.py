@@ -737,7 +737,7 @@ class TestMLLMHybridPrefillCheckpoint:
             extra_kwargs={},
         )
 
-    def test_nonrewindable_prompt_is_stored_at_prefill_boundary(self, monkeypatch):
+    def test_nonrewindable_prompt_defers_store_until_full_prompt(self, monkeypatch):
         import numpy as np
 
         import vllm_mlx.mllm_batch_generator as module
@@ -757,15 +757,6 @@ class TestMLLMHybridPrefillCheckpoint:
         generator._request_prefix_checkpoints = {}
         cache = [self._HybridCache()]
         calls = []
-        completion_order = []
-
-        original_commit = generator.prefix_cache.commit_prepared
-
-        def commit_prepared(*args, **kwargs):
-            completion_order.append("commit")
-            return original_commit(*args, **kwargs)
-
-        generator.prefix_cache.commit_prepared = commit_prepared
 
         def language_model(tokens, cache):
             calls.append(tokens.tolist())
@@ -774,21 +765,14 @@ class TestMLLMHybridPrefillCheckpoint:
 
         generator.language_model = language_model
         monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
-        monkeypatch.setattr(
-            module.mx, "eval", lambda *_args: completion_order.append("eval")
-        )
+        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
 
         request = self._request(np.array([[10, 11, 12, 13, 14]]))
         generator._run_chunked_text_prefill(request, cache)
 
-        assert calls == [[[10, 11, 12]], [[13, 14]]]
-        assert completion_order == ["eval", "commit"]
-        assert generator.prefix_cache.get_stats()["entry_count"] == 1
-        stored, remaining = generator.prefix_cache.fetch([10, 11, 12])
-        assert remaining == []
-        assert stored[0].position == 3
+        assert calls == [[[10, 11, 12, 13, 14]]]
+        assert generator.prefix_cache.get_stats()["entry_count"] == 0
         assert cache[0].position == 5
-        assert stored[0] is not cache[0]
 
     def test_rewindable_prompt_keeps_single_forward(self, monkeypatch):
         import numpy as np
@@ -822,7 +806,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefix_cache.prepare_store.assert_not_called()
         generator.prefix_cache.commit_prepared.assert_not_called()
 
-    def test_no_think_hybrid_replays_one_token_on_prefix_hit(self, monkeypatch):
+    def test_no_think_hybrid_defers_store_until_final_logits_exist(self, monkeypatch):
         import numpy as np
 
         import vllm_mlx.mllm_batch_generator as module
@@ -854,10 +838,10 @@ class TestMLLMHybridPrefillCheckpoint:
         generator._run_chunked_text_prefill(request, cache)
 
         stored, remaining = generator.prefix_cache.fetch([10, 11, 12, 13, 14])
-        assert remaining == [14]
-        assert stored[0].position == 4
+        assert stored is None
+        assert remaining == [10, 11, 12, 13, 14]
 
-    def test_checkpoint_preserves_existing_prefix_and_duplicate_entry(
+    def test_full_prompt_store_does_not_replace_existing_prefix_during_prefill(
         self, monkeypatch
     ):
         import numpy as np
@@ -893,15 +877,15 @@ class TestMLLMHybridPrefillCheckpoint:
         generator._run_chunked_text_prefill(request, cache)
 
         assert (10, 11) in prefix_cache._entries
-        assert (10, 11, 12) in prefix_cache._entries
+        assert (10, 11, 12) not in prefix_cache._entries
 
-        original_entry = prefix_cache._entries[(10, 11, 12)]
+        original_entry = prefix_cache._entries[(10, 11)]
         second = self._request(np.array([[10, 11, 12, 13, 14]]))
         second.request_id = "duplicate-checkpoint"
         generator._run_chunked_text_prefill(second, [self._HybridCache()])
         generator.abort_prefill(second.request_id)
 
-        assert prefix_cache._entries[(10, 11, 12)] is original_entry
+        assert prefix_cache._entries[(10, 11)] is original_entry
 
     def test_abort_after_checkpoint_does_not_publish_entry(self, monkeypatch):
         import numpy as np
@@ -934,13 +918,10 @@ class TestMLLMHybridPrefillCheckpoint:
         with pytest.raises(PrefillAbortedError):
             generator._run_chunked_text_prefill(request, cache)
 
-        generator.prefix_cache.prepare_store.assert_called_once()
+        generator.prefix_cache.prepare_store.assert_not_called()
         generator.prefix_cache.commit_prepared.assert_not_called()
 
     def test_abort_during_checkpoint_commit_rejects_publication(self, monkeypatch):
-        import numpy as np
-
-        import vllm_mlx.mllm_batch_generator as module
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         store_started = threading.Event()
@@ -966,22 +947,13 @@ class TestMLLMHybridPrefillCheckpoint:
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
-        cache = [self._HybridCache()]
-
-        def language_model(tokens, cache):
-            cache[0].position += tokens.shape[1]
-            return np.zeros((1, tokens.shape[1], 4), dtype=np.float32)
-
-        generator.language_model = language_model
-        monkeypatch.setattr(module, "_eval_prompt_cache", lambda _cache: None)
-        monkeypatch.setattr(module.mx, "eval", lambda *_args: None)
-        request = self._request(np.array([[10, 11, 12, 13, 14]]))
+        request_id = "hybrid-prefill"
 
         prefill_errors = []
 
         def run_prefill():
             try:
-                generator._run_chunked_text_prefill(request, cache)
+                generator._publish_prefill_checkpoint(request_id, prepared_entry)
             except Exception as exc:
                 prefill_errors.append(exc)
 
@@ -990,7 +962,7 @@ class TestMLLMHybridPrefillCheckpoint:
         assert store_started.wait(timeout=5)
         abort = threading.Thread(
             target=generator.abort_prefill,
-            args=(request.request_id,),
+            args=(request_id,),
         )
         abort.start()
         release_store.set()
@@ -1002,7 +974,7 @@ class TestMLLMHybridPrefillCheckpoint:
         assert len(prefill_errors) == 1
         assert type(prefill_errors[0]).__name__ == "PrefillAbortedError"
         assert prefix_cache.commit_prepared.call_count == 1
-        assert request.request_id not in generator._request_prefix_checkpoints
+        assert request_id not in generator._request_prefix_checkpoints
 
 
 if __name__ == "__main__":

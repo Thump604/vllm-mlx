@@ -1954,6 +1954,9 @@ class MLLMBatchGenerator:
                         if (
                             self.prefix_cache is not None
                             and self._needs_prefill_checkpoint(request_cache)
+                            and callable(
+                                getattr(self.prefix_cache, "prepare_store", None)
+                            )
                         ):
                             entry = self.prefix_cache.prepare_store(
                                 req.input_ids.reshape(-1).tolist(),
