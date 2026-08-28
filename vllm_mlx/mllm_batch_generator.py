@@ -1436,7 +1436,9 @@ class MLLMBatchGenerator:
                         continuation = self._clone_prefix_for_replay(
                             checkpoint_entry.cache
                         )
-                        if continuation is None:
+                        if continuation is None or not self._prepare_rotating_caches(
+                            continuation
+                        ):
                             checkpoint_entry = None
                         else:
                             cache[:] = continuation
@@ -3355,7 +3357,10 @@ def install_chunked_prefill_mllm(
                             continuation = batch_gen._clone_prefix_for_replay(
                                 checkpoint_entry.cache
                             )
-                            if continuation is None:
+                            if (
+                                continuation is None
+                                or not batch_gen._prepare_rotating_caches(continuation)
+                            ):
                                 partial["checkpoint_entry"] = None
                             else:
                                 partial["cache"][:] = continuation
@@ -3761,7 +3766,12 @@ def install_chunked_prefill_mllm(
                                 continuation = batch_gen._clone_prefix_for_replay(
                                     checkpoint_entry.cache
                                 )
-                                if continuation is None:
+                                if (
+                                    continuation is None
+                                    or not batch_gen._prepare_rotating_caches(
+                                        continuation
+                                    )
+                                ):
                                     batch_gen._partial["checkpoint_entry"] = None
                                 else:
                                     request_cache[:] = continuation
