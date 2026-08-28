@@ -1256,6 +1256,12 @@ class MLLMBatchGenerator:
             video_grid_thw,
             request.attention_mask,
         )
+        if position_ids.ndim == 2:
+            position_ids = position_ids[:, None, :]
+        elif position_ids.ndim != 3:
+            raise RuntimeError(
+                f"position_ids must be rank 2 or 3, got rank {position_ids.ndim}"
+            )
         if rope_deltas is None:
             return mx.zeros((input_ids.shape[0], 1), dtype=mx.int32)
         if rope_deltas.ndim == 0:

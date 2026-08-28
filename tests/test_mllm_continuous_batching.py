@@ -441,7 +441,7 @@ class TestMLLMBatch:
                 captured["image_grid_thw"] = image_grid_thw.tolist()
                 captured["video_grid_thw"] = video_grid_thw.tolist()
                 captured["attention_mask"] = attention_mask.tolist()
-                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[11]])
+                return mx.zeros((3, input_ids.shape[1])), mx.array([[11]])
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator.language_model = LanguageModel()
