@@ -1821,13 +1821,7 @@ def get_engine() -> BaseEngine:
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
-    """
-    Coerce tool call arguments to match the tool schema.
-
-    If a schema field expects "string" but the model produced an object/array,
-    JSON-stringify the value. This fixes a common LLM failure mode where models
-    output raw JSON objects instead of JSON strings for file content, etc.
-    """
+    """Losslessly recover tool argument types from the request schema."""
     if not tools:
         return arguments_json
 
@@ -1853,16 +1847,133 @@ def _coerce_tool_arguments(
     changed = False
 
     for key, value in arguments.items():
-        if key in properties:
-            expected_type = properties[key].get("type")
-            if expected_type == "string" and isinstance(value, (dict, list)):
-                arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
-                changed = True
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        normalized = _coerce_tool_argument_value(value, property_schema.get("type"))
+        if normalized != value or type(normalized) is not type(value):
+            arguments[key] = normalized
+            changed = True
 
     if changed:
         return json.dumps(arguments, ensure_ascii=False)
 
     return arguments_json
+
+
+def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
+    if isinstance(declared_type, str):
+        expected_types = (declared_type,)
+    elif isinstance(declared_type, list):
+        expected_types = tuple(item for item in declared_type if isinstance(item, str))
+    else:
+        return value
+
+    if any(_tool_argument_matches_type(value, kind) for kind in expected_types):
+        return value
+
+    if "string" in expected_types and isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+
+    if not isinstance(value, str):
+        return value
+
+    for kind in expected_types:
+        normalized = _decode_tool_argument_string(value, kind)
+        if _tool_argument_matches_type(normalized, kind):
+            return normalized
+    return value
+
+
+def _decode_tool_argument_string(value: str, expected_type: str) -> object:
+    if expected_type not in {"array", "object", "integer", "number", "boolean", "null"}:
+        return value
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    return decoded
+
+
+def _tool_argument_matches_type(value: object, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "null":
+        return value is None
+    return False
+
+
+def _requires_buffered_tool_argument_coercion(tools: list[dict] | None) -> bool:
+    """Return whether streamed arguments must be complete before coercion."""
+    recoverable_types = {"array", "object", "integer", "number", "boolean", "null"}
+    for tool in tools or []:
+        function = tool.get("function", {})
+        parameters = function.get("parameters", {})
+        for property_schema in parameters.get("properties", {}).values():
+            if not isinstance(property_schema, dict):
+                continue
+            declared_type = property_schema.get("type")
+            if isinstance(declared_type, str):
+                declared_types = {declared_type}
+            elif isinstance(declared_type, list):
+                declared_types = {
+                    item for item in declared_type if isinstance(item, str)
+                }
+            else:
+                continue
+            if declared_types & recoverable_types:
+                return True
+    return False
+
+
+def _merge_streaming_tool_call_fragments(
+    calls: dict[int, dict], fragments: list[dict]
+) -> None:
+    """Accumulate OpenAI tool-call deltas without interpreting partial JSON."""
+    for fragment in fragments:
+        index = int(fragment.get("index", 0))
+        call = calls.setdefault(
+            index,
+            {
+                "index": index,
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        if fragment.get("id") and not call["id"]:
+            call["id"] = fragment["id"]
+        if fragment.get("type"):
+            call["type"] = fragment["type"]
+        function = fragment.get("function") or {}
+        if function.get("name") and not call["function"]["name"]:
+            call["function"]["name"] = function["name"]
+        call["function"]["arguments"] += function.get("arguments") or ""
+
+
+def _finalize_streaming_tool_calls(
+    calls: dict[int, dict], tools: list[dict] | None
+) -> list[dict]:
+    """Normalize complete buffered arguments and return ordered tool calls."""
+    finalized = []
+    for index in sorted(calls):
+        call = calls[index]
+        function = call["function"]
+        function["arguments"] = _coerce_tool_arguments(
+            function["arguments"], function["name"], tools
+        )
+        finalized.append(call)
+    return finalized
 
 
 def _validate_model_name(request_model: str) -> None:
@@ -6145,6 +6256,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6217,6 +6329,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6464,6 +6577,8 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_parser = _get_streaming_tool_parser(request, engine)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    buffer_typed_tool_calls = _requires_buffered_tool_argument_coercion(tools_dict)
+    buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
     # finished=True output can be swallowed by a parser `continue` below (e.g.
     # a bare end-of-turn token arriving after a completed tool call); without
@@ -6559,6 +6674,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress content output
                             if reasoning:
@@ -6582,8 +6705,17 @@ async def stream_chat_completion(
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                _merge_streaming_tool_call_fragments(
+                                    buffered_tool_calls, emitted_tool_calls
+                                )
+                                if not output.finished:
+                                    continue
+                                emitted_tool_calls = _finalize_streaming_tool_calls(
+                                    buffered_tool_calls, tools_dict
+                                )
+                            elif tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
@@ -6596,7 +6728,7 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls,
                                             content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
@@ -6710,6 +6842,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress output
                             continue
@@ -6717,8 +6857,17 @@ async def stream_chat_completion(
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                _merge_streaming_tool_call_fragments(
+                                    buffered_tool_calls, emitted_tool_calls
+                                )
+                                if not output.finished:
+                                    continue
+                                emitted_tool_calls = _finalize_streaming_tool_calls(
+                                    buffered_tool_calls, tools_dict
+                                )
+                            elif tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
                                     if "arguments" in fn and "name" in fn:
@@ -6731,7 +6880,7 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls,
                                             content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(
