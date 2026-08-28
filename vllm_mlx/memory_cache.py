@@ -1416,6 +1416,19 @@ class MemoryAwarePrefixCache:
         )
         return True
 
+    def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
+        """Return independently owned backing for a mutating model replay."""
+        try:
+            with self._copy_lock:
+                return _detach_cache_for_storage(cache)
+        except Exception as exc:
+            logger.warning(
+                "[cache_fetch] replay clone rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
     def store(
         self,
         tokens: list[int],

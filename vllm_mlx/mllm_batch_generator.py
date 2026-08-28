@@ -1118,6 +1118,13 @@ class MLLMBatchGenerator:
             logger.warning("Prefix cache copy rejected: %s", exc)
             return None
 
+    def _clone_prefix_for_replay(self, cache_list):
+        """Clone cached backing so replay cannot mutate the stored entry."""
+        clone = getattr(self.prefix_cache, "clone_for_replay", None)
+        if callable(clone):
+            return clone(cache_list)
+        return self._copy_prefix_cache(cache_list)
+
     @classmethod
     def _cache_leaves(cls, cache_list) -> Iterator[Any]:
         """Yield cache leaves from a possibly nested CacheList topology."""
@@ -1426,7 +1433,9 @@ class MLLMBatchGenerator:
                         checkpoint_key, checkpoint_snapshot
                     )
                     if checkpoint_entry is not None:
-                        continuation = self._copy_prefix_cache(checkpoint_entry.cache)
+                        continuation = self._clone_prefix_for_replay(
+                            checkpoint_entry.cache
+                        )
                         if continuation is None:
                             checkpoint_entry = None
                         else:
@@ -1729,7 +1738,7 @@ class MLLMBatchGenerator:
 
                 prepared_cache = None
                 if cached_kv is not None and remaining_ids:
-                    prepared_cache = self._copy_prefix_cache(cached_kv)
+                    prepared_cache = self._clone_prefix_for_replay(cached_kv)
                     if prepared_cache is None or not self._prepare_rotating_caches(
                         prepared_cache
                     ):
@@ -1742,7 +1751,12 @@ class MLLMBatchGenerator:
                         remaining_ids = None
                         prepared_cache = None
                 elif cached_kv is not None and not remaining_ids:
-                    prepared_cache = self._rewind_prefix_cache(cached_kv, 1)
+                    isolated_cache = self._clone_prefix_for_replay(cached_kv)
+                    prepared_cache = (
+                        None
+                        if isolated_cache is None
+                        else self._rewind_prefix_cache(isolated_cache, 1)
+                    )
                     if prepared_cache is None:
                         logger.debug(
                             "Prefix cache exact hit for %s cannot be rewound "
@@ -3338,7 +3352,7 @@ def install_chunked_prefill_mllm(
                         )
                         checkpoint_entry = partial["checkpoint_entry"]
                         if checkpoint_entry is not None:
-                            continuation = batch_gen._copy_prefix_cache(
+                            continuation = batch_gen._clone_prefix_for_replay(
                                 checkpoint_entry.cache
                             )
                             if continuation is None:
@@ -3643,7 +3657,7 @@ def install_chunked_prefill_mllm(
 
                 prepared_cache = None
                 if cached_kv is not None and remaining_ids:
-                    prepared_cache = batch_gen._copy_prefix_cache(cached_kv)
+                    prepared_cache = batch_gen._clone_prefix_for_replay(cached_kv)
                     if (
                         prepared_cache is None
                         or not batch_gen._prepare_rotating_caches(prepared_cache)
@@ -3652,7 +3666,12 @@ def install_chunked_prefill_mllm(
                         remaining_ids = None
                         prepared_cache = None
                 elif cached_kv is not None and not remaining_ids:
-                    prepared_cache = batch_gen._rewind_prefix_cache(cached_kv, 1)
+                    isolated_cache = batch_gen._clone_prefix_for_replay(cached_kv)
+                    prepared_cache = (
+                        None
+                        if isolated_cache is None
+                        else batch_gen._rewind_prefix_cache(isolated_cache, 1)
+                    )
                     if prepared_cache is None:
                         cached_kv = None
 
@@ -3739,7 +3758,7 @@ def install_chunked_prefill_mllm(
                             )
                             checkpoint_entry = batch_gen._partial["checkpoint_entry"]
                             if checkpoint_entry is not None:
-                                continuation = batch_gen._copy_prefix_cache(
+                                continuation = batch_gen._clone_prefix_for_replay(
                                     checkpoint_entry.cache
                                 )
                                 if continuation is None:
