@@ -312,6 +312,10 @@ def serve_command(args):
             max_cache_blocks=args.max_cache_blocks,
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
+            # Keep the general prefill chunk setting authoritative for both
+            # text and multimodal schedulers.  The MLLM-specific option below
+            # remains an explicit override when supplied.
+            prefill_step_size=args.prefill_step_size,
             # MTP
             enable_mtp=args.enable_mtp,
             mtp_num_draft_tokens=args.mtp_num_draft_tokens,
