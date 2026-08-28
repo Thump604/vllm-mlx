@@ -1821,13 +1821,7 @@ def get_engine() -> BaseEngine:
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
-    """
-    Coerce tool call arguments to match the tool schema.
-
-    If a schema field expects "string" but the model produced an object/array,
-    JSON-stringify the value. This fixes a common LLM failure mode where models
-    output raw JSON objects instead of JSON strings for file content, etc.
-    """
+    """Losslessly recover tool argument types from the request schema."""
     if not tools:
         return arguments_json
 
@@ -1853,16 +1847,70 @@ def _coerce_tool_arguments(
     changed = False
 
     for key, value in arguments.items():
-        if key in properties:
-            expected_type = properties[key].get("type")
-            if expected_type == "string" and isinstance(value, (dict, list)):
-                arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
-                changed = True
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        normalized = _coerce_tool_argument_value(value, property_schema.get("type"))
+        if normalized != value or type(normalized) is not type(value):
+            arguments[key] = normalized
+            changed = True
 
     if changed:
         return json.dumps(arguments, ensure_ascii=False)
 
     return arguments_json
+
+
+def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
+    if isinstance(declared_type, str):
+        expected_types = (declared_type,)
+    elif isinstance(declared_type, list):
+        expected_types = tuple(item for item in declared_type if isinstance(item, str))
+    else:
+        return value
+
+    if any(_tool_argument_matches_type(value, kind) for kind in expected_types):
+        return value
+
+    if "string" in expected_types and isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+
+    if not isinstance(value, str):
+        return value
+
+    for kind in expected_types:
+        normalized = _decode_tool_argument_string(value, kind)
+        if _tool_argument_matches_type(normalized, kind):
+            return normalized
+    return value
+
+
+def _decode_tool_argument_string(value: str, expected_type: str) -> object:
+    if expected_type not in {"array", "object", "integer", "number", "boolean", "null"}:
+        return value
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+    return decoded
+
+
+def _tool_argument_matches_type(value: object, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "null":
+        return value is None
+    return False
 
 
 def _validate_model_name(request_model: str) -> None:
