@@ -1425,6 +1425,12 @@ class MLLMBatchGenerator:
                     checkpoint_entry = self.prefix_cache.prepare_store(
                         checkpoint_key, checkpoint_snapshot
                     )
+                    if checkpoint_entry is not None:
+                        continuation = self._copy_prefix_cache(checkpoint_entry.cache)
+                        if continuation is None:
+                            checkpoint_entry = None
+                        else:
+                            cache[:] = continuation
 
             if processed == total:
                 break
@@ -3330,6 +3336,15 @@ def install_chunked_prefill_mllm(
                                 partial["checkpoint_key"], checkpoint_snapshot
                             )
                         )
+                        checkpoint_entry = partial["checkpoint_entry"]
+                        if checkpoint_entry is not None:
+                            continuation = batch_gen._copy_prefix_cache(
+                                checkpoint_entry.cache
+                            )
+                            if continuation is None:
+                                partial["checkpoint_entry"] = None
+                            else:
+                                partial["cache"][:] = continuation
                 batch_gen._prefill_progress[req.request_id] = (
                     partial["cached_count"] + partial["processed"],
                     partial["total"],
@@ -3722,6 +3737,15 @@ def install_chunked_prefill_mllm(
                                     checkpoint_key, checkpoint_snapshot
                                 )
                             )
+                            checkpoint_entry = batch_gen._partial["checkpoint_entry"]
+                            if checkpoint_entry is not None:
+                                continuation = batch_gen._copy_prefix_cache(
+                                    checkpoint_entry.cache
+                                )
+                                if continuation is None:
+                                    batch_gen._partial["checkpoint_entry"] = None
+                                else:
+                                    request_cache[:] = continuation
                     batch_gen._prefill_progress[text_only_req.request_id] = (
                         cached_count + take,
                         total_tokens,
