@@ -1157,6 +1157,73 @@ class TestMLLMBatchGeneratorMTPGuards:
             batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
         )
 
+    def test_external_mtp_filters_drafter_when_batch_rows_retire(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm
+
+        draft_model = MagicMock()
+        active_batch = SimpleNamespace(
+            uids=[11, 22],
+            requests=[],
+        )
+
+        class FakeBatchGen:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = active_batch
+                self._step = MagicMock()
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+                def retire_first_row():
+                    self.active_batch.uids = [22]
+                    return [
+                        MLLMBatchResponse(
+                            uid=11,
+                            request_id="retired",
+                            token=1,
+                            logprobs=mx.zeros(2),
+                            finish_reason="stop",
+                        ),
+                        MLLMBatchResponse(
+                            uid=22,
+                            request_id="active",
+                            token=2,
+                            logprobs=mx.zeros(2),
+                        ),
+                    ]
+
+                self._next = retire_first_row
+
+        batch_gen = FakeBatchGen()
+        install_mtp_mllm(batch_gen, MagicMock(), draft_model=draft_model)
+
+        batch_gen._next()
+
+        draft_model.filter_batch.assert_called_once_with([1])
+
+    def test_external_mtp_resets_drafter_before_a_new_batch(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        draft_model = MagicMock()
+
+        class FakeBatchGen:
+            def __init__(self):
+                self.model = object()
+                self.active_batch = None
+                self._step = MagicMock()
+                self._next = MagicMock(return_value=[])
+                self.sampler = MagicMock()
+                self.stop_tokens = set()
+                self._maybe_store_prefix_cache = MagicMock()
+
+        batch_gen = FakeBatchGen()
+        install_mtp_mllm(batch_gen, MagicMock(), draft_model=draft_model)
+
+        batch_gen._next()
+
+        assert draft_model.reset.call_count == 2
+
     def test_positive_temperature_is_stochastic_without_sampling_filters(self):
         from vllm_mlx.mllm_batch_generator import _request_uses_stochastic_sampling
 

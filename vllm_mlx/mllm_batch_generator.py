@@ -2732,10 +2732,17 @@ def install_mtp_mllm(
 
     def _mtp_next() -> List[MLLMBatchResponse]:
         """Wrapper around _next that emits deferred MTP draft tokens."""
+        prior_active_uids = (
+            list(batch_gen.active_batch.uids)
+            if batch_gen.active_batch is not None
+            else []
+        )
         if batch_gen.active_batch is None:
             _skip_state_by_uid.clear()
             _deferred_drafts.clear()
             _attempted_drafts_by_uid.clear()
+            if external_drafter:
+                draft_model.reset(batch_gen.model)
 
         # `_inner_next` may extend a text-only request into an active batch
         # before the next `_mtp_step` call. That's fine: `_mtp_step` itself
@@ -2843,6 +2850,17 @@ def install_mtp_mllm(
             if batch_gen.active_batch is not None
             else set()
         )
+        if external_drafter and prior_active_uids:
+            keep = [
+                index
+                for index, uid in enumerate(prior_active_uids)
+                if uid in active_uids
+            ]
+            if len(keep) != len(prior_active_uids):
+                if keep:
+                    draft_model.filter_batch(keep)
+                else:
+                    draft_model.reset(batch_gen.model)
         for uid in list(_skip_state_by_uid):
             if uid not in active_uids:
                 _skip_state_by_uid.pop(uid, None)
