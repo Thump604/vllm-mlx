@@ -2724,17 +2724,19 @@ class TestChunkedPrefillCacheHandling:
 
         assert gen._next() == []
         assert gen._next() == []
-        assert gen._partial["checkpoint_entry"] is not None
+        assert gen._partial["checkpoint_entry"] is None
         gen._next()
 
         assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 
-        stored, remaining = gen.prefix_cache.fetch([1, 2, 3, 4, 5, 6, 7, 8])
+        full_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        stored, remaining = gen.prefix_cache.fetch(full_prompt)
         assert remaining == []
-        assert int(stored[0][0].item()) == 8
-        assert stored[1].offset == 8
-        assert stored[1].keys.shape[2] == 8
-        assert stored[1].keys.reshape(-1).tolist() == list(range(1, 9))
+        assert gen.prefix_cache.fetch_exact_auxiliary(full_prompt) is not None
+        assert int(stored[0][0].item()) == 10
+        assert stored[1].offset == 10
+        assert stored[1].keys.shape[2] == 10
+        assert stored[1].keys.reshape(-1).tolist() == list(range(1, 11))
 
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
         from types import SimpleNamespace

@@ -1316,15 +1316,11 @@ class MLLMBatchGenerator:
         """Return ``(token_count, key)`` for a non-rewindable prompt cache."""
         if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
             return None, None
-        total = input_ids.shape[1]
-        replay_tokens = self._think_suffix_len or 1
-        reusable_tokens = total - replay_tokens
-        cache_config = getattr(self.prefix_cache, "_config", None)
-        configured_minimum = getattr(cache_config, "min_prefix_tokens", 0)
-        min_prefix_tokens = configured_minimum if type(configured_minimum) is int else 0
-        if reusable_tokens < min_prefix_tokens or reusable_tokens <= 0:
-            return None, None
-        return reusable_tokens, input_ids[0, :reusable_tokens].tolist()
+        # Hybrid recurrent state cannot be replayed from a numerically exact
+        # mid-prompt split on every backend. Store the full prompt state and
+        # its final logits instead; exact hits can then start generation
+        # without replaying or rewinding recurrent state.
+        return None, None
 
     def _publish_prefill_checkpoint(
         self, request_id: str, checkpoint_entry: Any
@@ -1702,17 +1698,30 @@ class MLLMBatchGenerator:
                 # running them through the language model alone.
                 cached_kv = None
                 remaining_ids = None
+                cached_last_logits = None
                 if self.prefix_cache is not None and req.input_ids is not None:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
-                    # Strip think suffix from lookup key so stored entries
-                    # (also stripped) match as clean PREFIX.
-                    S = self._think_suffix_len
-                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
-                    # Append think suffix back to remaining so the model
-                    # sees the full generation prompt (<think>\n).
-                    if cached_kv is not None and S > 0:
-                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+                    fetch_auxiliary = getattr(
+                        self.prefix_cache, "fetch_exact_auxiliary", None
+                    )
+                    exact_aux = (
+                        fetch_auxiliary(input_ids_list)
+                        if callable(fetch_auxiliary)
+                        else None
+                    )
+                    if exact_aux is not None and "last_logits" in exact_aux:
+                        cached_kv, remaining_ids = self.prefix_cache.fetch(
+                            input_ids_list
+                        )
+                        cached_last_logits = exact_aux["last_logits"]
+                    else:
+                        # Ordinary rewindable caches retain historical prefix
+                        # matching by stripping the generated think suffix.
+                        S = self._think_suffix_len
+                        lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                        cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                        if cached_kv is not None and S > 0:
+                            remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
                     # If remaining tokens contain image placeholders, the
                     # language-model-only path cannot handle them — clear the
@@ -1739,7 +1748,15 @@ class MLLMBatchGenerator:
                     remaining_ids = None
 
                 prepared_cache = None
-                if cached_kv is not None and remaining_ids:
+                if cached_kv is not None and cached_last_logits is not None:
+                    prepared_cache = self._clone_prefix_for_replay(cached_kv)
+                    if prepared_cache is None or not self._prepare_rotating_caches(
+                        prepared_cache
+                    ):
+                        cached_kv = None
+                        cached_last_logits = None
+                        prepared_cache = None
+                elif cached_kv is not None and remaining_ids:
                     prepared_cache = self._clone_prefix_for_replay(cached_kv)
                     if prepared_cache is None or not self._prepare_rotating_caches(
                         prepared_cache
@@ -1767,7 +1784,19 @@ class MLLMBatchGenerator:
                         )
                         cached_kv = None
 
-                if cached_kv is not None and remaining_ids:
+                if cached_kv is not None and cached_last_logits is not None:
+                    request_cache = prepared_cache
+                    last_logits = cached_last_logits
+                    sampled, logprobs = _sample_first_token(req, last_logits)
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+                    per_request_caches.append(request_cache)
+                    req.vision_encoded = True
+                    self._prefill_progress[req.request_id] = (
+                        len(input_ids_list),
+                        len(input_ids_list),
+                    )
+                elif cached_kv is not None and remaining_ids:
                     # Prefix/LCP match — run language model on remaining tokens.
                     # The prepared cache is an isolated recursive copy.
                     request_cache = prepared_cache
@@ -1921,6 +1950,18 @@ class MLLMBatchGenerator:
 
                         # Extract last token logits
                         last_logits = logits[:, -1, :]
+
+                        if (
+                            self.prefix_cache is not None
+                            and self._needs_prefill_checkpoint(request_cache)
+                        ):
+                            entry = self.prefix_cache.prepare_store(
+                                req.input_ids.reshape(-1).tolist(),
+                                request_cache,
+                                auxiliary={"last_logits": last_logits},
+                            )
+                            if entry is not None:
+                                self._publish_prefill_checkpoint(req.request_id, entry)
 
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
@@ -3436,6 +3477,21 @@ def install_chunked_prefill_mllm(
                     logits = logits.logits
                 last_logits = logits[:, -1, :]
 
+                if (
+                    getattr(batch_gen, "prefix_cache", None) is not None
+                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
+                    and req.input_ids is not None
+                ):
+                    checkpoint_entry = batch_gen.prefix_cache.prepare_store(
+                        req.input_ids.reshape(-1).tolist(),
+                        partial["cache"],
+                        auxiliary={"last_logits": last_logits},
+                    )
+                    if checkpoint_entry is not None:
+                        batch_gen._publish_prefill_checkpoint(
+                            req.request_id, checkpoint_entry
+                        )
+
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
                     empty_tokens = mx.array([], dtype=mx.int32)
@@ -3647,6 +3703,18 @@ def install_chunked_prefill_mllm(
 
                 if batch_gen.prefix_cache is not None:
                     input_ids_list = input_ids.reshape(-1).tolist()
+                    fetch_auxiliary = getattr(
+                        batch_gen.prefix_cache, "fetch_exact_auxiliary", None
+                    )
+                    if callable(fetch_auxiliary) and fetch_auxiliary(input_ids_list):
+                        batch_gen.unprocessed_requests.remove(text_only_req)
+                        new_batch = batch_gen._process_prompts([text_only_req])
+                        if new_batch is not None:
+                            if batch_gen.active_batch is not None:
+                                batch_gen.active_batch.extend(new_batch)
+                            else:
+                                batch_gen.active_batch = new_batch
+                        return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                     cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)

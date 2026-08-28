@@ -304,15 +304,24 @@ class _CacheEntry:
     tokens: tuple[int, ...]
     cache: list[Any]
     memory_bytes: int
+    auxiliary: dict[str, Any] | None = None
 
     @classmethod
-    def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
+    def create(
+        cls,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry:
         """Create a cache entry with memory estimation."""
         memory = estimate_kv_cache_memory(cache)
+        if auxiliary:
+            memory += sum(getattr(value, "nbytes", 0) for value in auxiliary.values())
         return cls(
             tokens=tuple(tokens),
             cache=cache,
             memory_bytes=memory,
+            auxiliary=auxiliary,
         )
 
 
@@ -1291,7 +1300,12 @@ class MemoryAwarePrefixCache:
 
         return None, tokens
 
-    def prepare_store(self, tokens: list[int], cache: list[Any]) -> _CacheEntry | None:
+    def prepare_store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+    ) -> _CacheEntry | None:
         """Detach and account an entry without publishing it.
 
         Hybrid recurrent caches cannot be rewound after generation starts,
@@ -1337,7 +1351,22 @@ class MemoryAwarePrefixCache:
 
             with self._copy_lock:
                 cache = _detach_cache_for_storage(cache)
-            return _CacheEntry.create(tokens, cache)
+                detached_auxiliary = None
+                if auxiliary:
+                    import mlx.core as mx
+
+                    detached_auxiliary = {
+                        key: value + 0 if isinstance(value, mx.array) else value
+                        for key, value in auxiliary.items()
+                    }
+                    mx.eval(
+                        *(
+                            value
+                            for value in detached_auxiliary.values()
+                            if isinstance(value, mx.array)
+                        )
+                    )
+            return _CacheEntry.create(tokens, cache, detached_auxiliary)
         except UndetachableCacheError as e:
             self._stats.store_rejections += 1
             logger.warning("[cache_store] rejecting entry: %s", e)
@@ -1428,6 +1457,14 @@ class MemoryAwarePrefixCache:
                 exc,
             )
             return None
+
+    def fetch_exact_auxiliary(self, tokens: list[int]) -> dict[str, Any] | None:
+        """Return auxiliary data only when an exact resident entry owns it."""
+        with self._memory_lock:
+            entry = self._entries.get(tuple(tokens))
+            if entry is None or entry.auxiliary is None:
+                return None
+            return dict(entry.auxiliary)
 
     def store(
         self,
