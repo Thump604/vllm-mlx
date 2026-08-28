@@ -366,6 +366,101 @@ class TestMLLMBatch:
         assert batch.uids == [1, 3]
         assert batch.request_ids == ["req-1", "req-3"]
 
+    def test_batch_filter_preserves_request_local_mrope_rows(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        requests = [
+            MLLMBatchRequest(
+                uid=i,
+                request_id=f"req-{i}",
+                prompt="prompt",
+                rope_deltas=mx.array([[delta]], dtype=mx.int32),
+            )
+            for i, delta in enumerate((4, 9))
+        ]
+        batch = MLLMBatch(
+            uids=[0, 1],
+            request_ids=["req-0", "req-1"],
+            y=mx.array([100, 200]),
+            logprobs=[mx.array([0.1]), mx.array([0.2])],
+            max_tokens=[10, 10],
+            num_tokens=[0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        assert MLLMBatchGenerator._batch_rope_deltas(batch.requests).tolist() == [
+            [4],
+            [9],
+        ]
+        batch.filter([1])
+        assert MLLMBatchGenerator._batch_rope_deltas(batch.requests).tolist() == [[9]]
+
+    def test_step_forwards_explicit_request_local_mrope(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        captured = []
+
+        def language_model(tokens, cache=None, rope_deltas=None):
+            del cache
+            captured.append(rope_deltas.tolist())
+            return mx.zeros((tokens.shape[0], tokens.shape[1], 4))
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.language_model = language_model
+        generator.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        generator._step(
+            mx.array([[1], [2]]),
+            [],
+            rope_deltas=mx.array([[4], [9]], dtype=mx.int32),
+        )
+
+        assert captured == [[[4], [9]]]
+
+    def test_request_mrope_is_derived_from_full_processed_prompt(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        captured = {}
+
+        class LanguageModel:
+            def get_rope_index(
+                self,
+                input_ids,
+                image_grid_thw=None,
+                video_grid_thw=None,
+                attention_mask=None,
+            ):
+                captured["input_ids"] = input_ids.tolist()
+                captured["image_grid_thw"] = image_grid_thw.tolist()
+                captured["video_grid_thw"] = video_grid_thw.tolist()
+                captured["attention_mask"] = attention_mask.tolist()
+                return mx.zeros((3, 1, input_ids.shape[1])), mx.array([[11]])
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.language_model = LanguageModel()
+        request = MLLMBatchRequest(uid=1, request_id="media", prompt="prompt")
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.image_grid_thw = mx.array([[1, 2, 2]])
+        request.attention_mask = mx.ones((1, 4))
+        request.extra_kwargs = {"video_grid_thw": mx.array([[2, 2, 2]])}
+
+        rope_deltas = generator._derive_request_rope_deltas(request)
+
+        assert rope_deltas.tolist() == [[11]]
+        assert captured == {
+            "input_ids": [[1, 2, 3, 4]],
+            "image_grid_thw": [[1, 2, 2]],
+            "video_grid_thw": [[2, 2, 2]],
+            "attention_mask": [[1.0, 1.0, 1.0, 1.0]],
+        }
+
     def test_batch_extend_handles_empty_protocol_caches_without_keys(self):
         """Caches with empty()/extend() but no .keys still need batch extension."""
         from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
@@ -1477,6 +1572,78 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert model.mtp_calls == 1
         assert generator.get_mtp_stats()["attempted"] == 1
         assert generator.get_mtp_stats()["accepted"] == 1
+
+    def test_native_mtp_forwards_mrope_through_verify_and_hybrid_replay(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_mtp_mllm,
+        )
+
+        rope_deltas = mx.array([[7]], dtype=mx.int32)
+        request = MLLMBatchRequest(uid=7, request_id="mrope", prompt="prompt")
+
+        class Batch:
+            uids = [7]
+            requests = [request]
+
+            def __len__(self):
+                return 1
+
+        class Generator:
+            def __init__(self):
+                self.active_batch = Batch()
+                self._step = self._original_step
+                self._next = lambda: []
+                self.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+
+            @staticmethod
+            def _original_step(*_args, **_kwargs):
+                raise AssertionError("native MTP must not take the bypass path")
+
+        class HybridCache:
+            def __init__(self):
+                self.state = [mx.zeros((1, 1))]
+
+            def is_trimmable(self):
+                return False
+
+        class LanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del hidden_states, next_token_ids, mtp_cache
+                return mx.array([[[0.0, 5.0, -3.0]]])
+
+            def __call__(
+                self,
+                input_tokens,
+                cache=None,
+                return_hidden=False,
+                rope_deltas=None,
+            ):
+                del cache, return_hidden
+                self.calls.append((input_tokens.shape[1], rope_deltas.tolist()))
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((1, seq_len, 3), -3.0)
+                if seq_len == 1:
+                    logits[:, :, 1] = 5.0
+                else:
+                    logits[:, 0, 2] = 5.0
+                    logits[:, 1, 2] = 5.0
+                return logits, mx.zeros((1, seq_len, 2))
+
+        generator = Generator()
+        model = LanguageModel()
+        install_mtp_mllm(generator, model)
+        generator._step(
+            mx.array([[0]], dtype=mx.uint32),
+            cache=[HybridCache()],
+            rope_deltas=rope_deltas,
+        )
+
+        assert model.calls == [(1, [[7]]), (2, [[7]]), (2, [[7]])]
+        assert generator.get_mtp_stats()["rejected"] == 1
 
     def test_concurrent_mtp_keeps_verified_state_with_uid_reordering(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm

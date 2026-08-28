@@ -225,6 +225,11 @@ class MLLMBatchRequest:
     num_tokens: int = 0  # Tokens generated so far
     output_tokens: List[int] = field(default_factory=list)
 
+    # Request-local Qwen mRoPE continuation state. The language model also
+    # keeps a process-global copy, but continuous batching cannot safely use
+    # one request's value for another request or for a restored prefix.
+    rope_deltas: Optional[mx.array] = None
+
     # Vision state (populated after initial VLM forward pass)
     vision_encoded: bool = False
     cross_attention_states: Optional[Any] = None  # For models that use cross-attention
@@ -290,7 +295,6 @@ class MLLMBatch:
             self.logits_processors = [self.logits_processors[k] for k in keep_idx]
         if self.samplers is not None:
             self.samplers = [self.samplers[k] for k in keep_idx]
-
         keep_idx_array = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx_array]
 
@@ -1231,6 +1235,57 @@ class MLLMBatchGenerator:
                 return True
         return False
 
+    def _derive_request_rope_deltas(
+        self, request: MLLMBatchRequest
+    ) -> Optional[mx.array]:
+        """Derive request-local mRoPE continuation state from the full prompt."""
+        get_rope_index = getattr(type(self.language_model), "get_rope_index", None)
+        if not callable(get_rope_index):
+            return None
+        input_ids = request.input_ids
+        if input_ids is None:
+            raise RuntimeError("cannot derive rope_deltas without input_ids")
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+        video_grid_thw = request.extra_kwargs.get("video_grid_thw")
+        _position_ids, rope_deltas = get_rope_index(
+            self.language_model,
+            input_ids,
+            request.image_grid_thw,
+            video_grid_thw,
+            request.attention_mask,
+        )
+        if rope_deltas is None:
+            return mx.zeros((input_ids.shape[0], 1), dtype=mx.int32)
+        if rope_deltas.ndim == 0:
+            rope_deltas = rope_deltas.reshape(1, 1)
+        elif rope_deltas.ndim == 1:
+            rope_deltas = rope_deltas[:, None]
+        if rope_deltas.shape[0] != input_ids.shape[0]:
+            raise RuntimeError(
+                f"rope_deltas batch {rope_deltas.shape[0]} does not match "
+                f"request batch {input_ids.shape[0]}"
+            )
+        return rope_deltas
+
+    @staticmethod
+    def _language_model_kwargs(request: MLLMBatchRequest) -> Dict[str, Any]:
+        rope_deltas = getattr(request, "rope_deltas", None)
+        if rope_deltas is None:
+            return {}
+        return {"rope_deltas": rope_deltas}
+
+    @staticmethod
+    def _batch_rope_deltas(
+        requests: List[MLLMBatchRequest],
+    ) -> Optional[mx.array]:
+        deltas = [getattr(request, "rope_deltas", None) for request in requests]
+        if not deltas or all(delta is None for delta in deltas):
+            return None
+        if any(delta is None for delta in deltas):
+            raise RuntimeError("Cannot batch mixed mRoPE and non-mRoPE requests")
+        return mx.concatenate(deltas, axis=0)
+
     def _prefill_checkpoint_plan(self, input_ids, cache_list):
         """Return ``(token_count, key)`` for a non-rewindable prompt cache."""
         if self.prefix_cache is None or not self._needs_prefill_checkpoint(cache_list):
@@ -1331,7 +1386,9 @@ class MLLMBatchGenerator:
                 end = checkpoint_at
 
             chunk = input_ids[:, processed:end]
-            output = self.language_model(chunk, cache=cache)
+            output = self.language_model(
+                chunk, cache=cache, **self._language_model_kwargs(request)
+            )
             processed = end
             chunk_count += 1
 
@@ -1481,6 +1538,7 @@ class MLLMBatchGenerator:
         for req in requests:
             try:
                 self._preprocess_request(req)
+                req.rope_deltas = self._derive_request_rope_deltas(req)
             except Exception as e:
                 logger.error(
                     f"Failed to preprocess request {req.request_id}: "
@@ -1680,7 +1738,11 @@ class MLLMBatchGenerator:
                                 total_tokens,
                                 total_tokens,
                             )
-                            logits = self.language_model(remaining, cache=request_cache)
+                            logits = self.language_model(
+                                remaining,
+                                cache=request_cache,
+                                **self._language_model_kwargs(req),
+                            )
                         else:
                             # Chunked prefill on remaining tokens
                             self._prefill_progress[req.request_id] = (
@@ -1700,7 +1762,11 @@ class MLLMBatchGenerator:
                                     raise PrefillAbortedError(req.request_id)
 
                                 chunk = remaining[:, processed : processed + step]
-                                self.language_model(chunk, cache=request_cache)
+                                self.language_model(
+                                    chunk,
+                                    cache=request_cache,
+                                    **self._language_model_kwargs(req),
+                                )
                                 # Eval ALL cache types (see _run_chunked_text_prefill)
                                 _eval_prompt_cache(request_cache)
                                 processed += step
@@ -1713,7 +1779,11 @@ class MLLMBatchGenerator:
                                     mx.clear_cache()
                             # Last chunk — return logits
                             remaining = remaining[:, processed:]
-                            logits = self.language_model(remaining, cache=request_cache)
+                            logits = self.language_model(
+                                remaining,
+                                cache=request_cache,
+                                **self._language_model_kwargs(req),
+                            )
                             self._prefill_progress[req.request_id] = (
                                 total_tokens,
                                 total_tokens,
@@ -1752,7 +1822,11 @@ class MLLMBatchGenerator:
                     )
 
                     with mx.stream(MLLMBatchGenerator._stream):
-                        logits = self.language_model(last_token, cache=request_cache)
+                        logits = self.language_model(
+                            last_token,
+                            cache=request_cache,
+                            **self._language_model_kwargs(req),
+                        )
                         if hasattr(logits, "logits"):
                             logits = logits.logits
 
@@ -1911,6 +1985,7 @@ class MLLMBatchGenerator:
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
         samplers: Optional[List[Optional[Callable]]] = None,
+        rope_deltas: Optional[mx.array] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """
         Run one generation step through the language model.
@@ -1930,7 +2005,8 @@ class MLLMBatchGenerator:
             input_tokens = input_tokens[:, None]
 
         # Run language model only (not full VLM)
-        output = self.language_model(input_tokens, cache=cache)
+        model_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+        output = self.language_model(input_tokens, cache=cache, **model_kwargs)
 
         # Handle LanguageModelOutput or plain tensor
         if hasattr(output, "logits"):
@@ -2095,12 +2171,15 @@ class MLLMBatchGenerator:
                 list(req.output_tokens) + [token]
                 for req, token in zip(batch.requests, y_list)
             ]
+        rope_deltas = self._batch_rope_deltas(batch.requests)
+        step_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
         batch.y, batch.logprobs = self._step(
             y[:, None],
             batch.cache,
             batch.logits_processors,
             output_tokens,
             batch.samplers,
+            **step_kwargs,
         )
         mx.async_eval(batch.y, batch.logprobs)
 
@@ -2440,9 +2519,11 @@ def install_mtp_mllm(
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
         samplers: Optional[List[Optional[Callable]]] = None,
+        rope_deltas: Optional[mx.array] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
+        model_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
         active_requests = (
             list(batch_gen.active_batch.requests)
             if batch_gen.active_batch is not None
@@ -2456,9 +2537,14 @@ def install_mtp_mllm(
         logits_processors_bypass = logits_processors is not None and any(
             logits_processors
         )
+        mrope_media_bypass = external_drafter and any(
+            getattr(request, "images", None) or getattr(request, "videos", None)
+            for request in active_requests
+        )
         assistant_not_requested_bypass = external_drafter and (
             not active_requests
             or not all(request.mllm_draft for request in active_requests)
+            or mrope_media_bypass
         )
         if (
             prefill_bypass
@@ -2482,8 +2568,16 @@ def install_mtp_mllm(
                 if assistant_not_requested_bypass:
                     _bypass_counts["assistant_not_requested"] += 1
             _skip_state_by_uid.clear()
+            original_step_kwargs = (
+                {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+            )
             return _orig_step(
-                input_tokens, cache, logits_processors, output_tokens, samplers
+                input_tokens,
+                cache,
+                logits_processors,
+                output_tokens,
+                samplers,
+                **original_step_kwargs,
             )
 
         current_uids = list(batch_gen.active_batch.uids)
@@ -2509,11 +2603,21 @@ def install_mtp_mllm(
             )
         else:
             # Normal forward with return_hidden
-            model_output = language_model(input_tokens, cache=cache, return_hidden=True)
+            model_output = language_model(
+                input_tokens, cache=cache, return_hidden=True, **model_kwargs
+            )
             logits, hidden_states = _model_parts(model_output)
             if hidden_states is None:
+                original_step_kwargs = (
+                    {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
+                )
                 return _orig_step(
-                    input_tokens, cache, logits_processors, output_tokens, samplers
+                    input_tokens,
+                    cache,
+                    logits_processors,
+                    output_tokens,
+                    samplers,
+                    **original_step_kwargs,
                 )
             logits = logits[:, -1, :]
 
@@ -2624,7 +2728,7 @@ def install_mtp_mllm(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
             )
             verify_output = language_model(
-                verify_input, cache=cache, return_hidden=True
+                verify_input, cache=cache, return_hidden=True, **model_kwargs
             )
             verify_logits, verify_hidden = _model_parts(verify_output)
 
@@ -2747,6 +2851,7 @@ def install_mtp_mllm(
                         (replay_tokens if sampled_reject else primary_tokens[:, None]),
                         cache=cache,
                         return_hidden=True,
+                        **model_kwargs,
                     )
                     rerun_logits, rerun_hidden = _model_parts(rerun_out)
                     if rerun_hidden is not None:
@@ -2778,6 +2883,7 @@ def install_mtp_mllm(
                             residual_tokens[:, None],
                             cache=cache,
                             return_hidden=True,
+                            **model_kwargs,
                         )
                         if isinstance(rerun_out, tuple) or hasattr(rerun_out, "logits"):
                             rerun_logits, rerun_hidden = _model_parts(rerun_out)
@@ -3045,12 +3151,15 @@ def install_chunked_prefill_mllm(
             if batch.logits_processors
             else None
         )
+        rope_deltas = batch_gen._batch_rope_deltas(batch.requests)
+        step_kwargs = {"rope_deltas": rope_deltas} if rope_deltas is not None else {}
         batch.y, batch.logprobs = batch_gen._step(
             y[:, None],
             batch.cache,
             batch.logits_processors,
             output_tokens,
             batch.samplers,
+            **step_kwargs,
         )
         # Synchronous eval — must have results before context switch
         mx.eval(batch.y, batch.logprobs)
@@ -3160,7 +3269,11 @@ def install_chunked_prefill_mllm(
             if remaining_count > take:
                 # Process ONE chunk
                 tic = time.perf_counter()
-                batch_gen.language_model(remaining[:, :take], cache=partial["cache"])
+                batch_gen.language_model(
+                    remaining[:, :take],
+                    cache=partial["cache"],
+                    **batch_gen._language_model_kwargs(req),
+                )
                 _eval_prompt_cache(partial["cache"])
                 partial["remaining_ids"] = remaining[:, take:]
                 partial["processed"] += take
@@ -3239,7 +3352,11 @@ def install_chunked_prefill_mllm(
             else:
                 # Last chunk — finalize prefill
                 tic = time.perf_counter()
-                logits = batch_gen.language_model(remaining, cache=partial["cache"])
+                logits = batch_gen.language_model(
+                    remaining,
+                    cache=partial["cache"],
+                    **batch_gen._language_model_kwargs(req),
+                )
                 if hasattr(logits, "logits"):
                     logits = logits.logits
                 last_logits = logits[:, -1, :]
@@ -3422,6 +3539,9 @@ def install_chunked_prefill_mllm(
                 try:
                     # Preprocess to get input_ids
                     batch_gen._preprocess_request(text_only_req)
+                    text_only_req.rope_deltas = batch_gen._derive_request_rope_deltas(
+                        text_only_req
+                    )
                 except Exception as e:
                     logger.error(
                         f"Failed to preprocess request "
@@ -3539,7 +3659,11 @@ def install_chunked_prefill_mllm(
                     if checkpoint_at is not None and checkpoint_at < take:
                         take = checkpoint_at
                     tic = time.perf_counter()
-                    batch_gen.language_model(remaining[:, :take], cache=request_cache)
+                    batch_gen.language_model(
+                        remaining[:, :take],
+                        cache=request_cache,
+                        **batch_gen._language_model_kwargs(text_only_req),
+                    )
                     _eval_prompt_cache(request_cache)
                     batch_gen._partial["remaining_ids"] = remaining[:, take:]
                     batch_gen._partial["processed"] = take
