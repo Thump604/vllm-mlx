@@ -3485,6 +3485,15 @@ def install_chunked_prefill_mllm(
                 prompt_last_logits = logits[:, -1, :]
                 last_logits = prompt_last_logits
 
+                from mlx_lm.sample_utils import make_sampler
+
+                req_sampler = make_sampler(
+                    temp=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    min_p=req.min_p,
+                )
+
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
                     empty_tokens = mx.array([], dtype=mx.int32)
@@ -3494,7 +3503,7 @@ def install_chunked_prefill_mllm(
                 logprobs = last_logits - mx.logsumexp(
                     last_logits, axis=-1, keepdims=True
                 )
-                sampled = batch_gen.sampler(logprobs)
+                sampled = req_sampler(logprobs)
                 mx.eval(sampled, logprobs)
 
                 # Snapshot only after first-token sampling has materialized.
@@ -3558,7 +3567,7 @@ def install_chunked_prefill_mllm(
                 batch_gen._stats.prompt_time += time.perf_counter() - tic
 
                 # Build single-request batch
-                from mlx_lm.sample_utils import make_logits_processors, make_sampler
+                from mlx_lm.sample_utils import make_logits_processors
 
                 req_lp = []
                 need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
@@ -3573,15 +3582,6 @@ def install_chunked_prefill_mllm(
                 if req.logits_processors:
                     req_lp.extend(req.logits_processors)
 
-                req_sampler = None
-                if req.top_k != 0 or req.min_p != 0.0:
-                    req_sampler = make_sampler(
-                        temp=req.temperature,
-                        top_p=req.top_p,
-                        top_k=req.top_k,
-                        min_p=req.min_p,
-                    )
-
                 new_batch = MLLMBatch(
                     uids=[req.uid],
                     request_ids=[req.request_id],
@@ -3592,7 +3592,7 @@ def install_chunked_prefill_mllm(
                     cache=partial["cache"],
                     requests=[req],
                     logits_processors=[req_lp] if req_lp else None,
-                    samplers=[req_sampler] if req_sampler else None,
+                    samplers=[req_sampler],
                 )
 
                 # Extend active batch or set as new

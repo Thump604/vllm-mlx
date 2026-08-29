@@ -2781,12 +2781,25 @@ class TestChunkedPrefillCacheHandling:
 
         monkeypatch.setattr(mx, "eval", tracked_eval)
 
-        def sample(_logprobs):
+        def request_sample(logprobs):
             call_order.append("sample")
-            return mx.array([0])
+            return mx.argmax(logprobs, axis=-1)
 
-        gen.sampler = sample
-        gen.stop_tokens = {0}
+        def global_sample(_logprobs):
+            raise AssertionError("interleaved prefill must use the request sampler")
+
+        def make_request_sampler(**kwargs):
+            assert kwargs == {
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            }
+            return request_sample
+
+        monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", make_request_sampler)
+        gen.sampler = global_sample
+        gen.stop_tokens = {1}
 
         original_prepare_store = gen.prefix_cache.prepare_store
 
@@ -2832,6 +2845,8 @@ class TestChunkedPrefillCacheHandling:
         req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
         req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
         req.is_text_only = True
+        req.temperature = 0.0
+        req.top_p = 1.0
         req.logits_processors = [
             lambda _tokens, logits: logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
         ]
