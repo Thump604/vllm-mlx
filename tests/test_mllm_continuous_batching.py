@@ -1195,6 +1195,74 @@ class TestMLLMBatchGeneratorMTPGuards:
             ([[4]], [[13]], [[[3]], [[3]], [[3]]]),
         ]
 
+    def test_hybrid_cold_path_samples_from_owned_prompt_logits(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, _caches):
+                return self
+
+        class PrefixCache:
+            def fetch(self, tokens):
+                return None, tokens
+
+            def prepare_store(self, tokens, cache, auxiliary=None):
+                assert int(mx.argmax(auxiliary["last_logits"], axis=-1).item()) == 1
+                return SimpleNamespace(
+                    tokens=tuple(tokens),
+                    cache=cache,
+                    auxiliary={"last_logits": mx.array([[0.0, 0.0, 9.0, 0.0]])},
+                )
+
+            def commit_prepared(self, _entry, **kwargs):
+                return kwargs["commit_guard"]()
+
+        monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
+        )
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.language_model = object()
+        generator.model = MagicMock()
+        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.prefix_cache = PrefixCache()
+        generator._preprocess_request = lambda _request: None
+        generator._needs_prefill_checkpoint = lambda _cache: True
+        generator._clone_prefix_for_replay = lambda cache: list(cache)
+        generator._prepare_rotating_caches = lambda _cache: True
+        generator._run_chunked_text_prefill = lambda _request, cache: mx.array(
+            [[[0.0, 8.0, 0.0, 0.0]]]
+        )
+
+        request = MLLMBatchRequest(uid=1, request_id="cold-owned", prompt="prompt")
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.is_text_only = True
+
+        batch = generator._process_prompts([request])
+
+        assert batch.y.tolist() == [2]
+
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatch,

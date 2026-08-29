@@ -1976,6 +1976,10 @@ class MLLMBatchGenerator:
                                         "Cannot continue from stored hybrid prompt state"
                                     )
                                 request_cache[:] = continuation
+                                if entry.auxiliary is not None:
+                                    stored_logits = entry.auxiliary.get("last_logits")
+                                    if stored_logits is not None:
+                                        last_logits = stored_logits
 
                         sampled, logprobs = _sample_first_token(req, last_logits)
 
@@ -3516,6 +3520,12 @@ def install_chunked_prefill_mllm(
                                 "Cannot continue from stored hybrid prompt state"
                             )
                         partial["cache"][:] = continuation
+                        if checkpoint_entry.auxiliary is not None:
+                            stored_logits = checkpoint_entry.auxiliary.get(
+                                "last_logits"
+                            )
+                            if stored_logits is not None:
+                                last_logits = stored_logits
 
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
