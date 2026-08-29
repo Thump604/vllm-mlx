@@ -1206,11 +1206,14 @@ class TestMLLMBatchGeneratorMTPGuards:
             def merge(self, _caches):
                 return self
 
+        call_order = []
+
         class PrefixCache:
             def fetch(self, tokens):
                 return None, tokens
 
             def prepare_store(self, tokens, cache, auxiliary=None):
+                call_order.append("prepare")
                 assert int(mx.argmax(auxiliary["last_logits"], axis=-1).item()) == 1
                 return SimpleNamespace(
                     tokens=tuple(tokens),
@@ -1225,9 +1228,14 @@ class TestMLLMBatchGeneratorMTPGuards:
         monkeypatch.setattr(
             "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
         )
+
+        def sample(scores):
+            call_order.append("sample")
+            return mx.argmax(scores, axis=-1)
+
         monkeypatch.setattr(
             "mlx_lm.sample_utils.make_sampler",
-            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+            lambda **_kwargs: sample,
         )
         monkeypatch.setattr(
             "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
@@ -1245,7 +1253,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._think_suffix_len = 0
         generator.language_model = object()
         generator.model = MagicMock()
-        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.sampler = sample
         generator.prefix_cache = PrefixCache()
         generator._preprocess_request = lambda _request: None
         generator._needs_prefill_checkpoint = lambda _cache: True
@@ -1264,6 +1272,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         batch = generator._process_prompts([request])
 
         assert batch.y.tolist() == [1]
+        assert call_order[:2] == ["sample", "prepare"]
         generator._clone_prefix_for_replay.assert_not_called()
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
@@ -2756,8 +2765,24 @@ class TestChunkedPrefillCacheHandling:
             MagicMock(),
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
         )
-        gen.sampler = lambda _logprobs: mx.array([0])
+        call_order = []
+
+        def sample(_logprobs):
+            call_order.append("sample")
+            return mx.array([0])
+
+        gen.sampler = sample
         gen.stop_tokens = {0}
+
+        original_prepare_store = gen.prefix_cache.prepare_store
+
+        def prepare_store(tokens, cache, auxiliary=None):
+            call_order.append("prepare")
+            assert auxiliary is not None
+            assert auxiliary["last_logits"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+            return original_prepare_store(tokens, cache, auxiliary=auxiliary)
+
+        gen.prefix_cache.prepare_store = prepare_store
 
         prompt_cache = [ArraysCache(size=1), KVCache()]
         monkeypatch.setattr(
@@ -2793,6 +2818,9 @@ class TestChunkedPrefillCacheHandling:
         req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
         req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
         req.is_text_only = True
+        req.logits_processors = [
+            lambda _tokens, logits: logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
+        ]
         gen.unprocessed_requests.append(req)
         gen._preprocess_request = lambda _: None
 
@@ -2802,6 +2830,7 @@ class TestChunkedPrefillCacheHandling:
         gen._next()
 
         gen._clone_prefix_for_replay.assert_not_called()
+        assert call_order[:2] == ["sample", "prepare"]
 
         assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 

@@ -1951,6 +1951,12 @@ class MLLMBatchGenerator:
                         # Extract last token logits
                         last_logits = logits[:, -1, :]
 
+                        # Keep the cold request's first-token path identical
+                        # whether or not a prompt snapshot will be published.
+                        # prepare_store() materializes a detached cache-wide
+                        # copy, so sampling must complete before that barrier.
+                        sampled, logprobs = _sample_first_token(req, last_logits)
+
                         if (
                             self.prefix_cache is not None
                             and self._needs_prefill_checkpoint(request_cache)
@@ -1965,8 +1971,6 @@ class MLLMBatchGenerator:
                             )
                             if entry is not None:
                                 self._publish_prefill_checkpoint(req.request_id, entry)
-
-                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -3478,22 +3482,8 @@ def install_chunked_prefill_mllm(
                 )
                 if hasattr(logits, "logits"):
                     logits = logits.logits
-                last_logits = logits[:, -1, :]
-
-                if (
-                    getattr(batch_gen, "prefix_cache", None) is not None
-                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
-                    and req.input_ids is not None
-                ):
-                    checkpoint_entry = batch_gen.prefix_cache.prepare_store(
-                        req.input_ids.reshape(-1).tolist(),
-                        partial["cache"],
-                        auxiliary={"last_logits": last_logits},
-                    )
-                    if checkpoint_entry is not None:
-                        batch_gen._publish_prefill_checkpoint(
-                            req.request_id, checkpoint_entry
-                        )
+                prompt_last_logits = logits[:, -1, :]
+                last_logits = prompt_last_logits
 
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
@@ -3506,6 +3496,24 @@ def install_chunked_prefill_mllm(
                 )
                 sampled = batch_gen.sampler(logprobs)
                 mx.eval(sampled, logprobs)
+
+                # Snapshot only after first-token sampling has materialized.
+                # The stored auxiliary remains the raw prompt logits, before
+                # request-local processors are applied.
+                if (
+                    getattr(batch_gen, "prefix_cache", None) is not None
+                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
+                    and req.input_ids is not None
+                ):
+                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
+                        req.input_ids.reshape(-1).tolist(),
+                        partial["cache"],
+                        auxiliary={"last_logits": prompt_last_logits},
+                    )
+                    if full_prompt_entry is not None:
+                        batch_gen._publish_prefill_checkpoint(
+                            req.request_id, full_prompt_entry
+                        )
 
                 checkpoint_entry = partial.get("checkpoint_entry")
                 if checkpoint_entry is not None:
