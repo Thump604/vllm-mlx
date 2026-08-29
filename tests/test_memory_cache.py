@@ -265,6 +265,14 @@ class TestCacheEntry:
         assert entry.cache is cache
         assert entry.memory_bytes == 200
 
+    def test_create_entry_accounts_for_auxiliary_arrays(self):
+        cache = [MockKVCache(100, 100)]
+        entry = _CacheEntry.create(
+            [1, 2, 3], cache, auxiliary={"last_logits": MockArray(64)}
+        )
+
+        assert entry.memory_bytes == 264
+
 
 class TestMemoryAwarePrefixCache:
     """Tests for MemoryAwarePrefixCache."""
@@ -297,6 +305,35 @@ class TestMemoryAwarePrefixCache:
         cache = MemoryAwarePrefixCache(model, config)
         assert len(cache) == 0
         assert cache.memory_limit_mb == 100.0
+
+    def test_prepare_store_rejects_auxiliary_over_memory_limit(
+        self, small_cache, mock_kv_cache
+    ):
+        entry = small_cache.prepare_store(
+            [1, 2, 3],
+            mock_kv_cache(512 * 1024),
+            auxiliary={"last_logits": MockArray(600 * 1024)},
+        )
+
+        assert entry is None
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
+    def test_commit_rejects_oversized_prepared_entry(self, small_cache):
+        entry = _CacheEntry(
+            tokens=(1, 2, 3),
+            cache=[],
+            memory_bytes=2 * 1024 * 1024,
+            auxiliary=None,
+        )
+
+        assert small_cache.commit_prepared(entry) is False
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
 
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]

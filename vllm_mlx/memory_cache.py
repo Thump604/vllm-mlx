@@ -1366,7 +1366,17 @@ class MemoryAwarePrefixCache:
                             if isinstance(value, mx.array)
                         )
                     )
-            return _CacheEntry.create(tokens, cache, detached_auxiliary)
+            entry = _CacheEntry.create(tokens, cache, detached_auxiliary)
+            if entry.memory_bytes > self._max_memory:
+                self._stats.store_rejections += 1
+                logger.warning(
+                    "Cache entry too large after auxiliary accounting: "
+                    "%.1fMB exceeds limit %.1fMB",
+                    entry.memory_bytes / _BYTES_PER_MB,
+                    self._max_memory / _BYTES_PER_MB,
+                )
+                return None
+            return entry
         except UndetachableCacheError as e:
             self._stats.store_rejections += 1
             logger.warning("[cache_store] rejecting entry: %s", e)
@@ -1390,6 +1400,15 @@ class MemoryAwarePrefixCache:
         try:
             with self._memory_lock, commit_context:
                 if commit_guard is not None and not commit_guard():
+                    return False
+                if entry.memory_bytes > self._max_memory:
+                    self._stats.store_rejections += 1
+                    logger.warning(
+                        "[cache_store] rejecting oversized prepared entry: "
+                        "%.1fMB exceeds limit %.1fMB",
+                        entry.memory_bytes / _BYTES_PER_MB,
+                        self._max_memory / _BYTES_PER_MB,
+                    )
                     return False
                 if tokens_key in self._entries:
                     self._entries.move_to_end(tokens_key)
