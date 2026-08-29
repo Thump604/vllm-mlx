@@ -106,7 +106,6 @@ jobs:
             tests/test_streaming_think_router.py \
             tests/test_streaming_tool_filter.py \
             tests/test_tool_call_promotion.py \
-            tests/test_tool_argument_coercion.py \
             -v --tb=short \
             -k "not Integration and not InjectJson and not TestMLXMultimodalLMCache" \
             --cov=vllm_mlx \
@@ -197,6 +196,7 @@ jobs:
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
+            tests/test_tool_argument_coercion.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
             tests/test_harmony_render.py \
