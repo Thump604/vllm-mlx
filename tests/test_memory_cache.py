@@ -378,6 +378,42 @@ class TestMemoryAwarePrefixCache:
         assert stored[0].keys.tolist() == first_keys.tolist()
         assert stored[0].values.tolist() == first_values.tolist()
 
+    def test_prepared_hybrid_entry_owns_arrays_and_state_containers(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        cache_module = pytest.importorskip("mlx_lm.models.cache")
+
+        live_arrays = cache_module.ArraysCache(size=1)
+        prompt_state = mx.array([[1.0, 2.0, 3.0]])
+        live_arrays[0] = prompt_state
+        live_kv = cache_module.KVCache()
+        prompt_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        prompt_values = prompt_keys + 10
+        live_kv.update_and_fetch(prompt_keys, prompt_values)
+
+        prepared = small_cache.prepare_store(
+            [1, 2, 3],
+            [live_arrays, live_kv],
+        )
+        assert prepared is not None
+
+        live_arrays[0] = mx.array([[9.0, 9.0, 9.0]])
+        live_kv.update_and_fetch(
+            mx.array([[[[4.0]]]]),
+            mx.array([[[[14.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0] is not live_arrays
+        assert stored[0].state is not live_arrays.state
+        assert stored[0][0] is not prompt_state
+        assert stored[0][0].tolist() == [[1.0, 2.0, 3.0]]
+        assert stored[1] is not live_kv
+        assert stored[1].keys is not live_kv.keys
+        assert stored[1].keys.tolist() == prompt_keys.tolist()
+        assert stored[1].values.tolist() == prompt_values.tolist()
+
     def test_commit_guard_rejects_before_prefix_eviction(
         self, small_cache, mock_kv_cache
     ):

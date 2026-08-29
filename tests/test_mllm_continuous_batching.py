@@ -1225,6 +1225,13 @@ class TestMLLMBatchGeneratorMTPGuards:
                 return kwargs["commit_guard"]()
 
         monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
         monkeypatch.setattr(
             "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
         )
@@ -1272,7 +1279,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         batch = generator._process_prompts([request])
 
         assert batch.y.tolist() == [1]
-        assert call_order[:2] == ["sample", "prepare"]
+        assert call_order[:3] == ["sample", "eval", "prepare"]
         generator._clone_prefix_for_replay.assert_not_called()
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
@@ -2766,6 +2773,13 @@ class TestChunkedPrefillCacheHandling:
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
         )
         call_order = []
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
 
         def sample(_logprobs):
             call_order.append("sample")
@@ -2830,7 +2844,12 @@ class TestChunkedPrefillCacheHandling:
         gen._next()
 
         gen._clone_prefix_for_replay.assert_not_called()
-        assert call_order[:2] == ["sample", "prepare"]
+        sample_index = call_order.index("sample")
+        assert call_order[sample_index : sample_index + 3] == [
+            "sample",
+            "eval",
+            "prepare",
+        ]
 
         assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 
@@ -2876,6 +2895,55 @@ class TestChunkedPrefillCacheHandling:
         gen._publish_prefill_checkpoint = MagicMock(
             side_effect=PrefillAbortedError(req.request_id)
         )
+
+        responses = gen._next()
+
+        assert gen._partial is None
+        assert len(responses) == 1
+        assert responses[0].request_id == req.request_id
+        assert responses[0].finish_reason == "abort"
+
+    def test_interleaved_abort_during_full_prompt_commit_is_request_local(self):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            PrefillAbortedError,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = lambda tokens, cache: mx.zeros((1, tokens.shape[1], 4))
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen._next = lambda: []
+        gen._needs_prefill_checkpoint = lambda _cache: True
+        full_prompt_entry = SimpleNamespace(tokens=(1, 2, 3, 4, 5))
+        gen.prefix_cache = SimpleNamespace(
+            prepare_store=lambda *_args, **_kwargs: full_prompt_entry
+        )
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=7, request_id="abort-full-prompt", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=3)],
+            "remaining_ids": mx.array([[4, 5]]),
+            "processed": 3,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": None,
+            "checkpoint_key": None,
+            "checkpoint_entry": None,
+        }
+
+        def publish(_request_id, entry):
+            assert entry is full_prompt_entry
+            raise PrefillAbortedError(req.request_id)
+
+        gen._publish_prefill_checkpoint = publish
 
         responses = gen._next()
 

@@ -3511,9 +3511,24 @@ def install_chunked_prefill_mllm(
                         auxiliary={"last_logits": prompt_last_logits},
                     )
                     if full_prompt_entry is not None:
-                        batch_gen._publish_prefill_checkpoint(
-                            req.request_id, full_prompt_entry
-                        )
+                        try:
+                            batch_gen._publish_prefill_checkpoint(
+                                req.request_id, full_prompt_entry
+                            )
+                        except PrefillAbortedError:
+                            batch_gen._partial = None
+                            batch_gen._prefill_progress.pop(req.request_id, None)
+                            batch_gen._pending_error_responses.append(
+                                MLLMBatchResponse(
+                                    uid=req.uid,
+                                    request_id=req.request_id,
+                                    token=0,
+                                    logprobs=mx.zeros(1),
+                                    finish_reason="abort",
+                                )
+                            )
+                            mx.clear_cache()
+                            return _generation_step()
 
                 checkpoint_entry = partial.get("checkpoint_entry")
                 if checkpoint_entry is not None:
