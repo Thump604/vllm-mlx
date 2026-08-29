@@ -1195,7 +1195,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             ([[4]], [[13]], [[[3]], [[3]], [[3]]]),
         ]
 
-    def test_hybrid_cold_path_samples_from_owned_prompt_logits(self, monkeypatch):
+    def test_hybrid_cold_path_keeps_request_cache_and_prompt_logits(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,
             MLLMBatchRequest,
@@ -1249,7 +1249,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator.prefix_cache = PrefixCache()
         generator._preprocess_request = lambda _request: None
         generator._needs_prefill_checkpoint = lambda _cache: True
-        generator._clone_prefix_for_replay = lambda cache: list(cache)
+        generator._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
         generator._prepare_rotating_caches = lambda _cache: True
         generator._run_chunked_text_prefill = lambda _request, cache: mx.array(
             [[[0.0, 8.0, 0.0, 0.0]]]
@@ -1261,7 +1263,8 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         batch = generator._process_prompts([request])
 
-        assert batch.y.tolist() == [2]
+        assert batch.y.tolist() == [1]
+        generator._clone_prefix_for_replay.assert_not_called()
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
@@ -2783,6 +2786,9 @@ class TestChunkedPrefillCacheHandling:
         gen.language_model = LanguageModel()
         gen._next = lambda: []
         install_chunked_prefill_mllm(gen, budget=4)
+        gen._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
 
         req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
         req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
@@ -2794,6 +2800,8 @@ class TestChunkedPrefillCacheHandling:
         assert gen._next() == []
         assert gen._partial["checkpoint_entry"] is None
         gen._next()
+
+        gen._clone_prefix_for_replay.assert_not_called()
 
         assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 
