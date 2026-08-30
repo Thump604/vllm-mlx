@@ -1510,6 +1510,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             "concurrent_batch": 0,
             "logits_processors": 0,
             "assistant_not_requested": 0,
+            "hidden_state_unavailable": 0,
         }
 
         logits_processor = MagicMock()
@@ -1531,6 +1532,242 @@ class TestMLLMBatchGeneratorMTPGuards:
         stats = batch_gen.get_mtp_stats()
         assert stats["attempted"] == 0
         assert stats["bypass_counts"]["logits_processors"] == 1
+
+    @pytest.mark.parametrize("mode", ["native", "stateless_external"])
+    def test_mtp_missing_hidden_uses_first_target_logits_once(self, mode):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        requests = [
+            SimpleNamespace(
+                uid=uid,
+                request_id=f"hidden-none-{uid}",
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                mllm_draft=True,
+            )
+            for uid in (7, 8)
+        ]
+
+        class TrackingCache:
+            position = 0
+
+        cache = [TrackingCache()]
+
+        def hiddenless_logits(input_tokens):
+            logits = mx.full((2, input_tokens.shape[1], 8), -10.0)
+            logits[0, -1, 4] = 2.0
+            logits[1, -1, 5] = 3.0
+            return logits
+
+        class HiddenlessTarget:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                self.calls.append(return_hidden)
+                cache[0].position += input_tokens.shape[1]
+                return hiddenless_logits(input_tokens)
+
+        target = HiddenlessTarget()
+
+        def faithful_original_step(
+            input_tokens,
+            cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        ):
+            del logits_processors, output_tokens
+            logits = target(input_tokens, cache=cache, return_hidden=False)[:, -1, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            tokens = mx.concatenate(
+                [
+                    sampler(logprobs[row : row + 1])
+                    for row, sampler in enumerate(samplers)
+                ]
+            )
+            return tokens, list(logprobs)
+
+        original_step = MagicMock(side_effect=faithful_original_step)
+        fallback_sampler = MagicMock(
+            side_effect=AssertionError("per-request samplers must be preserved")
+        )
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=SimpleNamespace(uids=[7, 8], requests=requests),
+            _step=original_step,
+            _next=MagicMock(return_value=[]),
+            sampler=fallback_sampler,
+        )
+        draft_model = None
+        if mode == "stateless_external":
+            draft_model = SimpleNamespace(
+                requires_verified_token_reconciliation=False,
+                reset=MagicMock(),
+            )
+        install_mtp_mllm(generator, target, draft_model=draft_model)
+
+        row_samplers = [
+            MagicMock(return_value=mx.array([1], dtype=mx.uint32)),
+            MagicMock(return_value=mx.array([2], dtype=mx.uint32)),
+        ]
+        primary, logprobs = generator._step(
+            mx.array([[1], [2]], dtype=mx.uint32),
+            cache,
+            None,
+            None,
+            row_samplers,
+        )
+
+        expected_logits = hiddenless_logits(mx.array([[1], [2]], dtype=mx.uint32))[
+            :, -1, :
+        ]
+        expected_logprobs = expected_logits - mx.logsumexp(
+            expected_logits, axis=-1, keepdims=True
+        )
+
+        assert primary.tolist() == [1, 2]
+        assert target.calls == [True]
+        assert cache[0].position == 1
+        assert all(
+            mx.allclose(actual, expected).item()
+            for actual, expected in zip(logprobs, expected_logprobs)
+        )
+        assert all(sampler.call_count == 1 for sampler in row_samplers)
+        fallback_sampler.assert_not_called()
+        assert generator.get_mtp_stats()["attempted"] == 0
+        assert (
+            generator.get_mtp_stats()["bypass_counts"]["hidden_state_unavailable"] == 1
+        )
+        original_step.assert_not_called()
+
+    def test_stateful_external_mtp_missing_hidden_fails_closed(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        request = SimpleNamespace(
+            uid=7,
+            request_id="hidden-none",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+
+        class HiddenlessTarget:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                self.calls.append(return_hidden)
+                cache[0].position += input_tokens.shape[1]
+                logits = mx.full((1, input_tokens.shape[1], 8), -1000.0)
+                logits[:, -1, 4] = 0.0
+                return logits
+
+        class TrackingCache:
+            position = 0
+
+        cache = [TrackingCache()]
+        target = HiddenlessTarget()
+
+        def faithful_original_step(
+            input_tokens,
+            cache,
+            logits_processors=None,
+            output_tokens=None,
+            samplers=None,
+        ):
+            del logits_processors, output_tokens, samplers
+            logits = target(input_tokens, cache=cache, return_hidden=False)[:, -1, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            return mx.argmax(logprobs, axis=-1), list(logprobs)
+
+        original_step = MagicMock(side_effect=faithful_original_step)
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=SimpleNamespace(uids=[7], requests=[request]),
+            _step=original_step,
+            _next=MagicMock(return_value=[]),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        )
+        drafter = _RecordingStatefulDrafter(rows=["hidden-none"])
+        install_mtp_mllm(generator, target, draft_model=drafter)
+
+        with pytest.raises(RuntimeError, match="requires target hidden states"):
+            generator._step(mx.array([[1]], dtype=mx.uint32), cache, None, None, None)
+
+        assert target.calls == [True]
+        assert cache[0].position == 1
+        assert drafter.reset_calls == 2
+        assert generator.get_mtp_stats()["errors"] == 1
+        original_step.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["native", "stateless_external"])
+    def test_mtp_verify_failure_aborts_every_mode(self, monkeypatch, mode):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        request = SimpleNamespace(
+            uid=7,
+            request_id="verify-failure",
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            mllm_draft=True,
+        )
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=SimpleNamespace(uids=[7], requests=[request]),
+            _step=MagicMock(side_effect=AssertionError("must not fall through")),
+            _next=MagicMock(return_value=[]),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        )
+
+        class TrackingCache:
+            position = 0
+
+        cache = [TrackingCache()]
+
+        class FailingVerifyTarget:
+            def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
+                del hidden_states, next_token_ids, mtp_cache
+                logits = mx.full((1, 1, 8), -1000.0)
+                logits[:, :, 5] = 0.0
+                return logits
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                cache[0].position += input_tokens.shape[1]
+                if input_tokens.shape[1] == 2:
+                    raise ValueError("verify failed")
+                logits = mx.full((1, 1, 8), -1000.0)
+                logits[:, :, 4] = 0.0
+                return logits, mx.zeros((1, 1, 4))
+
+        target = FailingVerifyTarget()
+        draft_model = None
+        if mode == "stateless_external":
+            _patch_external_mtp_metadata(monkeypatch)
+            monkeypatch.setattr(
+                "vllm_mlx.mllm_batch_generator._draft_external_mtp_active_batch",
+                lambda *args, **kwargs: mx.array([5], dtype=mx.uint32),
+            )
+            draft_model = SimpleNamespace(
+                requires_verified_token_reconciliation=False,
+                reset=MagicMock(),
+                set_shared_kv=MagicMock(),
+                accept_lens=[],
+                draft_lens=[],
+            )
+        install_mtp_mllm(generator, target, draft_model=draft_model)
+
+        with pytest.raises(RuntimeError, match="target cache may have advanced"):
+            generator._step(mx.array([[1]], dtype=mx.uint32), cache, None, None, None)
+
+        assert cache[0].position == 3
+        assert generator.get_mtp_stats()["errors"] == 1
 
     def test_external_mtp_requires_every_active_request_to_opt_in(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
