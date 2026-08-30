@@ -160,6 +160,19 @@ def test_wire_format_and_round_trip_are_explicit():
     assert parsed == target
 
 
+def test_missing_or_null_top_level_digest_uses_public_value_error_surface():
+    target, _ = _pair()
+    target.pop("digest")
+
+    with pytest.raises(ValueError, match="manifest.digest"):
+        validate_identity_manifest(target)
+
+    target, _ = _pair()
+    target["digest"] = None
+    with pytest.raises(ValueError, match="manifest.digest"):
+        validate_identity_manifest(target)
+
+
 def test_jcs_official_string_vector_and_utf16_property_order():
     # RFC 8785 Appendix B's string/literal shape, without unsupported floats.
     assert (

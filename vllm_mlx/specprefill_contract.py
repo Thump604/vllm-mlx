@@ -733,6 +733,8 @@ def validate_identity_manifest(manifest: Mapping[str, Any]) -> None:
 
     if not isinstance(manifest, Mapping):
         raise ValueError("identity manifest must be an object")
+    if "digest" not in manifest or manifest["digest"] is None:
+        raise ValueError("manifest.digest is required and cannot be null")
     _validate_json_value(manifest)
     normalized = _normalize_identity_collections(manifest)
     expected = identity_digest(normalized)
