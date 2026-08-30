@@ -2545,6 +2545,46 @@ class TestPreprocessIdempotent:
         with pytest.raises(Exception):
             gen._preprocess_request(req)
 
+    def test_failed_media_decode_never_marks_request_text_only(self, monkeypatch):
+        import mlx_vlm.utils as mlx_vlm_utils
+        import vllm_mlx.models.mllm as mllm_model
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        req = MLLMBatchRequest(
+            uid=0,
+            prompt="Describe",
+            request_id="failed-media",
+            images=["broken.png"],
+        )
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.processor = object()
+        gen.model = SimpleNamespace(config=None)
+        gen.vision_cache = SimpleNamespace(get_pixel_cache=lambda *_args: None)
+        gen._stats = MLLMBatchStats()
+
+        def fail_image(_image):
+            raise ValueError("broken image")
+
+        monkeypatch.setattr(mllm_model, "process_image_input", fail_image)
+        monkeypatch.setattr(
+            mlx_vlm_utils,
+            "prepare_inputs",
+            lambda *_args, **_kwargs: {
+                "input_ids": mx.array([[1, 2, 3]]),
+                "pixel_values": None,
+                "attention_mask": None,
+            },
+        )
+
+        MLLMBatchGenerator._preprocess_request(gen, req)
+
+        assert req.input_ids.tolist() == [[1, 2, 3]]
+        assert req.is_text_only is False
+
 
 class TestChunkedPrefillCacheHandling:
     """Tests for chunked prefill prefix cache handling paths."""

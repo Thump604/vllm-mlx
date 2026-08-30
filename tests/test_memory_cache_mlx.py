@@ -1327,7 +1327,7 @@ class TestHybridRestartPersistence:
 
         arrays = ArraysCache(size=2)
         arrays.state = [
-            mx.arange(24, dtype=mx.float32).reshape(1, 2, 12),
+            mx.arange(32, dtype=mx.float32).reshape(1, 2, 16),
             mx.ones((1, 2, 4, 4), dtype=mx.float32),
         ]
         arrays.left_padding = mx.array([0], dtype=mx.int32)

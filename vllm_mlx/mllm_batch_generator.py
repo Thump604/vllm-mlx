@@ -1044,8 +1044,12 @@ class MLLMBatchGenerator:
         self._stats.num_images_processed += len(all_images)
         self._stats.vision_encoding_time += processing_time
 
-        # Mark text-only requests (eligible for prefix cache)
-        request.is_text_only = not bool(all_images or all_audio)
+        # Persistence eligibility follows the declared request modality, not
+        # successful media decoding. A failed image/video/audio conversion
+        # must never turn a multimodal request into restart-persistable text.
+        request.is_text_only = not bool(
+            request.images or request.videos or request.audio
+        )
 
         logger.debug(
             f"Preprocessed request {request.request_id}: "
