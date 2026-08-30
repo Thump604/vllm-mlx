@@ -128,6 +128,100 @@ class TestBatchedEngineCacheRestore:
         scheduler._ensure_batch_generator.assert_called_once_with()
         prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
 
+    @pytest.mark.anyio
+    async def test_hybrid_persist_keeps_snapshot_on_owner_and_io_off_thread(self):
+        import threading
+
+        engine = self._make_mllm_engine()
+        owner_thread = threading.get_ident()
+        calls = {}
+        snapshot = object()
+        prefix_cache = MagicMock()
+
+        def prepare():
+            calls["prepare_thread"] = threading.get_ident()
+            return snapshot
+
+        def write(path, value):
+            calls["write_thread"] = threading.get_ident()
+            calls["write_args"] = (path, value)
+            return True
+
+        prefix_cache.prepare_hybrid_persistence_snapshot.side_effect = prepare
+        prefix_cache.write_hybrid_persistence_snapshot.side_effect = write
+        engine._mllm_scheduler = MagicMock(
+            batch_generator=MagicMock(prefix_cache=prefix_cache)
+        )
+
+        assert await engine.persist_cache_to_disk("/tmp/cache") is True
+        assert calls["prepare_thread"] == owner_thread
+        assert calls["write_thread"] != owner_thread
+        assert calls["write_args"] == ("/tmp/cache", snapshot)
+
+    @pytest.mark.anyio
+    async def test_hybrid_restore_keeps_io_off_owner_and_rebuild_on_owner(self):
+        import threading
+
+        engine = self._make_mllm_engine()
+        owner_thread = threading.get_ident()
+        calls = {}
+        loaded_snapshot = object()
+        prefix_cache = MagicMock()
+
+        def read(path):
+            calls["read_thread"] = threading.get_ident()
+            calls["read_path"] = path
+            return loaded_snapshot
+
+        def restore(value):
+            calls["restore_thread"] = threading.get_ident()
+            calls["restore_value"] = value
+            return 1
+
+        prefix_cache.read_hybrid_persistence_snapshot.side_effect = read
+        prefix_cache.restore_hybrid_persistence_snapshot.side_effect = restore
+        scheduler = MagicMock(batch_generator=MagicMock(prefix_cache=prefix_cache))
+        engine._mllm_scheduler = scheduler
+
+        assert await engine.restore_cache_from_disk("/tmp/cache") == 1
+        assert calls["read_thread"] != owner_thread
+        assert calls["restore_thread"] == owner_thread
+        assert calls["read_path"] == "/tmp/cache"
+        assert calls["restore_value"] is loaded_snapshot
+
+    @pytest.mark.anyio
+    async def test_hybrid_persist_cancellation_waits_for_disk_publish(self):
+        import asyncio
+        import threading
+
+        engine = self._make_mllm_engine()
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        writer_finished = threading.Event()
+        prefix_cache = MagicMock()
+        prefix_cache.prepare_hybrid_persistence_snapshot.return_value = object()
+
+        def write(*_args):
+            writer_started.set()
+            release_writer.wait(timeout=2)
+            writer_finished.set()
+            return True
+
+        prefix_cache.write_hybrid_persistence_snapshot.side_effect = write
+        engine._mllm_scheduler = MagicMock(
+            batch_generator=MagicMock(prefix_cache=prefix_cache)
+        )
+
+        task = asyncio.create_task(engine.persist_cache_to_disk("/tmp/cache"))
+        assert await asyncio.to_thread(writer_started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_writer.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert writer_finished.is_set()
+
 
 class TestBatchedEngineMetalCacheLimit:
     def test_prefers_explicit_mlx_buffer_cache_limit(self, monkeypatch):

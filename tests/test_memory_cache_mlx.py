@@ -1254,9 +1254,7 @@ class TestFailClosedPostcondition:
         assert remaining == [1, 2, 3]
 
     def test_arrays_cache_metadata_arrays_priced(self):
-        """``estimate_kv_cache_memory`` on a state-carrying layer must price
-        the ``left_padding``/``lengths`` metadata arrays that detachment
-        copies — accounting must equal what the snapshot actually holds."""
+        """State metadata arrays must be included in resident accounting."""
         import mlx.core as mx
         from mlx_lm.models.cache import ArraysCache
 
@@ -1275,3 +1273,265 @@ class TestFailClosedPostcondition:
                 resident += extra.nbytes
 
         assert estimate_kv_cache_memory([ac]) == resident
+
+
+class TestHybridRestartPersistence:
+    class _Tokenizer:
+        name_or_path = "qualified-tokenizer"
+        vocab_size = 16
+        bos_token_id = 1
+        eos_token_id = 2
+        pad_token_id = 0
+        chat_template = "{{ messages }}"
+
+        def __init__(self, suffix=""):
+            self.suffix = suffix
+
+        def get_vocab(self):
+            return {f"token-{index}{self.suffix}": index for index in range(16)}
+
+    class _Args:
+        model_type = "qwen3_5"
+        num_hidden_layers = 2
+        hidden_size = 8
+        intermediate_size = 16
+        vocab_size = 16
+        num_attention_heads = 2
+        num_key_value_heads = 1
+        head_dim = 4
+        layer_types = ["linear_attention", "full_attention"]
+        tie_word_embeddings = True
+
+    class _Model:
+        def __init__(self):
+            self.args = TestHybridRestartPersistence._Args()
+
+        def make_cache(self):
+            from mlx_lm.models.cache import ArraysCache, KVCache
+
+            return [ArraysCache(size=2), KVCache()]
+
+    @staticmethod
+    def _state():
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        arrays = ArraysCache(size=2)
+        arrays.state = [
+            mx.arange(8, dtype=mx.float32).reshape(2, 4),
+            mx.ones((1, 4), dtype=mx.float32),
+        ]
+        arrays.left_padding = mx.array([0], dtype=mx.int32)
+        arrays.lengths = mx.array([4], dtype=mx.int32)
+        kv = KVCache()
+        kv.keys = mx.ones((1, 1, 4, 4), dtype=mx.float32)
+        kv.values = mx.full((1, 1, 4, 4), 2, dtype=mx.float32)
+        kv.offset = 4
+        logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+        mx.eval(*arrays.state, kv.keys, kv.values, logits)
+        return [arrays, kv], logits
+
+    def _cache(self, tokenizer=None):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        return MemoryAwarePrefixCache(
+            self._Model(),
+            MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
+            tokenizer=tokenizer or self._Tokenizer(),
+            model_identity="qualified-model@revision",
+        )
+
+    def test_round_trip_preserves_hybrid_state_and_exact_logits(self, tmp_path):
+        import mlx.core as mx
+
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert snapshot is not None
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = self._cache()
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        fetched, remaining = restored.fetch([1, 2, 3, 4])
+        auxiliary = restored.fetch_exact_auxiliary([1, 2, 3, 4])
+
+        assert remaining == []
+        assert [type(layer).__name__ for layer in fetched] == [
+            "ArraysCache",
+            "KVCache",
+        ]
+        assert auxiliary is not None
+        assert mx.array_equal(auxiliary["last_logits"], logits).item()
+        for actual, expected in zip(fetched[0].state, state[0].state, strict=True):
+            assert mx.array_equal(actual, expected).item()
+        assert mx.array_equal(fetched[0].left_padding, state[0].left_padding).item()
+        assert mx.array_equal(fetched[0].lengths, state[0].lengths).item()
+        assert fetched[1].offset == state[1].offset
+        assert mx.array_equal(fetched[1].keys, state[1].keys).item()
+        assert mx.array_equal(fetched[1].values, state[1].values).item()
+
+    def test_ineligible_multimodal_entry_is_not_persisted(self):
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=False,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+
+        assert source.prepare_hybrid_persistence_snapshot() is None
+
+    def test_cache_runtime_identity_mismatch_publishes_nothing(self, tmp_path):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        source = MemoryAwarePrefixCache(
+            self._Model(),
+            MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
+            tokenizer=self._Tokenizer(),
+            model_identity="qualified-model@revision",
+            cache_runtime_identity={"max_kv_size": 4096},
+        )
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        incompatible = MemoryAwarePrefixCache(
+            self._Model(),
+            MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
+            tokenizer=self._Tokenizer(),
+            model_identity="qualified-model@revision",
+            cache_runtime_identity={"max_kv_size": 8192},
+        )
+        loaded = incompatible.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
+        assert len(incompatible) == 0
+
+    def test_tokenizer_identity_mismatch_publishes_nothing(self, tmp_path):
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        incompatible = self._cache(self._Tokenizer(suffix="-changed"))
+        loaded = incompatible.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
+        assert len(incompatible) == 0
+
+    def test_each_required_identity_field_fails_closed(self, tmp_path):
+        from vllm_mlx.cache_persistence import LoadedHybridCache
+
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+        loaded = source.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        for field in ("model", "tokenizer", "cache_layout"):
+            changed_identity = dict(loaded.identity)
+            changed_identity[field] = f"changed-{field}"
+            incompatible = LoadedHybridCache(changed_identity, loaded.entries)
+            target = self._cache()
+            assert target.restore_hybrid_persistence_snapshot(incompatible) == 0
+            assert len(target) == 0
+
+    def test_restored_exact_hit_uses_logits_without_rewind_or_prefill(self, tmp_path):
+        import threading
+        from types import SimpleNamespace
+
+        import mlx.core as mx
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = self._cache()
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.prefix_cache = restored
+        generator.model = SimpleNamespace(
+            config=SimpleNamespace(image_token_index=None)
+        )
+        generator.language_model = MagicMock(
+            side_effect=AssertionError("exact restart hit must not run prefill")
+        )
+        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator._preprocess_request = lambda _request: None
+        generator._derive_request_rope_deltas = lambda _request: None
+        generator._prepare_rotating_caches = lambda _cache: True
+        generator._run_chunked_text_prefill = MagicMock(
+            side_effect=AssertionError("exact restart hit must not run prefill")
+        )
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="restart-exact-hit",
+            prompt="prompt",
+            temperature=0.0,
+        )
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.is_text_only = True
+
+        batch = generator._process_prompts([request])
+
+        assert batch.y.tolist() == [15]
+        generator.language_model.assert_not_called()
+        generator._run_chunked_text_prefill.assert_not_called()

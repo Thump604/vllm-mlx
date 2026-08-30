@@ -2074,6 +2074,40 @@ class TestLifecycleFailureHandling:
         assert callback_seen_during_hook["value"] is True
 
     @pytest.mark.anyio
+    async def test_async_cache_hooks_are_preferred_for_owner_thread_restore(
+        self, monkeypatch
+    ):
+        import vllm_mlx.server as srv
+
+        calls = []
+
+        class FakeEngine:
+            async def restore_cache_from_disk(self, path):
+                calls.append(("restore", path))
+                return 1
+
+            async def persist_cache_to_disk(self, path):
+                calls.append(("persist", path))
+                return True
+
+            def load_cache_from_disk(self, _path):
+                raise AssertionError("sync restore must not run")
+
+            def save_cache_to_disk(self, _path):
+                raise AssertionError("sync persist must not run")
+
+        monkeypatch.setattr(srv, "_get_cache_dir", lambda: "/tmp/hybrid-cache")
+        engine = FakeEngine()
+
+        await srv._restore_engine_state(None, engine)
+        await srv._persist_engine_state(None, engine)
+
+        assert calls == [
+            ("restore", "/tmp/hybrid-cache"),
+            ("persist", "/tmp/hybrid-cache"),
+        ]
+
+    @pytest.mark.anyio
     async def test_idle_unload_persists_and_restores_prefix_cache(self, monkeypatch):
         """Server-managed idle unload should save and reload prefix cache state."""
         import vllm_mlx.server as srv

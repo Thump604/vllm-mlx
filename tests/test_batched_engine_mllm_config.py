@@ -81,6 +81,7 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
     # SSD fields default to (None, 10.0) when absent from SchedulerConfig.
     assert captured["config_kwargs"]["ssd_cache_dir"] is None
     assert captured["config_kwargs"]["ssd_cache_max_gb"] == 10.0
+    assert captured["config_kwargs"]["model_identity"] == "fake-qwen"
 
 
 def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):

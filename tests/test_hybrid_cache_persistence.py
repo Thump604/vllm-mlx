@@ -1,0 +1,289 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-I/O regressions for exact hybrid prefix-cache restart snapshots."""
+
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import pytest
+
+from vllm_mlx.cache_persistence import (
+    HybridCachePersistenceError,
+    HybridCacheSnapshot,
+    HybridEntrySnapshot,
+    HybridLayerSnapshot,
+    read_hybrid_snapshot,
+    write_hybrid_snapshot,
+)
+
+
+def _snapshot(*, model="model-a", tokenizer="tokenizer-a"):
+    return HybridCacheSnapshot(
+        identity={
+            "model": model,
+            "tokenizer": tokenizer,
+            "cache_layout": "arrays-kv-layout",
+        },
+        entries=(
+            HybridEntrySnapshot(
+                tokens=(1, 2, 3, 4),
+                memory_bytes=358,
+                layers=(
+                    HybridLayerSnapshot(
+                        "ArraysCache",
+                        {
+                            "state_0": np.arange(8, dtype=np.float32).reshape(2, 4),
+                            "state_1": np.ones((1, 3), dtype=np.float16),
+                        },
+                        {
+                            "num_arrays": 2,
+                            "state_original_dtypes": [None, None],
+                            "metadata_arrays": [],
+                            "metadata_original_dtypes": {},
+                        },
+                    ),
+                    HybridLayerSnapshot(
+                        "KVCache",
+                        {
+                            "keys": np.ones((1, 2, 4, 8), dtype=np.float16),
+                            "values": np.full((1, 2, 4, 8), 2, dtype=np.float16),
+                        },
+                        {"offset": 4},
+                    ),
+                ),
+                auxiliary={
+                    "last_logits": np.arange(16, dtype=np.float32).reshape(1, 16)
+                },
+                auxiliary_original_dtypes={"last_logits": None},
+            ),
+        ),
+    )
+
+
+def _generation_dir(tmp_path):
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    return tmp_path / pointer["generation"]
+
+
+def test_hybrid_snapshot_round_trip_preserves_layers_tokens_and_logits(tmp_path):
+    source = _snapshot()
+    assert write_hybrid_snapshot(str(tmp_path), source)
+
+    loaded = read_hybrid_snapshot(str(tmp_path))
+
+    assert loaded is not None
+    assert loaded.identity == source.identity
+    assert loaded.entries[0].tokens == source.entries[0].tokens
+    assert [layer.layer_type for layer in loaded.entries[0].layers] == [
+        "ArraysCache",
+        "KVCache",
+    ]
+    np.testing.assert_array_equal(
+        loaded.entries[0].auxiliary["last_logits"],
+        source.entries[0].auxiliary["last_logits"],
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "entry-0/tokens.bin",
+        "entry-0/layer-0.safetensors",
+        "entry-0/auxiliary.safetensors",
+    ],
+)
+def test_hybrid_snapshot_rejects_same_length_tampering(tmp_path, relative_path):
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    path = _generation_dir(tmp_path) / relative_path
+    payload = bytearray(path.read_bytes())
+    payload[len(payload) // 2] ^= 0x01
+    path.write_bytes(payload)
+
+    with pytest.raises(HybridCachePersistenceError, match="checksum mismatch"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_malformed_or_duplicate_json(tmp_path):
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    (tmp_path / "index.json").write_text(
+        '{"version":1,"version":1,"generation":"x","manifest_sha256":"y"}'
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="duplicate JSON key"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_requires_last_logits(tmp_path):
+    source = _snapshot()
+    invalid = HybridCacheSnapshot(
+        identity=source.identity,
+        entries=(
+            HybridEntrySnapshot(
+                tokens=source.entries[0].tokens,
+                memory_bytes=source.entries[0].memory_bytes,
+                layers=source.entries[0].layers,
+                auxiliary={},
+                auxiliary_original_dtypes={},
+            ),
+        ),
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="last_logits"):
+        write_hybrid_snapshot(str(tmp_path), invalid)
+
+
+def test_hybrid_snapshot_rejects_wrong_logits_shape(tmp_path):
+    source = _snapshot()
+    invalid = HybridCacheSnapshot(
+        identity=source.identity,
+        entries=(
+            HybridEntrySnapshot(
+                tokens=source.entries[0].tokens,
+                memory_bytes=source.entries[0].memory_bytes - 48,
+                layers=source.entries[0].layers,
+                auxiliary={"last_logits": np.arange(4, dtype=np.float32)},
+                auxiliary_original_dtypes={"last_logits": None},
+            ),
+        ),
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="last_logits shape"):
+        write_hybrid_snapshot(str(tmp_path), invalid)
+
+
+def test_interrupted_publish_keeps_previous_generation_loadable(tmp_path, monkeypatch):
+    first = _snapshot(model="model-first")
+    write_hybrid_snapshot(str(tmp_path), first)
+    original_replace = os.replace
+
+    def interrupt_pointer_publish(source, destination):
+        if str(destination).endswith("index.json"):
+            raise OSError("simulated interruption")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", interrupt_pointer_publish)
+    with pytest.raises(OSError, match="simulated interruption"):
+        write_hybrid_snapshot(str(tmp_path), _snapshot(model="model-second"))
+
+    loaded = read_hybrid_snapshot(str(tmp_path))
+    assert loaded is not None
+    assert loaded.identity["model"] == "model-first"
+
+
+def test_hybrid_snapshot_rejects_parent_generation_component(tmp_path):
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["generation"] = ".."
+    (tmp_path / "index.json").write_text(json.dumps(pointer))
+
+    with pytest.raises(HybridCachePersistenceError, match="invalid generation"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_symlinked_generation(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "manifest.json").write_text("{}")
+    pointer = {
+        "version": 1,
+        "generation": "generation-link",
+        "manifest_sha256": "0" * 64,
+    }
+    (tmp_path / "generation-link").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "index.json").write_text(json.dumps(pointer))
+
+    with pytest.raises(
+        HybridCachePersistenceError, match="missing or invalid generation"
+    ):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_truncated_tokens_even_with_updated_checksum(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    tokens = generation / "entry-0" / "tokens.bin"
+    tokens.write_bytes(tokens.read_bytes()[:-4])
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["tokens_sha256"] = hashlib.sha256(
+        tokens.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (tmp_path / "index.json").write_text(
+        json.dumps(pointer, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="token file length"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_declared_memory_mismatch(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["memory_bytes"] += 1
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (tmp_path / "index.json").write_text(
+        json.dumps(pointer, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="memory byte count"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_prunes_stale_generations_after_commit(tmp_path):
+    write_hybrid_snapshot(str(tmp_path), _snapshot(model="first"))
+    first = _generation_dir(tmp_path)
+    write_hybrid_snapshot(str(tmp_path), _snapshot(model="second"))
+    second = _generation_dir(tmp_path)
+
+    assert first != second
+    assert not first.exists()
+    assert second.is_dir()
+
+
+def test_hybrid_snapshot_rejects_invalid_layer_metadata(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["layers"][1]["metadata"]["offset"] = 99
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (tmp_path / "index.json").write_text(
+        json.dumps(pointer, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(HybridCachePersistenceError, match="KV layer offset"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_symlinked_tensor_file(tmp_path):
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    layer = _generation_dir(tmp_path) / "entry-0" / "layer-0.safetensors"
+    outside = tmp_path.parent / f"{tmp_path.name}-layer.safetensors"
+    layer.replace(outside)
+    layer.symlink_to(outside)
+
+    with pytest.raises(HybridCachePersistenceError, match="missing layer 0 file"):
+        read_hybrid_snapshot(str(tmp_path))

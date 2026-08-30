@@ -1212,8 +1212,16 @@ class TestMLLMBatchGeneratorMTPGuards:
             def fetch(self, tokens):
                 return None, tokens
 
-            def prepare_store(self, tokens, cache, auxiliary=None):
+            def prepare_store(
+                self,
+                tokens,
+                cache,
+                auxiliary=None,
+                *,
+                persistence_eligible=False,
+            ):
                 call_order.append("prepare")
+                assert persistence_eligible is True
                 assert int(mx.argmax(auxiliary["last_logits"], axis=-1).item()) == 1
                 return SimpleNamespace(
                     tokens=tuple(tokens),
@@ -2803,11 +2811,17 @@ class TestChunkedPrefillCacheHandling:
 
         original_prepare_store = gen.prefix_cache.prepare_store
 
-        def prepare_store(tokens, cache, auxiliary=None):
+        def prepare_store(tokens, cache, auxiliary=None, *, persistence_eligible=False):
             call_order.append("prepare")
+            assert persistence_eligible is True
             assert auxiliary is not None
             assert auxiliary["last_logits"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
-            return original_prepare_store(tokens, cache, auxiliary=auxiliary)
+            return original_prepare_store(
+                tokens,
+                cache,
+                auxiliary=auxiliary,
+                persistence_eligible=persistence_eligible,
+            )
 
         gen.prefix_cache.prepare_store = prepare_store
 
