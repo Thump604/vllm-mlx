@@ -2784,6 +2784,84 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         assert drafter.reset_calls == 2
 
+    def test_stateful_external_mtp_binds_existing_batch_before_first_step(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            install_mtp_mllm,
+        )
+
+        request = SimpleNamespace(uid=1, request_id="existing", mllm_draft=True)
+        batch = MLLMBatch(
+            uids=[1],
+            request_ids=["existing"],
+            y=mx.array([0], dtype=mx.uint32),
+            logprobs=[mx.zeros(4)],
+            max_tokens=[8],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+        )
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=batch,
+            unprocessed_requests=[],
+            _step=MagicMock(),
+            _next=MagicMock(return_value=[]),
+            sampler=MagicMock(),
+            stop_tokens=set(),
+            _maybe_store_prefix_cache=MagicMock(),
+        )
+        drafter = _RecordingStatefulDrafter(rows=["existing"])
+
+        install_mtp_mllm(generator, object(), draft_model=drafter)
+        MLLMBatchGenerator.remove(generator, [1])
+
+        assert generator.active_batch is None
+        assert drafter.reset_calls == 2
+
+    def test_stateful_external_mtp_binds_batch_created_by_wrapped_next(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            install_mtp_mllm,
+        )
+
+        request = SimpleNamespace(uid=1, request_id="created", mllm_draft=True)
+        batch = MLLMBatch(
+            uids=[1],
+            request_ids=["created"],
+            y=mx.array([0], dtype=mx.uint32),
+            logprobs=[mx.zeros(4)],
+            max_tokens=[8],
+            num_tokens=[0],
+            cache=[],
+            requests=[request],
+        )
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=None,
+            unprocessed_requests=[],
+            _step=MagicMock(),
+            sampler=MagicMock(),
+            stop_tokens=set(),
+            _maybe_store_prefix_cache=MagicMock(),
+        )
+
+        def create_batch():
+            generator.active_batch = batch
+            return []
+
+        generator._next = create_batch
+        drafter = _RecordingStatefulDrafter(rows=["created"])
+
+        install_mtp_mllm(generator, object(), draft_model=drafter)
+        generator._next()
+        MLLMBatchGenerator.remove(generator, [1])
+
+        assert generator.active_batch is None
+        assert drafter.reset_calls == 2
+
     def test_stateful_external_mtp_reconciles_on_next_target_primary(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 

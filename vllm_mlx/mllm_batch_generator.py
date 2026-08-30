@@ -2755,6 +2755,14 @@ def install_mtp_mllm(
             _reset_external_drafter()
             raise
 
+    def _attach_external_lifecycle_hook() -> None:
+        if stateful_external_drafter and batch_gen.active_batch is not None:
+            batch_gen.active_batch._row_filter_hook = _filter_external_drafter_rows
+
+    # Installation can occur with a pre-existing batch in tests or embedded
+    # callers. Bind lifecycle ownership before any public removal can mutate it.
+    _attach_external_lifecycle_hook()
+
     # MTP stats. These are intentionally exposed through get_mtp_stats() so
     # /v1/status can distinguish "weights injected" from useful draft work.
     _mtp_stats_lock = threading.Lock()
@@ -2843,8 +2851,7 @@ def install_mtp_mllm(
             if batch_gen.active_batch is not None
             else []
         )
-        if stateful_external_drafter and batch_gen.active_batch is not None:
-            batch_gen.active_batch._row_filter_hook = _filter_external_drafter_rows
+        _attach_external_lifecycle_hook()
         # Prefill and request-local logits processors remain non-speculative.
         # Sampling and concurrent batches are supported below with per-request
         # distributions and UID-keyed verified state.
@@ -3310,6 +3317,7 @@ def install_mtp_mllm(
     def _mtp_next() -> List[MLLMBatchResponse]:
         """Wrapper around _next that emits deferred MTP draft tokens."""
         nonlocal _pending_external_sync
+        _attach_external_lifecycle_hook()
         prior_active_uids = (
             list(batch_gen.active_batch.uids)
             if batch_gen.active_batch is not None
@@ -3338,6 +3346,9 @@ def install_mtp_mllm(
                     prev_deferred[uid] = _deferred_drafts.pop(uid)
 
         responses = batch_gen._inner_next()
+        # Prompt or chunked-prefill work may have created a new active batch.
+        # Bind its lifecycle before control returns to public remove/abort paths.
+        _attach_external_lifecycle_hook()
 
         if responses:
             _mark_mtp_attempts_on_primary_responses(responses, _attempted_drafts_by_uid)
