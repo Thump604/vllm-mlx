@@ -10,6 +10,8 @@ import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 
 def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch):
     from vllm_mlx.engine.batched import BatchedEngine
@@ -84,11 +86,10 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
     assert captured["config_kwargs"]["model_identity"] == "fake-qwen"
 
 
-def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
     from vllm_mlx.engine.batched import BatchedEngine
 
     captured = {}
-    loaded_drafter = object()
 
     class FakeMLXMultimodalLM:
         def __init__(self, model_name, trust_remote_code=True, **kwargs):
@@ -133,6 +134,12 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         mllm_draft_block_size=6,
     )
     asyncio.run(engine._start_mllm())
+    return captured
+
+
+def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+    loaded_drafter = SimpleNamespace(supports_continuous_batching=True)
+    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
 
     assert captured["model_kwargs"]["draft_model"] == "assistant"
     assert captured["model_kwargs"]["draft_kind"] == "mtp"
@@ -142,6 +149,21 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         "draft_kind": "mtp",
         "draft_block_size": 6,
     }
+
+
+@pytest.mark.parametrize(
+    "loaded_drafter",
+    [
+        None,
+        object(),
+        SimpleNamespace(supports_continuous_batching=None),
+        SimpleNamespace(supports_continuous_batching="false"),
+        SimpleNamespace(supports_continuous_batching=False),
+    ],
+)
+def test_start_mllm_rejects_unqualified_external_drafter(monkeypatch, loaded_drafter):
+    with pytest.raises(ValueError, match="explicitly declares"):
+        _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
 
 
 def _generation_output():
@@ -169,6 +191,9 @@ def _batched_mllm_engine(scheduler, *, default_mllm_draft=False):
     )
     engine._loaded = True
     engine._mllm_scheduler = scheduler
+    engine._mllm_instance = SimpleNamespace(
+        _draft_model=SimpleNamespace(supports_continuous_batching=True)
+    )
     return engine
 
 
@@ -253,6 +278,19 @@ def test_idle_stats_report_configured_mllm_draft_default():
         "default_enabled": True,
         "continuous_batching_supported": True,
     }
+
+
+@pytest.mark.parametrize("reported", [False, None, "false"])
+def test_batched_stats_preserve_scheduler_batch_capability(reported):
+    engine = _batched_mllm_engine(
+        SimpleNamespace(
+            get_stats=lambda: {"mtp": {"continuous_batching_supported": reported}}
+        )
+    )
+
+    assert engine.get_stats()["mtp"]["continuous_batching_supported"] is (
+        reported if type(reported) is bool else None
+    )
 
 
 def _run_start_mllm(monkeypatch, scheduler_config):

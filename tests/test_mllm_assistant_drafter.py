@@ -210,6 +210,31 @@ def test_mllm_load_preserves_registered_drafter_error(monkeypatch, tmp_path):
         model.load()
 
 
+@pytest.mark.parametrize(
+    ("drafter", "expected"),
+    [
+        (SimpleNamespace(supports_continuous_batching=True), True),
+        (SimpleNamespace(supports_continuous_batching=False), False),
+        (SimpleNamespace(supports_continuous_batching=None), None),
+        (SimpleNamespace(supports_continuous_batching="false"), None),
+        (SimpleNamespace(), None),
+    ],
+)
+def test_simple_engine_reports_explicit_drafter_batch_capability(drafter, expected):
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "qwen4-exp",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+    )
+    engine._loaded = True
+    engine._model = SimpleNamespace(_draft_model=drafter)
+
+    assert engine.get_stats()["mtp"]["continuous_batching_supported"] is expected
+
+
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
     from vllm_mlx.models.mllm import MLXMultimodalLM
 
@@ -484,7 +509,7 @@ def test_simple_engine_reports_configured_mllm_drafter_status():
         "draft_kind": "mtp",
         "draft_block_size": 4,
         "default_enabled": True,
-        "continuous_batching_supported": True,
+        "continuous_batching_supported": None,
     }
 
 
