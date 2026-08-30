@@ -1842,6 +1842,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
         language_model = MagicMock()
         draft_model = MagicMock()
+        draft_model.requires_verified_token_reconciliation = False
         install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
 
         result = batch_gen._step(
@@ -1862,6 +1863,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm
 
         draft_model = MagicMock()
+        draft_model.requires_verified_token_reconciliation = False
         active_batch = SimpleNamespace(
             uids=[11, 22],
             requests=[],
@@ -1907,6 +1909,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
         draft_model = MagicMock()
+        draft_model.requires_verified_token_reconciliation = False
 
         class FakeBatchGen:
             def __init__(self):
