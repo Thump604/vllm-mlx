@@ -9,6 +9,8 @@ job excludes this file because MLX has no Linux distribution.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 
 class TestTrimCacheOffset:
     """Tests for ``_trim_cache_offset``, focused on the LCP contamination fix.
@@ -1320,6 +1322,38 @@ class TestHybridRestartPersistence:
 
             return [ArraysCache(size=2), KVCache()]
 
+    class _VLMArgs:
+        model_type = "qwen3_5"
+
+        def __init__(self, *, as_mapping=False):
+            text_config = TestHybridRestartPersistence._Args()
+            if as_mapping:
+                keys = (
+                    "model_type",
+                    "num_hidden_layers",
+                    "vocab_size",
+                    "num_key_value_heads",
+                    "head_dim",
+                    "linear_num_value_heads",
+                    "linear_num_key_heads",
+                    "linear_key_head_dim",
+                    "linear_value_head_dim",
+                    "linear_conv_kernel_dim",
+                )
+                text_config = {key: getattr(text_config, key) for key in keys}
+            self.text_config = text_config
+
+    class _VLMModel:
+        def __init__(self, *, text_config_as_mapping=False):
+            self.args = TestHybridRestartPersistence._VLMArgs(
+                as_mapping=text_config_as_mapping
+            )
+
+        def make_cache(self):
+            from mlx_lm.models.cache import ArraysCache, KVCache
+
+            return [ArraysCache(size=2), KVCache()]
+
     @staticmethod
     def _state():
         import mlx.core as mx
@@ -1340,11 +1374,11 @@ class TestHybridRestartPersistence:
         mx.eval(*arrays.state, kv.keys, kv.values, logits)
         return [arrays, kv], logits
 
-    def _cache(self, tokenizer=None, renderer=None, model_identity=None):
+    def _cache(self, tokenizer=None, renderer=None, model_identity=None, model=None):
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
         return MemoryAwarePrefixCache(
-            self._Model(),
+            model or self._Model(),
             MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
             tokenizer=tokenizer or self._Tokenizer(),
             model_identity=model_identity or "qualified-model@revision",
@@ -1399,6 +1433,61 @@ class TestHybridRestartPersistence:
         assert fetched[1].offset == state[1].offset
         assert mx.array_equal(fetched[1].keys, state[1].keys).item()
         assert mx.array_equal(fetched[1].values, state[1].values).item()
+
+    @pytest.mark.parametrize("text_config_as_mapping", [False, True])
+    def test_round_trip_uses_nested_vlm_text_config_geometry(
+        self, tmp_path, text_config_as_mapping
+    ):
+        def make_cache():
+            return self._cache(
+                model=self._VLMModel(text_config_as_mapping=text_config_as_mapping),
+                model_identity="qualified-vlm@revision",
+            )
+
+        source = make_cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = make_cache()
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        assert len(restored) == 1
+
+    def test_nested_vlm_missing_text_geometry_publishes_nothing(self, tmp_path):
+        source = self._cache(
+            model=self._VLMModel(),
+            model_identity="qualified-vlm@revision",
+        )
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        invalid_model = self._VLMModel(text_config_as_mapping=True)
+        invalid_model.args.text_config["linear_conv_kernel_dim"] = None
+        restored = self._cache(
+            model=invalid_model,
+            model_identity="qualified-vlm@revision",
+        )
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 0
+        assert len(restored) == 0
 
     def test_ineligible_multimodal_entry_is_not_persisted(self):
         source = self._cache()

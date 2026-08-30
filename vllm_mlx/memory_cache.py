@@ -1005,6 +1005,22 @@ def _identity_attr(source: Any, key: str) -> Any:
     return getattr(source, key, None)
 
 
+def _model_text_config(model: Any) -> Any:
+    """Return the language config that owns cache geometry.
+
+    Text-only models expose these fields directly. VLM wrappers such as
+    Qwen3.5/Qwen3.8 keep them under ``text_config``.
+    """
+    cfg = None
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    cfg = cfg if cfg is not None else model
+    text_config = _identity_attr(cfg, "text_config")
+    return text_config if text_config is not None else cfg
+
+
 def _compute_model_persistence_fingerprint(
     model: Any, artifact_identity: str | None = None
 ) -> str:
@@ -2263,11 +2279,7 @@ class MemoryAwarePrefixCache:
             (qualified_name.rsplit(".", 1)[-1], arity)
             for qualified_name, arity in (_cache_topology(self._model) or ())
         )
-        cfg = None
-        for cfg_attr in ("config", "args", "model_config"):
-            cfg = getattr(self._model, cfg_attr, None)
-            if cfg is not None:
-                break
+        cfg = _model_text_config(self._model)
         vocab_size = _identity_attr(cfg or self._model, "vocab_size")
         candidates = []
         seen_tokens = set()
