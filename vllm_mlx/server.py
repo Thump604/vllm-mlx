@@ -7058,6 +7058,19 @@ async def stream_chat_completion(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
 
+        # Emit request-level diagnostics after the final content/tool delta.  A
+        # speculative decoder updates its counters on the terminal output, so
+        # emitting earlier would report stale values.
+        generation_metadata = _generation_metadata(None, last_output)
+        if generation_metadata is not None:
+            metadata_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_response_model_name(request.model),
+                choices=[],
+                generation_metadata=generation_metadata,
+            )
+            yield f"data: {metadata_chunk.model_dump_json()}\n\n"
+
         # Send final chunk with usage if requested
         if include_usage:
             usage_chunk = ChatCompletionChunk(
