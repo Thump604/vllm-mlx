@@ -3127,7 +3127,7 @@ def install_mtp_mllm(
                     if callable(filter_batch):
                         filter_batch(keep)
                 else:
-                    draft_model.reset(batch_gen.model)
+                    _reset_external_drafter()
         for uid in list(_skip_state_by_uid):
             if uid not in active_uids:
                 _skip_state_by_uid.pop(uid, None)
