@@ -32,6 +32,7 @@ from vllm_mlx.api.models import (
     EmbeddingResponse,
     EmbeddingUsage,
     FunctionCall,
+    GenerationMetadata,
     ImageUrl,
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -726,6 +727,21 @@ class TestModelSerialization:
         delta = data["choices"][0]["delta"]
         assert delta["reasoning_content"] == "thinking"
         assert "reasoning" not in delta
+
+    def test_chat_completion_chunk_serializes_generation_metadata(self):
+        chunk = ChatCompletionChunk(
+            model="test-model",
+            choices=[],
+            generation_metadata=GenerationMetadata(mtp_drafts=6, mtp_accepted=4),
+        )
+
+        data = chunk.model_dump(exclude_none=True)
+
+        assert data["generation_metadata"] == {
+            "no_final_content_watchdog_enforced": False,
+            "mtp_drafts": 6,
+            "mtp_accepted": 4,
+        }
 
     def test_assistant_message_excludes_null_tool_calls(self):
         msg = AssistantMessage(content="Hello!")

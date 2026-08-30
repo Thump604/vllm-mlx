@@ -577,3 +577,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None
