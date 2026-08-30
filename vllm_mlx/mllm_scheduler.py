@@ -240,14 +240,16 @@ class MLLMScheduler:
         self.running: Dict[str, MLLMRequest] = {}  # Running requests by ID
         self.requests: Dict[str, MLLMRequest] = {}  # All requests by ID
         self.finished_req_ids: Set[str] = set()  # Recently finished
+        # One re-entrant lock owns scheduler request state, generator insertion,
+        # and cache lifecycle transitions.
+        self._state_lock = threading.RLock()
+        self._request_lock = self._state_lock
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
-        # Scheduler state and generator insertion form one transaction.  This
-        # also serializes cache lifecycle mutations with request admission.
-        self._state_lock = threading.RLock()
         self._owner_thread_id = threading.get_ident()
+        self._pending_generator_removals: Set[int] = set()
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
@@ -518,7 +520,7 @@ class MLLMScheduler:
         except Exception:
             pass
 
-        with self._state_lock:
+        with self._request_lock:
             if request_id in self.requests:
                 raise ValueError(f"duplicate MLLM request ID: {request_id}")
             pending_removal = getattr(self.batch_generator, "has_pending_removal", None)
@@ -536,10 +538,10 @@ class MLLMScheduler:
 
     def abort_request(self, request_id: str) -> bool:
         self._assert_owner_thread()
-        with self._state_lock:
-            return self._abort_request_locked(request_id)
+        with self._request_lock:
+            return self._abort_request(request_id)
 
-    def _abort_request_locked(self, request_id: str) -> bool:
+    def _abort_request(self, request_id: str) -> bool:
         """
         Abort a request.
 
@@ -553,13 +555,31 @@ class MLLMScheduler:
         if request is None:
             return False
 
-        # Signal the batch generator only after admission.  A request that is
-        # still waiting has not been inserted into the generator, so marking
-        # its ID would poison a later request that legitimately reuses it.
-        # The prefill loop checks _aborted_request_ids between chunks and
-        # raises PrefillAbortedError to exit early for admitted requests.
-        if request.status != RequestStatus.WAITING and self.batch_generator is not None:
-            self.batch_generator.abort_prefill(request_id)
+        first_cleanup_error: Optional[Exception] = None
+
+        def record_cleanup_error(action: str, error: Exception) -> None:
+            nonlocal first_cleanup_error
+            if first_cleanup_error is None:
+                first_cleanup_error = error
+            logger.error(
+                "Failed to %s for MLLM request %s: %s",
+                action,
+                request_id,
+                error,
+                exc_info=True,
+            )
+
+        # Signal batch generator to abort any in-progress prefill for this
+        # request.  The prefill loop checks _aborted_request_ids between
+        # chunks and raises PrefillAbortedError to exit early.
+        batch_uid = self.request_id_to_uid.get(request_id)
+        if self.batch_generator is not None and batch_uid is not None:
+            try:
+                self.batch_generator.abort_prefill(request_id, batch_uid)
+            except Exception as error:
+                # External batch-generator cleanup must not prevent local
+                # request state from being retired.
+                record_cleanup_error("abort prefill", error)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -588,14 +608,22 @@ class MLLMScheduler:
         # will drain the queue at the next safe boundary (start of
         # step(), before any forward pass).
         if request_id in self.request_id_to_uid:
-            uid = self.request_id_to_uid[request_id]
+            uid = self.request_id_to_uid.pop(request_id)
+            self.uid_to_request_id.pop(uid, None)
             if self.batch_generator is not None:
-                self.batch_generator.schedule_removal([uid], request_ids=[request_id])
-            del self.uid_to_request_id[uid]
-            del self.request_id_to_uid[request_id]
+                try:
+                    self.batch_generator.schedule_removal(
+                        [uid], request_ids=[request_id]
+                    )
+                except Exception as error:
+                    # Preserve generator ownership for a scheduler-boundary
+                    # retry while local maps retire exactly once.
+                    self._pending_generator_removals.add(uid)
+                    record_cleanup_error("schedule batch removal", error)
 
         if request_id in self.running:
             del self.running[request_id]
+        request.batch_uid = None
 
         # Credit in-flight tokens so dashboard metrics stay accurate
         # (without this, aborted requests' tokens vanish from /v1/status).
@@ -618,11 +646,22 @@ class MLLMScheduler:
                 pass
 
         logger.debug(f"Aborted request {request_id}")
+        if first_cleanup_error is not None:
+            raise first_cleanup_error
         return True
 
     def has_requests(self) -> bool:
         """Check if there are any pending or running requests."""
-        return bool(self.waiting or self.running)
+        generator_pending = bool(
+            self.batch_generator is not None
+            and self.batch_generator.has_pending_removals()
+        )
+        return bool(
+            self.waiting
+            or self.running
+            or self._pending_generator_removals
+            or generator_pending
+        )
 
     def get_num_waiting(self) -> int:
         """Get number of waiting requests."""
@@ -633,6 +672,11 @@ class MLLMScheduler:
         return len(self.running)
 
     def _schedule_waiting(self) -> List[MLLMRequest]:
+        """Move waiting requests to running under the scheduler state lock."""
+        with self._request_lock:
+            return self._schedule_waiting_locked()
+
+    def _schedule_waiting_locked(self) -> List[MLLMRequest]:
         """
         Move requests from waiting queue to running.
 
@@ -753,6 +797,16 @@ class MLLMScheduler:
     def _process_batch_responses(
         self, responses: List[MLLMBatchResponse]
     ) -> Tuple[List[RequestOutput], Set[str]]:
+        """Process batch responses under the scheduler state lock."""
+        request_lock = getattr(self, "_request_lock", None)
+        if request_lock is None:
+            return self._process_batch_responses_locked(responses)
+        with request_lock:
+            return self._process_batch_responses_locked(responses)
+
+    def _process_batch_responses_locked(
+        self, responses: List[MLLMBatchResponse]
+    ) -> Tuple[List[RequestOutput], Set[str]]:
         """
         Process responses from batch generator.
 
@@ -775,10 +829,27 @@ class MLLMScheduler:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
                 continue
+            if response.request_id != request_id:
+                raise RuntimeError(
+                    "MLLM batch response owner mismatch: "
+                    f"uid={response.uid}, mapped={request_id}, "
+                    f"response={response.request_id}"
+                )
 
             request = self.running.get(request_id)
             if request is None:
                 continue
+            request_id_to_uid = getattr(self, "request_id_to_uid", None)
+            if request_id_to_uid is not None and (
+                request.batch_uid != response.uid
+                or request_id_to_uid.get(request_id) != response.uid
+            ):
+                raise RuntimeError(
+                    "MLLM batch response UID ownership mismatch: "
+                    f"uid={response.uid}, request={request_id}, "
+                    f"request_uid={request.batch_uid}, "
+                    f"mapped_uid={request_id_to_uid.get(request_id)}"
+                )
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
@@ -869,9 +940,31 @@ class MLLMScheduler:
 
         return outputs, finished_ids
 
-    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
-        """Clean up finished requests."""
+    def _cleanup_finished(
+        self,
+        finished_ids: Set[str],
+        expected_owners: Optional[Dict[str, Tuple[MLLMRequest, Optional[int]]]] = None,
+    ) -> None:
+        """Clean up finished requests under the scheduler state lock."""
+        with self._request_lock:
+            self._cleanup_finished_locked(finished_ids, expected_owners)
+
+    def _cleanup_finished_locked(
+        self,
+        finished_ids: Set[str],
+        expected_owners: Optional[Dict[str, Tuple[MLLMRequest, Optional[int]]]] = None,
+    ) -> None:
+        """Clean up finished requests owned by expected request instances."""
         for request_id in finished_ids:
+            if expected_owners is not None and request_id in expected_owners:
+                expected_request, expected_uid = expected_owners[request_id]
+                if self.requests.get(request_id) is not expected_request:
+                    continue
+                if self.running.get(request_id) is not expected_request:
+                    continue
+                if self.request_id_to_uid.get(request_id) != expected_uid:
+                    continue
+
             # Remove from running
             if request_id in self.running:
                 del self.running[request_id]
@@ -918,7 +1011,13 @@ class MLLMScheduler:
         # ``encodeSignalEvent: uncommitted encoder`` race.  See
         # `abort_request` and `MLLMBatchGenerator.schedule_removal`.
         if self.batch_generator is not None:
-            self.batch_generator.process_pending_removals()
+            with self._request_lock:
+                if self._pending_generator_removals:
+                    self.batch_generator.schedule_removal(
+                        list(self._pending_generator_removals)
+                    )
+                    self._pending_generator_removals.clear()
+                self.batch_generator.process_pending_removals()
 
         # Schedule waiting requests
         scheduled = self._schedule_waiting()
@@ -931,7 +1030,18 @@ class MLLMScheduler:
             output.has_work = True
 
             if responses:
-                outputs, finished_ids = self._process_batch_responses(responses)
+                with self._request_lock:
+                    outputs, finished_ids = self._process_batch_responses_locked(
+                        responses
+                    )
+                    finished_owners = {}
+                    for request_id in finished_ids:
+                        request = self.requests.get(request_id)
+                        if request is not None:
+                            finished_owners[request_id] = (
+                                request,
+                                self.request_id_to_uid.get(request_id),
+                            )
                 output.outputs = outputs
                 output.finished_request_ids = finished_ids
 
@@ -946,7 +1056,7 @@ class MLLMScheduler:
                         except asyncio.QueueFull:
                             pass
 
-                self._cleanup_finished(finished_ids)
+                self._cleanup_finished(finished_ids, expected_owners=finished_owners)
                 if finished_ids:
                     mx.clear_cache()
 
@@ -968,6 +1078,15 @@ class MLLMScheduler:
         return output
 
     def _fail_requests_after_step_error(self, error: Exception) -> None:
+        """Fail scheduler state atomically against concurrent cancellation."""
+        request_lock = getattr(self, "_request_lock", None)
+        if request_lock is None:
+            self._fail_requests_after_step_error_locked(error)
+            return
+        with request_lock:
+            self._fail_requests_after_step_error_locked(error)
+
+    def _fail_requests_after_step_error_locked(self, error: Exception) -> None:
         """Terminate every request that may share a partially mutated batch.
 
         A model forward can update earlier cache layers before a later layer
@@ -1000,21 +1119,50 @@ class MLLMScheduler:
                     )
                 except asyncio.QueueFull:
                     pass
-            self.abort_request(request_id)
+            try:
+                self.abort_request(request_id)
+            except Exception as cleanup_error:
+                # _abort_request performs local cleanup before re-raising an
+                # external abort/schedule-removal failure. Keep handling the
+                # remaining requests even when this one reports that error.
+                logger.error(
+                    "Failed to abort MLLM request %s after step error: %s",
+                    request_id,
+                    cleanup_error,
+                    exc_info=True,
+                )
 
         # abort_request defers batch mutation for thread safety. This handler
         # runs on the scheduler loop after the failed forward has unwound, so
         # draining now is both safe and necessary before any later request.
         if self.batch_generator is not None:
-            self.batch_generator.process_pending_removals()
+            try:
+                self.batch_generator.process_pending_removals()
+            except Exception as cleanup_error:
+                logger.error(
+                    "Failed to drain pending MLLM removals after step error: %s",
+                    cleanup_error,
+                    exc_info=True,
+                )
 
     def get_request(self, request_id: str) -> Optional[MLLMRequest]:
         """Get a request by ID."""
         return self.requests.get(request_id)
 
     def remove_finished_request(self, request_id: str) -> Optional[MLLMRequest]:
-        """Remove a finished request from tracking."""
-        return self.requests.pop(request_id, None)
+        """Remove a terminal request without bypassing ownership cleanup."""
+        request_lock = getattr(self, "_request_lock", None)
+        if request_lock is None:
+            return self._remove_finished_request_locked(request_id)
+        with request_lock:
+            return self._remove_finished_request_locked(request_id)
+
+    def _remove_finished_request_locked(self, request_id: str) -> Optional[MLLMRequest]:
+        request = self.requests.get(request_id)
+        if request is None or not RequestStatus.is_finished(request.status):
+            return None
+        self._cleanup_finished_locked({request_id})
+        return request
 
     # ========== Async API (for streaming) ==========
 
@@ -1506,10 +1654,18 @@ class MLLMScheduler:
     def reset(self) -> None:
         """Reset the scheduler state."""
         self._assert_owner_thread()
-        with self._state_lock:
+        with self._request_lock:
             # Abort all requests
             for request_id in list(self.requests.keys()):
                 self.abort_request(request_id)
+
+            if self.batch_generator is not None:
+                if self._pending_generator_removals:
+                    self.batch_generator.schedule_removal(
+                        list(self._pending_generator_removals)
+                    )
+                    self._pending_generator_removals.clear()
+                self.batch_generator.process_pending_removals()
 
             self.waiting.clear()
             self.running.clear()

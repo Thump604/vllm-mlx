@@ -318,6 +318,51 @@ class MLLMBatch:
     def __len__(self) -> int:
         return len(self.uids)
 
+    @staticmethod
+    def _copy_cache_container(container: Any, clone_item: Callable[[Any], Any]) -> Any:
+        """Copy a cache container while preserving its list/tuple type."""
+        if isinstance(container, list):
+            copied = copy.copy(container)
+            copied[:] = [clone_item(item) for item in container]
+            return copied
+        if isinstance(container, tuple):
+            items = tuple(clone_item(item) for item in container)
+            if type(container) is tuple:
+                return items
+            if hasattr(container, "_fields"):
+                return type(container)(*items)
+            return type(container)(items)
+        return container
+
+    @classmethod
+    def _copy_cache_state(cls, value: Any) -> Any:
+        """Copy mutable Python containers without copying MLX array storage."""
+        if isinstance(value, (list, tuple)):
+            return cls._copy_cache_container(value, cls._copy_cache_state)
+        if isinstance(value, dict):
+            copied = copy.copy(value)
+            copied.clear()
+            copied.update(
+                (key, cls._copy_cache_state(item)) for key, item in value.items()
+            )
+            return copied
+        return value
+
+    @classmethod
+    def _copy_cache_for_filter(cls, cache: Any) -> Any:
+        """Shallow-copy a cache and its mutable filter-owned containers."""
+        if not hasattr(cache, "filter"):
+            return cache
+
+        copied = copy.copy(cache)
+        for name, value in getattr(cache, "__dict__", {}).items():
+            if name == "caches":
+                value = cls._copy_cache_container(value, cls._copy_cache_for_filter)
+            elif isinstance(value, (list, tuple, dict)):
+                value = cls._copy_cache_state(value)
+            setattr(copied, name, value)
+        return copied
+
     def filter(self, keep_idx: List[int]) -> None:
         """
         Filter batch to keep only requests at specified indices.
@@ -326,23 +371,53 @@ class MLLMBatch:
             keep_idx: Indices of requests to keep
         """
         previous_uids = list(self.uids)
-        self.uids = [self.uids[k] for k in keep_idx]
-        self.request_ids = [self.request_ids[k] for k in keep_idx]
-        self.logprobs = [self.logprobs[k] for k in keep_idx]
-        self.max_tokens = [self.max_tokens[k] for k in keep_idx]
-        self.num_tokens = [self.num_tokens[k] for k in keep_idx]
-        self.requests = [self.requests[k] for k in keep_idx]
-        if self.logits_processors is not None:
-            self.logits_processors = [self.logits_processors[k] for k in keep_idx]
-        if self.samplers is not None:
-            self.samplers = [self.samplers[k] for k in keep_idx]
         keep_idx_array = mx.array(keep_idx, mx.int32)
-        self.y = self.y[keep_idx_array]
+        staged_y = self.y[keep_idx_array]
+        staged_uids = [self.uids[k] for k in keep_idx]
+        staged_request_ids = [self.request_ids[k] for k in keep_idx]
+        staged_logprobs = [self.logprobs[k] for k in keep_idx]
+        staged_max_tokens = [self.max_tokens[k] for k in keep_idx]
+        staged_num_tokens = [self.num_tokens[k] for k in keep_idx]
+        staged_requests = [self.requests[k] for k in keep_idx]
 
-        # Filter cache entries
-        for c in self.cache:
-            if hasattr(c, "filter"):
-                c.filter(keep_idx_array)
+        staged_logits_processors = None
+        if self.logits_processors is not None:
+            staged_logits_processors = [self.logits_processors[k] for k in keep_idx]
+
+        staged_samplers = None
+        if self.samplers is not None:
+            staged_samplers = [self.samplers[k] for k in keep_idx]
+
+        staged_cache = self._copy_cache_container(
+            self.cache, self._copy_cache_for_filter
+        )
+        for cache in staged_cache:
+            if hasattr(cache, "filter"):
+                cache.filter(keep_idx_array)
+
+        (
+            self.uids,
+            self.request_ids,
+            self.y,
+            self.logprobs,
+            self.max_tokens,
+            self.num_tokens,
+            self.cache,
+            self.requests,
+            self.logits_processors,
+            self.samplers,
+        ) = (
+            staged_uids,
+            staged_request_ids,
+            staged_y,
+            staged_logprobs,
+            staged_max_tokens,
+            staged_num_tokens,
+            staged_cache,
+            staged_requests,
+            staged_logits_processors,
+            staged_samplers,
+        )
 
         if self._row_filter_hook is not None:
             self._row_filter_hook(previous_uids, list(self.uids))
@@ -784,6 +859,7 @@ class MLLMBatchGenerator:
         self._cache_owner_lifecycle_mutating = False
         self._cache_owner_lifecycle_failed = False
         self._ssd_tier = None
+        self._aborted_request_uids: set = set()
 
         # Deferred removal queue — UIDs scheduled for removal from another
         # thread (typically the event loop on client disconnect).  The
@@ -1382,7 +1458,7 @@ class MLLMBatchGenerator:
             raise PrefillAbortedError(request_id)
         return auxiliary if decision.accepted else None
 
-    def abort_prefill(self, request_id: str) -> None:
+    def abort_prefill(self, request_id: str, uid: Optional[int] = None) -> None:
         """Signal that a request's prefill should be aborted.
 
         Called from the event loop thread when a client disconnects.
@@ -1393,7 +1469,12 @@ class MLLMBatchGenerator:
         the request and may remain reusable after a later disconnect.
         """
         with self._prefix_checkpoint_lock:
-            self._aborted_request_ids.add(request_id)
+            if uid is None:
+                # Backward-compatible diagnostic path. Scheduler-owned requests
+                # provide the UID so reused external IDs do not inherit aborts.
+                self._aborted_request_ids.add(request_id)
+            else:
+                self._aborted_request_uids.add(uid)
             binding = getattr(self, "_cache_owner_requests", {}).get(request_id)
             if binding is not None:
                 prefix_cache = self.prefix_cache
@@ -1404,6 +1485,17 @@ class MLLMBatchGenerator:
             if state is not None:
                 state["cancelled"] = True
         logger.info(f"[abort_prefill] Marked {request_id} for prefill abort")
+
+    def _consume_prefill_abort(self, request: MLLMBatchRequest) -> bool:
+        """Consume an abort owned by this exact request instance."""
+        with self._prefix_checkpoint_lock:
+            by_uid = request.uid in self._aborted_request_uids
+            by_legacy_id = request.request_id in self._aborted_request_ids
+            if not (by_uid or by_legacy_id):
+                return False
+            self._aborted_request_uids.discard(request.uid)
+            self._aborted_request_ids.discard(request.request_id)
+            return True
 
     def _discard_prefill_checkpoint(self, request_id: str) -> None:
         """Forget request-local checkpoint publication state."""
@@ -1500,6 +1592,11 @@ class MLLMBatchGenerator:
             self._pending_removal_uids.update(uid_list)
             pending_request_ids.update(request_ids_by_uid)
 
+    def has_pending_removals(self) -> bool:
+        """Return whether scheduler-thread removal work is queued."""
+        with self._pending_removal_lock:
+            return bool(self._pending_removal_uids)
+
     def process_pending_removals(self) -> None:
         """Remove any UIDs enqueued via :meth:`schedule_removal`.
 
@@ -1517,7 +1614,15 @@ class MLLMBatchGenerator:
             self._pending_removal_uids = set()
 
         uids = list(pending)
-        self.remove(uids)
+        try:
+            self.remove(uids)
+        except Exception:
+            # Preserve failed ownership for a later safe-boundary retry. A
+            # failed removal must never silently drop the only record of ghost
+            # generator work.
+            with self._pending_removal_lock:
+                self._pending_removal_uids.update(uids)
+            raise
 
     def __del__(self):
         try:
@@ -1558,13 +1663,31 @@ class MLLMBatchGenerator:
             if duplicate:
                 raise RuntimeError("duplicate owner-bound request ID")
 
-        uids = []
-        minted_request_ids = []
+        first_uid = self.uid_counter
+        if type(first_uid) is not int or first_uid < 0:
+            raise ValueError("MLLM UID counter must be a nonnegative integer")
+
+        object_ids = [id(request) for request in requests]
+        if len(set(object_ids)) != len(object_ids):
+            raise ValueError("Cannot insert the same MLLM request object twice")
+
+        active_batch = getattr(self, "active_batch", None)
+        partial = getattr(self, "_partial", None)
+        owned_requests = list(self.unprocessed_requests)
+        if active_batch is not None:
+            owned_requests.extend(active_batch.requests)
+        if partial is not None:
+            owned_requests.append(partial["request"])
+        if set(object_ids).intersection(id(request) for request in owned_requests):
+            raise ValueError("Cannot insert an MLLM request that is already owned")
+
+        original_uids = [request.uid for request in requests]
+        uids = list(range(first_uid, first_uid + len(requests)))
+        minted_request_ids: List[str] = []
         with self._prefix_checkpoint_lock:
             pending_request_ids = self._pending_removal_request_ids_snapshot()
             if any(request.request_id in pending_request_ids for request in requests):
                 raise RuntimeError("request ID has pending removal")
-            original_uid_counter = self.uid_counter
             if owner_enabled:
                 if getattr(self, "_cache_owner_lifecycle_failed", False):
                     raise RuntimeError(
@@ -1573,9 +1696,16 @@ class MLLMBatchGenerator:
                 if getattr(self, "_cache_owner_lifecycle_mutating", False):
                     raise RuntimeError("owner-bound cache lifecycle mutation is active")
             try:
-                for req in requests:
-                    req.uid = self.uid_counter
-                    self.uid_counter += 1
+                owned_uids = {request.uid for request in self.unprocessed_requests}
+                if active_batch is not None:
+                    owned_uids.update(active_batch.uids)
+                if partial is not None:
+                    owned_uids.add(partial["request"].uid)
+                if owned_uids.intersection(uids):
+                    raise RuntimeError("MLLM UID counter overlaps live generator work")
+
+                for req, uid in zip(requests, uids):
+                    req.uid = uid
                     if owner_enabled:
                         assert prefix_cache is not None
                         binding = prefix_cache.mint_owner_request(req.uid)
@@ -1584,30 +1714,24 @@ class MLLMBatchGenerator:
                             raise RuntimeError("duplicate owner-bound request ID")
                         self._cache_owner_requests[req.request_id] = binding
                         minted_request_ids.append(req.request_id)
-                    self.unprocessed_requests.append(req)
-                    uids.append(req.uid)
-
-                # Keep ordering inside the same transaction.  Request media
+                # Stage ordering inside the same transaction. Request media
                 # access is caller-controlled and can fail; no owner binding
                 # or UID allocation may survive such a failure.
-                self.unprocessed_requests = sorted(
-                    self.unprocessed_requests,
+                pending = sorted(
+                    [*self.unprocessed_requests, *requests],
                     key=lambda x: (
                         0 if not x.images and not x.videos and not x.audio else 1,
                         len(x.images or []) + len(x.videos or []) + len(x.audio or []),
                     ),
                 )
             except BaseException:
-                self.uid_counter = original_uid_counter
-                inserted = set(uids)
-                self.unprocessed_requests = [
-                    request
-                    for request in self.unprocessed_requests
-                    if request.uid not in inserted
-                ]
+                for request, original_uid in zip(requests, original_uids):
+                    request.uid = original_uid
                 for request_id in minted_request_ids:
                     self._release_cache_owner_request(request_id)
                 raise
+            self.unprocessed_requests = pending
+            self.uid_counter = first_uid + len(requests)
 
         logger.debug(f"Inserted {len(requests)} requests, UIDs: {uids}")
         return uids
@@ -1727,6 +1851,18 @@ class MLLMBatchGenerator:
             else:
                 for uid in uid_set:
                     pending_request_ids.pop(uid, None)
+
+        # Publish abort-marker retirement only after generator ownership was
+        # removed successfully. If active-batch filtering raises, the pending
+        # removal retry must retain the abort signal as well as the UID.
+        aborted_ids = getattr(self, "_aborted_request_ids", set())
+        aborted_uids = getattr(self, "_aborted_request_uids", set())
+        prefill_progress = getattr(self, "_prefill_progress", None)
+        for request_id in removed_request_ids:
+            aborted_ids.discard(request_id)
+            if prefill_progress is not None:
+                prefill_progress.pop(request_id, None)
+        aborted_uids.difference_update(uid_set)
 
     def _compatible_pending_requests(
         self,
@@ -2283,8 +2419,7 @@ class MLLMBatchGenerator:
         checkpoint_entry = None
         while processed < total:
             # Check for abort between chunks (client disconnect)
-            if request.request_id in self._aborted_request_ids:
-                self._aborted_request_ids.discard(request.request_id)
+            if self._consume_prefill_abort(request):
                 logger.info(
                     f"[chunked_prefill] Aborted {request.request_id} at "
                     f"{processed}/{total} tokens"
@@ -2579,8 +2714,7 @@ class MLLMBatchGenerator:
         for req in requests:
             try:
                 # Check abort before starting prefill
-                if req.request_id in self._aborted_request_ids:
-                    self._aborted_request_ids.discard(req.request_id)
+                if self._consume_prefill_abort(req):
                     raise PrefillAbortedError(req.request_id)
 
                 # Token IDs do not identify media-conditioned KV state. Until
@@ -2731,8 +2865,7 @@ class MLLMBatchGenerator:
                             chunk_count = 0
                             while processed + step < remaining_count:
                                 # Check for abort between chunks
-                                if req.request_id in self._aborted_request_ids:
-                                    self._aborted_request_ids.discard(req.request_id)
+                                if self._consume_prefill_abort(req):
                                     logger.info(
                                         f"[chunked_prefill] Aborted {req.request_id} "
                                         f"at {cached_count + processed}/{total_tokens} tokens"
@@ -4545,8 +4678,7 @@ def install_chunked_prefill_mllm(
             req = partial["request"]
 
             # Abort check
-            if req.request_id in batch_gen._aborted_request_ids:
-                batch_gen._aborted_request_ids.discard(req.request_id)
+            if batch_gen._consume_prefill_abort(req):
                 batch_gen._partial = None
                 mx.clear_cache()
                 batch_gen._prefill_progress.pop(req.request_id, None)
@@ -5153,18 +5285,27 @@ def install_chunked_prefill_mllm(
     _orig_remove = batch_gen.remove
 
     def _patched_remove(uids: List[int]) -> None:
-        uid_set = set(uids)
         partial = batch_gen._partial
-        partial_uid = (
-            partial["request"].uid
-            if isinstance(partial, dict) and partial.get("request") is not None
-            else None
+        partial_request = partial["request"] if partial is not None else None
+        partial_uid = partial_request.uid if partial_request is not None else None
+        partial_request_id = (
+            partial_request.request_id if partial_request is not None else None
         )
-        # Let the original remover discover the partial request and release its
-        # owner lease before clearing the only remaining request reference.
+        uid_set = set(uids)
+
+        # Remove published queue/batch ownership first. If that operation
+        # fails, preserve the partial request, both abort-marker sets, and
+        # progress so deferred removal remains a complete retry.
         _orig_remove(uids)
-        if partial_uid is not None and partial_uid in uid_set:
+        if partial_uid in uid_set:
             batch_gen._partial = None
+            prefill_progress = getattr(batch_gen, "_prefill_progress", None)
+            if prefill_progress is not None:
+                prefill_progress.pop(partial_request_id, None)
+            aborted_ids = getattr(batch_gen, "_aborted_request_ids", set())
+            aborted_uids = getattr(batch_gen, "_aborted_request_uids", set())
+            aborted_ids.discard(partial_request_id)
+            aborted_uids.discard(partial_uid)
             mx.clear_cache()
 
     batch_gen.remove = _patched_remove

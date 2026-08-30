@@ -1072,6 +1072,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -1151,7 +1152,10 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.RLock()
+        generator._request_prefix_checkpoints = {}
         generator.prefix_cache = PrefixCache()
         generator._think_suffix_len = 0
         generator.prefill_step_size = 512
@@ -1217,7 +1221,10 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.RLock()
+        generator._request_prefix_checkpoints = {}
         generator.prefix_cache = None
         generator.prefill_step_size = 512
         generator.language_model = object()
@@ -1317,6 +1324,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -1416,6 +1424,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -3189,8 +3198,11 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator.unprocessed_requests = []
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator.prefix_cache = None
+        generator._prefix_checkpoint_lock = threading.RLock()
+        generator._request_prefix_checkpoints = {}
         generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator._maybe_store_prefix_cache = MagicMock()
@@ -3681,6 +3693,7 @@ class TestChunkedPrefillCacheHandling:
         gen._stats = MLLMBatchStats()
         gen._pending_error_responses = []
         gen._aborted_request_ids = set()
+        gen._aborted_request_uids = set()
         gen._prefill_progress = {}
         gen._prefix_checkpoint_lock = threading.Lock()
         gen._request_prefix_checkpoints = {}
@@ -4235,7 +4248,7 @@ def test_external_mtp_drafts_mixed_position_rows_independently():
 def test_scheduler_loop_verification_error_and_cleanup_boundary(
     monkeypatch, cleanup_fails
 ):
-    """Characterize fanout and the existing unhandled cleanup-error boundary."""
+    """Keep failed cleanup owned until the scheduler loop drains one retry."""
     import threading
     from collections import deque
 
@@ -4246,8 +4259,21 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
     monkeypatch.setattr(scheduler_mod, "bind_generation_streams", lambda: None)
 
     async def run():
+        real_asyncio_sleep = asyncio.sleep
+        retry_waiting = asyncio.Event()
+        allow_retry = asyncio.Event()
+
+        async def controlled_sleep(delay):
+            if cleanup_fails and delay == 0.1 and not allow_retry.is_set():
+                retry_waiting.set()
+                await allow_retry.wait()
+                return
+            await real_asyncio_sleep(0)
+
+        monkeypatch.setattr(scheduler_mod.asyncio, "sleep", controlled_sleep)
         scheduler = MLLMScheduler.__new__(MLLMScheduler)
         scheduler._state_lock = threading.RLock()
+        scheduler._request_lock = scheduler._state_lock
         scheduler._owner_thread_id = threading.get_ident()
         scheduler._running = True
         scheduler.requests = {
@@ -4270,19 +4296,27 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         scheduler.waiting = deque([scheduler.requests["waiting"]])
         scheduler.request_id_to_uid = {"active": 7}
         scheduler.uid_to_request_id = {7: "active"}
+        scheduler._pending_generator_removals = set()
         scheduler.finished_req_ids = set()
         scheduler._detokenizer_pool = {}
         scheduler.total_completion_tokens = scheduler.total_prompt_tokens = 0
         scheduler.output_queues = {key: asyncio.Queue() for key in scheduler.requests}
         scheduler._schedule_waiting = lambda: []
-        drained = asyncio.Event()
+        cleanup_attempted = asyncio.Event()
+        cleanup_succeeded = asyncio.Event()
         abort_markers_at_cleanup = []
 
         def notify_removed():
-            abort_markers_at_cleanup.append(set(generator._aborted_request_ids))
-            drained.set()
-            if cleanup_fails:
+            abort_markers_at_cleanup.append(
+                (
+                    set(generator._aborted_request_ids),
+                    set(generator._aborted_request_uids),
+                )
+            )
+            cleanup_attempted.set()
+            if cleanup_fails and len(abort_markers_at_cleanup) == 1:
                 raise RuntimeError("cleanup callback failed")
+            cleanup_succeeded.set()
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
         generator._old_wired_limit = None
@@ -4293,6 +4327,7 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         generator._request_prefix_checkpoints = {}
         generator._cache_owner_requests = {}
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator.unprocessed_requests = []
         generator.active_batch = SimpleNamespace(
             uids=[7],
@@ -4310,17 +4345,23 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         scheduler.batch_generator = generator
         task = asyncio.create_task(scheduler._process_loop())
         try:
-            await asyncio.wait_for(drained.wait(), timeout=1)
+            await asyncio.wait_for(cleanup_attempted.wait(), timeout=1)
             if cleanup_fails:
-                with pytest.raises(RuntimeError, match="cleanup callback failed"):
-                    await asyncio.wait_for(task, timeout=1)
-                # Existing limitation: cleanup escapes the loop and retains the
-                # poisoned batch. This is not a recovery/reusability assertion.
-                assert generator.active_batch is poisoned_batch
-            else:
+                await asyncio.wait_for(retry_waiting.wait(), timeout=1)
                 assert not task.done()
-                assert generator.active_batch is None
+                assert generator.active_batch is poisoned_batch
+                assert generator._pending_removal_uids == {7}
+                assert generator._aborted_request_ids == set()
+                assert generator._aborted_request_uids == {7}
+                allow_retry.set()
+            await asyncio.wait_for(cleanup_succeeded.wait(), timeout=1)
+            assert not task.done()
+            assert generator.active_batch is None
+            assert generator._pending_removal_uids == set()
+            assert generator._aborted_request_ids == set()
+            assert generator._aborted_request_uids == set()
         finally:
+            allow_retry.set()
             scheduler._running = False
             if not task.done():
                 await asyncio.wait_for(task, timeout=1)
@@ -4328,10 +4369,8 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         assert scheduler.requests == scheduler.running == {}
         assert not scheduler.waiting
         assert not scheduler.request_id_to_uid and not scheduler.uid_to_request_id
-        assert abort_markers_at_cleanup == [{"active"}]
-        assert generator._aborted_request_ids == (
-            {"active"} if cleanup_fails else set()
-        )
+        expected_attempts = 2 if cleanup_fails else 1
+        assert abort_markers_at_cleanup == [(set(), {7})] * expected_attempts
         for queue in scheduler.output_queues.values():
             output = queue.get_nowait()
             assert output.finished and output.finish_reason == "error"
