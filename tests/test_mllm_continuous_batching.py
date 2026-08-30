@@ -35,6 +35,81 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 
+class _RecordingStatefulDrafter:
+    requires_verified_token_reconciliation = True
+
+    def __init__(self, rows=None):
+        self.accept_lens = []
+        self.draft_lens = []
+        self.rows = list(rows or [])
+        self.filter_calls = []
+        self.reconciliations = []
+        self.reset_calls = 0
+        self.events = []
+
+    def reset(self, model):
+        self.model = model
+        self.reset_calls += 1
+        self.events.append("reset")
+
+    def set_shared_kv(self, *args, **kwargs):
+        self.last_shared_kv = (args, kwargs)
+        self.events.append("set_shared_kv")
+
+    def accept_verified_tokens_batch(
+        self,
+        verify_hidden,
+        draft_tokens,
+        accepted,
+        new_tokens,
+        sampler,
+        token_dtype,
+        greedy,
+    ):
+        self.events.append("reconcile")
+        self.reconciliations.append(
+            {
+                "rows": list(self.rows),
+                "hidden_shape": tuple(verify_hidden.shape),
+                "draft_tokens": draft_tokens.tolist(),
+                "accepted": list(accepted),
+                "new_tokens": [list(row) for row in new_tokens],
+                "token_dtype": token_dtype,
+                "greedy": greedy,
+            }
+        )
+
+    def filter_batch(self, keep):
+        keep = keep.tolist()
+        self.events.append("filter_batch")
+        self.filter_calls.append(keep)
+        if self.rows:
+            self.rows = [self.rows[index] for index in keep]
+
+
+def _patch_external_mtp_metadata(monkeypatch):
+    import mlx_vlm.speculative.common as speculative_common
+    import mlx_vlm.speculative.mtp as speculative_mtp
+
+    monkeypatch.setattr(
+        speculative_common, "_batch_cache_left_padding", lambda cache: None
+    )
+    monkeypatch.setattr(
+        speculative_mtp,
+        "_mtp_shared_kv_from_prompt_cache",
+        lambda model, cache: {"shared": object()},
+    )
+    monkeypatch.setattr(
+        speculative_mtp,
+        "_mtp_cache_positions",
+        lambda cache, batch_size: (10, [10] * batch_size),
+    )
+    monkeypatch.setattr(
+        speculative_mtp, "_mtp_draft_position", lambda positions: positions
+    )
+    return speculative_mtp
+
+
 # Test image (small PNG)
 TEST_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
@@ -1464,6 +1539,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         expected_logprobs = [mx.array([0.1, 0.9]), mx.array([0.2, 0.8])]
         original_step = MagicMock(return_value=(expected_tokens, expected_logprobs))
         draft_model = MagicMock()
+        draft_model.requires_verified_token_reconciliation = False
 
         class FakeBatchGen:
             def __init__(self):
@@ -1620,30 +1696,12 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert _request_uses_stochastic_sampling(request) is True
 
     def test_external_stochastic_rejection_replays_sampled_target(self, monkeypatch):
-        import mlx_vlm.speculative.common as speculative_common
-        import mlx_vlm.speculative.mtp as speculative_mtp
-
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchResponse,
             install_mtp_mllm,
         )
 
-        monkeypatch.setattr(
-            speculative_common, "_batch_cache_left_padding", lambda cache: None
-        )
-        monkeypatch.setattr(
-            speculative_mtp,
-            "_mtp_shared_kv_from_prompt_cache",
-            lambda model, cache: {"shared": object()},
-        )
-        monkeypatch.setattr(
-            speculative_mtp,
-            "_mtp_cache_positions",
-            lambda cache, batch_size: (10, [10] * batch_size),
-        )
-        monkeypatch.setattr(
-            speculative_mtp, "_mtp_draft_position", lambda positions: positions
-        )
+        speculative_mtp = _patch_external_mtp_metadata(monkeypatch)
         monkeypatch.setattr(
             speculative_mtp,
             "_mtp_draft_block_active",
@@ -1695,17 +1753,6 @@ class TestMLLMBatchGeneratorMTPGuards:
             def trim(self, count):
                 self.trim_calls.append(count)
 
-        class DraftModel:
-            def __init__(self):
-                self.accept_lens = []
-                self.draft_lens = []
-
-            def reset(self, model):
-                self.model = model
-
-            def set_shared_kv(self, *args, **kwargs):
-                return None
-
         class LanguageModel:
             def __init__(self):
                 self.inputs = []
@@ -1722,7 +1769,7 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         generator = Generator()
         language_model = LanguageModel()
-        draft_model = DraftModel()
+        draft_model = _RecordingStatefulDrafter()
         cache = TrimmableCache()
         install_mtp_mllm(generator, language_model, draft_model=draft_model)
 
@@ -1742,6 +1789,25 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert int(mx.argmax(responses[1].logprobs).item()) == 3
         assert draft_model.accept_lens == [0]
         assert generator.get_mtp_stats()["rejected"] == 1
+        assert draft_model.reconciliations[0]["accepted"] == [0]
+        assert draft_model.reconciliations[0]["draft_tokens"] == [[]]
+        assert draft_model.reconciliations[0]["new_tokens"] == [[1]]
+        assert draft_model.reconciliations[1]["accepted"] == [0]
+        assert draft_model.reconciliations[1]["draft_tokens"] == [[2]]
+        assert draft_model.reconciliations[1]["new_tokens"] == [[3]]
+
+        generator._step(
+            mx.array([[1]], dtype=mx.uint32),
+            cache=[cache],
+            logits_processors=None,
+            output_tokens=None,
+            samplers=[lambda logprobs: mx.array([1], dtype=mx.uint32)],
+        )
+
+        assert draft_model.reconciliations[2]["accepted"] == [0]
+        assert draft_model.reconciliations[2]["draft_tokens"] == [[]]
+        assert draft_model.reconciliations[2]["new_tokens"] == [[1]]
+        assert draft_model.reconciliations[2]["hidden_shape"] == (1, 1, 2)
 
     def test_uniform_draft_batches_remove_only_selected_requests(self):
         from vllm_mlx.mllm_batch_generator import (
@@ -2419,6 +2485,321 @@ class TestMLLMBatchGeneratorMTPGuards:
         assert len(responses) == 1
         assert generator.active_batch is not None
         assert generator.active_batch.logits_processors == [None]
+
+    def test_stateful_external_mtp_requires_batch_lifecycle_hooks(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        generator = SimpleNamespace(
+            model=object(),
+            _step=MagicMock(),
+            _next=MagicMock(),
+        )
+        drafter = SimpleNamespace(
+            requires_verified_token_reconciliation=True,
+            reset=MagicMock(),
+        )
+
+        with pytest.raises(
+            TypeError, match="accept_verified_tokens_batch, filter_batch"
+        ):
+            install_mtp_mllm(generator, object(), draft_model=drafter)
+
+    @pytest.mark.parametrize("marker", [None, "false", 1])
+    def test_external_mtp_reconciliation_marker_fails_closed(self, marker):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        generator = SimpleNamespace(
+            model=object(), _step=MagicMock(), _next=MagicMock()
+        )
+        drafter = SimpleNamespace(
+            requires_verified_token_reconciliation=marker,
+            reset=MagicMock(),
+        )
+
+        with pytest.raises(TypeError, match="literal boolean"):
+            install_mtp_mllm(generator, object(), draft_model=drafter)
+
+    def test_stateful_external_mtp_filter_failure_clears_lifecycle(self):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        request = SimpleNamespace(mllm_draft=True)
+        active_batch = SimpleNamespace(
+            uids=[1, 2], requests=[request, request], _row_filter_hook=None
+        )
+        original_step = MagicMock(return_value=(mx.array([3, 4]), [mx.zeros(1)] * 2))
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=active_batch,
+            _step=original_step,
+            _next=MagicMock(),
+            sampler=MagicMock(),
+        )
+        drafter = _RecordingStatefulDrafter(rows=["a", "b"])
+        drafter.filter_batch = MagicMock(side_effect=RuntimeError("filter failed"))
+        install_mtp_mllm(generator, object(), draft_model=drafter)
+
+        generator._step(mx.array([[1], [2]]), [], [[MagicMock()]], None, None)
+        with pytest.raises(RuntimeError, match="filter failed"):
+            active_batch._row_filter_hook([1, 2], [2])
+
+        assert drafter.reset_calls == 2
+
+    def test_stateful_external_mtp_reconciles_on_next_target_primary(self, monkeypatch):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        speculative_mtp = _patch_external_mtp_metadata(monkeypatch)
+        drafter = _RecordingStatefulDrafter()
+        drafter.draft_round = 0
+
+        def fake_draft_block(*args, **kwargs):
+            del args, kwargs
+            tokens = ([20, 21], [22, 23], [24, 25])[drafter.draft_round]
+            drafter.draft_round += 1
+            return mx.array(tokens, dtype=mx.uint32)[:, None]
+
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_block_active", fake_draft_block
+        )
+
+        requests = [
+            SimpleNamespace(
+                uid=uid,
+                request_id=f"row-{uid}",
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                mllm_draft=True,
+            )
+            for uid in (7, 8)
+        ]
+
+        class LanguageModel:
+            def __init__(self):
+                self.verify_round = 0
+
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                seq_len = input_tokens.shape[1]
+                logits = mx.full((2, seq_len, 32), -1000.0)
+                if seq_len == 1:
+                    targets = [10, 11]
+                    for row, target in enumerate(targets):
+                        logits[row, 0, target] = 0.0
+                else:
+                    verify_targets = ([20, 21], [29, 28], [24, 25])[self.verify_round]
+                    bonus_targets = ([12, 13], [14, 15], [16, 17])[self.verify_round]
+                    self.verify_round += 1
+                    for row, target in enumerate(verify_targets):
+                        logits[row, 0, target] = 0.0
+                    for row, target in enumerate(bonus_targets):
+                        logits[row, 1, target] = 0.0
+                return logits, mx.zeros((2, seq_len, 4))
+
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=SimpleNamespace(uids=[7, 8], requests=requests),
+            _step=MagicMock(side_effect=AssertionError("must not bypass MTP")),
+            _next=MagicMock(return_value=[]),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        )
+        install_mtp_mllm(generator, LanguageModel(), draft_model=drafter)
+
+        first, _ = generator._step(
+            mx.array([[0], [0]], dtype=mx.uint32), [], None, None, None
+        )
+        second, _ = generator._step(
+            mx.array([[10], [11]], dtype=mx.uint32), [], None, None, None
+        )
+        third, _ = generator._step(
+            mx.array([[12], [13]], dtype=mx.uint32), [], None, None, None
+        )
+
+        assert first.tolist() == [10, 11]
+        assert second.tolist() == [12, 13]
+        assert third.tolist() == [29, 28]
+        assert drafter.events[:3] == ["reset", "set_shared_kv", "reconcile"]
+        assert [call["accepted"] for call in drafter.reconciliations[:3]] == [
+            [0, 0],
+            [1, 1],
+            [0, 0],
+        ]
+        assert [call["draft_tokens"] for call in drafter.reconciliations[:3]] == [
+            [[], []],
+            [[20], [21]],
+            [[22], [23]],
+        ]
+        assert [call["new_tokens"] for call in drafter.reconciliations[:3]] == [
+            [[10], [11]],
+            [[20, 12], [21, 13]],
+            [[29], [28]],
+        ]
+        assert [call["hidden_shape"] for call in drafter.reconciliations[:3]] == [
+            (2, 1, 4),
+            (2, 2, 4),
+            (2, 2, 4),
+        ]
+        assert all(
+            call["token_dtype"] == mx.uint32 for call in drafter.reconciliations[:3]
+        )
+        assert all(call["greedy"] is True for call in drafter.reconciliations)
+
+    @pytest.mark.parametrize(
+        ("stop_tokens", "num_tokens", "max_tokens", "expected_finish"),
+        [
+            ({5}, [0, 0], [8, 8], "stop"),
+            (set(), [1, 0], [2, 8], "length"),
+        ],
+    )
+    def test_stateful_external_mtp_filters_deferred_draft_retirement(
+        self,
+        monkeypatch,
+        stop_tokens,
+        num_tokens,
+        max_tokens,
+        expected_finish,
+    ):
+        import mlx_vlm.speculative.common as speculative_common
+        import mlx_vlm.speculative.mtp as speculative_mtp
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchResponse,
+            install_mtp_mllm,
+        )
+
+        monkeypatch.setattr(
+            speculative_common, "_batch_cache_left_padding", lambda cache: None
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_shared_kv_from_prompt_cache",
+            lambda model, cache: {"shared": object()},
+        )
+        monkeypatch.setattr(
+            speculative_mtp,
+            "_mtp_cache_positions",
+            lambda cache, batch_size: (10, [10] * batch_size),
+        )
+        monkeypatch.setattr(
+            speculative_mtp, "_mtp_draft_position", lambda positions: positions
+        )
+
+        draft_round = 0
+
+        def fake_draft_block(
+            draft_model,
+            primary_tokens,
+            hidden_states,
+            positions,
+            sampler,
+            token_dtype,
+        ):
+            nonlocal draft_round
+            del draft_model, hidden_states, positions, sampler
+            tokens = [5, 6] if draft_round == 0 else [7]
+            draft_round += 1
+            assert len(tokens) == primary_tokens.shape[0]
+            return mx.array(tokens, dtype=token_dtype)
+
+        monkeypatch.setattr(
+            "vllm_mlx.mllm_batch_generator._draft_external_mtp_active_batch",
+            fake_draft_block,
+        )
+
+        requests = [
+            SimpleNamespace(
+                uid=uid,
+                request_id=name,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                mllm_draft=True,
+                output_tokens=[],
+            )
+            for uid, name in ((1, "a"), (2, "b"))
+        ]
+        batch = MLLMBatch(
+            uids=[1, 2],
+            request_ids=["a", "b"],
+            y=mx.array([0, 0], dtype=mx.uint32),
+            logprobs=[mx.zeros(16), mx.zeros(16)],
+            max_tokens=list(max_tokens),
+            num_tokens=list(num_tokens),
+            cache=[],
+            requests=requests,
+        )
+
+        class LanguageModel:
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
+                del cache, return_hidden
+                batch_size, seq_len = input_tokens.shape
+                logits = mx.full((batch_size, seq_len, 16), -1000.0)
+                if seq_len == 1:
+                    targets = [10, 11][:batch_size]
+                else:
+                    targets = ([5, 6] if batch_size == 2 else [7])[:batch_size]
+                for row, target in enumerate(targets):
+                    logits[row, 0, target] = 0.0
+                if seq_len == 2:
+                    logits[:, 1, 8] = 0.0
+                return logits, mx.zeros((batch_size, seq_len, 4))
+
+        primary_responses = [
+            MLLMBatchResponse(
+                uid=uid,
+                request_id=name,
+                token=token,
+                logprobs=mx.zeros(16),
+            )
+            for uid, name, token in ((1, "a", 10), (2, "b", 11))
+        ]
+        generator = SimpleNamespace(
+            model=object(),
+            active_batch=batch,
+            _step=MagicMock(side_effect=AssertionError("must not bypass MTP")),
+            _next=MagicMock(return_value=primary_responses),
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_tokens=stop_tokens,
+            _maybe_store_prefix_cache=MagicMock(),
+            unprocessed_requests=[],
+        )
+        drafter = _RecordingStatefulDrafter(rows=["a", "b"])
+        install_mtp_mllm(generator, LanguageModel(), draft_model=drafter)
+
+        generator._step(mx.array([[0], [0]], dtype=mx.uint32), [], None, None, None)
+        responses = generator._next()
+
+        assert [response.token for response in responses] == [10, 5, 11, 6]
+        assert responses[1].finish_reason == expected_finish
+        assert responses[3].finish_reason is None
+        assert generator.active_batch.uids == [2]
+        assert drafter.filter_calls == [[1]]
+        assert drafter.rows == ["b"]
+
+        generator._step(mx.array([[11]], dtype=mx.uint32), [], None, None, None)
+        assert [call["rows"] for call in drafter.reconciliations[:2]] == [
+            ["a", "b"],
+            ["b"],
+        ]
+        assert [call["draft_tokens"] for call in drafter.reconciliations[:2]] == [
+            [[], []],
+            [[6]],
+        ]
+        assert [call["accepted"] for call in drafter.reconciliations[:2]] == [
+            [0, 0],
+            [1],
+        ]
+        assert [call["new_tokens"] for call in drafter.reconciliations[:2]] == [
+            [[10], [11]],
+            [[6, 8]],
+        ]
+
+        MLLMBatchGenerator.remove(generator, [2])
+        assert generator.active_batch is None
+        assert drafter.reset_calls == 2
 
 
 class TestBatchedMLLMConfigWiring:
