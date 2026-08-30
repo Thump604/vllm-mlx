@@ -3123,7 +3123,9 @@ def install_mtp_mllm(
             ]
             if len(keep) != len(prior_active_uids):
                 if keep:
-                    draft_model.filter_batch(keep)
+                    filter_batch = getattr(draft_model, "filter_batch", None)
+                    if callable(filter_batch):
+                        filter_batch(keep)
                 else:
                     draft_model.reset(batch_gen.model)
         for uid in list(_skip_state_by_uid):
