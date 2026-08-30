@@ -2162,14 +2162,26 @@ class MemoryAwarePrefixCache:
             return None
 
     @staticmethod
-    def _restore_hybrid_layer(layer_snapshot):
+    def _restore_hybrid_layer(layer_snapshot, expected_qualified_name: str):
         """Reconstruct one validated layer on the model-owning thread."""
         import mlx.core as mx
-        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
         layer_type = layer_snapshot.layer_type
         tensors = layer_snapshot.tensors
         metadata = layer_snapshot.metadata
+
+        if expected_qualified_name.startswith("mlx_lm.models.cache."):
+            from mlx_lm.models import cache as cache_module
+        elif expected_qualified_name.startswith("mlx_vlm.models.cache."):
+            from mlx_vlm.models import cache as cache_module
+        else:
+            raise ValueError("unsupported cache layer implementation")
+        cls = getattr(cache_module, layer_type, None)
+        if (
+            cls is None
+            or f"{cls.__module__}.{cls.__qualname__}" != expected_qualified_name
+        ):
+            raise ValueError("cache layer implementation mismatch")
 
         def restore_dtype(value, dtype_name):
             dtype = getattr(mx, dtype_name, None) if dtype_name else None
@@ -2201,7 +2213,6 @@ class MemoryAwarePrefixCache:
             offset = metadata.get("offset")
             if not isinstance(offset, int) or offset < 1 or offset > keys_np.shape[-2]:
                 raise ValueError("KV layer offset is invalid")
-            cls = RotatingKVCache if layer_type == "RotatingKVCache" else KVCache
             layer = cls.__new__(cls)
             layer.keys = restore_dtype(
                 mx.array(keys_np), metadata.get("keys_original_dtype")
@@ -2250,7 +2261,7 @@ class MemoryAwarePrefixCache:
                 if value.size == 0 or value.dtype.kind != "f":
                     raise ValueError("ArraysCache tensor is invalid")
                 state.append(restore_dtype(mx.array(value), dtype_names[index]))
-            layer = ArraysCache(num_arrays)
+            layer = cls(num_arrays)
             layer.state = state
             metadata_dtype_names = metadata.get("metadata_original_dtypes")
             if not isinstance(metadata_dtype_names, dict) or set(
@@ -2275,9 +2286,10 @@ class MemoryAwarePrefixCache:
             logger.warning("[cache_persist] hybrid identity mismatch; discarding cache")
             return 0
 
+        expected_qualified_topology = _cache_topology(self._model) or ()
         expected_topology = tuple(
             (qualified_name.rsplit(".", 1)[-1], arity)
-            for qualified_name, arity in (_cache_topology(self._model) or ())
+            for qualified_name, arity in expected_qualified_topology
         )
         cfg = _model_text_config(self._model)
         vocab_size = _identity_attr(cfg or self._model, "vocab_size")
@@ -2390,7 +2402,8 @@ class MemoryAwarePrefixCache:
                 ):
                     raise ValueError("persisted last_logits shape or dtype is invalid")
                 cache = [
-                    self._restore_hybrid_layer(layer) for layer in persisted.layers
+                    self._restore_hybrid_layer(layer, expected_qualified_topology[i][0])
+                    for i, layer in enumerate(persisted.layers)
                 ]
                 import mlx.core as mx
 

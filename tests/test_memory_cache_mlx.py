@@ -1350,14 +1350,18 @@ class TestHybridRestartPersistence:
             )
 
         def make_cache(self):
-            from mlx_lm.models.cache import ArraysCache, KVCache
+            from mlx_vlm.models.cache import ArraysCache, KVCache
 
             return [ArraysCache(size=2), KVCache()]
 
     @staticmethod
-    def _state():
+    def _state(*, vlm=False):
         import mlx.core as mx
-        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        if vlm:
+            from mlx_vlm.models.cache import ArraysCache, KVCache
+        else:
+            from mlx_lm.models.cache import ArraysCache, KVCache
 
         arrays = ArraysCache(size=2)
         arrays.state = [
@@ -1445,7 +1449,7 @@ class TestHybridRestartPersistence:
             )
 
         source = make_cache()
-        state, logits = self._state()
+        state, logits = self._state(vlm=True)
         prepared = source.prepare_store(
             [1, 2, 3, 4],
             state,
@@ -1461,13 +1465,19 @@ class TestHybridRestartPersistence:
 
         assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
         assert len(restored) == 1
+        fetched, remaining = restored.fetch([1, 2, 3, 4])
+        assert remaining == []
+        assert all(
+            type(layer).__module__ == "mlx_vlm.models.cache" for layer in fetched
+        )
+        assert restored.prepare_hybrid_persistence_snapshot() is not None
 
     def test_nested_vlm_missing_text_geometry_publishes_nothing(self, tmp_path):
         source = self._cache(
             model=self._VLMModel(),
             model_identity="qualified-vlm@revision",
         )
-        state, logits = self._state()
+        state, logits = self._state(vlm=True)
         prepared = source.prepare_store(
             [1, 2, 3, 4],
             state,
