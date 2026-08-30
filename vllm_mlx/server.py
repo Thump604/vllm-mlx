@@ -1978,7 +1978,7 @@ def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
         return value
 
     if "string" in expected_types and isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, indent=2)
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     if not isinstance(value, str):
         return value

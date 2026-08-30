@@ -61,12 +61,30 @@ def test_preserves_value_that_already_matches_any_union_type():
     assert _coerce_tool_arguments(arguments, "terminal", tools) == arguments
 
 
-def test_preserves_existing_object_to_string_normalization():
-    arguments = json.dumps({"content": {"answer": 42}})
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            {"answer": 42, "labels": ["café", "ok"]},
+            '{"answer":42,"labels":["café","ok"]}',
+        ),
+        ([{"answer": 42}, "café"], '[{"answer":42},"café"]'),
+    ],
+)
+def test_object_and_array_to_string_normalization_uses_compact_json(value, expected):
+    arguments = json.dumps({"content": value})
     tools = _tool_schema({"content": {"type": "string"}})
 
     normalized = json.loads(_coerce_tool_arguments(arguments, "terminal", tools))
-    assert json.loads(normalized["content"]) == {"answer": 42}
+    assert normalized["content"] == expected
+
+
+def test_preserves_existing_string_bytes():
+    content = '{\n  "answer": 42,\n  "label": "café"\n}'
+    arguments = json.dumps({"content": content})
+    tools = _tool_schema({"content": {"type": "string"}})
+
+    assert _coerce_tool_arguments(arguments, "terminal", tools) == arguments
 
 
 def test_coerces_json_boolean_without_treating_it_as_integer():
