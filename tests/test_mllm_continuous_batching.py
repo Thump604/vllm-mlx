@@ -2280,7 +2280,6 @@ class TestMLLMBatchGeneratorMTPGuards:
             logits_processors=None,
             output_tokens=None,
             samplers=[lambda logprobs: mx.argmax(logprobs, axis=-1)],
-            rope_deltas=rope_deltas,
         )
 
         assert model.mtp_calls == 1
