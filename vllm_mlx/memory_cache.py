@@ -1082,6 +1082,19 @@ def _compute_model_persistence_fingerprint(
                     }
                 )
             artifact = {"resolved_path": str(resolved), "files": files}
+        else:
+            revision = _identity_attr(cfg, "_commit_hash") or _identity_attr(
+                cfg, "revision"
+            )
+            if not revision and "@" not in artifact_identity:
+                # A floating remote repository name can resolve to different
+                # weights after restart. Disable persistence unless the loaded
+                # configuration or caller supplies an immutable revision.
+                return ""
+            artifact = {
+                "reference": artifact_identity,
+                "revision": revision,
+            }
     identity = {
         "class": f"{type(model).__module__}.{type(model).__qualname__}",
         "artifact": artifact,

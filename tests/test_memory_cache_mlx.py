@@ -1351,6 +1351,16 @@ class TestHybridRestartPersistence:
             template_renderer=renderer or self._Renderer(),
         )
 
+    def test_unpinned_remote_model_identity_disables_restart(self):
+        from vllm_mlx.memory_cache import _compute_model_persistence_fingerprint
+
+        assert (
+            _compute_model_persistence_fingerprint(self._Model(), "owner/model") == ""
+        )
+        assert _compute_model_persistence_fingerprint(
+            self._Model(), "owner/model@0123456789abcdef"
+        )
+
     def test_round_trip_preserves_hybrid_state_and_exact_logits(self, tmp_path):
         import mlx.core as mx
 
