@@ -1016,6 +1016,8 @@ def _compute_model_persistence_fingerprint(
             break
     cfg = cfg if cfg is not None else model
     keys = (
+        "_commit_hash",
+        "revision",
         "_name_or_path",
         "name_or_path",
         "model_type",
@@ -1048,7 +1050,26 @@ def _compute_model_persistence_fingerprint(
             for candidate in candidates:
                 if not candidate.is_file():
                     continue
-                stat = candidate.stat()
+                before = candidate.stat()
+                digest = hashlib.sha256()
+                with candidate.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                after = candidate.stat()
+                if (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                ) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                ):
+                    raise ValueError("model artifact changed while fingerprinting")
                 files.append(
                     {
                         "path": (
@@ -1056,8 +1077,8 @@ def _compute_model_persistence_fingerprint(
                             if resolved.is_file()
                             else candidate.relative_to(resolved).as_posix()
                         ),
-                        "size": stat.st_size,
-                        "mtime_ns": stat.st_mtime_ns,
+                        "size": after.st_size,
+                        "sha256": digest.hexdigest(),
                     }
                 )
             artifact = {"resolved_path": str(resolved), "files": files}
@@ -2261,6 +2282,8 @@ class MemoryAwarePrefixCache:
                     if layer.layer_type not in {"KVCache", "RotatingKVCache"}:
                         continue
                     shape = layer.tensors["keys"].shape
+                    if layer.metadata.get("offset") != len(persisted.tokens):
+                        raise ValueError("persisted KV/token length mismatch")
                     if shape[0] != 1:
                         raise ValueError("persisted KV batch geometry mismatch")
                     if (
@@ -2273,6 +2296,61 @@ class MemoryAwarePrefixCache:
                         and shape[-1] != expected_head_dim
                     ):
                         raise ValueError("persisted KV dimension mismatch")
+                arrays_layers = [
+                    layer
+                    for layer in persisted.layers
+                    if layer.layer_type == "ArraysCache"
+                ]
+                if arrays_layers:
+                    model_type = str(
+                        _identity_attr(cfg or self._model, "model_type") or ""
+                    ).replace(".", "_")
+                    if not model_type.startswith(("qwen3_5", "qwen3_8")):
+                        raise ValueError("unsupported ArraysCache model geometry")
+                    linear_k_heads = _identity_attr(
+                        cfg or self._model, "linear_num_key_heads"
+                    )
+                    linear_v_heads = _identity_attr(
+                        cfg or self._model, "linear_num_value_heads"
+                    )
+                    linear_k_dim = _identity_attr(
+                        cfg or self._model, "linear_key_head_dim"
+                    )
+                    linear_v_dim = _identity_attr(
+                        cfg or self._model, "linear_value_head_dim"
+                    )
+                    conv_kernel = _identity_attr(
+                        cfg or self._model, "linear_conv_kernel_dim"
+                    )
+                    geometry = (
+                        linear_k_heads,
+                        linear_v_heads,
+                        linear_k_dim,
+                        linear_v_dim,
+                        conv_kernel,
+                    )
+                    if not all(
+                        isinstance(value, int) and value > 0 for value in geometry
+                    ):
+                        raise ValueError("missing ArraysCache model geometry")
+                    conv_dim = (
+                        2 * linear_k_heads * linear_k_dim
+                        + linear_v_heads * linear_v_dim
+                    )
+                    expected_arrays_shapes = (
+                        (1, conv_kernel - 1, conv_dim),
+                        (1, linear_v_heads, linear_v_dim, linear_k_dim),
+                    )
+                    for layer in arrays_layers:
+                        num_arrays = layer.metadata.get("num_arrays")
+                        if num_arrays != len(expected_arrays_shapes):
+                            raise ValueError("persisted ArraysCache arity mismatch")
+                        shapes = tuple(
+                            layer.tensors[f"state_{index}"].shape
+                            for index in range(num_arrays)
+                        )
+                        if shapes != expected_arrays_shapes:
+                            raise ValueError("persisted ArraysCache geometry mismatch")
                 logits_np = persisted.auxiliary.get("last_logits")
                 if (
                     logits_np is None

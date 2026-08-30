@@ -1303,6 +1303,11 @@ class TestHybridRestartPersistence:
         num_attention_heads = 2
         num_key_value_heads = 1
         head_dim = 4
+        linear_num_value_heads = 2
+        linear_num_key_heads = 1
+        linear_key_head_dim = 4
+        linear_value_head_dim = 4
+        linear_conv_kernel_dim = 3
         layer_types = ["linear_attention", "full_attention"]
         tie_word_embeddings = True
 
@@ -1322,8 +1327,8 @@ class TestHybridRestartPersistence:
 
         arrays = ArraysCache(size=2)
         arrays.state = [
-            mx.arange(8, dtype=mx.float32).reshape(2, 4),
-            mx.ones((1, 4), dtype=mx.float32),
+            mx.arange(24, dtype=mx.float32).reshape(1, 2, 12),
+            mx.ones((1, 2, 4, 4), dtype=mx.float32),
         ]
         arrays.left_padding = mx.array([0], dtype=mx.int32)
         arrays.lengths = mx.array([4], dtype=mx.int32)
@@ -1470,11 +1475,14 @@ class TestHybridRestartPersistence:
         assert len(incompatible) == 0
 
     def test_mutated_local_model_artifact_publishes_nothing(self, tmp_path):
+        import os
+
         model_dir = tmp_path / "model"
         cache_dir = tmp_path / "cache"
         model_dir.mkdir()
         marker = model_dir / "config.json"
-        marker.write_text('{"revision":"first"}')
+        marker.write_text("first")
+        original_times = marker.stat()
         source = self._cache(model_identity=str(model_dir))
         state, logits = self._state()
         prepared = source.prepare_store(
@@ -1487,12 +1495,51 @@ class TestHybridRestartPersistence:
         snapshot = source.prepare_hybrid_persistence_snapshot()
         assert source.write_hybrid_persistence_snapshot(str(cache_dir), snapshot)
 
-        marker.write_text('{"revision":"second"}')
+        marker.write_text("other")
+        os.utime(
+            marker,
+            ns=(original_times.st_atime_ns, original_times.st_mtime_ns),
+        )
         incompatible = self._cache(model_identity=str(model_dir))
         loaded = incompatible.read_hybrid_persistence_snapshot(str(cache_dir))
 
         assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
         assert len(incompatible) == 0
+
+    def test_in_range_kv_offset_mismatch_publishes_nothing(self, tmp_path):
+        from dataclasses import replace
+
+        from vllm_mlx.cache_persistence import LoadedHybridCache
+
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+        loaded = source.read_hybrid_persistence_snapshot(str(tmp_path))
+        bad_kv = replace(
+            loaded.entries[0].layers[1],
+            metadata={**loaded.entries[0].layers[1].metadata, "offset": 3},
+        )
+        bad_entry = replace(
+            loaded.entries[0],
+            layers=(loaded.entries[0].layers[0], bad_kv),
+        )
+        target = self._cache()
+
+        assert (
+            target.restore_hybrid_persistence_snapshot(
+                LoadedHybridCache(loaded.identity, (bad_entry,))
+            )
+            == 0
+        )
+        assert len(target) == 0
 
     def test_bfloat16_last_logits_restore_exact_dtype(self, tmp_path):
         import mlx.core as mx

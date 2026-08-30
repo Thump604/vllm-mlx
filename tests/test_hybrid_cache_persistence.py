@@ -336,3 +336,27 @@ def test_hybrid_snapshot_rejects_aggregate_token_count_above_runtime_limit(tmp_p
         HybridCachePersistenceError, match="snapshot exceeds restore token budget"
     ):
         read_hybrid_snapshot(str(tmp_path), max_tokens=7)
+
+
+def test_hybrid_snapshot_rejects_oversized_manifest_before_json_parse(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    manifest_path = generation / "manifest.json"
+    manifest_path.write_bytes(b"{" + (b" " * (16 * 1024 * 1024)))
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(HybridCachePersistenceError, match="invalid JSON file"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_nonempty_arrays_meta_state(tmp_path):
+    snapshot = _snapshot()
+    snapshot.entries[0].layers[0].metadata["meta_state"] = []
+
+    with pytest.raises(HybridCachePersistenceError, match="ArraysCache meta_state"):
+        write_hybrid_snapshot(str(tmp_path), snapshot)

@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,9 @@ _SUPPORTED_LAYERS = {"KVCache", "RotatingKVCache", "ArraysCache"}
 _SUPPORTED_AUXILIARY = {"last_logits"}
 _SUPPORTED_ORIGINAL_DTYPES = {None, "bfloat16", "float16", "float32"}
 _ABSOLUTE_MAX_TOKENS = 16 * 1024 * 1024
+_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 100_000
 logger = logging.getLogger(__name__)
 
 
@@ -105,6 +109,46 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _read_bounded_file(path: Path, *, max_bytes: int, context: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HybridCachePersistenceError(f"invalid {context}: {exc}") from exc
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > max_bytes:
+            raise HybridCachePersistenceError(f"invalid {context} size")
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > max_bytes:
+            raise HybridCachePersistenceError(f"invalid {context} size")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _validate_json_bounds(value: Any) -> None:
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise HybridCachePersistenceError("JSON structure exceeds safety bounds")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     def reject_duplicates(pairs):
         result = {}
@@ -118,8 +162,11 @@ def _load_json(path: Path) -> dict[str, Any]:
         raise HybridCachePersistenceError(f"invalid JSON constant: {value}")
 
     try:
+        payload = _read_bounded_file(
+            path, max_bytes=_MAX_JSON_BYTES, context=f"JSON file {path.name}"
+        ).decode("utf-8")
         value = json.loads(
-            path.read_text(),
+            payload,
             object_pairs_hook=reject_duplicates,
             parse_constant=reject_constant,
         )
@@ -129,6 +176,7 @@ def _load_json(path: Path) -> dict[str, Any]:
         ) from exc
     if not isinstance(value, dict):
         raise HybridCachePersistenceError(f"{path.name} must contain an object")
+    _validate_json_bounds(value)
     return value
 
 
@@ -293,7 +341,7 @@ def _validate_layer_payload(
             )
         ):
             raise HybridCachePersistenceError("invalid ArraysCache metadata dtypes")
-        if not isinstance(meta_state, (str, int, float, bool, list, dict, type(None))):
+        if meta_state != "":
             raise HybridCachePersistenceError("invalid ArraysCache meta_state")
         expected_tensors = {f"state_{index}" for index in range(num_arrays)} | set(
             names
