@@ -698,6 +698,10 @@ class TestMLLMCompletionCacheStore:
 
 
 class TestMLLMHybridPrefillCheckpoint:
+    @pytest.fixture(autouse=True)
+    def _require_full_mlx_runtime(self):
+        pytest.importorskip("mlx.nn")
+
     class _HybridCache:
         def __init__(self, position=0):
             self.position = position
