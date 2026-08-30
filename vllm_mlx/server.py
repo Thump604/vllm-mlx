@@ -1409,14 +1409,43 @@ async def _run_blocking_engine_cache_io(io_fn, engine: BaseEngine) -> None:
         raise
 
 
-async def _restore_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
+async def _restore_engine_state(spec: ModelSpec | None, engine: BaseEngine) -> None:
     """Restore engine-local state, such as prefix cache, after a cold load."""
+    restore = getattr(engine, "restore_cache_from_disk", None)
+    if callable(restore):
+        cache_dir = _get_cache_dir()
+        logger.info("[lifespan] Loading prefix cache from %s", cache_dir)
+        try:
+            loaded = await restore(cache_dir)
+            logger.info("[lifespan] Loaded %s prefix cache entries", loaded)
+        except Exception as exc:
+            logger.warning(
+                "[lifespan] Failed to load cache from disk: %s",
+                _sanitize_log_text(exc, limit=500),
+            )
+        return
     if hasattr(engine, "load_cache_from_disk"):
         await _run_blocking_engine_cache_io(_load_prefix_cache_from_disk, engine)
 
 
-async def _persist_engine_state(spec: ModelSpec, engine: BaseEngine) -> None:
+async def _persist_engine_state(spec: ModelSpec | None, engine: BaseEngine) -> None:
     """Persist engine-local state before an idle unload or shutdown unload."""
+    persist = getattr(engine, "persist_cache_to_disk", None)
+    if callable(persist):
+        cache_dir = _get_cache_dir()
+        logger.info("[lifespan] Saving prefix cache to %s", cache_dir)
+        try:
+            saved = await persist(cache_dir)
+            if saved:
+                logger.info("[lifespan] Saved prefix cache to %s", cache_dir)
+            else:
+                logger.info("[lifespan] No cache saved at %s", cache_dir)
+        except Exception as exc:
+            logger.warning(
+                "[lifespan] Failed to save cache to disk: %s",
+                _sanitize_log_text(exc, limit=500),
+            )
+        return
     if hasattr(engine, "save_cache_to_disk"):
         await _run_blocking_engine_cache_io(_save_prefix_cache_to_disk, engine)
 
@@ -1553,7 +1582,7 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "load_cache_from_disk")
         ):
-            _load_prefix_cache_from_disk()
+            await _restore_engine_state(None, _engine)
 
         # Warm up prefix cache with user-provided prompts (AFTER disk cache load,
         # so any already-persisted entries are preserved and warm-up only fills
@@ -1609,7 +1638,7 @@ async def lifespan(app: FastAPI):
             and _engine is not None
             and hasattr(_engine, "save_cache_to_disk")
         ):
-            _save_prefix_cache_to_disk()
+            await _persist_engine_state(None, _engine)
 
         # Shutdown: Close MCP connections and stop engine
         if _lifecycle_task is not None:

@@ -477,6 +477,7 @@ class BatchedEngine(BaseEngine):
             max_kv_size=max_kv_size,
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
+            model_identity=self._model_name,
             **mllm_extra,
         )
 
@@ -1319,6 +1320,49 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0
+
+    async def persist_cache_to_disk(self, cache_dir: str) -> bool:
+        """Persist cache state without moving MLLM array work off its owner."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is None:
+                return False
+            snapshot = pc.prepare_hybrid_persistence_snapshot()
+            if snapshot is None:
+                return False
+            return await self._run_cache_io(
+                pc.write_hybrid_persistence_snapshot, cache_dir, snapshot
+            )
+        return await self._run_cache_io(self.save_cache_to_disk, cache_dir)
+
+    async def restore_cache_from_disk(self, cache_dir: str) -> int:
+        """Read on an I/O thread, then rebuild MLLM arrays on their owner."""
+        if self._mllm_scheduler:
+            self._mllm_scheduler._ensure_batch_generator()
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is None:
+                return 0
+            snapshot = await self._run_cache_io(
+                pc.read_hybrid_persistence_snapshot, cache_dir
+            )
+            return pc.restore_hybrid_persistence_snapshot(snapshot)
+        return await self._run_cache_io(self.load_cache_from_disk, cache_dir)
+
+    @staticmethod
+    async def _run_cache_io(function, *args):
+        """Finish an in-flight disk mutation before propagating cancellation."""
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            raise
 
     def clear_prefix_cache(self) -> None:
         """Clear the in-memory prefix cache. Used by bench-serve for clean

@@ -489,6 +489,7 @@ class MLLMBatchGenerator:
         vision_cache_size: int = 100,
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
+        model_identity: Optional[str] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -507,6 +508,8 @@ class MLLMBatchGenerator:
             vision_cache_size: Max entries in vision cache
             prefix_cache_config: Config for KV prefix cache (text-only requests)
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
+            model_identity: Stable model artifact path or revision used to
+                reject incompatible restart snapshots.
         """
         self.model = model
         self.processor = processor
@@ -598,6 +601,9 @@ class MLLMBatchGenerator:
             self.prefix_cache = MemoryAwarePrefixCache(
                 model=self.language_model,
                 config=prefix_cache_config,
+                tokenizer=getattr(self.processor, "tokenizer", self.processor),
+                model_identity=model_identity,
+                cache_runtime_identity={"max_kv_size": self.max_kv_size},
             )
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
 
@@ -1968,6 +1974,7 @@ class MLLMBatchGenerator:
                                 req.input_ids.reshape(-1).tolist(),
                                 request_cache,
                                 auxiliary={"last_logits": last_logits},
+                                persistence_eligible=req.is_text_only,
                             )
                             if entry is not None:
                                 self._publish_prefill_checkpoint(req.request_id, entry)
@@ -3518,6 +3525,7 @@ def install_chunked_prefill_mllm(
                         req.input_ids.reshape(-1).tolist(),
                         partial["cache"],
                         auxiliary={"last_logits": prompt_last_logits},
+                        persistence_eligible=req.is_text_only,
                     )
                     if full_prompt_entry is not None:
                         try:

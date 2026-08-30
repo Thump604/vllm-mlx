@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import bisect
 import copy
+import hashlib
+import json
 import logging
 import math
 import threading
@@ -44,6 +46,7 @@ _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
 _CACHE_PERSIST_VERSION = 4
+_HYBRID_CACHE_LAYOUT_ABI = "arrays-kv-v1"
 
 
 def _get_available_memory() -> int:
@@ -305,6 +308,7 @@ class _CacheEntry:
     cache: list[Any]
     memory_bytes: int
     auxiliary: dict[str, Any] | None = None
+    persistence_eligible: bool = False
 
     @classmethod
     def create(
@@ -312,6 +316,7 @@ class _CacheEntry:
         tokens: list[int],
         cache: list[Any],
         auxiliary: dict[str, Any] | None = None,
+        persistence_eligible: bool = False,
     ) -> _CacheEntry:
         """Create a cache entry with memory estimation."""
         memory = estimate_kv_cache_memory(cache)
@@ -322,6 +327,7 @@ class _CacheEntry:
             cache=cache,
             memory_bytes=memory,
             auxiliary=auxiliary,
+            persistence_eligible=persistence_eligible,
         )
 
 
@@ -992,6 +998,238 @@ def _compute_model_fingerprint(model: Any) -> str:
     return fingerprint
 
 
+def _identity_attr(source: Any, key: str) -> Any:
+    if isinstance(source, dict):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
+def _compute_model_persistence_fingerprint(
+    model: Any, artifact_identity: str | None = None
+) -> str:
+    """Return a strict, stable identity for restart-persisted cache state."""
+    cfg = None
+    for cfg_attr in ("config", "args", "model_config"):
+        cfg = getattr(model, cfg_attr, None)
+        if cfg is not None:
+            break
+    cfg = cfg if cfg is not None else model
+    keys = (
+        "_name_or_path",
+        "name_or_path",
+        "model_type",
+        "architectures",
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "vocab_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "rope_theta",
+        "rope_scaling",
+        "sliding_window",
+        "layer_types",
+        "tie_word_embeddings",
+        "torch_dtype",
+        "quantization",
+        "quantization_config",
+    )
+    identity = {
+        "class": f"{type(model).__module__}.{type(model).__qualname__}",
+        "artifact": artifact_identity,
+        "config": {
+            key: value
+            for key in keys
+            if (value := _identity_attr(cfg, key)) is not None
+        },
+    }
+    try:
+        payload = json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()
+    except Exception as exc:
+        raise ValueError(f"model identity is not serializable: {exc}") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _compute_tokenizer_persistence_fingerprint(tokenizer: Any) -> str:
+    """Hash tokenizer vocabulary and formatting semantics used by cache keys."""
+    if tokenizer is None:
+        return ""
+    digest = hashlib.sha256()
+    header = {
+        "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+        "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+        "chat_template": getattr(tokenizer, "chat_template", None),
+    }
+    digest.update(
+        json.dumps(header, sort_keys=True, separators=(",", ":"), default=str).encode()
+    )
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        vocab = get_vocab()
+        if not isinstance(vocab, dict) or not vocab:
+            return ""
+        for token, token_id in sorted(vocab.items(), key=lambda item: item[0]):
+            digest.update(str(token).encode("utf-8", errors="surrogatepass"))
+            digest.update(b"\0")
+            digest.update(str(token_id).encode())
+            digest.update(b"\0")
+    else:
+        return ""
+    return digest.hexdigest()
+
+
+def _cache_topology(model: Any) -> tuple[tuple[str, int], ...] | None:
+    """Describe the ordered empty-cache topology without sequence state."""
+    make_cache = getattr(model, "make_cache", None)
+    if not callable(make_cache):
+        return None
+    try:
+        cache = make_cache()
+    except Exception:
+        logger.debug("Failed to construct cache topology", exc_info=True)
+        return None
+    topology = []
+    for layer in cache:
+        layer_type = type(layer).__name__
+        if hasattr(layer, "state") and isinstance(layer.state, list):
+            arity = len(layer.state)
+        elif hasattr(layer, "keys") and hasattr(layer, "values"):
+            arity = 2
+        else:
+            return None
+        topology.append((layer_type, arity))
+    return tuple(topology) or None
+
+
+def _cache_topology_fingerprint(
+    topology: tuple[tuple[str, int], ...] | None,
+    config: MemoryCacheConfig | None = None,
+    runtime_identity: dict[str, Any] | None = None,
+) -> str:
+    if not topology:
+        return ""
+    config_identity = None
+    if config is not None:
+        config_identity = {
+            "kv_quantize": config.kv_quantize,
+            "kv_bits": config.kv_bits,
+            "kv_group_size": config.kv_group_size,
+            "kv_min_quantize_tokens": config.kv_min_quantize_tokens,
+        }
+    payload = json.dumps(
+        {
+            "abi": _HYBRID_CACHE_LAYOUT_ABI,
+            "topology": topology,
+            "cache_config": config_identity,
+            "runtime": runtime_identity or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _mx_array_to_numpy(value: Any) -> tuple[Any, str | None]:
+    """Materialize one MLX value to numpy on the calling model-owner thread."""
+    import numpy as np
+
+    original_dtype = str(value.dtype).rsplit(".", 1)[-1]
+    if original_dtype == "bfloat16":
+        import mlx.core as mx
+
+        converted = value.astype(mx.float32)
+        mx.eval(converted)
+        return np.array(converted), original_dtype
+    try:
+        return np.array(value), None
+    except RuntimeError as exc:
+        if "buffer format string" not in str(exc):
+            raise
+        import mlx.core as mx
+
+        converted = value.astype(mx.float32)
+        mx.eval(converted)
+        return np.array(converted), original_dtype
+
+
+def _snapshot_hybrid_layer(layer: Any):
+    from .cache_persistence import HybridLayerSnapshot
+
+    layer_type = type(layer).__name__
+    if layer_type in {"KVCache", "RotatingKVCache"}:
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if keys is None or values is None or isinstance(keys, (tuple, list)):
+            raise ValueError(f"unsupported persisted {layer_type} state")
+        keys_np, keys_dtype = _mx_array_to_numpy(keys)
+        values_np, values_dtype = _mx_array_to_numpy(values)
+        metadata: dict[str, Any] = {"offset": int(layer.offset)}
+        if keys_dtype is not None:
+            metadata["keys_original_dtype"] = keys_dtype
+        if values_dtype is not None:
+            metadata["values_original_dtype"] = values_dtype
+        for attr in ("max_size", "keep", "step", "_idx"):
+            if hasattr(layer, attr):
+                value = getattr(layer, attr)
+                if isinstance(value, (bool, int, float, str)) or value is None:
+                    metadata[attr] = value
+        return HybridLayerSnapshot(
+            layer_type, {"keys": keys_np, "values": values_np}, metadata
+        )
+    if layer_type == "ArraysCache" and isinstance(getattr(layer, "state", None), list):
+        tensors = {}
+        original_dtypes = []
+        for index, value in enumerate(layer.state):
+            if value is None:
+                raise ValueError("ArraysCache contains an uninitialized state")
+            array, original_dtype = _mx_array_to_numpy(value)
+            tensors[f"state_{index}"] = array
+            original_dtypes.append(original_dtype)
+        state_count = len(tensors)
+        metadata_arrays = []
+        metadata_original_dtypes = {}
+        for attr in ("left_padding", "lengths"):
+            value = getattr(layer, attr, None)
+            if value is not None:
+                array, original_dtype = _mx_array_to_numpy(value)
+                tensors[attr] = array
+                metadata_arrays.append(attr)
+                metadata_original_dtypes[attr] = original_dtype
+        return HybridLayerSnapshot(
+            layer_type,
+            tensors,
+            {
+                "num_arrays": state_count,
+                "state_original_dtypes": original_dtypes,
+                "metadata_arrays": metadata_arrays,
+                "metadata_original_dtypes": metadata_original_dtypes,
+            },
+        )
+    raise ValueError(f"unsupported persisted cache layer: {layer_type}")
+
+
+def _iter_cache_arrays(layer: Any):
+    if hasattr(layer, "state") and isinstance(layer.state, list):
+        yield from (value for value in layer.state if value is not None)
+        for attr in ("left_padding", "lengths"):
+            value = getattr(layer, attr, None)
+            if value is not None:
+                yield value
+        return
+    for attr in ("keys", "values"):
+        value = getattr(layer, attr, None)
+        if value is not None:
+            yield value
+
+
 class MemoryAwarePrefixCache:
     """
     Prefix cache with memory-based eviction.
@@ -1014,6 +1252,9 @@ class MemoryAwarePrefixCache:
         self,
         model: Any,
         config: MemoryCacheConfig | None = None,
+        tokenizer: Any | None = None,
+        model_identity: str | None = None,
+        cache_runtime_identity: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize the memory-aware prefix cache.
@@ -1021,10 +1262,44 @@ class MemoryAwarePrefixCache:
         Args:
             model: The MLX model (used for identification).
             config: Cache configuration. Uses defaults if None.
+            tokenizer: Tokenizer whose exact vocabulary and formatting define
+                cache keys. Required for hybrid restart persistence.
+            model_identity: Stable model artifact path or revision identity.
+                Required for hybrid restart persistence.
+            cache_runtime_identity: Cache-shaping runtime settings such as the
+                rotating-cache limit. Included in the strict layout identity.
         """
         self._model_id = id(model)
+        self._model = model
         self._config = config or MemoryCacheConfig()
+        self._cache_runtime_identity = dict(cache_runtime_identity or {})
         self._model_fingerprint = _compute_model_fingerprint(model)
+        try:
+            self._persistence_identity = {
+                "model": (
+                    _compute_model_persistence_fingerprint(model, model_identity)
+                    if model_identity
+                    else ""
+                ),
+                "tokenizer": _compute_tokenizer_persistence_fingerprint(tokenizer),
+                "cache_layout": _cache_topology_fingerprint(
+                    _cache_topology(model),
+                    self._config,
+                    self._cache_runtime_identity,
+                ),
+            }
+        except Exception as exc:
+            logger.warning(
+                "[cache_persist] strict identity unavailable; restart persistence "
+                "disabled: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            self._persistence_identity = {
+                "model": "",
+                "tokenizer": "",
+                "cache_layout": "",
+            }
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1305,6 +1580,8 @@ class MemoryAwarePrefixCache:
         tokens: list[int],
         cache: list[Any],
         auxiliary: dict[str, Any] | None = None,
+        *,
+        persistence_eligible: bool = False,
     ) -> _CacheEntry | None:
         """Detach and account an entry without publishing it.
 
@@ -1366,7 +1643,12 @@ class MemoryAwarePrefixCache:
                             if isinstance(value, mx.array)
                         )
                     )
-            entry = _CacheEntry.create(tokens, cache, detached_auxiliary)
+            entry = _CacheEntry.create(
+                tokens,
+                cache,
+                detached_auxiliary,
+                persistence_eligible=persistence_eligible,
+            )
             if entry.memory_bytes > self._max_memory:
                 self._stats.store_rejections += 1
                 logger.warning(
@@ -1661,6 +1943,317 @@ class MemoryAwarePrefixCache:
             return prefix
 
         return None
+
+    # -----------------------------------------------------------------
+    # Exact hybrid restart persistence
+    # -----------------------------------------------------------------
+
+    def prepare_hybrid_persistence_snapshot(self):
+        """Materialize a stable numpy snapshot on the model-owning thread.
+
+        This deliberately accepts only the Package 1 hybrid contract:
+        ordered ``ArraysCache``/``KVCache`` layers plus exact-hit
+        ``last_logits``. Unsupported or incomplete entries reject the whole
+        snapshot rather than silently degrading a restored hit to prefill.
+        """
+        from .cache_persistence import HybridCacheSnapshot, HybridEntrySnapshot
+
+        if any(not value for value in self._persistence_identity.values()):
+            logger.warning(
+                "[cache_persist] hybrid snapshot rejected: model, tokenizer, "
+                "and cache-layout identity are required"
+            )
+            return None
+        with self._memory_lock:
+            entries = [
+                entry for entry in self._entries.values() if entry.persistence_eligible
+            ]
+        if not entries:
+            return None
+
+        expected_layout = self._persistence_identity["cache_layout"]
+        snapshots = []
+        try:
+            for entry in entries:
+                if set(entry.auxiliary or {}) != {"last_logits"}:
+                    raise ValueError("hybrid entry is missing exact last_logits")
+                topology = tuple(
+                    (
+                        type(layer).__name__,
+                        (
+                            len(layer.state)
+                            if hasattr(layer, "state") and isinstance(layer.state, list)
+                            else 2
+                        ),
+                    )
+                    for layer in entry.cache
+                )
+                if (
+                    _cache_topology_fingerprint(
+                        topology, self._config, self._cache_runtime_identity
+                    )
+                    != expected_layout
+                ):
+                    raise ValueError("cache layout differs from the loaded model")
+                layers = tuple(_snapshot_hybrid_layer(layer) for layer in entry.cache)
+                last_logits, logits_dtype = _mx_array_to_numpy(
+                    entry.auxiliary["last_logits"]
+                )
+                snapshots.append(
+                    HybridEntrySnapshot(
+                        tokens=entry.tokens,
+                        memory_bytes=entry.memory_bytes,
+                        layers=layers,
+                        auxiliary={"last_logits": last_logits},
+                        auxiliary_original_dtypes={"last_logits": logits_dtype},
+                    )
+                )
+            return HybridCacheSnapshot(
+                identity=dict(self._persistence_identity),
+                entries=tuple(snapshots),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[cache_persist] hybrid snapshot rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def write_hybrid_persistence_snapshot(self, cache_dir: str, snapshot) -> bool:
+        """Write a prepared numpy snapshot; safe to call on an I/O thread."""
+        from .cache_persistence import write_hybrid_snapshot
+
+        if snapshot is None:
+            return False
+        try:
+            return write_hybrid_snapshot(cache_dir, snapshot)
+        except Exception as exc:
+            logger.warning(
+                "[cache_persist] hybrid write rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return False
+
+    def read_hybrid_persistence_snapshot(self, cache_dir: str):
+        """Read and validate numpy state; safe to call on an I/O thread."""
+        from .cache_persistence import read_hybrid_snapshot
+
+        try:
+            return read_hybrid_snapshot(
+                cache_dir,
+                max_memory_bytes=self._max_memory,
+                max_entries=self._config.max_entries,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[cache_persist] hybrid load rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _restore_hybrid_layer(layer_snapshot):
+        """Reconstruct one validated layer on the model-owning thread."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+        layer_type = layer_snapshot.layer_type
+        tensors = layer_snapshot.tensors
+        metadata = layer_snapshot.metadata
+
+        def restore_dtype(value, dtype_name):
+            dtype = getattr(mx, dtype_name, None) if dtype_name else None
+            return value.astype(dtype) if dtype is not None else value
+
+        if layer_type in {"KVCache", "RotatingKVCache"}:
+            allowed_metadata = {
+                "offset",
+                "keys_original_dtype",
+                "values_original_dtype",
+                "max_size",
+                "keep",
+                "step",
+                "_idx",
+            }
+            if not set(metadata).issubset(allowed_metadata) or "offset" not in metadata:
+                raise ValueError("KV layer metadata is invalid")
+            if set(tensors) != {"keys", "values"}:
+                raise ValueError("KV layer tensor names are invalid")
+            keys_np = tensors["keys"]
+            values_np = tensors["values"]
+            if (
+                keys_np.shape != values_np.shape
+                or keys_np.ndim < 3
+                or keys_np.dtype.kind != "f"
+                or values_np.dtype.kind != "f"
+            ):
+                raise ValueError("KV layer shape or dtype is invalid")
+            offset = metadata.get("offset")
+            if not isinstance(offset, int) or offset < 1 or offset > keys_np.shape[-2]:
+                raise ValueError("KV layer offset is invalid")
+            cls = RotatingKVCache if layer_type == "RotatingKVCache" else KVCache
+            layer = cls.__new__(cls)
+            layer.keys = restore_dtype(
+                mx.array(keys_np), metadata.get("keys_original_dtype")
+            )
+            layer.values = restore_dtype(
+                mx.array(values_np), metadata.get("values_original_dtype")
+            )
+            layer.offset = offset
+            for attr in ("max_size", "keep", "step", "_idx"):
+                if attr in metadata:
+                    setattr(layer, attr, metadata[attr])
+            return layer
+
+        if layer_type == "ArraysCache":
+            if set(metadata) != {
+                "num_arrays",
+                "state_original_dtypes",
+                "metadata_arrays",
+                "metadata_original_dtypes",
+            }:
+                raise ValueError("ArraysCache metadata is invalid")
+            num_arrays = metadata.get("num_arrays")
+            if not isinstance(num_arrays, int) or num_arrays < 1:
+                raise ValueError("ArraysCache arity is invalid")
+            metadata_arrays = metadata.get("metadata_arrays")
+            if (
+                not isinstance(metadata_arrays, list)
+                or len(set(metadata_arrays)) != len(metadata_arrays)
+                or any(
+                    name not in {"left_padding", "lengths"} for name in metadata_arrays
+                )
+            ):
+                raise ValueError("ArraysCache metadata arrays are invalid")
+            expected_names = {f"state_{index}" for index in range(num_arrays)} | set(
+                metadata_arrays
+            )
+            if set(tensors) != expected_names:
+                raise ValueError("ArraysCache tensor names are invalid")
+            dtype_names = metadata.get("state_original_dtypes")
+            if not isinstance(dtype_names, list) or len(dtype_names) != num_arrays:
+                raise ValueError("ArraysCache dtype metadata is invalid")
+            state = []
+            for index in range(num_arrays):
+                value = tensors[f"state_{index}"]
+                if value.size == 0 or value.dtype.kind != "f":
+                    raise ValueError("ArraysCache tensor is invalid")
+                state.append(restore_dtype(mx.array(value), dtype_names[index]))
+            layer = ArraysCache(num_arrays)
+            layer.state = state
+            metadata_dtype_names = metadata.get("metadata_original_dtypes")
+            if not isinstance(metadata_dtype_names, dict) or set(
+                metadata_dtype_names
+            ) != set(metadata_arrays):
+                raise ValueError("ArraysCache metadata dtype information is invalid")
+            for attr in metadata_arrays:
+                setattr(
+                    layer,
+                    attr,
+                    restore_dtype(mx.array(tensors[attr]), metadata_dtype_names[attr]),
+                )
+            return layer
+        raise ValueError(f"unsupported cache layer: {layer_type}")
+
+    def restore_hybrid_persistence_snapshot(self, loaded) -> int:
+        """Reconstruct and atomically publish validated entries on owner thread."""
+        if loaded is None:
+            return 0
+        if loaded.identity != self._persistence_identity:
+            logger.warning("[cache_persist] hybrid identity mismatch; discarding cache")
+            return 0
+
+        expected_topology = _cache_topology(self._model)
+        cfg = None
+        for cfg_attr in ("config", "args", "model_config"):
+            cfg = getattr(self._model, cfg_attr, None)
+            if cfg is not None:
+                break
+        vocab_size = _identity_attr(cfg or self._model, "vocab_size")
+        candidates = []
+        seen_tokens = set()
+        try:
+            for persisted in loaded.entries:
+                if persisted.tokens in seen_tokens or any(
+                    token < 0 for token in persisted.tokens
+                ):
+                    raise ValueError("duplicate or invalid token sequence")
+                seen_tokens.add(persisted.tokens)
+                topology = tuple(
+                    (
+                        layer.layer_type,
+                        int(layer.metadata.get("num_arrays", 2)),
+                    )
+                    for layer in persisted.layers
+                )
+                if topology != expected_topology:
+                    raise ValueError("persisted cache topology mismatch")
+                logits_np = persisted.auxiliary.get("last_logits")
+                if (
+                    logits_np is None
+                    or logits_np.size == 0
+                    or logits_np.dtype.kind != "f"
+                    or logits_np.ndim != 2
+                    or logits_np.shape[0] != 1
+                    or (
+                        isinstance(vocab_size, int)
+                        and logits_np.shape[-1] != vocab_size
+                    )
+                ):
+                    raise ValueError("persisted last_logits shape or dtype is invalid")
+                cache = [
+                    self._restore_hybrid_layer(layer) for layer in persisted.layers
+                ]
+                import mlx.core as mx
+
+                logits = mx.array(logits_np)
+                original_dtype = persisted.auxiliary_original_dtypes.get("last_logits")
+                if original_dtype:
+                    dtype = getattr(mx, original_dtype, None)
+                    if dtype is None:
+                        raise ValueError("persisted last_logits dtype is unavailable")
+                    logits = logits.astype(dtype)
+                auxiliary = {"last_logits": logits}
+                mx.eval(
+                    *(array for layer in cache for array in _iter_cache_arrays(layer)),
+                    auxiliary["last_logits"],
+                )
+                candidates.append(
+                    _CacheEntry.create(
+                        list(persisted.tokens),
+                        cache,
+                        auxiliary,
+                        persistence_eligible=True,
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "[cache_persist] hybrid reconstruction rejected: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+
+        loaded_count = 0
+        with self._memory_lock:
+            for entry in candidates:
+                if entry.tokens in self._entries:
+                    continue
+                if (
+                    self._current_memory + entry.memory_bytes > self._max_memory
+                    or len(self._entries) >= self._config.max_entries
+                ):
+                    break
+                self._entries[entry.tokens] = entry
+                bisect.insort(self._sorted_keys, entry.tokens)
+                self._current_memory += entry.memory_bytes
+                loaded_count += 1
+            self._stats.entry_count = len(self._entries)
+            self._stats.current_memory_bytes = self._current_memory
+        return loaded_count
 
     # -----------------------------------------------------------------
     # Disk persistence — survives server restarts

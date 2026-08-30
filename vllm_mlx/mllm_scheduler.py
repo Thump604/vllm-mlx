@@ -90,6 +90,8 @@ class MLLMSchedulerConfig:
     # evicted entries to disk and promotes them back on hit.
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_gb: float = 10.0
+    # Stable artifact path/revision used by restart-cache compatibility checks.
+    model_identity: Optional[str] = None
 
 
 @dataclass
@@ -335,6 +337,7 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                model_identity=self.config.model_identity,
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
