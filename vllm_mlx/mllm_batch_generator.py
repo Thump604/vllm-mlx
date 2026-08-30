@@ -2455,7 +2455,38 @@ def install_mtp_mllm(
         "concurrent_batch": 0,
         "logits_processors": 0,
         "assistant_not_requested": 0,
+        "hidden_state_unavailable": 0,
     }
+
+    def _sample_primary_logits(
+        logits: mx.array,
+        logits_processors: Optional[List[Optional[List[Callable]]]],
+        output_tokens: Optional[List[List[int]]],
+        samplers: Optional[List[Optional[Callable]]],
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """Sample one target token from logits already backed by the live cache."""
+        if logits_processors and output_tokens and any(logits_processors):
+            processed_logits = []
+            for row in range(logits.shape[0]):
+                sample_logits = logits[row : row + 1]
+                if logits_processors[row]:
+                    for processor in logits_processors[row]:
+                        sample_logits = processor(
+                            mx.array(output_tokens[row]), sample_logits
+                        )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if samplers and any(samplers):
+            sampled = []
+            for row in range(logprobs.shape[0]):
+                sampler = samplers[row] if samplers[row] else batch_gen.sampler
+                sampled.append(sampler(logprobs[row : row + 1]))
+            primary_tokens = mx.concatenate(sampled, axis=0)
+        else:
+            primary_tokens = batch_gen.sampler(logprobs)
+        return primary_tokens, list(logprobs)
 
     def _get_mtp_stats() -> Dict[str, Any]:
         with _mtp_stats_lock:
@@ -2567,35 +2598,27 @@ def install_mtp_mllm(
             # Normal forward with return_hidden
             model_output = language_model(input_tokens, cache=cache, return_hidden=True)
             logits, hidden_states = _model_parts(model_output)
-            if hidden_states is None:
-                return _orig_step(
-                    input_tokens, cache, logits_processors, output_tokens, samplers
-                )
             logits = logits[:, -1, :]
+            if hidden_states is None:
+                _skip_state_by_uid.clear()
+                if stateful_external_drafter:
+                    _reset_external_drafter()
+                    with _mtp_stats_lock:
+                        _mtp_stats["errors"] += 1
+                    raise RuntimeError(
+                        "Stateful assistant MTP requires target hidden states; "
+                        "aborting after the single target forward instead of "
+                        "replaying against an advanced cache"
+                    )
+                with _mtp_stats_lock:
+                    _bypass_counts["hidden_state_unavailable"] += 1
+                return _sample_primary_logits(
+                    logits, logits_processors, output_tokens, samplers
+                )
 
-        # Apply logits processors before sampling
-        if logits_processors and output_tokens and any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                if logits_processors[e]:
-                    for processor in logits_processors[e]:
-                        sample_logits = processor(
-                            mx.array(output_tokens[e]), sample_logits
-                        )
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        # Sample primary (use per-request sampler if available)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if samplers and any(samplers):
-            sampled_list = []
-            for e in range(logprobs.shape[0]):
-                s = samplers[e] if samplers[e] else batch_gen.sampler
-                sampled_list.append(s(logprobs[e : e + 1]))
-            primary_tokens = mx.concatenate(sampled_list, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
+        primary_tokens, logprobs = _sample_primary_logits(
+            logits, logits_processors, output_tokens, samplers
+        )
 
         # MTP draft + always-advance verify
         target_verify_started = False
@@ -2930,11 +2953,11 @@ def install_mtp_mllm(
                 _reset_external_drafter()
             with _mtp_stats_lock:
                 _mtp_stats["errors"] += 1
-            if stateful_external_drafter and target_verify_started:
+            if target_verify_started:
                 raise RuntimeError(
-                    "Stateful assistant verification failed after the target cache "
-                    "may have advanced; aborting the batch instead of continuing "
-                    "with unverified cache state"
+                    "MTP verification failed after the target cache may have "
+                    "advanced; aborting the batch instead of continuing with "
+                    "unverified cache state"
                 ) from e
 
         # Log MTP stats every 50 steps
