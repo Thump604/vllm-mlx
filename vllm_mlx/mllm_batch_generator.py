@@ -598,25 +598,18 @@ class MLLMBatchGenerator:
         # KV prefix cache for text-only requests
         self.prefix_cache: Optional[MemoryAwarePrefixCache] = None
         if prefix_cache_config is not None:
+            # Normalize first so the persisted identity covers the exact
+            # processor/tokenizer templates that render cache-key tokens.
+            self._normalize_chat_template_for_prefix_cache(enabled=True)
             self.prefix_cache = MemoryAwarePrefixCache(
                 model=self.language_model,
                 config=prefix_cache_config,
                 tokenizer=getattr(self.processor, "tokenizer", self.processor),
                 model_identity=model_identity,
                 cache_runtime_identity={"max_kv_size": self.max_kv_size},
+                template_renderer=self.processor,
             )
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
-
-        # Normalize chat template for prefix-cache stability.
-        # Qwen3.5 chat template retroactively changes formatting of earlier
-        # assistant messages based on last_query_index (position of last
-        # non-tool user message).  When a user text message is appended,
-        # last_query_index jumps forward, removing <think> blocks from
-        # earlier assistant turns — shifting tokens mid-sequence and
-        # breaking prefix match.  Fix: always use plain format for
-        # historical assistant turns (thinking is still added by the
-        # generation prompt at the end).
-        self._normalize_chat_template_for_prefix_cache()
 
         # Compute think-suffix length for prefix cache key stripping.
         # Models with enable_thinking=True add <think>\n to the generation
@@ -636,7 +629,9 @@ class MLLMBatchGenerator:
                 mx.device_info()["max_recommended_working_set_size"]
             )
 
-    def _normalize_chat_template_for_prefix_cache(self) -> None:
+    def _normalize_chat_template_for_prefix_cache(
+        self, enabled: bool | None = None
+    ) -> None:
         """Patch chat template so historical assistant turns are prefix-stable.
 
         Qwen3.5's chat template computes ``last_query_index`` — the position
@@ -652,7 +647,9 @@ class MLLMBatchGenerator:
         without any injected ``<think>`` block.  The generation prompt still
         adds ``<think>\\n`` at the very end, so the model generates thinking.
         """
-        if self.prefix_cache is None:
+        if enabled is None:
+            enabled = self.prefix_cache is not None
+        if not enabled:
             return  # No prefix cache — no need to normalize
 
         # Find the chat template.  VLM processors (e.g. Qwen3VLProcessor)

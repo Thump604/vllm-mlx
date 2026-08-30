@@ -34,6 +34,7 @@ import threading
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ _MAX_ENTRIES_FALLBACK = 50  # Fallback if memory detection fails
 # Bump this when the cache on-disk format or KV semantics change.
 # Loading a cache with a different version is rejected automatically.
 _CACHE_PERSIST_VERSION = 4
-_HYBRID_CACHE_LAYOUT_ABI = "arrays-kv-v1"
+_HYBRID_CACHE_LAYOUT_ABI = "arrays-kv-v2"
 
 
 def _get_available_memory() -> int:
@@ -1035,9 +1036,34 @@ def _compute_model_persistence_fingerprint(
         "quantization",
         "quantization_config",
     )
+    artifact: Any = artifact_identity
+    if artifact_identity:
+        path = Path(artifact_identity).expanduser()
+        if path.exists():
+            resolved = path.resolve()
+            files = []
+            candidates = (
+                [resolved] if resolved.is_file() else sorted(resolved.rglob("*"))
+            )
+            for candidate in candidates:
+                if not candidate.is_file():
+                    continue
+                stat = candidate.stat()
+                files.append(
+                    {
+                        "path": (
+                            candidate.name
+                            if resolved.is_file()
+                            else candidate.relative_to(resolved).as_posix()
+                        ),
+                        "size": stat.st_size,
+                        "mtime_ns": stat.st_mtime_ns,
+                    }
+                )
+            artifact = {"resolved_path": str(resolved), "files": files}
     identity = {
         "class": f"{type(model).__module__}.{type(model).__qualname__}",
-        "artifact": artifact_identity,
+        "artifact": artifact,
         "config": {
             key: value
             for key in keys
@@ -1053,7 +1079,9 @@ def _compute_model_persistence_fingerprint(
     return hashlib.sha256(payload).hexdigest()
 
 
-def _compute_tokenizer_persistence_fingerprint(tokenizer: Any) -> str:
+def _compute_tokenizer_persistence_fingerprint(
+    tokenizer: Any, template_renderer: Any | None = None
+) -> str:
     """Hash tokenizer vocabulary and formatting semantics used by cache keys."""
     if tokenizer is None:
         return ""
@@ -1066,6 +1094,13 @@ def _compute_tokenizer_persistence_fingerprint(tokenizer: Any) -> str:
         "eos_token_id": getattr(tokenizer, "eos_token_id", None),
         "pad_token_id": getattr(tokenizer, "pad_token_id", None),
         "chat_template": getattr(tokenizer, "chat_template", None),
+        "renderer_class": (
+            f"{type(template_renderer).__module__}."
+            f"{type(template_renderer).__qualname__}"
+            if template_renderer is not None
+            else None
+        ),
+        "renderer_chat_template": getattr(template_renderer, "chat_template", None),
     }
     digest.update(
         json.dumps(header, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -1097,7 +1132,7 @@ def _cache_topology(model: Any) -> tuple[tuple[str, int], ...] | None:
         return None
     topology = []
     for layer in cache:
-        layer_type = type(layer).__name__
+        layer_type = f"{type(layer).__module__}.{type(layer).__qualname__}"
         if hasattr(layer, "state") and isinstance(layer.state, list):
             arity = len(layer.state)
         elif hasattr(layer, "keys") and hasattr(layer, "values"):
@@ -1211,6 +1246,7 @@ def _snapshot_hybrid_layer(layer: Any):
                 "state_original_dtypes": original_dtypes,
                 "metadata_arrays": metadata_arrays,
                 "metadata_original_dtypes": metadata_original_dtypes,
+                "meta_state": getattr(layer, "meta_state", ""),
             },
         )
     raise ValueError(f"unsupported persisted cache layer: {layer_type}")
@@ -1255,6 +1291,7 @@ class MemoryAwarePrefixCache:
         tokenizer: Any | None = None,
         model_identity: str | None = None,
         cache_runtime_identity: dict[str, Any] | None = None,
+        template_renderer: Any | None = None,
     ) -> None:
         """
         Initialize the memory-aware prefix cache.
@@ -1268,6 +1305,8 @@ class MemoryAwarePrefixCache:
                 Required for hybrid restart persistence.
             cache_runtime_identity: Cache-shaping runtime settings such as the
                 rotating-cache limit. Included in the strict layout identity.
+            template_renderer: Processor whose effective chat template renders
+                cache-key token sequences. Included in tokenizer identity.
         """
         self._model_id = id(model)
         self._model = model
@@ -1281,7 +1320,9 @@ class MemoryAwarePrefixCache:
                     if model_identity
                     else ""
                 ),
-                "tokenizer": _compute_tokenizer_persistence_fingerprint(tokenizer),
+                "tokenizer": _compute_tokenizer_persistence_fingerprint(
+                    tokenizer, template_renderer
+                ),
                 "cache_layout": _cache_topology_fingerprint(
                     _cache_topology(model),
                     self._config,
@@ -1312,6 +1353,21 @@ class MemoryAwarePrefixCache:
 
         # Memory tracking
         self._max_memory = self._config.compute_memory_limit()
+        configured_token_limit = self._cache_runtime_identity.get("max_kv_size")
+        if not isinstance(configured_token_limit, int) or configured_token_limit < 1:
+            cfg = None
+            for cfg_attr in ("config", "args", "model_config"):
+                cfg = getattr(model, cfg_attr, None)
+                if cfg is not None:
+                    break
+            configured_token_limit = _identity_attr(
+                cfg or model, "max_position_embeddings"
+            )
+        self._max_persisted_tokens = (
+            configured_token_limit
+            if isinstance(configured_token_limit, int) and configured_token_limit > 0
+            else 1024 * 1024
+        )
         self._current_memory = 0
         self._memory_lock = threading.RLock()
         # Serializes the entry-sized snapshot copy in store().  Separate
@@ -1979,7 +2035,7 @@ class MemoryAwarePrefixCache:
                     raise ValueError("hybrid entry is missing exact last_logits")
                 topology = tuple(
                     (
-                        type(layer).__name__,
+                        f"{type(layer).__module__}.{type(layer).__qualname__}",
                         (
                             len(layer.state)
                             if hasattr(layer, "state") and isinstance(layer.state, list)
@@ -2045,6 +2101,7 @@ class MemoryAwarePrefixCache:
                 cache_dir,
                 max_memory_bytes=self._max_memory,
                 max_entries=self._config.max_entries,
+                max_tokens=self._max_persisted_tokens,
             )
         except Exception as exc:
             logger.warning(
@@ -2114,6 +2171,7 @@ class MemoryAwarePrefixCache:
                 "state_original_dtypes",
                 "metadata_arrays",
                 "metadata_original_dtypes",
+                "meta_state",
             }:
                 raise ValueError("ArraysCache metadata is invalid")
             num_arrays = metadata.get("num_arrays")
@@ -2155,6 +2213,7 @@ class MemoryAwarePrefixCache:
                     attr,
                     restore_dtype(mx.array(tensors[attr]), metadata_dtype_names[attr]),
                 )
+            layer.meta_state = metadata["meta_state"]
             return layer
         raise ValueError(f"unsupported cache layer: {layer_type}")
 
@@ -2166,7 +2225,10 @@ class MemoryAwarePrefixCache:
             logger.warning("[cache_persist] hybrid identity mismatch; discarding cache")
             return 0
 
-        expected_topology = _cache_topology(self._model)
+        expected_topology = tuple(
+            (qualified_name.rsplit(".", 1)[-1], arity)
+            for qualified_name, arity in (_cache_topology(self._model) or ())
+        )
         cfg = None
         for cfg_attr in ("config", "args", "model_config"):
             cfg = getattr(self._model, cfg_attr, None)
@@ -2191,6 +2253,26 @@ class MemoryAwarePrefixCache:
                 )
                 if topology != expected_topology:
                     raise ValueError("persisted cache topology mismatch")
+                expected_kv_heads = _identity_attr(
+                    cfg or self._model, "num_key_value_heads"
+                )
+                expected_head_dim = _identity_attr(cfg or self._model, "head_dim")
+                for layer in persisted.layers:
+                    if layer.layer_type not in {"KVCache", "RotatingKVCache"}:
+                        continue
+                    shape = layer.tensors["keys"].shape
+                    if shape[0] != 1:
+                        raise ValueError("persisted KV batch geometry mismatch")
+                    if (
+                        isinstance(expected_kv_heads, int)
+                        and shape[-3] != expected_kv_heads
+                    ):
+                        raise ValueError("persisted KV head geometry mismatch")
+                    if (
+                        isinstance(expected_head_dim, int)
+                        and shape[-1] != expected_head_dim
+                    ):
+                        raise ValueError("persisted KV dimension mismatch")
                 logits_np = persisted.auxiliary.get("last_logits")
                 if (
                     logits_np is None

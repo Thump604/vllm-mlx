@@ -1290,6 +1290,10 @@ class TestHybridRestartPersistence:
         def get_vocab(self):
             return {f"token-{index}{self.suffix}": index for index in range(16)}
 
+    class _Renderer:
+        def __init__(self, suffix=""):
+            self.chat_template = f"{{{{ messages }}}}{suffix}"
+
     class _Args:
         model_type = "qwen3_5"
         num_hidden_layers = 2
@@ -1331,14 +1335,15 @@ class TestHybridRestartPersistence:
         mx.eval(*arrays.state, kv.keys, kv.values, logits)
         return [arrays, kv], logits
 
-    def _cache(self, tokenizer=None):
+    def _cache(self, tokenizer=None, renderer=None, model_identity=None):
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
         return MemoryAwarePrefixCache(
             self._Model(),
             MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
             tokenizer=tokenizer or self._Tokenizer(),
-            model_identity="qualified-model@revision",
+            model_identity=model_identity or "qualified-model@revision",
+            template_renderer=renderer or self._Renderer(),
         )
 
     def test_round_trip_preserves_hybrid_state_and_exact_logits(self, tmp_path):
@@ -1375,6 +1380,7 @@ class TestHybridRestartPersistence:
             assert mx.array_equal(actual, expected).item()
         assert mx.array_equal(fetched[0].left_padding, state[0].left_padding).item()
         assert mx.array_equal(fetched[0].lengths, state[0].lengths).item()
+        assert fetched[0].meta_state == state[0].meta_state
         assert fetched[1].offset == state[1].offset
         assert mx.array_equal(fetched[1].keys, state[1].keys).item()
         assert mx.array_equal(fetched[1].values, state[1].values).item()
@@ -1444,6 +1450,75 @@ class TestHybridRestartPersistence:
         assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
         assert len(incompatible) == 0
 
+    def test_effective_processor_template_mismatch_publishes_nothing(self, tmp_path):
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        incompatible = self._cache(renderer=self._Renderer("-changed"))
+        loaded = incompatible.read_hybrid_persistence_snapshot(str(tmp_path))
+
+        assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
+        assert len(incompatible) == 0
+
+    def test_mutated_local_model_artifact_publishes_nothing(self, tmp_path):
+        model_dir = tmp_path / "model"
+        cache_dir = tmp_path / "cache"
+        model_dir.mkdir()
+        marker = model_dir / "config.json"
+        marker.write_text('{"revision":"first"}')
+        source = self._cache(model_identity=str(model_dir))
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(cache_dir), snapshot)
+
+        marker.write_text('{"revision":"second"}')
+        incompatible = self._cache(model_identity=str(model_dir))
+        loaded = incompatible.read_hybrid_persistence_snapshot(str(cache_dir))
+
+        assert incompatible.restore_hybrid_persistence_snapshot(loaded) == 0
+        assert len(incompatible) == 0
+
+    def test_bfloat16_last_logits_restore_exact_dtype(self, tmp_path):
+        import mlx.core as mx
+
+        source = self._cache()
+        state, _ = self._state()
+        logits = mx.arange(16, dtype=mx.bfloat16).reshape(1, 16)
+        mx.eval(logits)
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = self._cache()
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        auxiliary = restored.fetch_exact_auxiliary([1, 2, 3, 4])
+
+        assert auxiliary["last_logits"].dtype == mx.bfloat16
+        assert mx.array_equal(auxiliary["last_logits"], logits).item()
+
     def test_each_required_identity_field_fails_closed(self, tmp_path):
         from vllm_mlx.cache_persistence import LoadedHybridCache
 
@@ -1467,6 +1542,38 @@ class TestHybridRestartPersistence:
             target = self._cache()
             assert target.restore_hybrid_persistence_snapshot(incompatible) == 0
             assert len(target) == 0
+
+    def test_invalid_second_entry_publishes_no_partial_restore(self, tmp_path):
+        from dataclasses import replace
+
+        import numpy as np
+
+        from vllm_mlx.cache_persistence import LoadedHybridCache
+
+        source = self._cache()
+        state, logits = self._state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+        loaded = source.read_hybrid_persistence_snapshot(str(tmp_path))
+        invalid_second = replace(
+            loaded.entries[0],
+            tokens=(5, 6, 7, 8),
+            auxiliary={"last_logits": np.arange(16, dtype=np.float32)},
+        )
+        multi_entry = LoadedHybridCache(
+            loaded.identity, (loaded.entries[0], invalid_second)
+        )
+        target = self._cache()
+
+        assert target.restore_hybrid_persistence_snapshot(multi_entry) == 0
+        assert len(target) == 0
 
     def test_restored_exact_hit_uses_logits_without_rewind_or_prefill(self, tmp_path):
         import threading

@@ -42,6 +42,7 @@ def _snapshot(*, model="model-a", tokenizer="tokenizer-a"):
                             "state_original_dtypes": [None, None],
                             "metadata_arrays": [],
                             "metadata_original_dtypes": {},
+                            "meta_state": "",
                         },
                     ),
                     HybridLayerSnapshot(
@@ -287,3 +288,51 @@ def test_hybrid_snapshot_rejects_symlinked_tensor_file(tmp_path):
 
     with pytest.raises(HybridCachePersistenceError, match="missing layer 0 file"):
         read_hybrid_snapshot(str(tmp_path))
+
+
+def test_hybrid_snapshot_rejects_token_count_above_runtime_limit(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["entries"][0]["num_tokens"] = 5
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (tmp_path / "index.json").write_text(
+        json.dumps(pointer, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(
+        HybridCachePersistenceError, match="snapshot exceeds restore token budget"
+    ):
+        read_hybrid_snapshot(str(tmp_path), max_tokens=4)
+
+
+def test_hybrid_snapshot_rejects_aggregate_token_count_above_runtime_limit(tmp_path):
+    import hashlib
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot())
+    generation = _generation_dir(tmp_path)
+    manifest_path = generation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    second = dict(manifest["entries"][0])
+    second["directory"] = "entry-000001"
+    manifest["entries"].append(second)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (tmp_path / "index.json").write_text(
+        json.dumps(pointer, sort_keys=True, separators=(",", ":"))
+    )
+
+    with pytest.raises(
+        HybridCachePersistenceError, match="snapshot exceeds restore token budget"
+    ):
+        read_hybrid_snapshot(str(tmp_path), max_tokens=7)

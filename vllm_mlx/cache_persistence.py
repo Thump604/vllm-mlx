@@ -27,6 +27,7 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SUPPORTED_LAYERS = {"KVCache", "RotatingKVCache", "ArraysCache"}
 _SUPPORTED_AUXILIARY = {"last_logits"}
 _SUPPORTED_ORIGINAL_DTYPES = {None, "bfloat16", "float16", "float32"}
+_ABSOLUTE_MAX_TOKENS = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -113,8 +114,15 @@ def _load_json(path: Path) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def reject_constant(value):
+        raise HybridCachePersistenceError(f"invalid JSON constant: {value}")
+
     try:
-        value = json.loads(path.read_text(), object_pairs_hook=reject_duplicates)
+        value = json.loads(
+            path.read_text(),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise HybridCachePersistenceError(
             f"invalid JSON at {path.name}: {exc}"
@@ -253,6 +261,7 @@ def _validate_layer_payload(
             "state_original_dtypes",
             "metadata_arrays",
             "metadata_original_dtypes",
+            "meta_state",
         }
         if not isinstance(metadata, dict) or set(metadata) != expected_metadata:
             raise HybridCachePersistenceError("invalid ArraysCache metadata")
@@ -260,6 +269,7 @@ def _validate_layer_payload(
         names = metadata["metadata_arrays"]
         state_dtypes = metadata["state_original_dtypes"]
         metadata_dtypes = metadata["metadata_original_dtypes"]
+        meta_state = metadata["meta_state"]
         if not isinstance(num_arrays, int) or num_arrays < 1:
             raise HybridCachePersistenceError("invalid ArraysCache arity")
         if (
@@ -283,6 +293,8 @@ def _validate_layer_payload(
             )
         ):
             raise HybridCachePersistenceError("invalid ArraysCache metadata dtypes")
+        if not isinstance(meta_state, (str, int, float, bool, list, dict, type(None))):
+            raise HybridCachePersistenceError("invalid ArraysCache meta_state")
         expected_tensors = {f"state_{index}" for index in range(num_arrays)} | set(
             names
         )
@@ -387,6 +399,7 @@ def write_hybrid_snapshot(cache_dir: str, snapshot: HybridCacheSnapshot) -> bool
             save_file(entry.auxiliary, str(auxiliary_path))
             os.chmod(auxiliary_path, 0o600)
             _sync_file(auxiliary_path)
+            _sync_directory(entry_dir)
             entry_records.append(
                 {
                     "directory": entry_dir.name,
@@ -423,6 +436,7 @@ def write_hybrid_snapshot(cache_dir: str, snapshot: HybridCacheSnapshot) -> bool
         os.replace(pointer_tmp, root / "index.json")
         _sync_directory(root)
         _prune_old_generations(root, generation)
+        _sync_directory(root)
         return True
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -449,6 +463,7 @@ def read_hybrid_snapshot(
     cache_dir: str,
     max_memory_bytes: int | None = None,
     max_entries: int | None = None,
+    max_tokens: int | None = None,
 ) -> LoadedHybridCache | None:
     """Load and fully validate one committed generation without importing MLX."""
     root = Path(cache_dir)
@@ -489,14 +504,30 @@ def read_hybrid_snapshot(
         raise HybridCachePersistenceError("manifest entries must be nonempty")
     if max_entries is not None and len(raw_entries) > max_entries:
         raise HybridCachePersistenceError("snapshot exceeds restore entry budget")
+    token_limit = _ABSOLUTE_MAX_TOKENS
+    if max_tokens is not None:
+        if not isinstance(max_tokens, int) or max_tokens < 1:
+            raise HybridCachePersistenceError("invalid restore token budget")
+        token_limit = min(token_limit, max_tokens)
+    if max_memory_bytes is not None:
+        # A Python int plus its tuple slot costs about 36 bytes on CPython.
+        # Use 40 so the materialized token tuple cannot escape the cache cap.
+        token_limit = min(token_limit, max(1, max_memory_bytes // 40))
     declared_memory: list[int] = []
+    declared_tokens: list[int] = []
     for record in raw_entries:
         value = record.get("memory_bytes") if isinstance(record, dict) else None
         if not isinstance(value, int) or value < 1:
             raise HybridCachePersistenceError("invalid declared memory byte count")
         declared_memory.append(value)
+        num_tokens = record.get("num_tokens") if isinstance(record, dict) else None
+        if not isinstance(num_tokens, int) or num_tokens < 1:
+            raise HybridCachePersistenceError("invalid token count")
+        declared_tokens.append(num_tokens)
     if max_memory_bytes is not None and sum(declared_memory) > max_memory_bytes:
         raise HybridCachePersistenceError("snapshot exceeds restore memory budget")
+    if sum(declared_tokens) > token_limit:
+        raise HybridCachePersistenceError("snapshot exceeds restore token budget")
 
     loaded_entries = []
     seen_entry_directories: set[str] = set()
@@ -535,7 +566,11 @@ def read_hybrid_snapshot(
         ):
             raise HybridCachePersistenceError("missing or invalid entry directory")
         num_tokens = record["num_tokens"]
-        if not isinstance(num_tokens, int) or num_tokens < 1:
+        if (
+            not isinstance(num_tokens, int)
+            or num_tokens < 1
+            or num_tokens > token_limit
+        ):
             raise HybridCachePersistenceError("invalid token count")
         if not isinstance(record["memory_bytes"], int) or record["memory_bytes"] < 1:
             raise HybridCachePersistenceError("invalid memory byte count")
@@ -544,6 +579,11 @@ def read_hybrid_snapshot(
         tokens_path = _checked_file(
             entry_dir, "tokens.bin", record["tokens_sha256"], "tokens"
         )
+        disk_tensor_bytes += tokens_path.stat().st_size
+        if disk_tensor_budget is not None and disk_tensor_bytes > disk_tensor_budget:
+            raise HybridCachePersistenceError(
+                "snapshot files exceed restore memory budget"
+            )
         token_bytes = tokens_path.read_bytes()
         if len(token_bytes) != num_tokens * 4:
             raise HybridCachePersistenceError("token file length mismatch")
