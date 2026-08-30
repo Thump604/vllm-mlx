@@ -31,6 +31,22 @@ def test_registered_non_gemma_mtp_drafter_uses_mlx_vlm_loader(monkeypatch, tmp_p
     assert captured == {"path": str(tmp_path), "kind": "mtp", "lazy": False}
 
 
+def test_registered_mtp_drafter_requires_validator_for_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MTPDrafterLoadError, load_mtp_drafter
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp_mtp"}), encoding="utf-8"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(load_drafter=lambda *args, **kwargs: (object(), "mtp")),
+    )
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        load_mtp_drafter(str(tmp_path), target_model=object())
+
+
 def test_simple_engine_reports_drafter_batch_capability():
     from vllm_mlx.engine.simple import SimpleEngine
 

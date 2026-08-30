@@ -538,10 +538,7 @@ def load_mtp_drafter(model_path: str, target_model=None):
         return model
 
     try:
-        from mlx_vlm.speculative.drafters import (
-            load_drafter,
-            validate_drafter_compatibility,
-        )
+        from mlx_vlm.speculative.drafters import load_drafter
     except ImportError as exc:
         raise MTPDrafterLoadError(
             "This MTP drafter requires an mlx-vlm build with the registered "
@@ -570,6 +567,15 @@ def load_mtp_drafter(model_path: str, target_model=None):
             f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
         )
     if target_model is not None:
+        try:
+            from mlx_vlm.speculative.drafters import (
+                validate_drafter_compatibility,
+            )
+        except ImportError as exc:
+            raise MTPDrafterLoadError(
+                "This MTP drafter requires an mlx-vlm build with the registered "
+                f"{model_type!r} architecture."
+            ) from exc
         validate_drafter_compatibility(target_model, model, resolved_kind)
     return model
 

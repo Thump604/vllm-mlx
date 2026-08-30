@@ -3261,14 +3261,13 @@ class TestMLLMBatchGeneratorMTPGuards:
             hidden_states,
             positions,
             sampler,
-            token_dtype,
         ):
             nonlocal draft_round
             del draft_model, hidden_states, positions, sampler
             tokens = [5, 6] if draft_round == 0 else [7]
             draft_round += 1
             assert len(tokens) == primary_tokens.shape[0]
-            return mx.array(tokens, dtype=token_dtype)
+            return mx.array(tokens, dtype=primary_tokens.dtype)
 
         monkeypatch.setattr(
             "vllm_mlx.mllm_batch_generator._draft_external_mtp_active_batch",
