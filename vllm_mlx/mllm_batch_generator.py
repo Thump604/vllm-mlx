@@ -1951,6 +1951,12 @@ class MLLMBatchGenerator:
                         # Extract last token logits
                         last_logits = logits[:, -1, :]
 
+                        # Keep the cold request's first-token path identical
+                        # whether or not a prompt snapshot will be published.
+                        # prepare_store() materializes a detached cache-wide
+                        # copy, so sampling must complete before that barrier.
+                        sampled, logprobs = _sample_first_token(req, last_logits)
+
                         if (
                             self.prefix_cache is not None
                             and self._needs_prefill_checkpoint(request_cache)
@@ -1965,23 +1971,6 @@ class MLLMBatchGenerator:
                             )
                             if entry is not None:
                                 self._publish_prefill_checkpoint(req.request_id, entry)
-                                continuation = self._clone_prefix_for_replay(
-                                    entry.cache
-                                )
-                                if (
-                                    continuation is None
-                                    or not self._prepare_rotating_caches(continuation)
-                                ):
-                                    raise RuntimeError(
-                                        "Cannot continue from stored hybrid prompt state"
-                                    )
-                                request_cache[:] = continuation
-                                if entry.auxiliary is not None:
-                                    stored_logits = entry.auxiliary.get("last_logits")
-                                    if stored_logits is not None:
-                                        last_logits = stored_logits
-
-                        sampled, logprobs = _sample_first_token(req, last_logits)
 
                         first_tokens.append(sampled.item())
                         all_logprobs.append(logprobs.squeeze(0))
@@ -3475,39 +3464,17 @@ def install_chunked_prefill_mllm(
                 )
                 if hasattr(logits, "logits"):
                     logits = logits.logits
-                last_logits = logits[:, -1, :]
+                prompt_last_logits = logits[:, -1, :]
+                last_logits = prompt_last_logits
 
-                if (
-                    getattr(batch_gen, "prefix_cache", None) is not None
-                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
-                    and req.input_ids is not None
-                ):
-                    checkpoint_entry = batch_gen.prefix_cache.prepare_store(
-                        req.input_ids.reshape(-1).tolist(),
-                        partial["cache"],
-                        auxiliary={"last_logits": last_logits},
-                    )
-                    if checkpoint_entry is not None:
-                        batch_gen._publish_prefill_checkpoint(
-                            req.request_id, checkpoint_entry
-                        )
-                        continuation = batch_gen._clone_prefix_for_replay(
-                            checkpoint_entry.cache
-                        )
-                        if (
-                            continuation is None
-                            or not batch_gen._prepare_rotating_caches(continuation)
-                        ):
-                            raise RuntimeError(
-                                "Cannot continue from stored hybrid prompt state"
-                            )
-                        partial["cache"][:] = continuation
-                        if checkpoint_entry.auxiliary is not None:
-                            stored_logits = checkpoint_entry.auxiliary.get(
-                                "last_logits"
-                            )
-                            if stored_logits is not None:
-                                last_logits = stored_logits
+                from mlx_lm.sample_utils import make_sampler
+
+                req_sampler = make_sampler(
+                    temp=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    min_p=req.min_p,
+                )
 
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
@@ -3518,8 +3485,41 @@ def install_chunked_prefill_mllm(
                 logprobs = last_logits - mx.logsumexp(
                     last_logits, axis=-1, keepdims=True
                 )
-                sampled = batch_gen.sampler(logprobs)
+                sampled = req_sampler(logprobs)
                 mx.eval(sampled, logprobs)
+
+                # Snapshot only after first-token sampling has materialized.
+                # The stored auxiliary remains the raw prompt logits, before
+                # request-local processors are applied.
+                if (
+                    getattr(batch_gen, "prefix_cache", None) is not None
+                    and batch_gen._needs_prefill_checkpoint(partial["cache"])
+                    and req.input_ids is not None
+                ):
+                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
+                        req.input_ids.reshape(-1).tolist(),
+                        partial["cache"],
+                        auxiliary={"last_logits": prompt_last_logits},
+                    )
+                    if full_prompt_entry is not None:
+                        try:
+                            batch_gen._publish_prefill_checkpoint(
+                                req.request_id, full_prompt_entry
+                            )
+                        except PrefillAbortedError:
+                            batch_gen._partial = None
+                            batch_gen._prefill_progress.pop(req.request_id, None)
+                            batch_gen._pending_error_responses.append(
+                                MLLMBatchResponse(
+                                    uid=req.uid,
+                                    request_id=req.request_id,
+                                    token=0,
+                                    logprobs=mx.zeros(1),
+                                    finish_reason="abort",
+                                )
+                            )
+                            mx.clear_cache()
+                            return _generation_step()
 
                 checkpoint_entry = partial.get("checkpoint_entry")
                 if checkpoint_entry is not None:
@@ -3549,7 +3549,7 @@ def install_chunked_prefill_mllm(
                 batch_gen._stats.prompt_time += time.perf_counter() - tic
 
                 # Build single-request batch
-                from mlx_lm.sample_utils import make_logits_processors, make_sampler
+                from mlx_lm.sample_utils import make_logits_processors
 
                 req_lp = []
                 need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
@@ -3564,15 +3564,6 @@ def install_chunked_prefill_mllm(
                 if req.logits_processors:
                     req_lp.extend(req.logits_processors)
 
-                req_sampler = None
-                if req.top_k != 0 or req.min_p != 0.0:
-                    req_sampler = make_sampler(
-                        temp=req.temperature,
-                        top_p=req.top_p,
-                        top_k=req.top_k,
-                        min_p=req.min_p,
-                    )
-
                 new_batch = MLLMBatch(
                     uids=[req.uid],
                     request_ids=[req.request_id],
@@ -3583,7 +3574,7 @@ def install_chunked_prefill_mllm(
                     cache=partial["cache"],
                     requests=[req],
                     logits_processors=[req_lp] if req_lp else None,
-                    samplers=[req_sampler] if req_sampler else None,
+                    samplers=[req_sampler],
                 )
 
                 # Extend active batch or set as new

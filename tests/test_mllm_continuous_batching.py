@@ -1195,7 +1195,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             ([[4]], [[13]], [[[3]], [[3]], [[3]]]),
         ]
 
-    def test_hybrid_cold_path_samples_from_owned_prompt_logits(self, monkeypatch):
+    def test_hybrid_cold_path_keeps_request_cache_and_prompt_logits(self, monkeypatch):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchGenerator,
             MLLMBatchRequest,
@@ -1206,11 +1206,14 @@ class TestMLLMBatchGeneratorMTPGuards:
             def merge(self, _caches):
                 return self
 
+        call_order = []
+
         class PrefixCache:
             def fetch(self, tokens):
                 return None, tokens
 
             def prepare_store(self, tokens, cache, auxiliary=None):
+                call_order.append("prepare")
                 assert int(mx.argmax(auxiliary["last_logits"], axis=-1).item()) == 1
                 return SimpleNamespace(
                     tokens=tuple(tokens),
@@ -1222,12 +1225,24 @@ class TestMLLMBatchGeneratorMTPGuards:
                 return kwargs["commit_guard"]()
 
         monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
         monkeypatch.setattr(
             "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
         )
+
+        def sample(scores):
+            call_order.append("sample")
+            return mx.argmax(scores, axis=-1)
+
         monkeypatch.setattr(
             "mlx_lm.sample_utils.make_sampler",
-            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+            lambda **_kwargs: sample,
         )
         monkeypatch.setattr(
             "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
@@ -1245,11 +1260,13 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._think_suffix_len = 0
         generator.language_model = object()
         generator.model = MagicMock()
-        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.sampler = sample
         generator.prefix_cache = PrefixCache()
         generator._preprocess_request = lambda _request: None
         generator._needs_prefill_checkpoint = lambda _cache: True
-        generator._clone_prefix_for_replay = lambda cache: list(cache)
+        generator._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
         generator._prepare_rotating_caches = lambda _cache: True
         generator._run_chunked_text_prefill = lambda _request, cache: mx.array(
             [[[0.0, 8.0, 0.0, 0.0]]]
@@ -1261,7 +1278,9 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         batch = generator._process_prompts([request])
 
-        assert batch.y.tolist() == [2]
+        assert batch.y.tolist() == [1]
+        assert call_order[:3] == ["sample", "eval", "prepare"]
+        generator._clone_prefix_for_replay.assert_not_called()
 
     def test_next_passes_current_token_to_logits_processor_prefix(self):
         from vllm_mlx.mllm_batch_generator import (
@@ -2686,8 +2705,44 @@ class TestChunkedPrefillCacheHandling:
             MagicMock(),
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
         )
-        gen.sampler = lambda _logprobs: mx.array([0])
-        gen.stop_tokens = {0}
+        call_order = []
+        original_eval = mx.eval
+
+        def tracked_eval(*values):
+            call_order.append("eval")
+            return original_eval(*values)
+
+        monkeypatch.setattr(mx, "eval", tracked_eval)
+
+        def request_sample(logprobs):
+            call_order.append("sample")
+            return mx.argmax(logprobs, axis=-1)
+
+        def global_sample(_logprobs):
+            raise AssertionError("interleaved prefill must use the request sampler")
+
+        def make_request_sampler(**kwargs):
+            assert kwargs == {
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            }
+            return request_sample
+
+        monkeypatch.setattr("mlx_lm.sample_utils.make_sampler", make_request_sampler)
+        gen.sampler = global_sample
+        gen.stop_tokens = {1}
+
+        original_prepare_store = gen.prefix_cache.prepare_store
+
+        def prepare_store(tokens, cache, auxiliary=None):
+            call_order.append("prepare")
+            assert auxiliary is not None
+            assert auxiliary["last_logits"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+            return original_prepare_store(tokens, cache, auxiliary=auxiliary)
+
+        gen.prefix_cache.prepare_store = prepare_store
 
         prompt_cache = [ArraysCache(size=1), KVCache()]
         monkeypatch.setattr(
@@ -2716,10 +2771,18 @@ class TestChunkedPrefillCacheHandling:
         gen.language_model = LanguageModel()
         gen._next = lambda: []
         install_chunked_prefill_mllm(gen, budget=4)
+        gen._clone_prefix_for_replay = MagicMock(
+            side_effect=AssertionError("cold request must not replay stored state")
+        )
 
         req = MLLMBatchRequest(uid=5, request_id="hybrid-interleaved", prompt="x")
         req.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
         req.is_text_only = True
+        req.temperature = 0.0
+        req.top_p = 1.0
+        req.logits_processors = [
+            lambda _tokens, logits: logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
+        ]
         gen.unprocessed_requests.append(req)
         gen._preprocess_request = lambda _: None
 
@@ -2727,6 +2790,14 @@ class TestChunkedPrefillCacheHandling:
         assert gen._next() == []
         assert gen._partial["checkpoint_entry"] is None
         gen._next()
+
+        gen._clone_prefix_for_replay.assert_not_called()
+        sample_index = call_order.index("sample")
+        assert call_order[sample_index : sample_index + 3] == [
+            "sample",
+            "eval",
+            "prepare",
+        ]
 
         assert gen.language_model.rope_calls == [[[17]], [[17]], [[17]], [[17]]]
 
@@ -2772,6 +2843,55 @@ class TestChunkedPrefillCacheHandling:
         gen._publish_prefill_checkpoint = MagicMock(
             side_effect=PrefillAbortedError(req.request_id)
         )
+
+        responses = gen._next()
+
+        assert gen._partial is None
+        assert len(responses) == 1
+        assert responses[0].request_id == req.request_id
+        assert responses[0].finish_reason == "abort"
+
+    def test_interleaved_abort_during_full_prompt_commit_is_request_local(self):
+        from types import SimpleNamespace
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            PrefillAbortedError,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.language_model = lambda tokens, cache: mx.zeros((1, tokens.shape[1], 4))
+        gen.sampler = lambda _logprobs: mx.array([0])
+        gen._next = lambda: []
+        gen._needs_prefill_checkpoint = lambda _cache: True
+        full_prompt_entry = SimpleNamespace(tokens=(1, 2, 3, 4, 5))
+        gen.prefix_cache = SimpleNamespace(
+            prepare_store=lambda *_args, **_kwargs: full_prompt_entry
+        )
+        install_chunked_prefill_mllm(gen, budget=4)
+
+        req = MLLMBatchRequest(uid=7, request_id="abort-full-prompt", prompt="x")
+        req.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        req.is_text_only = True
+        gen._partial = {
+            "request": req,
+            "cache": [self._make_fake_kv_cache(offset=3)],
+            "remaining_ids": mx.array([[4, 5]]),
+            "processed": 3,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": None,
+            "checkpoint_key": None,
+            "checkpoint_entry": None,
+        }
+
+        def publish(_request_id, entry):
+            assert entry is full_prompt_entry
+            raise PrefillAbortedError(req.request_id)
+
+        gen._publish_prefill_checkpoint = publish
 
         responses = gen._next()
 
