@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import threading
+import uuid
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from .cache_owner_identity import (
     OwnerBindingDecision,
     PREPARED_STORE_VERSION,
     PreparedOwnerBoundCacheEntry,
+    VerifiedCacheOwnerContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -1096,12 +1098,19 @@ def _compute_model_persistence_fingerprint(
     if artifact_identity:
         path = Path(artifact_identity).expanduser()
         if path.exists():
+            if path.is_symlink():
+                raise ValueError("model artifact root must not be a symlink")
             resolved = path.resolve()
             files = []
             candidates = (
                 [resolved] if resolved.is_file() else sorted(resolved.rglob("*"))
             )
             for candidate in candidates:
+                if candidate.is_symlink():
+                    raise ValueError(
+                        "model artifact must not contain symlinks: "
+                        f"{candidate.relative_to(resolved)}"
+                    )
                 if not candidate.is_file():
                     continue
                 before = candidate.stat()
@@ -1265,6 +1274,34 @@ def _cache_topology_fingerprint(
     return hashlib.sha256(payload).hexdigest()
 
 
+def build_cache_owner_persistence_identity(
+    model: Any,
+    tokenizer: Any,
+    model_identity: str,
+    cache_config: MemoryCacheConfig,
+    cache_runtime_identity: Mapping[str, Any],
+    template_renderer: Any,
+) -> Mapping[str, str]:
+    """Derive the exact loaded model/tokenizer/cache identity used by owners."""
+
+    if not isinstance(model_identity, str) or not model_identity:
+        raise ValueError("cache owner model identity must be non-empty")
+    identity = {
+        "model": _compute_model_persistence_fingerprint(model, model_identity),
+        "tokenizer": _compute_tokenizer_persistence_fingerprint(
+            tokenizer, template_renderer
+        ),
+        "cache_layout": _cache_topology_fingerprint(
+            _cache_topology(model),
+            cache_config,
+            dict(cache_runtime_identity),
+        ),
+    }
+    if any(not value for value in identity.values()):
+        raise ValueError("complete model/tokenizer/cache provenance is required")
+    return identity
+
+
 def _mx_array_to_numpy(value: Any) -> tuple[Any, str | None]:
     """Materialize one MLX value to numpy on the calling model-owner thread."""
     import numpy as np
@@ -1385,7 +1422,7 @@ class MemoryAwarePrefixCache:
         model_identity: str | None = None,
         cache_runtime_identity: dict[str, Any] | None = None,
         template_renderer: Any | None = None,
-        model_cache_identity_digest: str | None = None,
+        cache_owner_context: VerifiedCacheOwnerContext | None = None,
     ) -> None:
         """
         Initialize the memory-aware prefix cache.
@@ -1401,8 +1438,8 @@ class MemoryAwarePrefixCache:
                 rotating-cache limit. Included in the strict layout identity.
             template_renderer: Processor whose effective chat template renders
                 cache-key token sequences. Included in tokenizer identity.
-            model_cache_identity_digest: Trusted digest for the loaded model and
-                cache identity. Required before owner-bound work can be minted.
+            cache_owner_context: Opaque context verified from the loaded model,
+                tokenizer, artifact bytes, cache layout, and governed registry.
         """
         self._model_id = id(model)
         self._model = model
@@ -1410,21 +1447,26 @@ class MemoryAwarePrefixCache:
         self._cache_runtime_identity = dict(cache_runtime_identity or {})
         self._model_fingerprint = _compute_model_fingerprint(model)
         try:
-            self._persistence_identity = {
-                "model": (
-                    _compute_model_persistence_fingerprint(model, model_identity)
-                    if model_identity
-                    else ""
-                ),
-                "tokenizer": _compute_tokenizer_persistence_fingerprint(
-                    tokenizer, template_renderer
-                ),
-                "cache_layout": _cache_topology_fingerprint(
-                    _cache_topology(model),
-                    self._config,
-                    self._cache_runtime_identity,
-                ),
-            }
+            if cache_owner_context is not None:
+                self._persistence_identity = dict(
+                    cache_owner_context.persistence_identity
+                )
+            else:
+                self._persistence_identity = {
+                    "model": (
+                        _compute_model_persistence_fingerprint(model, model_identity)
+                        if model_identity
+                        else ""
+                    ),
+                    "tokenizer": _compute_tokenizer_persistence_fingerprint(
+                        tokenizer, template_renderer
+                    ),
+                    "cache_layout": _cache_topology_fingerprint(
+                        _cache_topology(model),
+                        self._config,
+                        self._cache_runtime_identity,
+                    ),
+                }
         except Exception as exc:
             logger.warning(
                 "[cache_persist] strict identity unavailable; restart persistence "
@@ -1438,7 +1480,10 @@ class MemoryAwarePrefixCache:
                 "cache_layout": "",
             }
         self._owner_identity: CacheOwnerIdentity | None = None
-        self._loaded_model_cache_identity_digest = model_cache_identity_digest
+        self._cache_owner_context = cache_owner_context
+        self._owner_prepared_entries: dict[
+            str, tuple[PreparedOwnerBoundCacheEntry, _CacheEntry]
+        ] = {}
 
         # OrderedDict maintains insertion order for LRU
         # Key: tuple(tokens), Value: _CacheEntry
@@ -1491,6 +1536,13 @@ class MemoryAwarePrefixCache:
         )
 
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
+        """Fetch through the legacy API only when no live owner is bound."""
+
+        if self._owner_identity is not None:
+            raise RuntimeError("owner-bound cache fetch requires a request lease")
+        return self._fetch_unchecked(tokens)
+
+    def _fetch_unchecked(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
         Find cached KV state for the given tokens.
 
@@ -1729,13 +1781,8 @@ class MemoryAwarePrefixCache:
 
         return None, tokens
 
-    def bind_owner_identity(
-        self,
-        governed_manifest: Mapping[str, Any],
-        *,
-        cache_namespace: str,
-        governed_model_cache_identity_digest: str,
-        runtime_composition_digest: str,
+    def bind_owner_context(
+        self, context: VerifiedCacheOwnerContext
     ) -> ModelCacheOwnerBinding:
         """Bind this live owner to governed identity resolved by Runtime.
 
@@ -1745,29 +1792,15 @@ class MemoryAwarePrefixCache:
 
         if any(not value for value in self._persistence_identity.values()):
             raise ValueError("complete model/tokenizer/cache provenance is required")
-        if not self._loaded_model_cache_identity_digest:
-            raise ValueError("loaded model/cache identity digest is required")
+        if context is not self._cache_owner_context:
+            raise ValueError("cache owner context does not belong to this cache")
+        if dict(context.persistence_identity) != self._persistence_identity:
+            raise ValueError("verified cache owner provenance does not match cache")
         if self._owner_identity is None:
-            self._owner_identity = CacheOwnerIdentity(
-                cache_namespace=cache_namespace,
-                actual_provenance=self._persistence_identity,
-                governed_manifest=governed_manifest,
-                actual_model_cache_identity_digest=(
-                    self._loaded_model_cache_identity_digest
-                ),
-                governed_model_cache_identity_digest=(
-                    governed_model_cache_identity_digest
-                ),
-                runtime_composition_digest=runtime_composition_digest,
-            )
+            self._owner_identity = CacheOwnerIdentity(context=context)
         binding = self._owner_identity.mint_owner_binding()
-        if not self._owner_identity.matches_governed_identity(
-            governed_manifest,
-            cache_namespace=cache_namespace,
-            model_cache_identity_digest=governed_model_cache_identity_digest,
-            runtime_composition_digest=runtime_composition_digest,
-        ):
-            raise ValueError("governed model/cache identity does not match bound owner")
+        if not self._owner_identity.matches_verified_context(context):
+            raise ValueError("verified context does not match bound owner")
         return binding
 
     def mint_owner_request(self, sequence_revision: int) -> ModelCacheRequestBinding:
@@ -1794,15 +1827,29 @@ class MemoryAwarePrefixCache:
     ) -> OwnerBindingDecision:
         if self._owner_identity is None:
             return OwnerBindingDecision(False, "cache_unsafe")
-        return self._owner_identity.release_request(binding)
+        decision = self._owner_identity.release_request(binding)
+        with self._memory_lock:
+            prepared_entries = getattr(self, "_owner_prepared_entries", {})
+            stale = [
+                handle
+                for handle, (prepared, _entry) in prepared_entries.items()
+                if prepared.request is binding
+            ]
+            for handle in stale:
+                prepared_entries.pop(handle, None)
+        return decision
 
     def invalidate_owner_identity(self, *, cache_namespace: str | None = None) -> None:
         if self._owner_identity is not None:
             self._owner_identity.invalidate(cache_namespace=cache_namespace)
+        with self._memory_lock:
+            getattr(self, "_owner_prepared_entries", {}).clear()
 
     def close_owner_identity(self) -> None:
         if self._owner_identity is not None:
             self._owner_identity.close()
+        with self._memory_lock:
+            getattr(self, "_owner_prepared_entries", {}).clear()
 
     def prepare_owner_bound_store(
         self,
@@ -1818,19 +1865,101 @@ class MemoryAwarePrefixCache:
         decision = self.validate_owner_request(request_binding)
         if not decision.accepted:
             return decision, None
-        entry = self.prepare_store(
+        entry = self._prepare_store_unchecked(
             tokens,
             cache,
             auxiliary,
             persistence_eligible=persistence_eligible,
         )
         if entry is None:
-            return OwnerBindingDecision(False, "runtime_error"), None
-        return decision, PreparedOwnerBoundCacheEntry(
+            return decision, None
+        prepared = PreparedOwnerBoundCacheEntry(
             owner=request_binding.owner,
             request=request_binding,
-            _entry=entry,
+            handle_id=uuid.uuid4().hex,
+            tokens=tuple(entry.tokens),
+            memory_bytes=int(entry.memory_bytes),
         )
+        with self._memory_lock:
+            self._owner_prepared_entries[prepared.handle_id] = (prepared, entry)
+        return decision, prepared
+
+    def _resolve_owner_prepared_entry(
+        self, prepared: PreparedOwnerBoundCacheEntry
+    ) -> _CacheEntry | None:
+        if not isinstance(prepared, PreparedOwnerBoundCacheEntry):
+            return None
+        with self._memory_lock:
+            record = self._owner_prepared_entries.get(prepared.handle_id)
+        if record is None or record[0] is not prepared:
+            return None
+        return record[1]
+
+    def clone_prepared_owner_bound_cache(
+        self,
+        prepared: PreparedOwnerBoundCacheEntry,
+        cloner: Callable[[Any], Any],
+    ) -> tuple[OwnerBindingDecision, Any | None]:
+        """Clone prepared replay state only while its request lease is live."""
+
+        if not isinstance(prepared, PreparedOwnerBoundCacheEntry):
+            return OwnerBindingDecision(False, "runtime_error"), None
+        decision = self.validate_owner_request(prepared.request)
+        if not decision.accepted or prepared.owner is not prepared.request.owner:
+            return decision, None
+        entry = self._resolve_owner_prepared_entry(prepared)
+        if entry is None:
+            return OwnerBindingDecision(False, "runtime_error"), None
+        try:
+            cloned = cloner(entry.cache)
+        except Exception:
+            return OwnerBindingDecision(False, "runtime_error"), None
+        decision = self.validate_owner_request(prepared.request)
+        return (decision, cloned if decision.accepted else None)
+
+    def fetch_owner_bound(
+        self,
+        request_binding: ModelCacheRequestBinding,
+        tokens: list[int],
+    ) -> tuple[OwnerBindingDecision, Any | None, list[int]]:
+        """Fetch shared state only for a live request owned by this cache."""
+
+        decision = self.validate_owner_request(request_binding)
+        if not decision.accepted:
+            return decision, None, tokens
+        cache, remaining = self._fetch_unchecked(tokens)
+        decision = self.validate_owner_request(request_binding)
+        if not decision.accepted:
+            return decision, None, tokens
+        return decision, cache, remaining
+
+    def clone_owner_bound_for_replay(
+        self,
+        request_binding: ModelCacheRequestBinding,
+        cache: list[Any],
+    ) -> tuple[OwnerBindingDecision, list[Any] | None]:
+        """Clone fetched state only while its request lease remains live."""
+
+        decision = self.validate_owner_request(request_binding)
+        if not decision.accepted:
+            return decision, None
+        cloned = self.clone_for_replay(cache)
+        decision = self.validate_owner_request(request_binding)
+        return (decision, cloned if decision.accepted else None)
+
+    def fetch_exact_auxiliary_owner_bound(
+        self,
+        request_binding: ModelCacheRequestBinding,
+        tokens: list[int],
+    ) -> tuple[OwnerBindingDecision, dict[str, Any] | None]:
+        """Fetch exact-match auxiliary state for a live owned request."""
+
+        decision = self.validate_owner_request(request_binding)
+        if not decision.accepted:
+            return decision, None
+        auxiliary = self._fetch_exact_auxiliary_unchecked(tokens)
+        decision = self.validate_owner_request(request_binding)
+        return (decision, auxiliary if decision.accepted else None)
 
     def commit_owner_bound_store(
         self,
@@ -1857,6 +1986,9 @@ class MemoryAwarePrefixCache:
         decision = self.validate_owner_request(prepared.request)
         if not decision.accepted:
             return decision
+        entry = self._resolve_owner_prepared_entry(prepared)
+        if entry is None:
+            return OwnerBindingDecision(False, "runtime_error")
 
         def _owned_commit_allowed() -> bool:
             if commit_guard is not None and not bool(commit_guard()):
@@ -1867,16 +1999,38 @@ class MemoryAwarePrefixCache:
             return OwnerBindingDecision(False, "cache_unsafe")
         commit_context = commit_lock if commit_lock is not None else nullcontext()
         with commit_context:
-            return self._owner_identity._commit_request(
+            result = self._owner_identity._commit_request(
                 prepared.request,
-                lambda: self.commit_prepared(
-                    prepared._entry,
+                lambda: self._commit_prepared_unchecked(
+                    entry,
                     evict_prefixes=evict_prefixes,
                     commit_guard=_owned_commit_allowed,
                 ),
             )
+        with self._memory_lock:
+            getattr(self, "_owner_prepared_entries", {}).pop(prepared.handle_id, None)
+        return result
 
     def prepare_store(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        auxiliary: dict[str, Any] | None = None,
+        *,
+        persistence_eligible: bool = False,
+    ) -> _CacheEntry | None:
+        """Prepare through the legacy API only when no owner is bound."""
+
+        if self._owner_identity is not None:
+            raise RuntimeError("owner-bound cache store requires a request lease")
+        return self._prepare_store_unchecked(
+            tokens,
+            cache,
+            auxiliary,
+            persistence_eligible=persistence_eligible,
+        )
+
+    def _prepare_store_unchecked(
         self,
         tokens: list[int],
         cache: list[Any],
@@ -1977,6 +2131,25 @@ class MemoryAwarePrefixCache:
         commit_lock: Any = None,
         commit_guard: Callable[[], bool] | None = None,
     ) -> bool:
+        """Commit through the legacy API only when no owner is bound."""
+
+        if self._owner_identity is not None:
+            raise RuntimeError("owner-bound cache commit requires a request lease")
+        return self._commit_prepared_unchecked(
+            entry,
+            evict_prefixes=evict_prefixes,
+            commit_lock=commit_lock,
+            commit_guard=commit_guard,
+        )
+
+    def _commit_prepared_unchecked(
+        self,
+        entry: _CacheEntry,
+        evict_prefixes: bool = True,
+        *,
+        commit_lock: Any = None,
+        commit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
         """Atomically publish an entry returned by :meth:`prepare_store`."""
         tokens_key = entry.tokens
         commit_context = commit_lock if commit_lock is not None else nullcontext()
@@ -2065,6 +2238,15 @@ class MemoryAwarePrefixCache:
             return None
 
     def fetch_exact_auxiliary(self, tokens: list[int]) -> dict[str, Any] | None:
+        """Fetch auxiliary state only when no owner is bound."""
+
+        if self._owner_identity is not None:
+            raise RuntimeError("owner-bound auxiliary fetch requires a request lease")
+        return self._fetch_exact_auxiliary_unchecked(tokens)
+
+    def _fetch_exact_auxiliary_unchecked(
+        self, tokens: list[int]
+    ) -> dict[str, Any] | None:
         """Return auxiliary data only when an exact resident entry owns it."""
         with self._memory_lock:
             entry = self._entries.get(tuple(tokens))
@@ -2079,6 +2261,8 @@ class MemoryAwarePrefixCache:
         evict_prefixes: bool = True,
     ) -> bool:
         """Detach, account, and atomically publish a reusable cache entry."""
+        if self._owner_identity is not None:
+            raise RuntimeError("owner-bound cache store requires a request lease")
         entry = self.prepare_store(tokens, cache)
         if entry is None:
             return False

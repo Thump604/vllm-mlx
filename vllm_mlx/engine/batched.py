@@ -462,6 +462,68 @@ class BatchedEngine(BaseEngine):
         mllm_extra = {}
         if prefill_step_size is not None:
             mllm_extra["prefill_step_size"] = prefill_step_size
+
+        cache_owner_context = None
+        cache_owner_target = getattr(self._scheduler_config, "cache_owner_target", None)
+        if cache_owner_target is not None:
+            if not enable_prefix_cache or not use_memory_aware_cache:
+                raise ValueError(
+                    "cache owner target requires memory-aware prefix cache"
+                )
+            model_config = getattr(self._model, "config", None)
+
+            def _declares_feature(*names: str) -> bool:
+                for name in names:
+                    value = (
+                        model_config.get(name)
+                        if isinstance(model_config, dict)
+                        else getattr(model_config, name, None)
+                    )
+                    if value:
+                        return True
+                return False
+
+            runtime_mode = {
+                "continuous_batching": True,
+                "serialized": False,
+                "mtp": bool(enable_mtp or self._mllm_draft_model is not None),
+                "chunked_prefill": bool(chunked_prefill_tokens),
+                "rotating_cache": bool(max_kv_size),
+                "ple": _declares_feature(
+                    "ple", "ple_storage", "external_ple", "ple_config"
+                ),
+                "qsa": _declares_feature("qsa", "qsa_config"),
+                "audio": _declares_feature(
+                    "audio", "audio_config", "audio_token_index"
+                ),
+            }
+            from ..cache_owner_identity import (
+                verify_loaded_model_cache_owner_context,
+            )
+            from ..memory_cache import MemoryCacheConfig
+            from ..mllm_batch_generator import (
+                normalize_prefix_cache_chat_template,
+            )
+
+            normalize_prefix_cache_chat_template(self._processor)
+            model_source = getattr(self._mllm_instance, "resolved_model_path", None)
+            if not isinstance(model_source, str) or not model_source:
+                raise ValueError("cache owner requires the loader-resolved model root")
+            cache_config = MemoryCacheConfig(
+                max_memory_mb=prefix_cache_memory_mb,
+                kv_quantize=kv_quant,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+            )
+            cache_owner_context = verify_loaded_model_cache_owner_context(
+                self._model,
+                self._processor,
+                model_source,
+                cache_owner_target,
+                cache_config=cache_config,
+                cache_runtime_identity={"max_kv_size": max_kv_size},
+                runtime_mode=runtime_mode,
+            )
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -482,6 +544,7 @@ class BatchedEngine(BaseEngine):
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
             model_identity=self._model_name,
+            cache_owner_context=cache_owner_context,
             **mllm_extra,
         )
 
@@ -1326,9 +1389,13 @@ class BatchedEngine(BaseEngine):
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            batch_generator = self._mllm_scheduler.batch_generator
+            pc = batch_generator.prefix_cache
             if pc is not None:
-                return pc.load_from_disk(cache_dir)
+                batch_generator.begin_cache_owner_lifecycle_mutation()
+                loaded = pc.load_from_disk(cache_dir)
+                batch_generator.finish_cache_owner_lifecycle_mutation()
+                return loaded
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0
@@ -1351,13 +1418,17 @@ class BatchedEngine(BaseEngine):
         """Read on an I/O thread, then rebuild MLLM arrays on their owner."""
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            batch_generator = self._mllm_scheduler.batch_generator
+            pc = batch_generator.prefix_cache
             if pc is None:
                 return 0
             snapshot = await self._run_cache_io(
                 pc.read_hybrid_persistence_snapshot, cache_dir
             )
-            return pc.restore_hybrid_persistence_snapshot(snapshot)
+            batch_generator.begin_cache_owner_lifecycle_mutation()
+            loaded = pc.restore_hybrid_persistence_snapshot(snapshot)
+            batch_generator.finish_cache_owner_lifecycle_mutation()
+            return loaded
         return await self._run_cache_io(self.load_cache_from_disk, cache_dir)
 
     @staticmethod
@@ -1380,9 +1451,12 @@ class BatchedEngine(BaseEngine):
         """Clear the in-memory prefix cache. Used by bench-serve for clean
         cold-start measurements between configurations."""
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            batch_generator = self._mllm_scheduler.batch_generator
+            pc = batch_generator.prefix_cache
             if pc is not None and hasattr(pc, "clear"):
+                batch_generator.begin_cache_owner_lifecycle_mutation()
                 pc.clear()
+                batch_generator.finish_cache_owner_lifecycle_mutation()
                 return
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
             self._engine.clear_prefix_cache()

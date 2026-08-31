@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .cache_owner_identity import VerifiedCacheOwnerContext
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
     MLLMBatchRequest,
@@ -92,6 +93,12 @@ class MLLMSchedulerConfig:
     ssd_cache_max_gb: float = 10.0
     # Stable artifact path/revision used by restart-cache compatibility checks.
     model_identity: Optional[str] = None
+    # Optional process-local ownership already verified by BatchedEngine.
+    cache_owner_context: Optional[VerifiedCacheOwnerContext] = None
+
+    def __post_init__(self) -> None:
+        if self.cache_owner_context is not None and not self.enable_prefix_cache:
+            raise ValueError("cache owner context requires prefix cache")
 
 
 @dataclass
@@ -338,6 +345,7 @@ class MLLMScheduler:
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
                 model_identity=self.config.model_identity,
+                cache_owner_context=self.config.cache_owner_context,
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -584,11 +592,11 @@ class MLLMScheduler:
         """
         self._ensure_batch_generator()
 
-        scheduled = []
+        available = max(0, self.config.max_num_seqs - len(self.running))
+        scheduled = list(self.waiting)[:available]
         batch_requests = []
 
-        while self.waiting and len(self.running) < self.config.max_num_seqs:
-            request = self.waiting.popleft()
+        for request in scheduled:
 
             # Create batch request
             batch_req = MLLMBatchRequest(
@@ -610,20 +618,39 @@ class MLLMScheduler:
             )
             batch_requests.append(batch_req)
 
-            request.status = RequestStatus.RUNNING
-            self.running[request.request_id] = request
-            scheduled.append(request)
-
-            self.total_prompt_tokens += request.num_prompt_tokens
-
-        # Insert into batch generator
+        # The generator owns request bindings. Commit scheduler state only
+        # after it returns one UID for every selected request.
+        if batch_requests and self.batch_generator is None:
+            raise RuntimeError("MLLM batch generator is unavailable")
         if batch_requests and self.batch_generator is not None:
-            uids = self.batch_generator.insert(batch_requests)
+            try:
+                uids = self.batch_generator.insert(batch_requests)
+            except Exception as exc:
+                logger.error("Failed to insert waiting MLLM requests: %s", exc)
+                return []
+            if len(uids) != len(scheduled):
+                if uids:
+                    self.batch_generator.remove(list(uids))
+                logger.error(
+                    "MLLM generator returned %s UIDs for %s requests",
+                    len(uids),
+                    len(scheduled),
+                )
+                return []
+
+            for request in scheduled:
+                if not self.waiting or self.waiting[0] is not request:
+                    self.batch_generator.remove(list(uids))
+                    raise RuntimeError("MLLM waiting queue changed during insertion")
+                self.waiting.popleft()
 
             for uid, request in zip(uids, scheduled):
+                request.status = RequestStatus.RUNNING
+                self.running[request.request_id] = request
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
                 request.batch_uid = uid
+                self.total_prompt_tokens += request.num_prompt_tokens
 
                 logger.debug(f"Scheduled request {request.request_id} (uid={uid})")
 
@@ -1302,7 +1329,9 @@ class MLLMScheduler:
             self.batch_generator is not None
             and self.batch_generator.prefix_cache is not None
         ):
+            self.batch_generator.begin_cache_owner_lifecycle_mutation()
             self.batch_generator.prefix_cache.clear()
+            self.batch_generator.finish_cache_owner_lifecycle_mutation()
             cleared["prefix_cache"] = True
         return cleared
 

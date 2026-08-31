@@ -27,11 +27,45 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .cache_owner_identity import VerifiedCacheOwnerContext
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_prefix_cache_chat_template(processor: Any) -> None:
+    """Normalize the effective Qwen3.5 template before identity is derived."""
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    template = getattr(processor, "chat_template", None) or getattr(
+        tokenizer, "chat_template", None
+    )
+    if not template or "last_query_index" not in template:
+        return
+
+    import re
+
+    pattern = (
+        r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
+        r".*?"
+        r"\{%-\s*else\s*%\}"
+        r"\s*(\{\{-.*?content.*?\}\})"
+        r"\s*\{%-\s*endif\s*%\}"
+    )
+    new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
+    if new_template == template:
+        logger.debug(
+            "[prefix_cache] Chat template has last_query_index but regex did not match"
+        )
+        return
+    if hasattr(processor, "chat_template"):
+        processor.chat_template = new_template
+    tokenizer.chat_template = new_template
+    logger.info(
+        "[prefix_cache] Normalized chat template for prefix-stable assistant turns"
+    )
 
 
 def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
@@ -500,6 +534,7 @@ class MLLMBatchGenerator:
         prefix_cache_config: Optional[MemoryCacheConfig] = None,
         max_kv_size: int = 0,
         model_identity: Optional[str] = None,
+        cache_owner_context: Optional[VerifiedCacheOwnerContext] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -520,6 +555,8 @@ class MLLMBatchGenerator:
             max_kv_size: Maximum KV cache size per sequence (0 = unbounded)
             model_identity: Stable model artifact path or revision used to
                 reject incompatible restart snapshots.
+            cache_owner_context: Opaque verified live-owner context. When absent,
+                the existing legacy prefix-cache behavior is preserved.
         """
         self.model = model
         self.processor = processor
@@ -582,6 +619,9 @@ class MLLMBatchGenerator:
         # cancellation. The lock is never held across MLX evaluation.
         self._prefix_checkpoint_lock = threading.Lock()
         self._request_prefix_checkpoints: Dict[str, Dict[str, Any]] = {}
+        self._cache_owner_required = cache_owner_context is not None
+        self._cache_owner_context = cache_owner_context
+        self._cache_owner_requests: Dict[str, Any] = {}
 
         # Deferred removal queue — UIDs scheduled for removal from another
         # thread (typically the event loop on client disconnect).  The
@@ -607,6 +647,8 @@ class MLLMBatchGenerator:
 
         # KV prefix cache for text-only requests
         self.prefix_cache: Optional[MemoryAwarePrefixCache] = None
+        if cache_owner_context is not None and prefix_cache_config is None:
+            raise ValueError("cache owner context requires prefix cache")
         if prefix_cache_config is not None:
             # Normalize first so the persisted identity covers the exact
             # processor/tokenizer templates that render cache-key tokens.
@@ -618,7 +660,10 @@ class MLLMBatchGenerator:
                 model_identity=model_identity,
                 cache_runtime_identity={"max_kv_size": self.max_kv_size},
                 template_renderer=self.processor,
+                cache_owner_context=cache_owner_context,
             )
+            if cache_owner_context is not None:
+                self.prefix_cache.bind_owner_context(cache_owner_context)
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
 
         # Compute think-suffix length for prefix cache key stripping.
@@ -659,54 +704,8 @@ class MLLMBatchGenerator:
         """
         if enabled is None:
             enabled = self.prefix_cache is not None
-        if not enabled:
-            return  # No prefix cache — no need to normalize
-
-        # Find the chat template.  VLM processors (e.g. Qwen3VLProcessor)
-        # keep a SEPARATE copy of chat_template from their tokenizer — both
-        # must be patched.  The processor's copy is used by
-        # BatchedEngine._apply_chat_template() (text rendering), while the
-        # tokenizer's copy is used by _compute_think_suffix_len().
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        # Prefer the processor's own template (it's the one used for rendering)
-        template = getattr(self.processor, "chat_template", None)
-        if not template:
-            template = getattr(tokenizer, "chat_template", None)
-        if not template or "last_query_index" not in template:
-            return  # Not affected
-
-        import re
-
-        # The pattern in Qwen3.5 template:
-        #   {%- if loop.index0 > ns.last_query_index %}
-        #       {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
-        #   {%- else %}
-        #       {{- '<|im_start|>' + message.role + '\n' + content }}
-        #   {%- endif %}
-        #
-        # Replace with just the ELSE branch (always plain format).
-        pattern = (
-            r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
-            r".*?"
-            r"\{%-\s*else\s*%\}"
-            r"\s*(\{\{-.*?content.*?\}\})"
-            r"\s*\{%-\s*endif\s*%\}"
-        )
-        new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
-        if new_template != template:
-            # Patch ALL copies: processor, tokenizer, and any dict variants.
-            if hasattr(self.processor, "chat_template"):
-                self.processor.chat_template = new_template
-            tokenizer.chat_template = new_template
-            logger.info(
-                "[prefix_cache] Normalized chat template: removed "
-                "last_query_index conditional for prefix-stable assistant turns"
-            )
-        else:
-            logger.debug(
-                "[prefix_cache] Chat template has last_query_index but "
-                "regex did not match — template may use a different pattern"
-            )
+        if enabled:
+            normalize_prefix_cache_chat_template(self.processor)
 
     def _compute_think_suffix_len(self) -> int:
         """Compute how many extra tokens enable_thinking=True adds at the END.
@@ -771,10 +770,162 @@ class MLLMBatchGenerator:
 
     def close(self) -> None:
         """Release resources and reset wired limit."""
+        if self.prefix_cache is not None and self._cache_owner_enabled():
+            self.invalidate_cache_owner_requests()
+            self.prefix_cache.close_owner_identity()
         if self._old_wired_limit is not None:
             mx.synchronize(MLLMBatchGenerator._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
+
+    def _cache_owner_enabled(self) -> bool:
+        return bool(getattr(self, "_cache_owner_required", False))
+
+    def _owner_request_binding(self, request_id: str) -> Any:
+        with self._prefix_checkpoint_lock:
+            binding = getattr(self, "_cache_owner_requests", {}).get(request_id)
+        if self._cache_owner_enabled() and binding is None:
+            raise RuntimeError(f"missing owner-bound request: {request_id}")
+        return binding
+
+    def _release_cache_owner_request(self, request_id: str) -> None:
+        with self._prefix_checkpoint_lock:
+            binding = getattr(self, "_cache_owner_requests", {}).pop(request_id, None)
+        if binding is None or not self._cache_owner_enabled():
+            return
+        if self.prefix_cache is not None:
+            self.prefix_cache.release_owner_request(binding)
+
+    def invalidate_cache_owner_requests(self) -> None:
+        """Cancel and release every lease before cache lifecycle mutation."""
+
+        with self._prefix_checkpoint_lock:
+            bindings = list(getattr(self, "_cache_owner_requests", {}).values())
+            getattr(self, "_cache_owner_requests", {}).clear()
+        if self.prefix_cache is not None and self._cache_owner_enabled():
+            for binding in bindings:
+                self.prefix_cache.cancel_owner_request(binding)
+                self.prefix_cache.release_owner_request(binding)
+
+    def rebind_cache_owner_context(self) -> None:
+        """Rebind the same verified owner context after clear or restore."""
+
+        context = getattr(self, "_cache_owner_context", None)
+        if context is not None:
+            if self.prefix_cache is None:
+                raise RuntimeError("owner-bound prefix cache is unavailable")
+            self.prefix_cache.bind_owner_context(context)
+
+    def begin_cache_owner_lifecycle_mutation(self) -> None:
+        """Fail closed unless no request can retain pre-mutation cache state."""
+
+        if not self._cache_owner_enabled():
+            return
+        with self._prefix_checkpoint_lock:
+            live_bindings = bool(self._cache_owner_requests)
+            live_checkpoints = bool(self._request_prefix_checkpoints)
+        partial = getattr(self, "_partial", None)
+        if (
+            live_bindings
+            or live_checkpoints
+            or self.unprocessed_requests
+            or self.active_batch is not None
+            or partial is not None
+        ):
+            raise RuntimeError(
+                "owner-bound cache lifecycle mutation requires an idle generator"
+            )
+
+    def finish_cache_owner_lifecycle_mutation(self) -> None:
+        """Rebind after a successful cache lifecycle mutation."""
+
+        self.rebind_cache_owner_context()
+
+    def _prepare_prefix_store(
+        self,
+        request_id: str,
+        tokens: List[int],
+        cache: List[Any],
+        auxiliary: Optional[Dict[str, Any]] = None,
+        *,
+        persistence_eligible: bool = False,
+    ) -> Any:
+        if self.prefix_cache is None:
+            return None
+        if not self._cache_owner_enabled():
+            prepare = getattr(self.prefix_cache, "prepare_store", None)
+            if not callable(prepare):
+                return None
+            return prepare(
+                tokens,
+                cache,
+                auxiliary,
+                persistence_eligible=persistence_eligible,
+            )
+        binding = self._owner_request_binding(request_id)
+        decision, prepared = self.prefix_cache.prepare_owner_bound_store(
+            binding,
+            tokens,
+            cache,
+            auxiliary=auxiliary,
+            persistence_eligible=persistence_eligible,
+        )
+        if decision.reason == "cancellation":
+            raise PrefillAbortedError(request_id)
+        if not decision.accepted:
+            logger.warning(
+                "Skipping owner-bound prefix store for %s: %s",
+                request_id,
+                decision.reason,
+            )
+            return None
+        return prepared
+
+    def _clone_prepared_prefix_cache(self, request_id: str, prepared: Any) -> Any:
+        if not self._cache_owner_enabled():
+            return self._clone_prefix_for_replay(request_id, prepared.cache)
+        self._owner_request_binding(request_id)
+        prefix_cache = self.prefix_cache
+        if prefix_cache is None:
+            raise RuntimeError("owner-bound prefix cache is unavailable")
+        decision, cloned = prefix_cache.clone_prepared_owner_bound_cache(
+            prepared,
+            self._clone_prefix_storage,
+        )
+        if decision.reason == "cancellation":
+            raise PrefillAbortedError(request_id)
+        if not decision.accepted:
+            return None
+        return cloned
+
+    def _fetch_prefix_cache(
+        self, request_id: str, tokens: List[int]
+    ) -> Tuple[Any, List[int]]:
+        if self.prefix_cache is None:
+            return None, tokens
+        if not self._cache_owner_enabled():
+            return self.prefix_cache.fetch(tokens)
+        decision, cache, remaining = self.prefix_cache.fetch_owner_bound(
+            self._owner_request_binding(request_id), tokens
+        )
+        if decision.reason == "cancellation":
+            raise PrefillAbortedError(request_id)
+        return (cache, remaining) if decision.accepted else (None, tokens)
+
+    def _fetch_exact_prefix_auxiliary(
+        self, request_id: str, tokens: List[int]
+    ) -> Optional[Dict[str, Any]]:
+        if self.prefix_cache is None:
+            return None
+        if not self._cache_owner_enabled():
+            fetch = getattr(self.prefix_cache, "fetch_exact_auxiliary", None)
+            return fetch(tokens) if callable(fetch) else None
+        decision, auxiliary = self.prefix_cache.fetch_exact_auxiliary_owner_bound(
+            self._owner_request_binding(request_id), tokens
+        )
+        if decision.reason == "cancellation":
+            raise PrefillAbortedError(request_id)
+        return auxiliary if decision.accepted else None
 
     def abort_prefill(self, request_id: str) -> None:
         """Signal that a request's prefill should be aborted.
@@ -788,6 +939,12 @@ class MLLMBatchGenerator:
         """
         with self._prefix_checkpoint_lock:
             self._aborted_request_ids.add(request_id)
+            binding = getattr(self, "_cache_owner_requests", {}).get(request_id)
+            if binding is not None:
+                prefix_cache = self.prefix_cache
+                if prefix_cache is None:
+                    raise RuntimeError("owner-bound prefix cache is unavailable")
+                prefix_cache.cancel_owner_request(binding)
             state = self._request_prefix_checkpoints.pop(request_id, None)
             if state is not None:
                 state["cancelled"] = True
@@ -797,6 +954,28 @@ class MLLMBatchGenerator:
         """Forget request-local checkpoint publication state."""
         with self._prefix_checkpoint_lock:
             self._request_prefix_checkpoints.pop(request_id, None)
+
+    def _fail_inline_requests(self, requests: List[MLLMBatchRequest]) -> None:
+        """Remove failed inline requests exactly once and release their leases."""
+
+        failed_uids = {request.uid for request in requests}
+        self.unprocessed_requests = [
+            request
+            for request in self.unprocessed_requests
+            if request.uid not in failed_uids
+        ]
+        for request in requests:
+            self._discard_prefill_checkpoint(request.request_id)
+            self._release_cache_owner_request(request.request_id)
+            self._pending_error_responses.append(
+                MLLMBatchResponse(
+                    uid=request.uid,
+                    request_id=request.request_id,
+                    token=0,
+                    logprobs=mx.zeros(1),
+                    finish_reason="error",
+                )
+            )
 
     def schedule_removal(self, uids: List[int]) -> None:
         """Thread-safe deferred removal of UIDs from the batch.
@@ -850,12 +1029,49 @@ class MLLMBatchGenerator:
         Returns:
             List of UIDs assigned to requests
         """
+        owner_enabled = self._cache_owner_enabled()
+        prefix_cache = self.prefix_cache
+        if owner_enabled:
+            if prefix_cache is None:
+                raise RuntimeError("owner-bound prefix cache is unavailable")
+            request_ids = [request.request_id for request in requests]
+            with self._prefix_checkpoint_lock:
+                duplicate = len(set(request_ids)) != len(request_ids) or any(
+                    request_id in self._cache_owner_requests
+                    for request_id in request_ids
+                )
+            if duplicate:
+                raise RuntimeError("duplicate owner-bound request ID")
+
+        original_uid_counter = self.uid_counter
         uids = []
-        for req in requests:
-            req.uid = self.uid_counter
-            self.uid_counter += 1
-            self.unprocessed_requests.append(req)
-            uids.append(req.uid)
+        minted_request_ids = []
+        try:
+            for req in requests:
+                req.uid = self.uid_counter
+                self.uid_counter += 1
+                if owner_enabled:
+                    assert prefix_cache is not None
+                    binding = prefix_cache.mint_owner_request(req.uid)
+                    with self._prefix_checkpoint_lock:
+                        if req.request_id in self._cache_owner_requests:
+                            prefix_cache.release_owner_request(binding)
+                            raise RuntimeError("duplicate owner-bound request ID")
+                        self._cache_owner_requests[req.request_id] = binding
+                    minted_request_ids.append(req.request_id)
+                self.unprocessed_requests.append(req)
+                uids.append(req.uid)
+        except Exception:
+            self.uid_counter = original_uid_counter
+            inserted = set(uids)
+            self.unprocessed_requests = [
+                request
+                for request in self.unprocessed_requests
+                if request.uid not in inserted
+            ]
+            for request_id in minted_request_ids:
+                self._release_cache_owner_request(request_id)
+            raise
 
         # Sort by estimated complexity (no images = simpler)
         self.unprocessed_requests = sorted(
@@ -877,6 +1093,22 @@ class MLLMBatchGenerator:
             uids: List of UIDs to remove
         """
         uid_set = set(uids)
+        removed_request_ids = {
+            request.request_id
+            for request in self.unprocessed_requests
+            if request.uid in uid_set
+        }
+        if self.active_batch is not None:
+            removed_request_ids.update(
+                request.request_id
+                for request in self.active_batch.requests
+                if request.uid in uid_set
+            )
+        partial = getattr(self, "_partial", None)
+        if isinstance(partial, dict):
+            partial_request = partial.get("request")
+            if partial_request is not None and partial_request.uid in uid_set:
+                removed_request_ids.add(partial_request.request_id)
 
         # Remove from active batch
         if self.active_batch is not None:
@@ -893,6 +1125,8 @@ class MLLMBatchGenerator:
         self.unprocessed_requests = [
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
+        for request_id in removed_request_ids:
+            self._release_cache_owner_request(request_id)
 
     def _compatible_pending_requests(
         self,
@@ -1136,12 +1370,26 @@ class MLLMBatchGenerator:
             logger.warning("Prefix cache copy rejected: %s", exc)
             return None
 
-    def _clone_prefix_for_replay(self, cache_list):
-        """Clone cached backing so replay cannot mutate the stored entry."""
+    def _clone_prefix_storage(self, cache_list):
+        """Clone backing without authorizing use of a shared cache hit."""
+
         clone = getattr(self.prefix_cache, "clone_for_replay", None)
         if callable(clone):
             return clone(cache_list)
         return self._copy_prefix_cache(cache_list)
+
+    def _clone_prefix_for_replay(self, request_id: str, cache_list):
+        """Clone a cache hit only while its request lease remains live."""
+        if self._cache_owner_enabled():
+            if self.prefix_cache is None:
+                raise RuntimeError("owner-bound prefix cache is unavailable")
+            decision, cloned = self.prefix_cache.clone_owner_bound_for_replay(
+                self._owner_request_binding(request_id), cache_list
+            )
+            if decision.reason == "cancellation":
+                raise PrefillAbortedError(request_id)
+            return cloned if decision.accepted else None
+        return self._clone_prefix_storage(cache_list)
 
     @classmethod
     def _cache_leaves(cls, cache_list) -> Iterator[Any]:
@@ -1363,12 +1611,32 @@ class MLLMBatchGenerator:
                 and not checkpoint_state["cancelled"]
             )
 
-        stored = self.prefix_cache.commit_prepared(
-            checkpoint_entry,
-            evict_prefixes=False,
-            commit_lock=self._prefix_checkpoint_lock,
-            commit_guard=_commit_allowed,
-        )
+        if self._cache_owner_enabled():
+            self._owner_request_binding(request_id)
+            prefix_cache = self.prefix_cache
+            if prefix_cache is None:
+                raise RuntimeError("owner-bound prefix cache is unavailable")
+            decision = prefix_cache.commit_owner_bound_store(
+                checkpoint_entry,
+                evict_prefixes=False,
+                commit_lock=self._prefix_checkpoint_lock,
+                commit_guard=_commit_allowed,
+            )
+            if decision.reason == "cancellation":
+                stored = False
+                checkpoint_state["cancelled"] = True
+            else:
+                stored = decision.accepted
+        else:
+            prefix_cache = self.prefix_cache
+            if prefix_cache is None:
+                return False
+            stored = prefix_cache.commit_prepared(
+                checkpoint_entry,
+                evict_prefixes=False,
+                commit_lock=self._prefix_checkpoint_lock,
+                commit_guard=_commit_allowed,
+            )
 
         with self._prefix_checkpoint_lock:
             current = self._request_prefix_checkpoints.get(request_id)
@@ -1443,12 +1711,14 @@ class MLLMBatchGenerator:
                 _eval_prompt_cache(cache)
                 checkpoint_snapshot = self._rewind_prefix_cache(cache, 0)
                 if checkpoint_snapshot is not None:
-                    checkpoint_entry = self.prefix_cache.prepare_store(
-                        checkpoint_key, checkpoint_snapshot
+                    checkpoint_entry = self._prepare_prefix_store(
+                        request.request_id,
+                        checkpoint_key,
+                        checkpoint_snapshot,
                     )
                     if checkpoint_entry is not None:
-                        continuation = self._clone_prefix_for_replay(
-                            checkpoint_entry.cache
+                        continuation = self._clone_prepared_prefix_cache(
+                            request.request_id, checkpoint_entry
                         )
                         if continuation is None or not self._prepare_rotating_caches(
                             continuation
@@ -1605,6 +1875,7 @@ class MLLMBatchGenerator:
         if failed_requests:
             for req in failed_requests:
                 requests.remove(req)
+                self._release_cache_owner_request(req.request_id)
                 self._pending_error_responses.append(
                     MLLMBatchResponse(
                         uid=req.uid,
@@ -1719,17 +1990,12 @@ class MLLMBatchGenerator:
                 cached_last_logits = None
                 if self.prefix_cache is not None and req.input_ids is not None:
                     input_ids_list = req.input_ids.reshape(-1).tolist()
-                    fetch_auxiliary = getattr(
-                        self.prefix_cache, "fetch_exact_auxiliary", None
-                    )
-                    exact_aux = (
-                        fetch_auxiliary(input_ids_list)
-                        if callable(fetch_auxiliary)
-                        else None
+                    exact_aux = self._fetch_exact_prefix_auxiliary(
+                        req.request_id, input_ids_list
                     )
                     if exact_aux is not None and "last_logits" in exact_aux:
-                        cached_kv, remaining_ids = self.prefix_cache.fetch(
-                            input_ids_list
+                        cached_kv, remaining_ids = self._fetch_prefix_cache(
+                            req.request_id, input_ids_list
                         )
                         cached_last_logits = exact_aux["last_logits"]
                     else:
@@ -1737,7 +2003,9 @@ class MLLMBatchGenerator:
                         # matching by stripping the generated think suffix.
                         S = self._think_suffix_len
                         lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                        cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                        cached_kv, remaining_ids = self._fetch_prefix_cache(
+                            req.request_id, lookup_ids
+                        )
                         if cached_kv is not None and S > 0:
                             remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
@@ -1767,7 +2035,9 @@ class MLLMBatchGenerator:
 
                 prepared_cache = None
                 if cached_kv is not None and cached_last_logits is not None:
-                    prepared_cache = self._clone_prefix_for_replay(cached_kv)
+                    prepared_cache = self._clone_prefix_for_replay(
+                        req.request_id, cached_kv
+                    )
                     if prepared_cache is None or not self._prepare_rotating_caches(
                         prepared_cache
                     ):
@@ -1775,7 +2045,9 @@ class MLLMBatchGenerator:
                         cached_last_logits = None
                         prepared_cache = None
                 elif cached_kv is not None and remaining_ids:
-                    prepared_cache = self._clone_prefix_for_replay(cached_kv)
+                    prepared_cache = self._clone_prefix_for_replay(
+                        req.request_id, cached_kv
+                    )
                     if prepared_cache is None or not self._prepare_rotating_caches(
                         prepared_cache
                     ):
@@ -1788,7 +2060,9 @@ class MLLMBatchGenerator:
                         remaining_ids = None
                         prepared_cache = None
                 elif cached_kv is not None and not remaining_ids:
-                    isolated_cache = self._clone_prefix_for_replay(cached_kv)
+                    isolated_cache = self._clone_prefix_for_replay(
+                        req.request_id, cached_kv
+                    )
                     prepared_cache = (
                         None
                         if isolated_cache is None
@@ -1978,11 +2252,9 @@ class MLLMBatchGenerator:
                         if (
                             self.prefix_cache is not None
                             and self._needs_prefill_checkpoint(request_cache)
-                            and callable(
-                                getattr(self.prefix_cache, "prepare_store", None)
-                            )
                         ):
-                            entry = self.prefix_cache.prepare_store(
+                            entry = self._prepare_prefix_store(
+                                req.request_id,
                                 req.input_ids.reshape(-1).tolist(),
                                 request_cache,
                                 auxiliary={"last_logits": last_logits},
@@ -2000,6 +2272,7 @@ class MLLMBatchGenerator:
                 aborted_requests.append(req)
                 self._discard_prefill_checkpoint(req.request_id)
                 self._prefill_progress.pop(req.request_id, None)
+                self._release_cache_owner_request(req.request_id)
                 self._pending_error_responses.append(
                     MLLMBatchResponse(
                         uid=req.uid,
@@ -2221,6 +2494,7 @@ class MLLMBatchGenerator:
                 ]
                 for req in requests:
                     self._discard_prefill_checkpoint(req.request_id)
+                    self._release_cache_owner_request(req.request_id)
                     self._pending_error_responses.append(
                         MLLMBatchResponse(
                             uid=req.uid,
@@ -2268,6 +2542,7 @@ class MLLMBatchGenerator:
                     ]
                     for req in text_only:
                         self._discard_prefill_checkpoint(req.request_id)
+                        self._release_cache_owner_request(req.request_id)
                         self._pending_error_responses.append(
                             MLLMBatchResponse(
                                 uid=req.uid,
@@ -2446,13 +2721,23 @@ class MLLMBatchGenerator:
                 trim_by,
             )
             return False
-        return bool(
-            self.prefix_cache.store(
-                cache_key,
-                snapshot,
-                evict_prefixes=evict_prefixes,
+        if not self._cache_owner_enabled():
+            return bool(
+                self.prefix_cache.store(
+                    cache_key,
+                    snapshot,
+                    evict_prefixes=evict_prefixes,
+                )
             )
-        )
+        prepared = self._prepare_prefix_store(request_id, cache_key, snapshot)
+        if prepared is None:
+            return False
+        if evict_prefixes:
+            decision = self.prefix_cache.commit_owner_bound_store(prepared)
+            if decision.reason == "cancellation":
+                raise PrefillAbortedError(request_id)
+            return decision.accepted
+        return self._publish_prefill_checkpoint(request_id, prepared)
 
     def _maybe_store_prefix_cache(
         self, batch: MLLMBatch, end_indices: List[int]
@@ -2465,9 +2750,9 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if req.input_ids is not None:
-                self._discard_prefill_checkpoint(req.request_id)
-                try:
+            self._discard_prefill_checkpoint(req.request_id)
+            try:
+                if req.input_ids is not None:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Store prompt-only KV: trim generated tokens (+ think
@@ -2485,10 +2770,12 @@ class MLLMBatchGenerator:
                         req.request_id,
                         "completion",
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
-                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
+                )
+            finally:
+                self._release_cache_owner_request(req.request_id)
 
     def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
         """Return (processed_tokens, total_tokens) or None."""
@@ -3618,6 +3905,7 @@ def install_chunked_prefill_mllm(
                 batch_gen._partial = None
                 mx.clear_cache()
                 batch_gen._prefill_progress.pop(req.request_id, None)
+                batch_gen._release_cache_owner_request(req.request_id)
                 batch_gen._pending_error_responses.append(
                     MLLMBatchResponse(
                         uid=req.uid,
@@ -3663,15 +3951,15 @@ def install_chunked_prefill_mllm(
                         partial["cache"], 0
                     )
                     if checkpoint_snapshot is not None:
-                        partial["checkpoint_entry"] = (
-                            batch_gen.prefix_cache.prepare_store(
-                                partial["checkpoint_key"], checkpoint_snapshot
-                            )
+                        partial["checkpoint_entry"] = batch_gen._prepare_prefix_store(
+                            req.request_id,
+                            partial["checkpoint_key"],
+                            checkpoint_snapshot,
                         )
                         checkpoint_entry = partial["checkpoint_entry"]
                         if checkpoint_entry is not None:
-                            continuation = batch_gen._clone_prefix_for_replay(
-                                checkpoint_entry.cache
+                            continuation = batch_gen._clone_prepared_prefix_cache(
+                                req.request_id, checkpoint_entry
                             )
                             if (
                                 continuation is None
@@ -3700,6 +3988,7 @@ def install_chunked_prefill_mllm(
                 ):
                     _budget = batch_gen._chunked_prefill_budget
                     short_reqs = []
+                    failed_inline_reqs = []
                     reference = (
                         batch_gen.active_batch.requests[0]
                         if batch_gen.active_batch is not None
@@ -3716,18 +4005,29 @@ def install_chunked_prefill_mllm(
                             try:
                                 batch_gen._preprocess_request(r)
                             except Exception:
+                                failed_inline_reqs.append(r)
                                 continue
                         if r.input_ids is not None and r.input_ids.size <= _budget:
                             short_reqs.append(r)
+                    if failed_inline_reqs:
+                        batch_gen._fail_inline_requests(failed_inline_reqs)
                     if short_reqs:
+                        inline_candidates = list(short_reqs)
+                        inline_uids = {request.uid for request in inline_candidates}
                         try:
                             new_batch = batch_gen._process_prompts(short_reqs)
+                            batch_gen.unprocessed_requests = [
+                                request
+                                for request in batch_gen.unprocessed_requests
+                                if request.uid not in inline_uids
+                            ]
                             if new_batch is not None:
                                 if batch_gen.active_batch is not None:
                                     batch_gen.active_batch.extend(new_batch)
                                 else:
                                     batch_gen.active_batch = new_batch
                         except Exception as e:
+                            batch_gen._fail_inline_requests(inline_candidates)
                             logger.warning(
                                 f"[chunked-prefill-mllm] Failed to process "
                                 f"inline short requests: {e}"
@@ -3782,7 +4082,8 @@ def install_chunked_prefill_mllm(
                     and batch_gen._needs_prefill_checkpoint(partial["cache"])
                     and req.input_ids is not None
                 ):
-                    full_prompt_entry = batch_gen.prefix_cache.prepare_store(
+                    full_prompt_entry = batch_gen._prepare_prefix_store(
+                        req.request_id,
                         req.input_ids.reshape(-1).tolist(),
                         partial["cache"],
                         auxiliary={"last_logits": prompt_last_logits},
@@ -3796,6 +4097,7 @@ def install_chunked_prefill_mllm(
                         except PrefillAbortedError:
                             batch_gen._partial = None
                             batch_gen._prefill_progress.pop(req.request_id, None)
+                            batch_gen._release_cache_owner_request(req.request_id)
                             batch_gen._pending_error_responses.append(
                                 MLLMBatchResponse(
                                     uid=req.uid,
@@ -3817,6 +4119,7 @@ def install_chunked_prefill_mllm(
                     except PrefillAbortedError:
                         batch_gen._partial = None
                         batch_gen._prefill_progress.pop(req.request_id, None)
+                        batch_gen._release_cache_owner_request(req.request_id)
                         batch_gen._pending_error_responses.append(
                             MLLMBatchResponse(
                                 uid=req.uid,
@@ -3975,6 +4278,7 @@ def install_chunked_prefill_mllm(
                         f"{text_only_req.request_id}: {e}"
                     )
                     batch_gen.unprocessed_requests.remove(text_only_req)
+                    batch_gen._release_cache_owner_request(text_only_req.request_id)
                     batch_gen._pending_error_responses.append(
                         MLLMBatchResponse(
                             uid=text_only_req.uid,
@@ -3998,10 +4302,9 @@ def install_chunked_prefill_mllm(
 
                 if batch_gen.prefix_cache is not None:
                     input_ids_list = input_ids.reshape(-1).tolist()
-                    fetch_auxiliary = getattr(
-                        batch_gen.prefix_cache, "fetch_exact_auxiliary", None
-                    )
-                    if callable(fetch_auxiliary) and fetch_auxiliary(input_ids_list):
+                    if batch_gen._fetch_exact_prefix_auxiliary(
+                        text_only_req.request_id, input_ids_list
+                    ):
                         batch_gen.unprocessed_requests.remove(text_only_req)
                         new_batch = batch_gen._process_prompts([text_only_req])
                         if new_batch is not None:
@@ -4012,7 +4315,9 @@ def install_chunked_prefill_mllm(
                         return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = batch_gen.prefix_cache.fetch(lookup_ids)
+                    cached_kv, remaining_ids = batch_gen._fetch_prefix_cache(
+                        text_only_req.request_id, lookup_ids
+                    )
                     if cached_kv is not None and S > 0:
                         remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
@@ -4025,7 +4330,9 @@ def install_chunked_prefill_mllm(
 
                 prepared_cache = None
                 if cached_kv is not None and remaining_ids:
-                    prepared_cache = batch_gen._clone_prefix_for_replay(cached_kv)
+                    prepared_cache = batch_gen._clone_prefix_for_replay(
+                        text_only_req.request_id, cached_kv
+                    )
                     if (
                         prepared_cache is None
                         or not batch_gen._prepare_rotating_caches(prepared_cache)
@@ -4034,7 +4341,9 @@ def install_chunked_prefill_mllm(
                         remaining_ids = None
                         prepared_cache = None
                 elif cached_kv is not None and not remaining_ids:
-                    isolated_cache = batch_gen._clone_prefix_for_replay(cached_kv)
+                    isolated_cache = batch_gen._clone_prefix_for_replay(
+                        text_only_req.request_id, cached_kv
+                    )
                     prepared_cache = (
                         None
                         if isolated_cache is None
@@ -4115,19 +4424,22 @@ def install_chunked_prefill_mllm(
                     batch_gen._partial["processed"] = take
                     batch_gen._partial["chunk_count"] = 1
                     if checkpoint_at is not None and take == checkpoint_at:
+                        assert checkpoint_key is not None
                         checkpoint_snapshot = batch_gen._rewind_prefix_cache(
                             request_cache, 0
                         )
                         if checkpoint_snapshot is not None:
                             batch_gen._partial["checkpoint_entry"] = (
-                                batch_gen.prefix_cache.prepare_store(
-                                    checkpoint_key, checkpoint_snapshot
+                                batch_gen._prepare_prefix_store(
+                                    text_only_req.request_id,
+                                    checkpoint_key,
+                                    checkpoint_snapshot,
                                 )
                             )
                             checkpoint_entry = batch_gen._partial["checkpoint_entry"]
                             if checkpoint_entry is not None:
-                                continuation = batch_gen._clone_prefix_for_replay(
-                                    checkpoint_entry.cache
+                                continuation = batch_gen._clone_prepared_prefix_cache(
+                                    text_only_req.request_id, checkpoint_entry
                                 )
                                 if (
                                     continuation is None

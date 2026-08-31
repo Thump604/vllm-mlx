@@ -23,6 +23,7 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .cache_owner_identity import CacheOwnerGovernanceTarget
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .ssd_cache import SSDCacheConfig, SSDCacheTier
@@ -135,7 +136,13 @@ class SchedulerConfig:
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
+    # Complete independent target used by BatchedEngine to verify and mint one
+    # opaque owner context after the real model and MTP composition are loaded.
+    cache_owner_target: Optional[CacheOwnerGovernanceTarget] = None
+
     def __post_init__(self) -> None:
+        if self.cache_owner_target is not None and not self.enable_prefix_cache:
+            raise ValueError("cache owner target requires prefix cache")
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 

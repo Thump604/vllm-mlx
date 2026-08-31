@@ -1457,6 +1457,7 @@ class MLXMultimodalLM:
             draft_block_size: Optional speculative block size passed to mlx-vlm.
         """
         self.model_name = model_name
+        self.resolved_model_path: str | None = None
         self.trust_remote_code = trust_remote_code
         self.enable_cache = enable_cache
         self.max_kv_size = max_kv_size
@@ -1485,12 +1486,14 @@ class MLXMultimodalLM:
 
         try:
             from mlx_vlm import load
-            from mlx_vlm.utils import load_config
+            from mlx_vlm.utils import get_model_path, load_config
 
             logger.info(f"Loading MLLM: {self.model_name}")
 
-            self.model, self.processor = load(self.model_name)
-            self.config = load_config(self.model_name)
+            resolved_model_path = Path(get_model_path(self.model_name)).resolve()
+            self.resolved_model_path = str(resolved_model_path)
+            self.model, self.processor = load(self.resolved_model_path)
+            self.config = load_config(self.resolved_model_path)
             if self.draft_model_path:
                 self._draft_model = self._load_draft_model()
                 _install_draft_metrics_hooks(self._draft_model)

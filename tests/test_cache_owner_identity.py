@@ -11,9 +11,11 @@ from types import MappingProxyType, MethodType, SimpleNamespace
 
 import pytest
 
+import vllm_mlx.cache_owner_identity as owner_module
 from vllm_mlx.cache_owner_identity import (
     CacheOwnerIdentity,
     PreparedOwnerBoundCacheEntry,
+    VerifiedCacheOwnerContext,
 )
 from vllm_mlx.memory_cache import MemoryAwarePrefixCache
 
@@ -52,28 +54,42 @@ def _authority(
     digest: str = "a" * 64,
 ) -> CacheOwnerIdentity:
     return CacheOwnerIdentity(
-        cache_namespace=namespace,
-        actual_provenance={
-            "model": "model-fingerprint",
-            "tokenizer": "tokenizer-fingerprint",
-            "cache_layout": "layout-fingerprint",
-            "loaded_owner": owner,
-        },
-        governed_manifest=_manifest(digest=digest),
-        actual_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
+        context=_context(owner=owner, namespace=namespace, digest=digest)
+    )
+
+
+def _context(
+    *,
+    owner: str = "owner-a",
+    namespace: str = "cache-a",
+    digest: str = "a" * 64,
+    complete_identity: bool = True,
+) -> VerifiedCacheOwnerContext:
+    return owner_module._issue_verified_cache_owner_context(
+        manifest=_manifest(digest=digest),
+        model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
+        persistence_identity=_freeze(
+            {
+                "model": "model-fingerprint",
+                "tokenizer": "tokenizer-fingerprint" if complete_identity else "",
+                "cache_layout": "layout-fingerprint",
+            }
+        ),
         runtime_composition_digest=_RUNTIME_COMPOSITION,
+        cache_namespace=namespace,
+        registry_source=f"test:{owner}",
     )
 
 
 def _cache(
     *,
     complete_identity: bool = True,
-    model_cache_identity_digest: str = _MODEL_CACHE_IDENTITY,
 ) -> MemoryAwarePrefixCache:
     cache = object.__new__(MemoryAwarePrefixCache)
     cache._owner_identity = None
-    cache._loaded_model_cache_identity_digest = model_cache_identity_digest
+    cache._cache_owner_context = _context(complete_identity=complete_identity)
+    cache._memory_lock = threading.RLock()
+    cache._owner_prepared_entries = {}
     cache._persistence_identity = {
         "model": "model-fingerprint" if complete_identity else "",
         "tokenizer": "tokenizer-fingerprint",
@@ -145,53 +161,27 @@ def test_request_cancellation_and_release_are_fail_closed():
     assert owner._request_states == {}
 
 
-def test_governed_manifest_must_be_frozen_and_match_loaded_cache_identity():
-    with pytest.raises(ValueError, match="validated and frozen"):
-        _cache().bind_owner_identity(
-            dict(_manifest()),
-            cache_namespace="cache-a",
-            governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-            runtime_composition_digest=_RUNTIME_COMPOSITION,
-        )
-    with pytest.raises(ValueError, match="does not match the loaded"):
-        _cache(model_cache_identity_digest="e" * 64).bind_owner_identity(
-            _manifest(),
-            cache_namespace="cache-a",
-            governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-            runtime_composition_digest=_RUNTIME_COMPOSITION,
-        )
+def test_cache_owner_accepts_only_its_verified_context():
+    with pytest.raises(TypeError, match="issued by verification"):
+        VerifiedCacheOwnerContext()
+    with pytest.raises(TypeError):
+        replace(_context(), cache_namespace="forged")
+    with pytest.raises(TypeError, match="immutable"):
+        _context().cache_namespace = "forged"
+    with pytest.raises(TypeError, match="process-local"):
+        pickle.dumps(_context())
 
     cache = _cache()
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
-    with pytest.raises(ValueError, match="does not match bound owner"):
-        cache.bind_owner_identity(
-            dict(_manifest()),
-            cache_namespace="cache-a",
-            governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-            runtime_composition_digest=_RUNTIME_COMPOSITION,
-        )
+    cache.bind_owner_context(cache._cache_owner_context)
+    with pytest.raises(ValueError, match="does not belong"):
+        cache.bind_owner_context(_context(owner="other"))
 
 
 def test_cache_callsite_rejects_wrong_owner_before_preparing_entry():
     cache_a = _cache()
     cache_b = _cache()
-    cache_a.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
-    cache_b.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache_a.bind_owner_context(cache_a._cache_owner_context)
+    cache_b.bind_owner_context(cache_b._cache_owner_context)
     request_a = cache_a.mint_owner_request(sequence_revision=1)
     prepared_calls: list[object] = []
 
@@ -199,7 +189,7 @@ def test_cache_callsite_rejects_wrong_owner_before_preparing_entry():
         prepared_calls.append(self)
         return SimpleNamespace(tokens=(1, 2), memory_bytes=16)
 
-    cache_b.prepare_store = MethodType(prepare_store, cache_b)
+    cache_b._prepare_store_unchecked = MethodType(prepare_store, cache_b)
     decision, prepared = cache_b.prepare_owner_bound_store(
         request_a,
         [1, 2],
@@ -213,12 +203,7 @@ def test_cache_callsite_rejects_wrong_owner_before_preparing_entry():
 
 def test_cache_callsite_rechecks_cancel_and_release_before_publication():
     cache = _cache()
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     committed: list[object] = []
 
     def prepare_store(self, tokens, *_args, **_kwargs):
@@ -230,8 +215,8 @@ def test_cache_callsite_rechecks_cancel_and_release_before_publication():
         committed.append(entry)
         return True
 
-    cache.prepare_store = MethodType(prepare_store, cache)
-    cache.commit_prepared = MethodType(commit_prepared, cache)
+    cache._prepare_store_unchecked = MethodType(prepare_store, cache)
+    cache._commit_prepared_unchecked = MethodType(commit_prepared, cache)
 
     cancelled = cache.mint_owner_request(sequence_revision=1)
     decision, prepared = cache.prepare_owner_bound_store(cancelled, [1, 2], [object()])
@@ -249,12 +234,7 @@ def test_cache_callsite_rechecks_cancel_and_release_before_publication():
 
 def test_cache_callsite_publishes_only_current_owner_request():
     cache = _cache()
-    binding = cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    binding = cache.bind_owner_context(cache._cache_owner_context)
     request = cache.mint_owner_request(sequence_revision=1)
     committed: list[object] = []
 
@@ -266,14 +246,58 @@ def test_cache_callsite_publishes_only_current_owner_request():
         committed.append(entry)
         return True
 
-    cache.prepare_store = MethodType(prepare_store, cache)
-    cache.commit_prepared = MethodType(commit_prepared, cache)
+    cache._prepare_store_unchecked = MethodType(prepare_store, cache)
+    cache._commit_prepared_unchecked = MethodType(commit_prepared, cache)
     decision, prepared = cache.prepare_owner_bound_store(request, [1, 2], [object()])
 
     assert binding.owner_provenance_digest
     assert decision.accepted and prepared is not None
     assert cache.commit_owner_bound_store(prepared).accepted
     assert len(committed) == 1
+
+
+def test_bound_cache_rejects_raw_fetch_and_publication_apis():
+    cache = _cache()
+    cache._memory_lock = threading.RLock()
+    cache._copy_lock = threading.Lock()
+    cache._entries = OrderedDict()
+    cache._sorted_keys = []
+    cache._stats = SimpleNamespace(misses=0)
+    cache._config = SimpleNamespace(min_prefix_tokens=1)
+    cache.bind_owner_context(cache._cache_owner_context)
+
+    with pytest.raises(RuntimeError, match="request lease"):
+        cache.fetch([1])
+    with pytest.raises(RuntimeError, match="request lease"):
+        cache.fetch_exact_auxiliary([1])
+    with pytest.raises(RuntimeError, match="request lease"):
+        cache.prepare_store([1], [object()])
+    with pytest.raises(RuntimeError, match="request lease"):
+        cache.store([1], [object()])
+
+
+def test_prepared_owner_wrapper_never_exposes_private_cache_entry():
+    cache = _cache()
+    cache.bind_owner_context(cache._cache_owner_context)
+    request = cache.mint_owner_request(sequence_revision=1)
+    cache._prepare_store_unchecked = MethodType(
+        lambda self, tokens, *_args, **_kwargs: SimpleNamespace(
+            tokens=tuple(tokens), memory_bytes=16, cache=["state"]
+        ),
+        cache,
+    )
+    decision, prepared = cache.prepare_owner_bound_store(request, [1], ["state"])
+
+    assert decision.accepted and prepared is not None
+    assert not hasattr(prepared, "cache")
+    assert not hasattr(prepared, "_entry")
+    cloned_decision, cloned = cache.clone_prepared_owner_bound_cache(
+        prepared, lambda value: list(value)
+    )
+    assert cloned_decision.accepted
+    assert cloned == ["state"]
+    copied = replace(prepared)
+    assert cache.commit_owner_bound_store(copied).reason == "runtime_error"
 
 
 @pytest.mark.parametrize(
@@ -286,12 +310,7 @@ def test_reentrant_lifecycle_guard_cannot_publish(lifecycle):
     cache._sorted_keys = []
     cache._current_memory = 0
     cache._max_memory = 1024
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     request = cache.mint_owner_request(sequence_revision=1)
     committed: list[object] = []
 
@@ -304,8 +323,8 @@ def test_reentrant_lifecycle_guard_cannot_publish(lifecycle):
         committed.append(entry)
         return True
 
-    cache.prepare_store = MethodType(prepare_store, cache)
-    cache.commit_prepared = MethodType(commit_prepared, cache)
+    cache._prepare_store_unchecked = MethodType(prepare_store, cache)
+    cache._commit_prepared_unchecked = MethodType(commit_prepared, cache)
     decision, prepared = cache.prepare_owner_bound_store(request, [1, 2], [object()])
     assert decision.accepted and prepared is not None
 
@@ -330,22 +349,55 @@ def test_reentrant_lifecycle_guard_cannot_publish(lifecycle):
 
 def test_prepared_entry_version_is_fail_closed():
     cache = _cache()
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     request = cache.mint_owner_request(sequence_revision=1)
     prepared = SimpleNamespace(tokens=(1, 2), memory_bytes=16)
     wrong_version = PreparedOwnerBoundCacheEntry(
         owner=request.owner,
         request=request,
+        handle_id="forged",
+        tokens=(1, 2),
+        memory_bytes=16,
         version="vllm-mlx.owner-bound-store.v0",
-        _entry=prepared,
     )
 
     assert cache.commit_owner_bound_store(wrong_version).reason == "runtime_error"
+
+
+def test_forged_prepared_handle_is_fail_closed():
+    cache = _cache()
+    cache.bind_owner_context(cache._cache_owner_context)
+    request = cache.mint_owner_request(sequence_revision=1)
+    forged = PreparedOwnerBoundCacheEntry(
+        owner=request.owner,
+        request=request,
+        handle_id="forged",
+        tokens=(1, 2),
+        memory_bytes=16,
+    )
+
+    assert cache.commit_owner_bound_store(forged).reason == "runtime_error"
+    decision, cloned = cache.clone_prepared_owner_bound_cache(
+        forged, lambda value: value
+    )
+    assert decision.reason == "runtime_error"
+    assert cloned is None
+
+
+def test_cache_replay_rechecks_request_after_clone():
+    cache = _cache()
+    cache.bind_owner_context(cache._cache_owner_context)
+    request = cache.mint_owner_request(sequence_revision=1)
+
+    def cancel_during_clone(value):
+        cache.cancel_owner_request(request)
+        return list(value)
+
+    cache.clone_for_replay = cancel_during_clone
+    decision, cloned = cache.clone_owner_bound_for_replay(request, ["state"])
+
+    assert decision.reason == "cancellation"
+    assert cloned is None
 
 
 def test_reentrant_ssd_spill_revocation_blocks_final_publication():
@@ -364,12 +416,7 @@ def test_reentrant_ssd_spill_revocation_blocks_final_publication():
         entry_count=1,
         current_memory_bytes=16,
     )
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     request = cache.mint_owner_request(sequence_revision=1)
 
     class RevokingTier:
@@ -377,11 +424,14 @@ def test_reentrant_ssd_spill_revocation_blocks_final_publication():
             cache.cancel_owner_request(request)
 
     cache._ssd_tier = RevokingTier()
-    prepared = PreparedOwnerBoundCacheEntry(
-        owner=request.owner,
-        request=request,
-        _entry=SimpleNamespace(tokens=(1,), cache=[object()], memory_bytes=16),
+    cache._prepare_store_unchecked = MethodType(
+        lambda self, tokens, *_args, **_kwargs: SimpleNamespace(
+            tokens=tuple(tokens), cache=[object()], memory_bytes=16
+        ),
+        cache,
     )
+    decision, prepared = cache.prepare_owner_bound_store(request, [1], [object()])
+    assert decision.accepted and prepared is not None
 
     result = cache.commit_owner_bound_store(prepared)
 
@@ -392,12 +442,7 @@ def test_reentrant_ssd_spill_revocation_blocks_final_publication():
 
 def test_in_place_restore_invalidates_live_owner_handles(tmp_path):
     cache = _cache()
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     request = cache.mint_owner_request(sequence_revision=1)
 
     assert cache.restore_hybrid_persistence_snapshot(None) == 0
@@ -410,20 +455,11 @@ def test_in_place_restore_invalidates_live_owner_handles(tmp_path):
 
 def test_cache_binding_requires_complete_provenance_and_closes_permanently():
     with pytest.raises(ValueError, match="complete model/tokenizer/cache"):
-        _cache(complete_identity=False).bind_owner_identity(
-            _manifest(),
-            cache_namespace="cache-a",
-            governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-            runtime_composition_digest=_RUNTIME_COMPOSITION,
-        )
+        cache = _cache(complete_identity=False)
+        cache.bind_owner_context(cache._cache_owner_context)
 
     cache = _cache()
-    cache.bind_owner_identity(
-        _manifest(),
-        cache_namespace="cache-a",
-        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
-        runtime_composition_digest=_RUNTIME_COMPOSITION,
-    )
+    cache.bind_owner_context(cache._cache_owner_context)
     cache.close_owner_identity()
     with pytest.raises(RuntimeError, match="closed"):
         cache.mint_owner_request(sequence_revision=1)
