@@ -519,7 +519,7 @@ class MLLMBatch:
         try:
             for c, o in cache_extensions:
                 c.extend(o)
-        except Exception:
+        except BaseException:
             for c, snapshot in reversed(snapshots):
                 self._restore_cache_transaction(c, snapshot)
             raise
@@ -916,22 +916,24 @@ class MLLMBatchGenerator:
 
     def close(self) -> None:
         """Release resources and reset wired limit."""
-        if self.prefix_cache is not None and self._cache_owner_enabled():
-            # Closing is terminal for this generator. Keep admission excluded
-            # from request invalidation through identity closure so no request
-            # binding can be published against an identity that is closing.
-            with self._prefix_checkpoint_lock:
-                self._cache_owner_lifecycle_mutating = True
-                try:
-                    self.invalidate_cache_owner_requests()
-                    self.prefix_cache.close_owner_identity()
-                finally:
-                    self._cache_owner_lifecycle_failed = True
-                    self._cache_owner_lifecycle_mutating = False
-        if self._old_wired_limit is not None:
-            mx.synchronize(MLLMBatchGenerator._stream)
-            mx.set_wired_limit(self._old_wired_limit)
-            self._old_wired_limit = None
+        try:
+            if self.prefix_cache is not None and self._cache_owner_enabled():
+                # Closing is terminal for this generator. Keep admission excluded
+                # from request invalidation through identity closure so no request
+                # binding can be published against an identity that is closing.
+                with self._prefix_checkpoint_lock:
+                    self._cache_owner_lifecycle_mutating = True
+                    try:
+                        self.invalidate_cache_owner_requests()
+                        self.prefix_cache.close_owner_identity()
+                    finally:
+                        self._cache_owner_lifecycle_failed = True
+                        self._cache_owner_lifecycle_mutating = False
+        finally:
+            if self._old_wired_limit is not None:
+                mx.synchronize(MLLMBatchGenerator._stream)
+                mx.set_wired_limit(self._old_wired_limit)
+                self._old_wired_limit = None
 
     def _cache_owner_enabled(self) -> bool:
         return bool(getattr(self, "_cache_owner_required", False))
@@ -2737,7 +2739,7 @@ class MLLMBatchGenerator:
                 ]
                 self.active_batch = new_batch
                 prompt_processing = True
-            except Exception as e:
+            except BaseException as e:
                 logger.error(
                     f"Failed to process batch of {len(requests)} prompts: "
                     f"{type(e).__name__}: {e}",
@@ -2759,6 +2761,8 @@ class MLLMBatchGenerator:
                             finish_reason="error",
                         )
                     )
+                if not isinstance(e, Exception):
+                    raise
 
         # Mid-batch extend: text-only requests can join an active batch
         # without vision encoding (no shape mismatch risk).
@@ -2784,7 +2788,7 @@ class MLLMBatchGenerator:
                     if new_batch is not None:
                         batch.extend(new_batch)
                     prompt_processing = True
-                except Exception as e:
+                except BaseException as e:
                     logger.warning(
                         f"Failed to extend batch with text-only requests: "
                         f"{type(e).__name__}: {e}"
@@ -2810,6 +2814,8 @@ class MLLMBatchGenerator:
                                     finish_reason="error",
                                 )
                             )
+                    if not isinstance(e, Exception):
+                        raise
 
         # Collect any pending error responses (from failed preprocessing)
         error_responses = []

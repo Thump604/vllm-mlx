@@ -185,6 +185,38 @@ def test_batch_extend_later_cache_failure_rolls_back_every_layer():
     assert batch.request_ids == ["request-1"]
 
 
+def test_batch_extend_base_exception_rolls_back_every_layer():
+    class Cache:
+        def __init__(self, value, *, fail=False):
+            self.cache = [value]
+            self.fail = fail
+
+        def empty(self):
+            return False
+
+        def extend(self, other):
+            self.cache.extend(other.cache)
+            if self.fail:
+                raise KeyboardInterrupt("cache extension interrupted")
+
+    first = Cache("first")
+    second = Cache("second", fail=True)
+    batch = _batch_for_extend(uid=1, y=mx.array([1]), cache=[first, second])
+    other = _batch_for_extend(
+        uid=2,
+        y=mx.array([2]),
+        cache=[Cache("other-first"), Cache("other-second")],
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="cache extension interrupted"):
+        batch.extend(other)
+
+    assert first.cache == ["first"]
+    assert second.cache == ["second"]
+    assert batch.uids == [1]
+    assert batch.request_ids == ["request-1"]
+
+
 @pytest.mark.parametrize(
     ("left", "right", "message"),
     [
@@ -399,6 +431,78 @@ def test_mid_batch_partial_preprocess_then_extend_failure_releases_selection_onc
     assert generator.unprocessed_requests == []
     assert generator._cache_owner_requests == {}
     assert release.call_args_list == [call(first_binding), call(second_binding)]
+
+
+def test_mid_batch_base_exception_releases_selected_request_before_propagating():
+    generator = _chunked_generator()
+    generator.completion_batch_size = 4
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+    generator.active_batch = _batch_for_extend(uid=90, y=mx.array([9]))
+    request = _request("keyboard-mid-batch")
+    request.uid = 91
+    binding = object()
+    generator._cache_owner_requests = {request.request_id: binding}
+    generator.unprocessed_requests = [request]
+    generator._process_prompts = MagicMock(
+        side_effect=KeyboardInterrupt("prompt processing interrupted")
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="prompt processing interrupted"):
+        MLLMBatchGenerator._next(generator)
+
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    release.assert_called_once_with(binding)
+    assert [response.request_id for response in generator._pending_error_responses] == [
+        request.request_id
+    ]
+
+
+def test_mid_batch_extend_base_exception_rolls_back_and_releases_request():
+    class InterruptingCache:
+        def __init__(self, value, *, fail=False):
+            self.cache = [value]
+            self.fail = fail
+
+        def empty(self):
+            return False
+
+        def extend(self, other):
+            self.cache.extend(other.cache)
+            if self.fail:
+                raise KeyboardInterrupt("batch extension interrupted")
+
+    generator = _chunked_generator()
+    generator.completion_batch_size = 4
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+    active_cache = InterruptingCache("active", fail=True)
+    generator.active_batch = _batch_for_extend(
+        uid=90, y=mx.array([9]), cache=[active_cache]
+    )
+    request = _request("keyboard-extend")
+    request.uid = 91
+    binding = object()
+    generator._cache_owner_requests = {request.request_id: binding}
+    generator.unprocessed_requests = [request]
+    generator._process_prompts = MagicMock(
+        return_value=_batch_for_extend(
+            uid=request.uid,
+            y=mx.array([7]),
+            cache=[InterruptingCache("new")],
+            request_id=request.request_id,
+        )
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="batch extension interrupted"):
+        MLLMBatchGenerator._next(generator)
+
+    assert active_cache.cache == ["active"]
+    assert generator.active_batch.uids == [90]
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    release.assert_called_once_with(binding)
 
 
 def test_chunked_next_success_retains_owner_lease_until_completion():
@@ -731,6 +835,54 @@ def test_close_excludes_insert_until_owner_identity_is_terminally_closed():
     assert "terminally failed" in str(insert_errors[0])
     assert generator.unprocessed_requests == []
     assert generator._cache_owner_requests == {}
+
+
+def test_close_base_exception_releases_all_resources_and_leaves_terminal_owner_state(
+    monkeypatch,
+):
+    generator = _generator()
+    generator._old_wired_limit = 123
+    synchronize = MagicMock()
+    set_wired_limit = MagicMock()
+    monkeypatch.setattr(mx, "synchronize", synchronize)
+    monkeypatch.setattr(mx, "set_wired_limit", set_wired_limit)
+    binding = object()
+    generator._cache_owner_requests["request-1"] = binding
+    generator.prefix_cache.close_owner_identity.side_effect = KeyboardInterrupt(
+        "close interrupted"
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="close interrupted"):
+        generator.close()
+
+    assert generator._cache_owner_lifecycle_mutating is False
+    assert generator._cache_owner_lifecycle_failed is True
+    assert generator._cache_owner_requests == {}
+    assert generator._old_wired_limit is None
+    synchronize.assert_called_once_with(MLLMBatchGenerator._stream)
+    set_wired_limit.assert_called_once_with(123)
+    generator.prefix_cache.cancel_owner_request.assert_called_once_with(binding)
+    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
+
+    insert_finished = threading.Event()
+    insert_errors = []
+
+    def insert_after_failed_close():
+        try:
+            generator.insert([_request("after-failed-close")])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            insert_errors.append(exc)
+        finally:
+            insert_finished.set()
+
+    worker = threading.Thread(target=insert_after_failed_close)
+    worker.start()
+    assert insert_finished.wait(timeout=2)
+    worker.join(timeout=2)
+
+    assert len(insert_errors) == 1
+    assert isinstance(insert_errors[0], RuntimeError)
+    assert "terminally failed" in str(insert_errors[0])
 
 
 def test_cache_lifecycle_revokes_requests_then_rebinds_verified_context():
@@ -1617,26 +1769,37 @@ def test_generator_insert_sort_failure_rolls_back_owner_state():
 
 
 def test_generator_insert_failure_cannot_restore_stale_uid_counter():
-    class BlockingExplodingMedia:
-        def __init__(self, entered, release):
-            self.entered = entered
-            self.release = release
-
+    class ExplodingMedia:
         def __bool__(self):
-            self.entered.set()
-            assert self.release.wait(timeout=2)
             raise RuntimeError("sort failure")
 
-    generator = _generator()
+    class NormalFirstLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.failing_waiting = threading.Event()
+            self.normal_finished = threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread().name == "failing-insert":
+                self.failing_waiting.set()
+                assert self.normal_finished.wait(timeout=2)
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    generator = _generator(owner_required=False)
+    ordered_lock = NormalFirstLock()
+    generator._prefix_checkpoint_lock = ordered_lock
     failing_entered = threading.Event()
-    release_failure = threading.Event()
-    normal_finished = threading.Event()
     failures = []
     normal_uids = []
     failing = _request("failing")
-    failing.images = BlockingExplodingMedia(failing_entered, release_failure)
+    failing.images = ExplodingMedia()
 
     def insert_failing():
+        failing_entered.set()
         try:
             generator.insert([failing])
         except BaseException as exc:  # pragma: no cover - assertion below
@@ -1644,15 +1807,14 @@ def test_generator_insert_failure_cannot_restore_stale_uid_counter():
 
     def insert_normal():
         normal_uids.extend(generator.insert([_request("normal")]))
-        normal_finished.set()
+        ordered_lock.normal_finished.set()
 
-    failing_worker = threading.Thread(target=insert_failing)
+    failing_worker = threading.Thread(target=insert_failing, name="failing-insert")
     normal_worker = threading.Thread(target=insert_normal)
     failing_worker.start()
     assert failing_entered.wait(timeout=2)
+    assert ordered_lock.failing_waiting.wait(timeout=2)
     normal_worker.start()
-    assert normal_finished.wait(timeout=0.05) is False
-    release_failure.set()
     failing_worker.join(timeout=2)
     normal_worker.join(timeout=2)
 
@@ -1772,12 +1934,14 @@ def test_scheduler_insert_validation_is_atomic_against_direct_insert():
 
 def test_scheduler_commit_failure_rolls_back_generator_and_scheduler_state():
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
-    request = MLLMRequest(request_id="commit-failure", prompt="hello")
-    request.num_prompt_tokens = "invalid"
-    scheduler.waiting = deque([request])
+    first = MLLMRequest(request_id="commit-first", prompt="hello")
+    first.num_prompt_tokens = 3
+    second = MLLMRequest(request_id="commit-second", prompt="hello")
+    second.num_prompt_tokens = "invalid"
+    scheduler.waiting = deque([first, second])
     scheduler.running = {}
     scheduler.config = MLLMSchedulerConfig(
-        max_num_seqs=1,
+        max_num_seqs=2,
         cache_owner_context=object(),
     )
     scheduler.request_id_to_uid = {}
@@ -1786,17 +1950,19 @@ def test_scheduler_commit_failure_rolls_back_generator_and_scheduler_state():
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
-    binding = object()
-    generator.prefix_cache.mint_owner_request.return_value = binding
+    bindings = [object(), object()]
+    generator.prefix_cache.mint_owner_request.side_effect = bindings
     scheduler.batch_generator = generator
     scheduler._ensure_batch_generator = MagicMock()
 
     with pytest.raises(TypeError):
         scheduler._schedule_waiting()
 
-    assert list(scheduler.waiting) == [request]
-    assert request.status is RequestStatus.WAITING
-    assert request.batch_uid is None
+    assert list(scheduler.waiting) == [first, second]
+    assert first.status is RequestStatus.WAITING
+    assert first.batch_uid is None
+    assert second.status is RequestStatus.WAITING
+    assert second.batch_uid is None
     assert scheduler.running == {}
     assert scheduler.request_id_to_uid == {}
     assert scheduler.uid_to_request_id == {}
@@ -1804,7 +1970,10 @@ def test_scheduler_commit_failure_rolls_back_generator_and_scheduler_state():
     assert generator.unprocessed_requests == []
     assert generator._cache_owner_requests == {}
     assert generator.uid_counter == 0
-    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
+    generator.prefix_cache.release_owner_request.assert_has_calls(
+        [call(bindings[0]), call(bindings[1])], any_order=True
+    )
+    assert generator.prefix_cache.release_owner_request.call_count == 2
 
 
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
@@ -2465,6 +2634,7 @@ def test_owner_disabled_scheduler_lifecycle_allows_cross_thread():
     scheduler._owner_thread_id = threading.get_ident()
     scheduler._state_lock = threading.RLock()
     scheduler._running = False
+    scheduler._stopping = False
     scheduler._processing_task = None
     scheduler.batch_generator = None
     scheduler._ssd_tier = None
@@ -2494,6 +2664,44 @@ def test_owner_disabled_scheduler_lifecycle_allows_cross_thread():
     assert errors == []
     assert scheduler._running is False
     assert scheduler._processing_task is None
+
+
+@pytest.mark.anyio
+async def test_scheduler_start_rejects_while_stop_awaits_task_cancellation():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._state_lock = threading.RLock()
+    scheduler._running = True
+    scheduler._stopping = False
+    scheduler.batch_generator = MagicMock()
+    scheduler._ssd_tier = None
+    cancellation_entered = asyncio.Event()
+    release_cancellation = asyncio.Event()
+
+    async def processing_loop():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_entered.set()
+            await release_cancellation.wait()
+            raise
+
+    original_task = asyncio.create_task(processing_loop())
+    scheduler._processing_task = original_task
+    stop_task = asyncio.create_task(scheduler.stop())
+    await asyncio.wait_for(cancellation_entered.wait(), timeout=2)
+
+    with pytest.raises(RuntimeError, match="stop is in progress"):
+        await scheduler.start()
+
+    release_cancellation.set()
+    await asyncio.wait_for(stop_task, timeout=2)
+
+    assert scheduler._running is False
+    assert scheduler._stopping is False
+    assert scheduler._processing_task is None
+    assert scheduler.batch_generator is None
 
 
 @pytest.mark.parametrize("operation", ["load", "restore"])

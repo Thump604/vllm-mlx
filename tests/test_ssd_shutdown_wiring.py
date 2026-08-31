@@ -175,6 +175,7 @@ class TestMLLMSchedulerStopClosesSSDTier:
 
         sched = MLLMScheduler.__new__(MLLMScheduler)
         sched._running = False
+        sched._stopping = False
         sched._processing_task = None
         sched.batch_generator = None
         sched._state_lock = threading.RLock()
@@ -257,6 +258,22 @@ class TestMLLMSchedulerStopClosesSSDTier:
         await sched.stop()  # should not raise
 
         assert sched._ssd_tier is None
+
+    @pytest.mark.anyio
+    async def test_stop_retains_ssd_tier_when_close_fails(self):
+        sched = self._bare_scheduler()
+
+        class FailingTier:
+            def close(self):
+                raise RuntimeError("tier close failed")
+
+        tier = FailingTier()
+        sched._ssd_tier = tier
+
+        with pytest.raises(RuntimeError, match="tier close failed"):
+            await sched.stop()
+
+        assert sched._ssd_tier is tier
 
     @pytest.mark.anyio
     async def test_stop_flushes_queued_spill(self, tmp_path):

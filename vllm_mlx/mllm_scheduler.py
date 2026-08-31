@@ -257,6 +257,7 @@ class MLLMScheduler:
 
         # Async processing control
         self._running = False
+        self._stopping = False
         self._processing_task: Optional[asyncio.Task] = None
 
         # Memory management: periodic mx.clear_cache() to free Metal buffer pool
@@ -987,6 +988,8 @@ class MLLMScheduler:
         """Start the async scheduler processing loop."""
         self._assert_owner_thread()
         with self._state_lock:
+            if self._stopping:
+                raise RuntimeError("MLLM scheduler stop is in progress")
             if self._running:
                 return
 
@@ -1000,32 +1003,41 @@ class MLLMScheduler:
         """Stop the scheduler."""
         self._assert_owner_thread()
         with self._state_lock:
+            if self._stopping:
+                raise RuntimeError("MLLM scheduler stop is already in progress")
+            self._stopping = True
             self._running = False
             processing_task = self._processing_task
             if processing_task:
                 processing_task.cancel()
-        if processing_task:
-            try:
-                await processing_task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if processing_task:
+                try:
+                    await processing_task
+                except asyncio.CancelledError:
+                    pass
 
-        with self._state_lock:
-            if self._processing_task is processing_task:
-                self._processing_task = None
-            if self.batch_generator is not None:
-                self.batch_generator.close()
-                self.batch_generator = None
-            tier = self._ssd_tier
-            self._ssd_tier = None
+            with self._state_lock:
+                if self._processing_task is processing_task:
+                    self._processing_task = None
+                if self.batch_generator is not None:
+                    self.batch_generator.close()
+                    self.batch_generator = None
+                tier = self._ssd_tier
 
-        if tier is not None:
-            aclose = getattr(tier, "aclose", None)
-            if aclose is not None:
-                await aclose()
-            else:
-                await asyncio.to_thread(tier.close)
-            logger.info("SSD cache tier closed")
+            if tier is not None:
+                aclose = getattr(tier, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    await asyncio.to_thread(tier.close)
+                with self._state_lock:
+                    if self._ssd_tier is tier:
+                        self._ssd_tier = None
+                logger.info("SSD cache tier closed")
+        finally:
+            with self._state_lock:
+                self._stopping = False
 
         logger.info("MLLM Scheduler stopped")
 
