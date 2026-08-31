@@ -1470,49 +1470,6 @@ class TestMLLMBatchGeneratorMTPGuards:
             batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
         )
 
-    def test_external_media_mtp_bypass_preserves_target_mrope(self):
-        from vllm_mlx.mllm_batch_generator import (
-            MLLMBatchRequest,
-            install_mtp_mllm,
-        )
-
-        rope_deltas = mx.array([[21]], dtype=mx.int32)
-        expected = (mx.array([2]), [mx.zeros((4,))])
-        original_step = MagicMock(return_value=expected)
-        request = MLLMBatchRequest(
-            uid=1,
-            request_id="media",
-            prompt="prompt",
-            images=["image"],
-            mllm_draft=True,
-            rope_deltas=rope_deltas,
-        )
-        batch_gen = SimpleNamespace(
-            model=object(),
-            _step=original_step,
-            _next=lambda: [],
-            active_batch=SimpleNamespace(uids=[1], requests=[request]),
-            sampler=lambda scores: mx.argmax(scores, axis=-1),
-        )
-        language_model = MagicMock()
-        draft_model = MagicMock()
-        draft_model.requires_verified_token_reconciliation = False
-        install_mtp_mllm(batch_gen, language_model, draft_model=draft_model)
-
-        result = batch_gen._step(
-            mx.array([[1]]),
-            [],
-            rope_deltas=rope_deltas,
-        )
-
-        assert result is expected
-        original_step.assert_called_once()
-        assert original_step.call_args.kwargs["rope_deltas"].tolist() == [[21]]
-        language_model.assert_not_called()
-        assert (
-            batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
-        )
-
     def test_external_mtp_filters_drafter_when_batch_rows_retire(self):
         from vllm_mlx.mllm_batch_generator import MLLMBatchResponse, install_mtp_mllm
 
@@ -2067,23 +2024,13 @@ class TestMLLMBatchGeneratorMTPGuards:
                 raise AssertionError("sampled MTP must not take the bypass path")
 
         class LanguageModel:
-            def __init__(self):
-                self.calls = []
-
             def mtp_forward(self, hidden_states, next_token_ids, mtp_cache=None):
                 del hidden_states, next_token_ids, mtp_cache
                 # Draft is confident in token 1.
                 return mx.array([[[0.0, 5.0, 1.0, -3.0]]])
 
-            def __call__(
-                self,
-                input_tokens,
-                cache=None,
-                return_hidden=False,
-                rope_deltas=None,
-            ):
+            def __call__(self, input_tokens, cache=None, return_hidden=False):
                 del cache, return_hidden
-                self.calls.append((input_tokens.shape[1], rope_deltas.tolist()))
                 if input_tokens.shape[1] == 2:
                     # Verify pass: target is confident in token 2, not the
                     # draft's token 1, so the sampled draft is rejected and
@@ -2101,18 +2048,14 @@ class TestMLLMBatchGeneratorMTPGuards:
         model = LanguageModel()
         install_mtp_mllm(generator, model)
         cache = [TrimmableCache()]
-        rope_deltas = mx.array([[13]], dtype=mx.int32)
-
         generator._step(
             mx.array([[0]], dtype=mx.uint32),
             cache=cache,
             logits_processors=None,
             output_tokens=None,
             samplers=[lambda logprobs: mx.argmax(logprobs, axis=-1)],
-            rope_deltas=rope_deltas,
         )
         assert generator.get_mtp_stats()["rejected"] == 1
-        assert model.calls == [(1, [[13]]), (2, [[13]]), (1, [[13]])]
 
         # A second decode step must not crash: the skip-state entry populated
         # by the residual replay above must be rank-2 (batch, vocab), not a
@@ -2123,7 +2066,6 @@ class TestMLLMBatchGeneratorMTPGuards:
             logits_processors=None,
             output_tokens=None,
             samplers=[lambda logprobs: mx.argmax(logprobs, axis=-1)],
-            rope_deltas=rope_deltas,
         )
         mx.eval(tokens)
         assert tokens.shape == (1,)
@@ -2841,14 +2783,13 @@ class TestMLLMBatchGeneratorMTPGuards:
             hidden_states,
             positions,
             sampler,
-            token_dtype,
         ):
             nonlocal draft_round
             del draft_model, hidden_states, positions, sampler
             tokens = [5, 6] if draft_round == 0 else [7]
             draft_round += 1
             assert len(tokens) == primary_tokens.shape[0]
-            return mx.array(tokens, dtype=token_dtype)
+            return mx.array(tokens, dtype=primary_tokens.dtype)
 
         monkeypatch.setattr(
             "vllm_mlx.mllm_batch_generator._draft_external_mtp_active_batch",
