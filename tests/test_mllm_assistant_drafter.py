@@ -170,6 +170,22 @@ def test_mllm_load_preserves_registered_drafter_error(monkeypatch, tmp_path):
         model.load()
 
 
+def test_registered_mtp_drafter_requires_validator_for_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MTPDrafterLoadError, load_mtp_drafter
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp_mtp"}), encoding="utf-8"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(load_drafter=lambda *args, **kwargs: (object(), "mtp")),
+    )
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        load_mtp_drafter(str(tmp_path), target_model=object())
+
+
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
     from vllm_mlx.models.mllm import MLXMultimodalLM
 
