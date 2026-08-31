@@ -137,17 +137,10 @@ _GOVERNED_TARGET_IDENTITY_PATHS = frozenset(
 
 
 def _is_mode_reason(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and value.startswith("mode_incompatible_")
-        and (
-            len(value) > len("mode_incompatible_")
-            and all(
-                character in "abcdefghijklmnopqrstuvwxyz0123456789_"
-                for character in value
-            )
-        )
-    )
+    if not isinstance(value, str) or not value.startswith("mode_incompatible_"):
+        return False
+    suffix = value[len("mode_incompatible_") :]
+    return suffix in _MODE_FIELDS
 
 
 def _is_result_reason(value: Any) -> bool:

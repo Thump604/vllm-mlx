@@ -593,6 +593,28 @@ def test_result_state_invariants_and_dense_branch_semantics():
         )
     )
 
+
+def test_mode_reason_vocabulary_is_closed():
+    validate_specprefill_outcome(
+        _outcome(
+            stage="admission",
+            disposition="not_attempted",
+            engaged=False,
+            reason="mode_incompatible_mtp",
+            selected_tokens=0,
+        )
+    )
+    with pytest.raises(ValueError, match="unknown SpecPrefill reason"):
+        validate_specprefill_outcome(
+            _outcome(
+                stage="admission",
+                disposition="not_attempted",
+                engaged=False,
+                reason="mode_incompatible_untrusted_flag",
+                selected_tokens=0,
+            )
+        )
+
     with pytest.raises(ValueError, match="dense_result"):
         validate_specprefill_outcome(_outcome(dense_result="succeeded"))
     with pytest.raises(ValueError, match="terminal acknowledgement"):
