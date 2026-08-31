@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
+import hashlib
 
 import pytest
 
@@ -14,6 +15,7 @@ from vllm_mlx.specprefill_contract import (
     build_identity_manifest,
     canonical_identity_bytes,
     freeze_identity_manifest,
+    governed_target_identity_reason,
     identity_compatibility_reason,
     identity_digest,
     identity_manifest_for,
@@ -145,6 +147,20 @@ def _pair(*, draft_cache=None, target_cache=None):
         draft_compatibility=relation,
     )
     return target, draft
+
+
+def _governed_target_fields(target):
+    return (
+        ("role", target["role"]),
+        ("request_protocol_identity", deepcopy(target["request_protocol_identity"])),
+        ("draft_compatibility", deepcopy(target["draft_compatibility"])),
+    )
+
+
+def _governed_cache_digest(target):
+    return hashlib.sha256(
+        canonical_identity_bytes(target["model_cache_identity"])
+    ).hexdigest()
 
 
 def test_wire_format_and_round_trip_are_explicit():
@@ -351,6 +367,124 @@ def test_model_cache_and_protocol_identity_are_separate():
             SimpleNamespace(specprefill_identity_manifest=changed_template),
         )
         == "template_parser_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("template_digest", "e" * 64, "template_parser_mismatch"),
+        ("parser_digest", "f" * 64, "template_parser_mismatch"),
+        ("renderer", "other-renderer", "draft_mismatch"),
+        ("version", "2", "draft_mismatch"),
+    ],
+)
+def test_draft_protocol_relation_rejects_wrong_protocol(field, value, reason):
+    target, draft = _pair()
+    changed = deepcopy(draft)
+    changed["request_protocol_identity"][field] = value
+    changed["digest"] = identity_digest(changed)
+
+    assert (
+        identity_compatibility_reason(
+            SimpleNamespace(specprefill_identity_manifest=target),
+            SimpleNamespace(specprefill_identity_manifest=changed),
+        )
+        == reason
+    )
+
+
+def test_governed_target_identity_requires_complete_external_anchors():
+    target, _ = _pair()
+    fields = _governed_target_fields(target)
+    digest = _governed_cache_digest(target)
+
+    assert (
+        governed_target_identity_reason(
+            target,
+            expected_model_cache_digest=digest,
+            expected_identity_fields=fields,
+            registry_complete=True,
+        )
+        is None
+    )
+
+    assert (
+        governed_target_identity_reason(
+            target,
+            expected_model_cache_digest=digest,
+            expected_identity_fields=(("role", "target"),),
+            registry_complete=True,
+        )
+        == "cache_unsafe"
+    )
+    assert (
+        governed_target_identity_reason(
+            target,
+            expected_model_cache_digest=None,
+            expected_identity_fields=fields,
+            registry_complete=True,
+        )
+        == "cache_unsafe"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda manifest: manifest.update({"role": "draft"}),
+        lambda manifest: manifest["model_cache_identity"].update(
+            {"model_revision": "wrong-revision"}
+        ),
+        lambda manifest: manifest["model_cache_identity"].update(
+            {"config_digest": "d" * 64}
+        ),
+        lambda manifest: manifest["model_cache_identity"]["chat_template"].update(
+            {"sha256": "e" * 64}
+        ),
+        lambda manifest: manifest["model_cache_identity"]["parser"].update(
+            {"sha256": "f" * 64}
+        ),
+        lambda manifest: manifest["model_cache_identity"]["vision"].update(
+            {"media_mapping_digest": "a" * 64}
+        ),
+        lambda manifest: manifest["draft_compatibility"].update(
+            {"relation": "wrong-relation"}
+        ),
+        lambda manifest: manifest["request_protocol_identity"].update(
+            {"renderer": "wrong-renderer"}
+        ),
+    ],
+)
+def test_governed_target_identity_rejects_mutated_or_rebound_manifest(mutator):
+    target, _ = _pair()
+    expected_fields = _governed_target_fields(target)
+    expected_digest = _governed_cache_digest(target)
+    mutated = deepcopy(target)
+    mutator(mutated)
+    # Rebinding the top-level digest must not turn an unauthorized identity
+    # mutation into an eligible target.
+    mutated["digest"] = identity_digest(mutated)
+
+    assert (
+        governed_target_identity_reason(
+            mutated,
+            expected_model_cache_digest=expected_digest,
+            expected_identity_fields=expected_fields,
+            registry_complete=True,
+        )
+        == "cache_unsafe"
+    )
+
+
+def test_copied_manifest_digest_is_rejected_before_governed_admission():
+    target, _ = _pair()
+    copied = deepcopy(target)
+    copied["model_cache_identity"]["config_digest"] = "d" * 64
+
+    assert (
+        identity_manifest_for(SimpleNamespace(specprefill_identity_manifest=copied))
+        is None
     )
 
 

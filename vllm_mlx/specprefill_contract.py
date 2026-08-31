@@ -131,6 +131,10 @@ _BYPASS_REASONS = frozenset(
 )
 _FAILURE_REASONS = frozenset({"scoring_failed", "runtime_error"})
 
+_GOVERNED_TARGET_IDENTITY_PATHS = frozenset(
+    {"role", "request_protocol_identity", "draft_compatibility"}
+)
+
 
 def _is_mode_reason(value: Any) -> bool:
     return (
@@ -728,6 +732,82 @@ def identity_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_identity_bytes(payload)).hexdigest()
 
 
+_MISSING_IDENTITY_PATH = object()
+
+
+def _identity_path(root: Mapping[str, Any], dotted_path: str) -> Any:
+    value: Any = root
+    for component in dotted_path.split("."):
+        if not isinstance(value, Mapping) or component not in value:
+            return _MISSING_IDENTITY_PATH
+        value = value[component]
+    return value
+
+
+def governed_target_identity_reason(
+    manifest: Mapping[str, Any] | None,
+    *,
+    expected_model_cache_digest: str | None,
+    expected_identity_fields: tuple[tuple[str, Any], ...],
+    registry_complete: bool,
+) -> str | None:
+    """Return a fail-closed reason for governed target admission.
+
+    The cache digest binds the complete model/cache identity. The additional
+    role, protocol, and draft-relation anchors bind the parts intentionally
+    kept outside that cache digest. Their values must come from the immutable
+    governed registry; a model-supplied manifest alone is not authorization.
+    """
+
+    if manifest is None:
+        return "unsupported_model"
+    if manifest.get("role") != "target":
+        return "cache_unsafe"
+    if registry_complete is not True:
+        return "cache_unsafe"
+    if (
+        not isinstance(expected_model_cache_digest, str)
+        or _SHA256_RE.fullmatch(expected_model_cache_digest) is None
+    ):
+        return "cache_unsafe"
+    if not isinstance(expected_identity_fields, (tuple, list)):
+        return "cache_unsafe"
+
+    seen_paths: set[str] = set()
+    for entry in expected_identity_fields:
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not entry[0]
+            or entry[0] in seen_paths
+        ):
+            return "cache_unsafe"
+        path, expected = entry
+        seen_paths.add(path)
+        actual = _identity_path(manifest, path)
+        if actual is _MISSING_IDENTITY_PATH:
+            return "cache_unsafe"
+        try:
+            if canonical_identity_bytes(actual) != canonical_identity_bytes(expected):
+                return "cache_unsafe"
+        except ValueError:
+            return "cache_unsafe"
+
+    if not _GOVERNED_TARGET_IDENTITY_PATHS.issubset(seen_paths):
+        return "cache_unsafe"
+
+    try:
+        actual_cache_digest = hashlib.sha256(
+            canonical_identity_bytes(manifest["model_cache_identity"])
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError):
+        return "cache_unsafe"
+    if actual_cache_digest != expected_model_cache_digest:
+        return "cache_unsafe"
+    return None
+
+
 def validate_identity_manifest(manifest: Mapping[str, Any]) -> None:
     """Validate schema, strict records, canonical set ordering, and digest."""
 
@@ -844,6 +924,15 @@ def identity_compatibility_reason(model: Any, draft_model: Any) -> str | None:
     for key in ("chat_template", "parser"):
         if not _same_canonical(target_cache[key], draft_cache[key]):
             return "template_parser_mismatch"
+
+    target_protocol = target["request_protocol_identity"]
+    draft_protocol = draft["request_protocol_identity"]
+    for key in ("template_digest", "parser_digest"):
+        if target_protocol[key] != draft_protocol[key]:
+            return "template_parser_mismatch"
+    for key in ("renderer", "version"):
+        if target_protocol[key] != draft_protocol[key]:
+            return "draft_mismatch"
 
     target_relation = target["draft_compatibility"]
     draft_relation = draft["draft_compatibility"]
@@ -1028,6 +1117,7 @@ __all__ = [
     "build_identity_manifest",
     "canonical_identity_bytes",
     "freeze_identity_manifest",
+    "governed_target_identity_reason",
     "identity_compatibility_reason",
     "identity_digest",
     "identity_manifest_for",
