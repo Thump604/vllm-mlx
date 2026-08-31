@@ -1267,6 +1267,17 @@ class MLLMBatchGenerator:
                         minted_request_ids.append(req.request_id)
                     self.unprocessed_requests.append(req)
                     uids.append(req.uid)
+
+                # Keep ordering inside the same transaction.  Request media
+                # access is caller-controlled and can fail; no owner binding
+                # or UID allocation may survive such a failure.
+                self.unprocessed_requests = sorted(
+                    self.unprocessed_requests,
+                    key=lambda x: (
+                        0 if not x.images and not x.videos and not x.audio else 1,
+                        len(x.images or []) + len(x.videos or []) + len(x.audio or []),
+                    ),
+                )
             except BaseException:
                 self.uid_counter = original_uid_counter
                 inserted = set(uids)
@@ -1279,27 +1290,31 @@ class MLLMBatchGenerator:
                     self._release_cache_owner_request(request_id)
                 raise
 
-        # Sort by estimated complexity (no images = simpler)
-        self.unprocessed_requests = sorted(
-            self.unprocessed_requests,
-            key=lambda x: (
-                0 if not x.images and not x.videos and not x.audio else 1,
-                len(x.images or []) + len(x.videos or []) + len(x.audio or []),
-            ),
-        )
-
         logger.debug(f"Inserted {len(requests)} requests, UIDs: {uids}")
         return uids
 
-    def rollback_inserted_requests(self, request_ids: List[str]) -> None:
+    def capture_insert_boundary(self) -> int:
+        """Return the first UID that a subsequent insert may allocate."""
+
+        return self.uid_counter
+
+    def rollback_inserted_requests(
+        self, request_ids: List[str], *, minimum_uid: int
+    ) -> None:
         """Roll back generator state after a scheduler insertion breach."""
 
+        if (
+            not isinstance(minimum_uid, int)
+            or isinstance(minimum_uid, bool)
+            or minimum_uid < 0
+            or minimum_uid > self.uid_counter
+        ):
+            raise ValueError("invalid insertion rollback boundary")
         request_id_set = set(request_ids)
-        tail_start = max(0, self.uid_counter - len(request_id_set))
         inserted = [
             request
             for request in self.unprocessed_requests
-            if request.request_id in request_id_set and request.uid >= tail_start
+            if request.request_id in request_id_set and request.uid >= minimum_uid
         ]
         inserted_uids = {request.uid for request in inserted}
         inserted_request_ids = {request.request_id for request in inserted}
@@ -1312,10 +1327,8 @@ class MLLMBatchGenerator:
         for request_id in inserted_request_ids:
             self._discard_prefill_checkpoint(request_id)
             self._release_cache_owner_request(request_id)
-        if inserted_uids:
-            minimum_uid = min(inserted_uids)
-            if inserted_uids == set(range(minimum_uid, self.uid_counter)):
-                self.uid_counter = minimum_uid
+        if inserted_uids == set(range(minimum_uid, self.uid_counter)):
+            self.uid_counter = minimum_uid
 
     def remove(self, uids: List[int]) -> None:
         """

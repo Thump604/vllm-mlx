@@ -1321,6 +1321,7 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.capture_insert_boundary.return_value = 0
     scheduler._ensure_batch_generator = MagicMock()
     if isinstance(insert_result, Exception):
         scheduler.batch_generator.insert.side_effect = insert_result
@@ -1454,6 +1455,61 @@ def test_scheduler_insert_exception_preserves_preexisting_generator_request():
     generator.prefix_cache.release_owner_request.assert_not_called()
 
 
+def test_scheduler_malformed_noop_insert_preserves_preexisting_generator_request():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="request-1", prompt="hello")
+    request.num_prompt_tokens = 3
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=object(),
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    existing = _request("request-1")
+    existing.uid = 0
+    binding = object()
+    generator.unprocessed_requests = [existing]
+    generator._cache_owner_requests = {existing.request_id: binding}
+    generator.uid_counter = 1
+    generator.insert = MagicMock(return_value=None)
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(RuntimeError, match="atomic UID commit"):
+        scheduler._schedule_waiting()
+
+    assert generator.unprocessed_requests == [existing]
+    assert generator._cache_owner_requests == {existing.request_id: binding}
+    assert generator.uid_counter == 1
+    generator.prefix_cache.release_owner_request.assert_not_called()
+
+
+def test_generator_insert_sort_failure_rolls_back_owner_state():
+    class ExplodingMedia:
+        def __bool__(self):
+            raise RuntimeError("media inspection failed")
+
+    generator = _generator()
+    binding = object()
+    generator.prefix_cache.mint_owner_request.return_value = binding
+    request = _request("sort-failure")
+    request.images = ExplodingMedia()
+
+    with pytest.raises(RuntimeError, match="media inspection failed"):
+        generator.insert([request])
+
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    assert generator.uid_counter == 0
+    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
+
+
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
 def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -1468,6 +1524,7 @@ def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.capture_insert_boundary.return_value = 0
     scheduler.batch_generator.insert.return_value = insert_result
     scheduler._ensure_batch_generator = MagicMock()
 
@@ -1508,6 +1565,7 @@ def test_scheduler_rejects_duplicate_or_colliding_uids_transactionally(
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.capture_insert_boundary.return_value = 0
     scheduler.batch_generator.insert.return_value = insert_result
     scheduler._ensure_batch_generator = MagicMock()
 
@@ -1538,6 +1596,7 @@ def test_scheduler_rejects_insert_that_mutates_waiting_queue():
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.capture_insert_boundary.return_value = 0
     scheduler._ensure_batch_generator = MagicMock()
 
     def mutate_queue(_requests):
@@ -1550,7 +1609,7 @@ def test_scheduler_rejects_insert_that_mutates_waiting_queue():
         scheduler._schedule_waiting()
 
     scheduler.batch_generator.rollback_inserted_requests.assert_called_once_with(
-        ["request-1", "request-2"]
+        ["request-1", "request-2"], minimum_uid=0
     )
     assert scheduler.running == {}
     assert scheduler.request_id_to_uid == {}
@@ -1858,6 +1917,54 @@ def test_owner_insert_cannot_cross_lifecycle_admission():
     assert generator.unprocessed_requests == []
     generator._prefix_checkpoint_lock = threading.RLock()
     generator.finish_cache_owner_lifecycle_mutation()
+
+
+def test_owner_lifecycle_cannot_enter_during_mint_and_append_transaction():
+    generator = _generator()
+    mint_entered = threading.Event()
+    release_mint = threading.Event()
+    lifecycle_finished = threading.Event()
+    insert_errors = []
+    lifecycle_errors = []
+
+    def mint(_uid):
+        mint_entered.set()
+        assert release_mint.wait(timeout=2)
+        return object()
+
+    generator.prefix_cache.mint_owner_request.side_effect = mint
+
+    def insert():
+        try:
+            generator.insert([_request("mint-race")])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            insert_errors.append(exc)
+
+    def begin_lifecycle():
+        try:
+            generator.begin_cache_owner_lifecycle_mutation()
+        except BaseException as exc:  # pragma: no cover - assertion below
+            lifecycle_errors.append(exc)
+        finally:
+            lifecycle_finished.set()
+
+    insert_worker = threading.Thread(target=insert)
+    lifecycle_worker = threading.Thread(target=begin_lifecycle)
+    insert_worker.start()
+    assert mint_entered.wait(timeout=2)
+    lifecycle_worker.start()
+    assert lifecycle_finished.wait(timeout=0.05) is False
+    release_mint.set()
+    insert_worker.join(timeout=2)
+    lifecycle_worker.join(timeout=2)
+
+    assert insert_errors == []
+    assert len(lifecycle_errors) == 1
+    assert isinstance(lifecycle_errors[0], RuntimeError)
+    assert "idle generator" in str(lifecycle_errors[0])
+    assert [request.request_id for request in generator.unprocessed_requests] == [
+        "mint-race"
+    ]
 
 
 def test_scheduler_lifecycle_mutations_are_serialized_across_threads():

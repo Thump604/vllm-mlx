@@ -640,6 +640,7 @@ class MLLMScheduler:
                 raise RuntimeError("MLLM batch generator is unavailable")
             if batch_requests and self.batch_generator is not None:
                 request_ids = [request.request_id for request in scheduled]
+                insert_boundary = self.batch_generator.capture_insert_boundary()
                 uids = self.batch_generator.insert(batch_requests)
                 uid_sequence = isinstance(uids, (list, tuple))
                 valid_uids = (
@@ -655,7 +656,9 @@ class MLLMScheduler:
                 )
                 queue_unchanged = list(self.waiting)[: len(scheduled)] == scheduled
                 if not valid_uids or not queue_unchanged:
-                    self.batch_generator.rollback_inserted_requests(request_ids)
+                    self.batch_generator.rollback_inserted_requests(
+                        request_ids, minimum_uid=insert_boundary
+                    )
                     raise RuntimeError(
                         "MLLM generator insertion did not produce an atomic UID commit"
                     )
