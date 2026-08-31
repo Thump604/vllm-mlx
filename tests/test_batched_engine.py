@@ -152,9 +152,11 @@ class TestBatchedEngineCacheRestore:
 
         prefix_cache.prepare_hybrid_persistence_snapshot.side_effect = prepare
         prefix_cache.write_hybrid_persistence_snapshot.side_effect = write
-        engine._mllm_scheduler = MagicMock(
-            batch_generator=MagicMock(prefix_cache=prefix_cache)
+        scheduler = MagicMock(batch_generator=MagicMock(prefix_cache=prefix_cache))
+        scheduler.run_cache_owner_lifecycle_mutation.side_effect = (
+            lambda operation, *args: operation(*args)
         )
+        engine._mllm_scheduler = scheduler
 
         assert await engine.persist_cache_to_disk("/tmp/cache") is True
         assert calls["prepare_thread"] == owner_thread

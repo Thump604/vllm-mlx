@@ -639,9 +639,16 @@ class MLLMScheduler:
             if batch_requests and self.batch_generator is None:
                 raise RuntimeError("MLLM batch generator is unavailable")
             if batch_requests and self.batch_generator is not None:
-                uids = self.batch_generator.insert(batch_requests)
+                request_ids = [request.request_id for request in scheduled]
+                try:
+                    uids = self.batch_generator.insert(batch_requests)
+                except BaseException:
+                    self.batch_generator.rollback_inserted_requests(request_ids)
+                    raise
+                uid_sequence = isinstance(uids, (list, tuple))
                 valid_uids = (
-                    len(uids) == len(scheduled)
+                    uid_sequence
+                    and len(uids) == len(scheduled)
                     and all(
                         isinstance(uid, int) and not isinstance(uid, bool)
                         for uid in uids
@@ -652,15 +659,7 @@ class MLLMScheduler:
                 )
                 queue_unchanged = list(self.waiting)[: len(scheduled)] == scheduled
                 if not valid_uids or not queue_unchanged:
-                    removable = [
-                        uid
-                        for uid in uids
-                        if isinstance(uid, int)
-                        and not isinstance(uid, bool)
-                        and uid >= 0
-                    ]
-                    if removable:
-                        self.batch_generator.remove(list(dict.fromkeys(removable)))
+                    self.batch_generator.rollback_inserted_requests(request_ids)
                     raise RuntimeError(
                         "MLLM generator insertion did not produce an atomic UID commit"
                     )
@@ -681,6 +680,9 @@ class MLLMScheduler:
         return scheduled
 
     def _assert_owner_thread(self) -> None:
+        config = getattr(self, "config", None)
+        if getattr(config, "cache_owner_context", None) is None:
+            return
         if threading.get_ident() != self._owner_thread_id:
             raise RuntimeError("MLLM cache lifecycle must run on the owner thread")
 
@@ -843,6 +845,7 @@ class MLLMScheduler:
         Returns:
             MLLMSchedulerOutput with results of this step
         """
+        self._assert_owner_thread()
         output = MLLMSchedulerOutput()
 
         # Drain any deferred removals queued from other threads (e.g.
@@ -1351,9 +1354,6 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
-            cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
             and self.batch_generator.prefix_cache is not None
@@ -1362,6 +1362,9 @@ class MLLMScheduler:
                 self.batch_generator.prefix_cache.clear
             )
             cleared["prefix_cache"] = True
+        if self.vision_cache:
+            self.vision_cache.clear()
+            cleared["vision_cache"] = True
         return cleared
 
     def run_cache_owner_lifecycle_mutation(self, operation, *args):

@@ -497,6 +497,7 @@ class BatchedEngine(BaseEngine):
                 "audio": _declares_feature(
                     "audio", "audio_config", "audio_token_index"
                 ),
+                "capability_modes": ["media", "text"],
             }
             from ..cache_owner_identity import (
                 verify_loaded_model_cache_owner_context,
@@ -1409,7 +1410,9 @@ class BatchedEngine(BaseEngine):
             pc = self._mllm_scheduler.batch_generator.prefix_cache
             if pc is None:
                 return False
-            snapshot = pc.prepare_hybrid_persistence_snapshot()
+            snapshot = self._mllm_scheduler.run_cache_owner_lifecycle_mutation(
+                pc.prepare_hybrid_persistence_snapshot
+            )
             if snapshot is None:
                 return False
             return await self._run_cache_io(

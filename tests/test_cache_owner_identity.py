@@ -249,6 +249,31 @@ def test_prepared_store_rechecks_revocation_before_handle_registration():
     assert cache._owner_prepared_entries == {}
 
 
+def test_prepared_store_removes_handle_when_revoked_during_registration():
+    cache = _cache()
+    cache.bind_owner_context(cache._cache_owner_context)
+    request = cache.mint_owner_request(sequence_revision=1)
+
+    class RevokingPreparedEntries(dict):
+        def __setitem__(self, handle_id, value):
+            super().__setitem__(handle_id, value)
+            cache.cancel_owner_request(request)
+
+    cache._owner_prepared_entries = RevokingPreparedEntries()
+    cache._prepare_store_unchecked = MethodType(
+        lambda self, tokens, *_args, **_kwargs: SimpleNamespace(
+            tokens=tuple(tokens), cache=[object()], memory_bytes=16
+        ),
+        cache,
+    )
+
+    decision, prepared = cache.prepare_owner_bound_store(request, [1, 2], [object()])
+
+    assert decision.reason == "cancellation"
+    assert prepared is None
+    assert cache._owner_prepared_entries == {}
+
+
 def test_cache_callsite_publishes_only_current_owner_request():
     cache = _cache()
     binding = cache.bind_owner_context(cache._cache_owner_context)
@@ -466,8 +491,34 @@ def test_in_place_restore_invalidates_live_owner_handles(tmp_path):
     assert cache.validate_owner_request(request).reason == "cache_unsafe"
 
     rebound = cache.mint_owner_request(sequence_revision=2)
-    assert cache.load_from_disk(str(tmp_path)) == 0
-    assert cache.validate_owner_request(rebound).reason == "cache_unsafe"
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        cache.load_from_disk(str(tmp_path))
+    assert cache.validate_owner_request(rebound).accepted
+
+
+@pytest.mark.parametrize("method", ["save_to_disk", "load_from_disk"])
+def test_owner_bound_generic_disk_persistence_rejects_before_io(method, tmp_path):
+    cache = _cache()
+
+    class ExplodingEntries(dict):
+        def __bool__(self):
+            raise AssertionError("owner-bound generic persistence touched entries")
+
+        def items(self):
+            raise AssertionError("owner-bound generic persistence touched entries")
+
+    cache._entries = ExplodingEntries()
+    cache.invalidate_owner_identity = MethodType(
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("owner-bound generic persistence invalidated owner")
+        ),
+        cache,
+    )
+
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        getattr(cache, method)(str(tmp_path))
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_cache_binding_requires_complete_provenance_and_closes_permanently():

@@ -176,7 +176,12 @@ class PreparedOwnerBoundCacheEntry:
 
 @dataclass(frozen=True, slots=True)
 class CacheOwnerGovernanceTarget:
-    """Complete independent registry evidence for one loaded cache owner."""
+    """Complete trusted-registry evidence for one loaded cache owner.
+
+    Runtime is responsible for constructing this value from its governed
+    registry.  The value is compatibility evidence, not an authorization
+    capability; successful verification issues the process-local capability.
+    """
 
     manifest: Mapping[str, Any]
     expected_model_cache_identity_digest: str
@@ -436,9 +441,11 @@ def verify_loaded_model_cache_owner_context(
 ) -> VerifiedCacheOwnerContext:
     """Validate the loaded model and source bytes against governed identity.
 
-    The governed digest is independent configuration.  The matching actual
-    digest is returned only after the loaded implementation, mode, and every
-    artifact file named by the manifest have been verified.
+    The caller supplies independent configuration from a trusted registry.
+    The matching actual digest is returned only after the loaded
+    implementation, mode, and every artifact file named by the manifest have
+    been verified.  This cooperative in-process boundary does not authenticate
+    a malicious caller that forges both the registry target and loaded state.
     """
 
     from .specprefill_contract import governed_target_identity_reason
@@ -536,9 +543,11 @@ def verify_loaded_model_cache_owner_context(
     if not isinstance(runtime_mode, Mapping) or not isinstance(governed_mode, Mapping):
         raise ValueError("cache owner runtime mode must be an object")
     for field_name, governed_value in governed_mode.items():
+        actual_value = runtime_mode.get(field_name)
         if field_name == "capability_modes":
-            continue
-        if runtime_mode.get(field_name) != governed_value:
+            actual_value = tuple(actual_value or ())
+            governed_value = tuple(governed_value or ())
+        if actual_value != governed_value:
             raise ValueError(f"loaded runtime mode mismatch: {field_name}")
 
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -552,6 +561,41 @@ def verify_loaded_model_cache_owner_context(
         raise ValueError("loaded tokenizer package version is unavailable") from exc
     if implementation_version != tokenizer_identity.get("implementation_version"):
         raise ValueError("loaded tokenizer version does not match governance")
+
+    def token_record(token_id: Any) -> dict[str, Any]:
+        token_id = int(token_id)
+        decoder = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+        value = decoder.get(token_id) if isinstance(decoder, Mapping) else None
+        if value is None:
+            convert = getattr(tokenizer, "convert_ids_to_tokens", None)
+            value = convert(token_id) if callable(convert) else None
+        content = getattr(value, "content", value)
+        if not isinstance(content, str):
+            raise ValueError("loaded tokenizer token semantics are unavailable")
+        return {"id": token_id, "token": content}
+
+    added_decoder = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+    if not isinstance(added_decoder, Mapping):
+        raise ValueError("loaded tokenizer added-token semantics are unavailable")
+    special_token_ids = {
+        int(token_id) for token_id in (getattr(tokenizer, "all_special_ids", ()) or ())
+    }
+    actual_added_tokens = sorted(
+        (
+            token_record(token_id)
+            for token_id in added_decoder
+            if int(token_id) not in special_token_ids
+        ),
+        key=lambda item: (item["id"], item["token"]),
+    )
+    actual_special_tokens = sorted(
+        (token_record(token_id) for token_id in special_token_ids),
+        key=lambda item: (item["id"], item["token"]),
+    )
+    if actual_added_tokens != list(tokenizer_identity.get("added_tokens", ())):
+        raise ValueError("loaded tokenizer added tokens do not match governance")
+    if actual_special_tokens != list(tokenizer_identity.get("special_tokens", ())):
+        raise ValueError("loaded tokenizer special tokens do not match governance")
 
     for probe in tokenizer_identity.get("encode_probes", ()):
         try:

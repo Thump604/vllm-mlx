@@ -502,6 +502,8 @@ class MLLMBatch:
         # layer may fail after an earlier layer has already changed.
         cache_extensions = []
         for c, o in zip(self.cache, other.cache):
+            if (c is None) != (o is None):
+                raise ValueError("cannot extend mismatched empty cache layers")
             if c is None or o is None or not hasattr(c, "extend"):
                 continue
             has_kv = hasattr(c, "keys") and c.keys is not None
@@ -764,6 +766,7 @@ class MLLMBatchGenerator:
         self._cache_owner_context = cache_owner_context
         self._cache_owner_requests: Dict[str, Any] = {}
         self._cache_owner_lifecycle_mutating = False
+        self._cache_owner_lifecycle_failed = False
 
         # Deferred removal queue — UIDs scheduled for removal from another
         # thread (typically the event loop on client disconnect).  The
@@ -964,6 +967,8 @@ class MLLMBatchGenerator:
         if not self._cache_owner_enabled():
             return
         with self._prefix_checkpoint_lock:
+            if getattr(self, "_cache_owner_lifecycle_failed", False):
+                raise RuntimeError("owner-bound cache lifecycle is terminally failed")
             if getattr(self, "_cache_owner_lifecycle_mutating", False):
                 raise RuntimeError("owner-bound cache lifecycle mutation is active")
             live_bindings = bool(self._cache_owner_requests)
@@ -989,9 +994,15 @@ class MLLMBatchGenerator:
     def finish_cache_owner_lifecycle_mutation(self) -> None:
         """Rebind after a successful cache lifecycle mutation."""
 
-        self.rebind_cache_owner_context()
-        with self._prefix_checkpoint_lock:
-            self._cache_owner_lifecycle_mutating = False
+        try:
+            self.rebind_cache_owner_context()
+        except BaseException:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_failed = True
+            raise
+        finally:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_mutating = False
 
     def recover_cache_owner_lifecycle_mutation(self) -> None:
         """Recover a failed mutation to a known-empty, rebound owner state."""
@@ -1000,10 +1011,19 @@ class MLLMBatchGenerator:
             return
         if self.prefix_cache is None:
             raise RuntimeError("owner-bound prefix cache is unavailable")
-        self.prefix_cache.clear()
-        self.rebind_cache_owner_context()
-        with self._prefix_checkpoint_lock:
-            self._cache_owner_lifecycle_mutating = False
+        try:
+            self.prefix_cache.clear()
+            self.rebind_cache_owner_context()
+        except BaseException:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_failed = True
+            raise
+        else:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_failed = False
+        finally:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_mutating = False
 
     def _prepare_prefix_store(
         self,
@@ -1200,6 +1220,10 @@ class MLLMBatchGenerator:
                 raise RuntimeError("owner-bound prefix cache is unavailable")
             request_ids = [request.request_id for request in requests]
             with self._prefix_checkpoint_lock:
+                if getattr(self, "_cache_owner_lifecycle_failed", False):
+                    raise RuntimeError(
+                        "owner-bound cache lifecycle is terminally failed"
+                    )
                 if getattr(self, "_cache_owner_lifecycle_mutating", False):
                     raise RuntimeError("owner-bound cache lifecycle mutation is active")
                 duplicate = len(set(request_ids)) != len(request_ids) or any(
@@ -1227,7 +1251,7 @@ class MLLMBatchGenerator:
                     minted_request_ids.append(req.request_id)
                 self.unprocessed_requests.append(req)
                 uids.append(req.uid)
-        except Exception:
+        except BaseException:
             self.uid_counter = original_uid_counter
             inserted = set(uids)
             self.unprocessed_requests = [
@@ -1250,6 +1274,29 @@ class MLLMBatchGenerator:
 
         logger.debug(f"Inserted {len(requests)} requests, UIDs: {uids}")
         return uids
+
+    def rollback_inserted_requests(self, request_ids: List[str]) -> None:
+        """Roll back generator state after a scheduler insertion breach."""
+
+        request_id_set = set(request_ids)
+        inserted = [
+            request
+            for request in self.unprocessed_requests
+            if request.request_id in request_id_set
+        ]
+        inserted_uids = {request.uid for request in inserted}
+        self.unprocessed_requests = [
+            request
+            for request in self.unprocessed_requests
+            if request.request_id not in request_id_set
+        ]
+        for request_id in request_id_set:
+            self._discard_prefill_checkpoint(request_id)
+            self._release_cache_owner_request(request_id)
+        if inserted_uids:
+            minimum_uid = min(inserted_uids)
+            if inserted_uids == set(range(minimum_uid, self.uid_counter)):
+                self.uid_counter = minimum_uid
 
     def remove(self, uids: List[int]) -> None:
         """

@@ -142,6 +142,56 @@ def test_batch_extend_cache_failure_propagates_and_rolls_back():
     assert cache.cache == ["original"]
 
 
+def test_batch_extend_later_cache_failure_rolls_back_every_layer():
+    class Cache:
+        def __init__(self, value, *, fail=False):
+            self.cache = [value]
+            self.fail = fail
+
+        def empty(self):
+            return False
+
+        def extend(self, other):
+            self.cache.extend(other.cache)
+            if self.fail:
+                raise RuntimeError("later cache extension failed")
+
+    first = Cache("first")
+    second = Cache("second", fail=True)
+    batch = _batch_for_extend(uid=1, y=mx.array([1]), cache=[first, second])
+    other = _batch_for_extend(
+        uid=2,
+        y=mx.array([2]),
+        cache=[Cache("other-first"), Cache("other-second")],
+    )
+
+    with pytest.raises(RuntimeError, match="later cache extension failed"):
+        batch.extend(other)
+
+    assert first.cache == ["first"]
+    assert second.cache == ["second"]
+    assert batch.uids == [1]
+    assert batch.request_ids == ["request-1"]
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "message"),
+    [
+        ([None], [], "different cache layer counts"),
+        ([None], [object()], "mismatched empty cache layers"),
+    ],
+)
+def test_batch_extend_rejects_incompatible_cache_topology(left, right, message):
+    batch = _batch_for_extend(uid=1, y=mx.array([1]), cache=left)
+    other = _batch_for_extend(uid=2, y=mx.array([2]), cache=right)
+
+    with pytest.raises(ValueError, match=message):
+        batch.extend(other)
+
+    assert batch.uids == [1]
+    assert batch.request_ids == ["request-1"]
+
+
 def _chunked_generator():
     from vllm_mlx.mllm_batch_generator import MLLMBatchStats
 
@@ -766,13 +816,15 @@ def test_owner_generic_persistence_requires_exact_identity(tmp_path, monkeypatch
     (tmp_path / "index.json").write_text(json.dumps(index))
     cache.invalidate_owner_identity = MagicMock()
 
-    assert cache.load_from_disk(str(tmp_path)) == 0
-    cache.invalidate_owner_identity.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        cache.load_from_disk(str(tmp_path))
+    cache.invalidate_owner_identity.assert_not_called()
 
     index["persistence_identity"] = dict(context.persistence_identity)
     (tmp_path / "index.json").write_text(json.dumps(index))
-    assert cache.load_from_disk(str(tmp_path)) == 0
-    assert cache.invalidate_owner_identity.call_count == 2
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        cache.load_from_disk(str(tmp_path))
+    cache.invalidate_owner_identity.assert_not_called()
 
 
 def _plain(value):
@@ -874,7 +926,7 @@ def _write_loaded_identity_fixture(root: Path):
         "ple": False,
         "qsa": False,
         "audio": False,
-        "capability_modes": ["text"],
+        "capability_modes": ["media", "text"],
     }
     cache_identity = {
         "model_id": "fixture/model",
@@ -1006,6 +1058,67 @@ def test_loaded_identity_is_derived_from_live_types_and_artifact_bytes(
             cache_config=cache_config,
             cache_runtime_identity={"max_kv_size": 1},
             runtime_mode=mode,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tokenizer_updates", "message"),
+    [
+        (
+            {
+                "added_tokens_decoder": {7: "<added>"},
+                "all_special_ids": [],
+            },
+            "added tokens",
+        ),
+        (
+            {
+                "added_tokens_decoder": {8: "<special>"},
+                "all_special_ids": [8],
+            },
+            "special tokens",
+        ),
+    ],
+)
+def test_loaded_identity_rejects_tokenizer_semantic_mismatch(
+    tmp_path, monkeypatch, tokenizer_updates, message
+):
+    model, processor, target, cache_config, mode = _write_loaded_identity_fixture(
+        tmp_path
+    )
+    _patch_fixture_tokenizer_version(monkeypatch)
+    for name, value in tokenizer_updates.items():
+        setattr(processor.tokenizer, name, value)
+
+    with pytest.raises(ValueError, match=message):
+        verify_loaded_model_cache_owner_context(
+            model,
+            processor,
+            str(tmp_path),
+            target,
+            cache_config=cache_config,
+            cache_runtime_identity={"max_kv_size": 1},
+            runtime_mode=mode,
+        )
+
+
+def test_loaded_identity_rejects_capability_mode_mismatch(tmp_path, monkeypatch):
+    model, processor, target, cache_config, mode = _write_loaded_identity_fixture(
+        tmp_path
+    )
+    _patch_fixture_tokenizer_version(monkeypatch)
+    changed_mode = dict(mode)
+    changed_mode["capability_modes"] = ["text"]
+
+    with pytest.raises(ValueError, match="capability_modes"):
+        verify_loaded_model_cache_owner_context(
+            model,
+            processor,
+            str(tmp_path),
+            target,
+            cache_config=cache_config,
+            cache_runtime_identity={"max_kv_size": 1},
+            runtime_mode=changed_mode,
         )
 
 
@@ -1227,6 +1340,83 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     assert scheduler.total_prompt_tokens == 0
 
 
+@pytest.mark.parametrize("malformed", [None, 7, "7"])
+def test_scheduler_malformed_insert_result_rolls_back_real_generator(malformed):
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="request-1", prompt="hello")
+    request.num_prompt_tokens = 3
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=object(),
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    binding = object()
+    generator.prefix_cache.mint_owner_request.return_value = binding
+    original_insert = generator.insert
+
+    def insert_then_corrupt(requests):
+        original_insert(requests)
+        return malformed
+
+    generator.insert = insert_then_corrupt
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(RuntimeError, match="atomic UID commit"):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == [request]
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    assert generator.uid_counter == 0
+    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
+
+
+def test_scheduler_base_exception_during_insert_rolls_back_real_generator():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    requests = [
+        MLLMRequest(request_id="request-1", prompt="hello"),
+        MLLMRequest(request_id="request-2", prompt="hello"),
+    ]
+    for request in requests:
+        request.num_prompt_tokens = 3
+    scheduler.waiting = deque(requests)
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=2,
+        cache_owner_context=object(),
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    binding = object()
+    generator.prefix_cache.mint_owner_request.side_effect = [
+        binding,
+        KeyboardInterrupt("interrupted mint"),
+    ]
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted mint"):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == requests
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    assert generator.uid_counter == 0
+    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
+
+
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
 def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -1355,6 +1545,7 @@ def test_batched_engine_derives_and_threads_verified_owner_context(
         "ple": False,
         "qsa": False,
         "audio": False,
+        "capability_modes": ["media", "text"],
     }
 
 
@@ -1470,6 +1661,63 @@ def test_owner_lifecycle_mutation_rejects_active_generator_work():
     generator.prefix_cache.release_owner_request.assert_not_called()
 
 
+def test_owner_lifecycle_rejects_a_concurrent_second_begin():
+    generator = _generator()
+    generator.begin_cache_owner_lifecycle_mutation()
+
+    with pytest.raises(RuntimeError, match="mutation is active"):
+        generator.begin_cache_owner_lifecycle_mutation()
+
+    generator.finish_cache_owner_lifecycle_mutation()
+    assert generator._cache_owner_lifecycle_mutating is False
+
+
+@pytest.mark.parametrize("phase", ["finish", "recover"])
+def test_owner_lifecycle_base_exception_clears_gate_and_fails_terminally(phase):
+    generator = _generator()
+    generator._cache_owner_context = object()
+    generator.begin_cache_owner_lifecycle_mutation()
+    if phase == "finish":
+        generator.prefix_cache.bind_owner_context.side_effect = KeyboardInterrupt(
+            "rebind interrupted"
+        )
+        operation = generator.finish_cache_owner_lifecycle_mutation
+    else:
+        generator.prefix_cache.clear.side_effect = KeyboardInterrupt(
+            "recovery interrupted"
+        )
+        operation = generator.recover_cache_owner_lifecycle_mutation
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted"):
+        operation()
+
+    assert generator._cache_owner_lifecycle_mutating is False
+    assert generator._cache_owner_lifecycle_failed is True
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        generator.begin_cache_owner_lifecycle_mutation()
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        generator.insert([_request("terminal")])
+
+
+def test_owner_replay_dispatch_never_uses_unchecked_clone():
+    generator = _generator()
+    binding = object()
+    generator._cache_owner_requests["request-1"] = binding
+    generator.prefix_cache.clone_owner_bound_for_replay.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["clone"],
+    )
+    generator.prefix_cache._clone_for_replay_unchecked = MagicMock(
+        side_effect=AssertionError("unchecked clone reached")
+    )
+
+    assert generator._clone_prefix_for_replay("request-1", ["state"]) == ["clone"]
+    generator.prefix_cache.clone_owner_bound_for_replay.assert_called_once_with(
+        binding, ["state"]
+    )
+    generator.prefix_cache._clone_for_replay_unchecked.assert_not_called()
+
+
 def test_scheduler_cache_clear_stops_before_mutation_when_owner_is_active():
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduler.vision_cache = None
@@ -1492,6 +1740,7 @@ def test_scheduler_cache_clear_stops_before_mutation_when_owner_is_active():
 
 def test_scheduler_cache_lifecycle_rejects_off_owner_thread():
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=object())
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident() + 1
     scheduler._ensure_batch_generator = MagicMock()
@@ -1503,3 +1752,46 @@ def test_scheduler_cache_lifecycle_rejects_off_owner_thread():
 
     operation.assert_not_called()
     scheduler._ensure_batch_generator.assert_not_called()
+
+
+def test_scheduler_disabled_owner_allows_cross_thread_admission():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="cross-thread", prompt="hello")
+    request.num_prompt_tokens = 3
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=None,
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator._cache_owner_required = False
+    scheduler.batch_generator.insert.return_value = [7]
+    scheduler._ensure_batch_generator = MagicMock()
+    result = []
+    errors = []
+
+    def admit_from_worker():
+        try:
+            result.append(scheduler._schedule_waiting())
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=admit_from_worker)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert result == [[request]]
+    assert list(scheduler.waiting) == []
+    assert scheduler.running == {request.request_id: request}
+    assert scheduler.request_id_to_uid == {request.request_id: 7}
+    assert scheduler.uid_to_request_id == {7: request.request_id}
+    assert request.status is RequestStatus.RUNNING
+    assert request.batch_uid == 7

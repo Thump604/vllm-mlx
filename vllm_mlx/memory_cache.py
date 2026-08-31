@@ -2876,6 +2876,8 @@ class MemoryAwarePrefixCache:
 
         Returns True if at least one entry was saved.
         """
+        if self._cache_owner_context is not None:
+            raise RuntimeError("owner-bound caches require strict hybrid persistence")
         import json
         import os
         import time as _time
@@ -2966,6 +2968,8 @@ class MemoryAwarePrefixCache:
 
         Returns the number of entries successfully loaded.
         """
+        if self._cache_owner_context is not None:
+            raise RuntimeError("owner-bound caches require strict hybrid persistence")
         self.invalidate_owner_identity()
         import json
         import os
