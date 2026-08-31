@@ -177,6 +177,8 @@ class TestMLLMSchedulerStopClosesSSDTier:
         sched._running = False
         sched._processing_task = None
         sched.batch_generator = None
+        sched._state_lock = threading.RLock()
+        sched._owner_thread_id = threading.get_ident()
         return sched
 
     @pytest.mark.anyio

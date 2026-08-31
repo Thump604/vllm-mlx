@@ -1393,6 +1393,7 @@ class BatchedEngine(BaseEngine):
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
+            self._mllm_scheduler._assert_owner_thread()
             self._mllm_scheduler._ensure_batch_generator()
             batch_generator = self._mllm_scheduler.batch_generator
             pc = batch_generator.prefix_cache
@@ -1423,6 +1424,7 @@ class BatchedEngine(BaseEngine):
     async def restore_cache_from_disk(self, cache_dir: str) -> int:
         """Read on an I/O thread, then rebuild MLLM arrays on their owner."""
         if self._mllm_scheduler:
+            self._mllm_scheduler._assert_owner_thread()
             self._mllm_scheduler._ensure_batch_generator()
             batch_generator = self._mllm_scheduler.batch_generator
             pc = batch_generator.prefix_cache

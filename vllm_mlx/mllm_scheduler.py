@@ -662,19 +662,49 @@ class MLLMScheduler:
                         raise RuntimeError(
                             "MLLM generator insertion did not produce an atomic UID commit"
                         )
+                    waiting_snapshot = list(self.waiting)
+                    running_snapshot = dict(self.running)
+                    request_to_uid_snapshot = dict(self.request_id_to_uid)
+                    uid_to_request_snapshot = dict(self.uid_to_request_id)
+                    prompt_tokens_snapshot = self.total_prompt_tokens
+                    request_state_snapshot = [
+                        (request, request.status, request.batch_uid)
+                        for request in scheduled
+                    ]
+                    try:
+                        for _ in scheduled:
+                            self.waiting.popleft()
 
-                for _ in scheduled:
-                    self.waiting.popleft()
+                        for uid, request in zip(uids, scheduled):
+                            request.status = RequestStatus.RUNNING
+                            self.running[request.request_id] = request
+                            self.request_id_to_uid[request.request_id] = uid
+                            self.uid_to_request_id[uid] = request.request_id
+                            request.batch_uid = uid
+                            self.total_prompt_tokens += request.num_prompt_tokens
 
-                for uid, request in zip(uids, scheduled):
-                    request.status = RequestStatus.RUNNING
-                    self.running[request.request_id] = request
-                    self.request_id_to_uid[request.request_id] = uid
-                    self.uid_to_request_id[uid] = request.request_id
-                    request.batch_uid = uid
-                    self.total_prompt_tokens += request.num_prompt_tokens
-
-                    logger.debug(f"Scheduled request {request.request_id} (uid={uid})")
+                            logger.debug(
+                                "Scheduled request %s (uid=%s)", request.request_id, uid
+                            )
+                    except BaseException:
+                        try:
+                            self.batch_generator.rollback_inserted_requests(
+                                request_ids, minimum_uid=insert_boundary
+                            )
+                        finally:
+                            self.waiting.clear()
+                            self.waiting.extend(waiting_snapshot)
+                            self.running.clear()
+                            self.running.update(running_snapshot)
+                            self.request_id_to_uid.clear()
+                            self.request_id_to_uid.update(request_to_uid_snapshot)
+                            self.uid_to_request_id.clear()
+                            self.uid_to_request_id.update(uid_to_request_snapshot)
+                            self.total_prompt_tokens = prompt_tokens_snapshot
+                            for request, status, batch_uid in request_state_snapshot:
+                                request.status = status
+                                request.batch_uid = batch_uid
+                        raise
 
         return scheduled
 
@@ -955,38 +985,46 @@ class MLLMScheduler:
 
     async def start(self) -> None:
         """Start the async scheduler processing loop."""
-        if self._running:
-            return
+        self._assert_owner_thread()
+        with self._state_lock:
+            if self._running:
+                return
 
-        self._running = True
-        self._processing_task = asyncio.create_task(self._process_loop())
+            self._running = True
+            self._processing_task = asyncio.create_task(self._process_loop())
         logger.info(
             f"MLLM Scheduler started with max_num_seqs={self.config.max_num_seqs}"
         )
 
     async def stop(self) -> None:
         """Stop the scheduler."""
-        self._running = False
-        if self._processing_task:
-            self._processing_task.cancel()
+        self._assert_owner_thread()
+        with self._state_lock:
+            self._running = False
+            processing_task = self._processing_task
+            if processing_task:
+                processing_task.cancel()
+        if processing_task:
             try:
-                await self._processing_task
+                await processing_task
             except asyncio.CancelledError:
                 pass
 
-        if self.batch_generator is not None:
-            self.batch_generator.close()
-            self.batch_generator = None
-
-        if self._ssd_tier is not None:
+        with self._state_lock:
+            if self._processing_task is processing_task:
+                self._processing_task = None
+            if self.batch_generator is not None:
+                self.batch_generator.close()
+                self.batch_generator = None
             tier = self._ssd_tier
+            self._ssd_tier = None
+
+        if tier is not None:
             aclose = getattr(tier, "aclose", None)
             if aclose is not None:
                 await aclose()
             else:
                 await asyncio.to_thread(tier.close)
-            if self._ssd_tier is tier:
-                self._ssd_tier = None
             logger.info("SSD cache tier closed")
 
         logger.info("MLLM Scheduler stopped")
@@ -1386,21 +1424,23 @@ class MLLMScheduler:
 
     def reset(self) -> None:
         """Reset the scheduler state."""
-        # Abort all requests
-        for request_id in list(self.requests.keys()):
-            self.abort_request(request_id)
+        self._assert_owner_thread()
+        with self._state_lock:
+            # Abort all requests
+            for request_id in list(self.requests.keys()):
+                self.abort_request(request_id)
 
-        self.waiting.clear()
-        self.running.clear()
-        self.requests.clear()
-        self.finished_req_ids.clear()
-        self.request_id_to_uid.clear()
-        self.uid_to_request_id.clear()
-        self._detokenizer_pool.clear()
+            self.waiting.clear()
+            self.running.clear()
+            self.requests.clear()
+            self.finished_req_ids.clear()
+            self.request_id_to_uid.clear()
+            self.uid_to_request_id.clear()
+            self._detokenizer_pool.clear()
 
-        if self.batch_generator is not None:
-            self.batch_generator.close()
-            self.batch_generator = None
+            if self.batch_generator is not None:
+                self.batch_generator.close()
+                self.batch_generator = None
 
-        if self.vision_cache:
-            self.vision_cache.clear()
+            if self.vision_cache:
+                self.vision_cache.clear()

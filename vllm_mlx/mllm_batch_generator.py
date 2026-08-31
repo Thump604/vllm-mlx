@@ -917,8 +917,17 @@ class MLLMBatchGenerator:
     def close(self) -> None:
         """Release resources and reset wired limit."""
         if self.prefix_cache is not None and self._cache_owner_enabled():
-            self.invalidate_cache_owner_requests()
-            self.prefix_cache.close_owner_identity()
+            # Closing is terminal for this generator. Keep admission excluded
+            # from request invalidation through identity closure so no request
+            # binding can be published against an identity that is closing.
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_mutating = True
+                try:
+                    self.invalidate_cache_owner_requests()
+                    self.prefix_cache.close_owner_identity()
+                finally:
+                    self._cache_owner_lifecycle_failed = True
+                    self._cache_owner_lifecycle_mutating = False
         if self._old_wired_limit is not None:
             mx.synchronize(MLLMBatchGenerator._stream)
             mx.set_wired_limit(self._old_wired_limit)
@@ -1241,10 +1250,10 @@ class MLLMBatchGenerator:
             if duplicate:
                 raise RuntimeError("duplicate owner-bound request ID")
 
-        original_uid_counter = self.uid_counter
         uids = []
         minted_request_ids = []
         with self._prefix_checkpoint_lock:
+            original_uid_counter = self.uid_counter
             if owner_enabled:
                 if getattr(self, "_cache_owner_lifecycle_failed", False):
                     raise RuntimeError(
@@ -1293,7 +1302,7 @@ class MLLMBatchGenerator:
         return uids
 
     @contextmanager
-    def insertion_transaction(self):
+    def insertion_transaction(self) -> Iterator[int]:
         """Hold generator insertion state through scheduler validation."""
 
         with self._prefix_checkpoint_lock:
@@ -2762,10 +2771,11 @@ class MLLMBatchGenerator:
             )
 
             if text_only:
+                selected_requests = list(text_only)
+                all_uids = {request.uid for request in selected_requests}
                 try:
                     # Capture UIDs before _process_prompts modifies
                     # text_only in-place via .remove() for failed items.
-                    all_uids = {r.uid for r in text_only}
                     new_batch = self._process_prompts(text_only)
                     # Remove ALL requested (both successful and failed)
                     self.unprocessed_requests = [
@@ -2780,24 +2790,26 @@ class MLLMBatchGenerator:
                         f"{type(e).__name__}: {e}"
                     )
                     # Remove failed requests to avoid infinite retry loop
-                    processed_uids = {r.uid for r in text_only}
                     self.unprocessed_requests = [
-                        r
-                        for r in self.unprocessed_requests
-                        if r.uid not in processed_uids
+                        r for r in self.unprocessed_requests if r.uid not in all_uids
                     ]
-                    for req in text_only:
+                    pending_error_ids = {
+                        response.request_id
+                        for response in self._pending_error_responses
+                    }
+                    for req in selected_requests:
                         self._discard_prefill_checkpoint(req.request_id)
                         self._release_cache_owner_request(req.request_id)
-                        self._pending_error_responses.append(
-                            MLLMBatchResponse(
-                                uid=req.uid,
-                                request_id=req.request_id,
-                                token=0,
-                                logprobs=mx.zeros(1),
-                                finish_reason="error",
+                        if req.request_id not in pending_error_ids:
+                            self._pending_error_responses.append(
+                                MLLMBatchResponse(
+                                    uid=req.uid,
+                                    request_id=req.request_id,
+                                    token=0,
+                                    logprobs=mx.zeros(1),
+                                    finish_reason="error",
+                                )
                             )
-                        )
 
         # Collect any pending error responses (from failed preprocessing)
         error_responses = []

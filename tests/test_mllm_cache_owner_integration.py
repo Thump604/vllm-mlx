@@ -23,7 +23,11 @@ from vllm_mlx.cache_owner_identity import (
     build_loaded_cache_owner_digest,
     verify_loaded_model_cache_owner_context,
 )
-from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+from vllm_mlx.mllm_batch_generator import (
+    MLLMBatchGenerator,
+    MLLMBatchRequest,
+    MLLMBatchResponse,
+)
 from vllm_mlx.mllm_batch_generator import MLLMBatch
 from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler, MLLMSchedulerConfig
 from vllm_mlx.request import RequestStatus
@@ -349,6 +353,54 @@ def test_chunked_next_extend_failure_is_transactional_and_releases_new_lease():
     release.assert_called_once_with(inline_binding)
 
 
+def test_mid_batch_partial_preprocess_then_extend_failure_releases_selection_once():
+    generator = _chunked_generator()
+    generator.completion_batch_size = 4
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+    generator.active_batch = _batch_for_extend(uid=90, y=mx.array([9]))
+    first = _request("first-fails-preprocess")
+    first.uid = 91
+    second = _request("second-fails-extend")
+    second.uid = 92
+    first_binding = object()
+    second_binding = object()
+    generator._cache_owner_requests = {
+        first.request_id: first_binding,
+        second.request_id: second_binding,
+    }
+    generator.unprocessed_requests = [first, second]
+
+    def partially_process_then_fail(requests):
+        failed = requests.pop(0)
+        generator._release_cache_owner_request(failed.request_id)
+        generator._pending_error_responses.append(
+            MLLMBatchResponse(
+                uid=failed.uid,
+                request_id=failed.request_id,
+                token=0,
+                logprobs=mx.zeros(1),
+                finish_reason="error",
+            )
+        )
+        raise RuntimeError("extend preparation failed")
+
+    generator._process_prompts = partially_process_then_fail
+
+    responses = MLLMBatchGenerator._next(generator)
+
+    error_ids = [
+        response.request_id
+        for response in responses
+        if response.finish_reason == "error"
+    ]
+    assert error_ids.count(first.request_id) == 1
+    assert error_ids.count(second.request_id) == 1
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    assert release.call_args_list == [call(first_binding), call(second_binding)]
+
+
 def test_chunked_next_success_retains_owner_lease_until_completion():
     from mlx_lm.models.cache import KVCache
 
@@ -631,6 +683,53 @@ def test_close_revokes_owner_and_discards_request_handles():
     generator.close()
 
     generator.prefix_cache.close_owner_identity.assert_called_once_with()
+    assert generator._cache_owner_requests == {}
+
+
+def test_close_excludes_insert_until_owner_identity_is_terminally_closed():
+    generator = _generator()
+    generator._old_wired_limit = None
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    insert_finished = threading.Event()
+    close_errors = []
+    insert_errors = []
+
+    def block_identity_close():
+        close_entered.set()
+        assert release_close.wait(timeout=2)
+
+    generator.prefix_cache.close_owner_identity.side_effect = block_identity_close
+
+    def close_generator():
+        try:
+            generator.close()
+        except BaseException as exc:  # pragma: no cover - assertion below
+            close_errors.append(exc)
+
+    def insert_request():
+        try:
+            generator.insert([_request("after-close")])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            insert_errors.append(exc)
+        finally:
+            insert_finished.set()
+
+    close_worker = threading.Thread(target=close_generator)
+    insert_worker = threading.Thread(target=insert_request)
+    close_worker.start()
+    assert close_entered.wait(timeout=2)
+    insert_worker.start()
+    assert insert_finished.wait(timeout=0.05) is False
+    release_close.set()
+    close_worker.join(timeout=2)
+    insert_worker.join(timeout=2)
+
+    assert close_errors == []
+    assert len(insert_errors) == 1
+    assert isinstance(insert_errors[0], RuntimeError)
+    assert "terminally failed" in str(insert_errors[0])
+    assert generator.unprocessed_requests == []
     assert generator._cache_owner_requests == {}
 
 
@@ -1517,6 +1616,91 @@ def test_generator_insert_sort_failure_rolls_back_owner_state():
     generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
 
 
+def test_generator_insert_failure_cannot_restore_stale_uid_counter():
+    class BlockingExplodingMedia:
+        def __init__(self, entered, release):
+            self.entered = entered
+            self.release = release
+
+        def __bool__(self):
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            raise RuntimeError("sort failure")
+
+    generator = _generator()
+    failing_entered = threading.Event()
+    release_failure = threading.Event()
+    normal_finished = threading.Event()
+    failures = []
+    normal_uids = []
+    failing = _request("failing")
+    failing.images = BlockingExplodingMedia(failing_entered, release_failure)
+
+    def insert_failing():
+        try:
+            generator.insert([failing])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            failures.append(exc)
+
+    def insert_normal():
+        normal_uids.extend(generator.insert([_request("normal")]))
+        normal_finished.set()
+
+    failing_worker = threading.Thread(target=insert_failing)
+    normal_worker = threading.Thread(target=insert_normal)
+    failing_worker.start()
+    assert failing_entered.wait(timeout=2)
+    normal_worker.start()
+    assert normal_finished.wait(timeout=0.05) is False
+    release_failure.set()
+    failing_worker.join(timeout=2)
+    normal_worker.join(timeout=2)
+
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert str(failures[0]) == "sort failure"
+    assert normal_uids == [0]
+    assert [
+        (request.request_id, request.uid) for request in generator.unprocessed_requests
+    ] == [("normal", 0)]
+    assert generator.uid_counter == 1
+
+
+def test_insertion_transaction_releases_lock_after_base_exception():
+    generator = _generator(owner_required=False)
+    interrupted = threading.Event()
+    insert_finished = threading.Event()
+    errors = []
+    inserted_uids = []
+
+    def interrupt_transaction():
+        try:
+            with generator.insertion_transaction():
+                raise KeyboardInterrupt("transaction interrupted")
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+        finally:
+            interrupted.set()
+
+    def insert_after_interrupt():
+        inserted_uids.extend(generator.insert([_request("after-interrupt")]))
+        insert_finished.set()
+
+    interrupt_worker = threading.Thread(target=interrupt_transaction)
+    interrupt_worker.start()
+    assert interrupted.wait(timeout=2)
+    insert_worker = threading.Thread(target=insert_after_interrupt)
+    insert_worker.start()
+    assert insert_finished.wait(timeout=2)
+    interrupt_worker.join(timeout=2)
+    insert_worker.join(timeout=2)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], KeyboardInterrupt)
+    assert inserted_uids == [0]
+    assert generator.uid_counter == 1
+
+
 def test_scheduler_insert_validation_is_atomic_against_direct_insert():
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduled = MLLMRequest(request_id="shared-request", prompt="hello")
@@ -1584,6 +1768,43 @@ def test_scheduler_insert_validation_is_atomic_against_direct_insert():
     assert generator.uid_counter == 1
     assert list(scheduler.waiting) == [scheduled]
     assert scheduler.running == {}
+
+
+def test_scheduler_commit_failure_rolls_back_generator_and_scheduler_state():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="commit-failure", prompt="hello")
+    request.num_prompt_tokens = "invalid"
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=object(),
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    binding = object()
+    generator.prefix_cache.mint_owner_request.return_value = binding
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(TypeError):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == [request]
+    assert request.status is RequestStatus.WAITING
+    assert request.batch_uid is None
+    assert scheduler.running == {}
+    assert scheduler.request_id_to_uid == {}
+    assert scheduler.uid_to_request_id == {}
+    assert scheduler.total_prompt_tokens == 0
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    assert generator.uid_counter == 0
+    generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
 
 
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
@@ -2207,6 +2428,93 @@ def test_scheduler_cache_lifecycle_rejects_off_owner_thread():
         scheduler.run_cache_owner_lifecycle_mutation(operation)
 
     operation.assert_not_called()
+    scheduler._ensure_batch_generator.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["start", "stop", "reset"])
+def test_owner_enabled_scheduler_lifecycle_rejects_cross_thread(operation):
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=object())
+    scheduler._owner_thread_id = threading.get_ident()
+    errors = []
+
+    def invoke():
+        try:
+            if operation == "start":
+                asyncio.run(scheduler.start())
+            elif operation == "stop":
+                asyncio.run(scheduler.stop())
+            else:
+                scheduler.reset()
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "owner thread" in str(errors[0])
+
+
+def test_owner_disabled_scheduler_lifecycle_allows_cross_thread():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._state_lock = threading.RLock()
+    scheduler._running = False
+    scheduler._processing_task = None
+    scheduler.batch_generator = None
+    scheduler._ssd_tier = None
+
+    async def process_loop():
+        await asyncio.sleep(0)
+
+    scheduler._process_loop = process_loop
+    errors = []
+
+    def run_lifecycle():
+        async def run():
+            await scheduler.start()
+            await scheduler._processing_task
+            await scheduler.stop()
+
+        try:
+            asyncio.run(run())
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=run_lifecycle)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert scheduler._running is False
+    assert scheduler._processing_task is None
+
+
+@pytest.mark.parametrize("operation", ["load", "restore"])
+def test_batched_engine_cache_restore_rejects_off_owner_before_construction(operation):
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=object())
+    scheduler._owner_thread_id = threading.get_ident() + 1
+    scheduler._ensure_batch_generator = MagicMock()
+    scheduler.batch_generator = None
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    with pytest.raises(RuntimeError, match="owner thread"):
+        if operation == "load":
+            engine.load_cache_from_disk("cache-dir")
+        else:
+            asyncio.run(engine.restore_cache_from_disk("cache-dir"))
+
     scheduler._ensure_batch_generator.assert_not_called()
 
 
