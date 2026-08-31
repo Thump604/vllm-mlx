@@ -5,6 +5,7 @@ import ast
 import asyncio
 from collections import deque
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import threading
 from unittest.mock import MagicMock, call
 
 import pytest
+import mlx.core as mx
 
 import vllm_mlx.cache_owner_identity as owner_identity_module
 from vllm_mlx.cache_owner_identity import (
@@ -19,10 +21,10 @@ from vllm_mlx.cache_owner_identity import (
     OwnerBindingDecision,
     VerifiedCacheOwnerContext,
     build_loaded_cache_owner_digest,
-    build_loaded_runtime_composition_digest,
     verify_loaded_model_cache_owner_context,
 )
 from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+from vllm_mlx.mllm_batch_generator import MLLMBatch
 from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler, MLLMSchedulerConfig
 from vllm_mlx.request import RequestStatus
 from vllm_mlx.memory_cache import (
@@ -42,6 +44,7 @@ def _generator(*, owner_required: bool = True):
     generator.prefix_cache = MagicMock()
     generator._cache_owner_required = owner_required
     generator._cache_owner_requests = {}
+    generator._cache_owner_lifecycle_mutating = False
     generator._prefix_checkpoint_lock = threading.Lock()
     generator._request_prefix_checkpoints = {}
     generator._aborted_request_ids = set()
@@ -57,6 +60,363 @@ def _generator(*, owner_required: bool = True):
 
 def _request(request_id: str = "request-1") -> MLLMBatchRequest:
     return MLLMBatchRequest(uid=-1, request_id=request_id, prompt="hello")
+
+
+def _batch_for_extend(*, uid: int, y, cache=None, request_id: str | None = None):
+    request_id = request_id or f"request-{uid}"
+    request = MLLMBatchRequest(uid=uid, request_id=request_id, prompt="hello")
+    return MLLMBatch(
+        uids=[uid],
+        request_ids=[request_id],
+        y=y,
+        logprobs=[mx.zeros_like(y)],
+        max_tokens=[8],
+        num_tokens=[0],
+        cache=[] if cache is None else cache,
+        requests=[request],
+    )
+
+
+def test_batch_extend_shape_failure_is_transactional():
+    batch = _batch_for_extend(uid=1, y=mx.array([[1, 2]]))
+    other = _batch_for_extend(
+        uid=2,
+        y=mx.array([[3, 4, 5]]),
+    )
+    original = {
+        "uids": list(batch.uids),
+        "request_ids": list(batch.request_ids),
+        "y": batch.y,
+        "logprobs": list(batch.logprobs),
+        "max_tokens": list(batch.max_tokens),
+        "num_tokens": list(batch.num_tokens),
+        "requests": list(batch.requests),
+    }
+
+    with pytest.raises(ValueError):
+        batch.extend(other)
+
+    assert batch.uids == original["uids"]
+    assert batch.request_ids == original["request_ids"]
+    assert batch.y is original["y"]
+    assert batch.logprobs == original["logprobs"]
+    assert batch.max_tokens == original["max_tokens"]
+    assert batch.num_tokens == original["num_tokens"]
+    assert batch.requests == original["requests"]
+
+
+def test_batch_extend_cache_failure_propagates_and_rolls_back():
+    class FailingCache:
+        def __init__(self, value):
+            self.cache = [value]
+            self.extend_calls = 0
+
+        def empty(self):
+            return False
+
+        def extend(self, other):
+            self.extend_calls += 1
+            self.cache.extend(other.cache)
+            raise RuntimeError("cache extension failed")
+
+    cache = FailingCache("original")
+    batch = _batch_for_extend(
+        uid=1,
+        y=mx.array([1]),
+        cache=[cache],
+    )
+    other = _batch_for_extend(
+        uid=2,
+        y=mx.array([2]),
+        cache=[FailingCache("other")],
+    )
+    original_uids = list(batch.uids)
+    original_y = batch.y
+
+    with pytest.raises(RuntimeError, match="cache extension failed"):
+        batch.extend(other)
+
+    assert batch.uids == original_uids
+    assert batch.y is original_y
+    assert cache.extend_calls == 0
+    assert cache.cache == ["original"]
+
+
+def _chunked_generator():
+    from vllm_mlx.mllm_batch_generator import MLLMBatchStats
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator._stats = MLLMBatchStats()
+    generator._pending_error_responses = []
+    generator._aborted_request_ids = set()
+    generator._prefill_progress = {}
+    generator._prefix_checkpoint_lock = threading.Lock()
+    generator._request_prefix_checkpoints = {}
+    generator._cache_owner_required = True
+    generator._cache_owner_requests = {}
+    generator._cache_owner_lifecycle_mutating = False
+    generator._cache_owner_context = None
+    generator.active_batch = None
+    generator.unprocessed_requests = []
+    generator.uid_counter = 0
+    generator.stop_tokens = set()
+    generator._think_suffix_len = 0
+    generator.max_kv_size = 0
+    generator._allow_mid_batch_extend = True
+    generator._require_uniform_mllm_draft = False
+    generator._has_empty_rotating_cache = lambda _cache: False
+    generator._compatible_pending_requests = (
+        lambda requests, limit, reference=None: requests[:limit]
+    )
+    generator._derive_request_rope_deltas = lambda _request: None
+    generator._batch_rope_deltas = lambda _requests: None
+    generator._language_model_kwargs = lambda *args, **kwargs: {}
+    generator._prefill_checkpoint_plan = lambda *args, **kwargs: (None, None)
+    generator._prepare_rotating_caches = lambda _cache: True
+    generator._maybe_store_prefix_cache = lambda *args: None
+    generator._step = lambda *args, **kwargs: (mx.array([0]), [mx.zeros(4)])
+    generator._next = lambda: []
+    return generator
+
+
+def test_chunked_next_preprocess_failure_releases_owner_lease():
+    from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+    generator = _chunked_generator()
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+    binding = object()
+    request = MLLMBatchRequest(uid=1, request_id="chunked-preprocess", prompt="hello")
+    generator._cache_owner_requests[request.request_id] = binding
+    generator.unprocessed_requests.append(request)
+    generator._preprocess_request = MagicMock(
+        side_effect=RuntimeError("preprocess failed")
+    )
+
+    install_chunked_prefill_mllm(generator, budget=2)
+
+    responses = generator._next()
+
+    assert len(responses) == 1
+    assert responses[0].request_id == request.request_id
+    assert responses[0].finish_reason == "error"
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    release.assert_called_once_with(binding)
+
+
+def test_chunked_next_extend_failure_is_transactional_and_releases_new_lease():
+    from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+    class MutatingFailingCache:
+        def __init__(self, value):
+            self.cache = [value]
+            self.extend_calls = 0
+
+        def empty(self):
+            return False
+
+        def extend(self, other):
+            self.extend_calls += 1
+            self.cache.extend(other.cache)
+            raise RuntimeError("chunked cache extension failed")
+
+    generator = _chunked_generator()
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+
+    active = _batch_for_extend(
+        uid=90, y=mx.array([9]), cache=[MutatingFailingCache("active")]
+    )
+    generator.active_batch = active
+    original_uids = list(active.uids)
+    original_request_ids = list(active.request_ids)
+    active_cache = active.cache[0]
+
+    partial_request = MLLMBatchRequest(
+        uid=91,
+        request_id="chunked-long",
+        prompt="long",
+        max_tokens=4,
+    )
+    partial_state = {
+        "request": partial_request,
+        "cache": [object()],
+        "remaining_ids": mx.array([[1, 2, 3]]),
+        "processed": 2,
+        "total": 5,
+        "cached_count": 0,
+        "chunk_count": 1,
+        "checkpoint_at": None,
+        "checkpoint_key": None,
+        "checkpoint_entry": None,
+    }
+
+    inline_binding = object()
+    inline_request = MLLMBatchRequest(
+        uid=92,
+        request_id="chunked-inline",
+        prompt="short",
+    )
+    inline_request.input_ids = mx.array([[7]])
+    generator._cache_owner_requests[inline_request.request_id] = inline_binding
+    generator.unprocessed_requests.append(inline_request)
+    new_batch = _batch_for_extend(
+        uid=inline_request.uid,
+        y=mx.array([7]),
+        cache=[MutatingFailingCache("new")],
+        request_id=inline_request.request_id,
+    )
+    generator._process_prompts = MagicMock(return_value=new_batch)
+    generator.language_model = lambda tokens, cache, **kwargs: mx.zeros(
+        (1, tokens.shape[1], 4)
+    )
+
+    install_chunked_prefill_mllm(generator, budget=2)
+    generator._partial = partial_state
+
+    responses = generator._next()
+
+    assert any(
+        response.request_id == inline_request.request_id
+        and response.finish_reason == "error"
+        for response in responses
+    )
+    assert active.uids == original_uids
+    assert active.request_ids == original_request_ids
+    assert active_cache.extend_calls == 0
+    assert active_cache.cache == ["active"]
+    assert generator._cache_owner_requests == {}
+    release.assert_called_once_with(inline_binding)
+
+
+def test_chunked_next_success_retains_owner_lease_until_completion():
+    from mlx_lm.models.cache import KVCache
+
+    from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+    generator = _chunked_generator()
+    generator.prefix_cache = SimpleNamespace()
+    generator._fetch_exact_prefix_auxiliary = lambda request_id, tokens: None
+    generator._fetch_prefix_cache = lambda request_id, tokens: (None, tokens)
+    generator._store_prefix_snapshot = MagicMock()
+    generator._preprocess_request = lambda _request: None
+
+    binding = object()
+    request = MLLMBatchRequest(
+        uid=3,
+        request_id="chunked-success",
+        prompt="long",
+        max_tokens=4,
+    )
+    request.input_ids = mx.array([[1, 2, 3, 4, 5, 6]])
+    request.is_text_only = True
+    generator._cache_owner_requests[request.request_id] = binding
+    generator.unprocessed_requests.append(request)
+
+    def make_prompt_cache(*args, **kwargs):
+        return [KVCache()]
+
+    generator.language_model = lambda tokens, cache, **kwargs: (
+        cache[0].update_and_fetch(
+            mx.zeros((1, 1, tokens.shape[1], 1)),
+            mx.zeros((1, 1, tokens.shape[1], 1)),
+        ),
+        mx.zeros((1, tokens.shape[1], 4)),
+    )[1]
+
+    import mlx_lm.models.cache as mlx_lm_cache
+
+    original_make_prompt_cache = mlx_lm_cache.make_prompt_cache
+    mlx_lm_cache.make_prompt_cache = make_prompt_cache
+    try:
+        install_chunked_prefill_mllm(generator, budget=2)
+
+        assert generator._next() == []
+        assert generator._next() == []
+        responses = generator._next()
+    finally:
+        mlx_lm_cache.make_prompt_cache = original_make_prompt_cache
+
+    assert len(responses) == 1
+    assert responses[0].request_id == request.request_id
+    assert responses[0].finish_reason is None
+    assert generator._cache_owner_requests == {request.request_id: binding}
+
+
+def test_chunked_remove_releases_partial_owner_before_reinsert():
+    from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+    generator = _chunked_generator()
+    prefix_cache = MagicMock()
+    binding = object()
+    replacement_binding = object()
+    prefix_cache.mint_owner_request.return_value = replacement_binding
+    generator.prefix_cache = prefix_cache
+
+    partial_request = MLLMBatchRequest(
+        uid=11,
+        request_id="chunked-drain-reinsert",
+        prompt="long",
+    )
+    generator._cache_owner_requests[partial_request.request_id] = binding
+
+    install_chunked_prefill_mllm(generator, budget=2)
+    generator._partial = {
+        "request": partial_request,
+        "remaining_ids": mx.array([[1]]),
+    }
+    generator.remove([partial_request.uid])
+
+    assert generator._partial is None
+    assert generator._cache_owner_requests == {}
+    prefix_cache.release_owner_request.assert_called_once_with(binding)
+
+    replacement = MLLMBatchRequest(
+        uid=-1,
+        request_id=partial_request.request_id,
+        prompt="retry",
+    )
+    assert generator.insert([replacement]) == [0]
+    assert generator._cache_owner_requests == {
+        partial_request.request_id: replacement_binding
+    }
+
+
+def test_chunked_exact_auxiliary_failure_releases_owner_lease():
+    from vllm_mlx.mllm_batch_generator import install_chunked_prefill_mllm
+
+    generator = _chunked_generator()
+    binding = object()
+    release = MagicMock()
+    generator.prefix_cache = SimpleNamespace(release_owner_request=release)
+    generator._fetch_exact_prefix_auxiliary = lambda request_id, tokens: {
+        "last_logits": mx.zeros((1, 4))
+    }
+    generator._preprocess_request = lambda _request: None
+    generator._derive_request_rope_deltas = lambda _request: None
+    generator._process_prompts = MagicMock(
+        side_effect=RuntimeError("exact auxiliary processing failed")
+    )
+
+    request = MLLMBatchRequest(
+        uid=12,
+        request_id="chunked-exact-auxiliary-failure",
+        prompt="cached",
+    )
+    request.input_ids = mx.array([[1, 2]])
+    generator._cache_owner_requests[request.request_id] = binding
+    generator.unprocessed_requests.append(request)
+
+    install_chunked_prefill_mllm(generator, budget=2)
+    responses = generator._next()
+
+    assert len(responses) == 1
+    assert responses[0].request_id == request.request_id
+    assert responses[0].finish_reason == "error"
+    assert generator.unprocessed_requests == []
+    assert generator._cache_owner_requests == {}
+    release.assert_called_once_with(binding)
 
 
 def test_insert_mints_owner_request_and_abort_revokes_it():
@@ -278,6 +638,7 @@ def test_generator_has_no_direct_cache_publication_or_fetch_bypass():
                 "store",
                 "fetch",
                 "fetch_exact_auxiliary",
+                "clone_for_replay",
             }:
                 calls.append((self.functions[-1], node.func.attr))
             self.generic_visit(node)
@@ -293,6 +654,125 @@ def test_generator_has_no_direct_cache_publication_or_fetch_bypass():
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _test_runtime_composition_digest() -> str:
+    """Independently hash declared runtime files and installed dependencies."""
+    module_names = (
+        "vllm_mlx.cache_owner_identity",
+        "vllm_mlx.memory_cache",
+        "vllm_mlx.mllm_batch_generator",
+        "vllm_mlx.mllm_scheduler",
+        "vllm_mlx.scheduler",
+        "vllm_mlx.engine.batched",
+        "vllm_mlx.models.mllm",
+    )
+    repo_root = Path(__file__).parents[1]
+    module_digests = {
+        f"module:{module_name}": _sha256(
+            repo_root / Path(*module_name.split(".")).with_suffix(".py")
+        )
+        for module_name in module_names
+    }
+    dependency_versions = {
+        f"dependency:{distribution}": importlib_metadata.version(distribution)
+        for distribution in ("mlx", "mlx-lm", "mlx-vlm", "vllm-mlx")
+    }
+    return hashlib.sha256(
+        json.dumps(
+            {**module_digests, **dependency_versions},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_owner_cache_constructor_recomputes_and_validates_persistence_identity(
+    tmp_path, monkeypatch
+):
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    model, processor, target, cache_config, mode = _write_loaded_identity_fixture(
+        tmp_path
+    )
+    _patch_fixture_tokenizer_version(monkeypatch)
+    context = verify_loaded_model_cache_owner_context(
+        model,
+        processor,
+        str(tmp_path),
+        target,
+        cache_config=cache_config,
+        cache_runtime_identity={"max_kv_size": 1},
+        runtime_mode=mode,
+    )
+    cache_kwargs = dict(
+        model=model.language_model,
+        config=cache_config,
+        tokenizer=processor.tokenizer,
+        model_identity=str(tmp_path),
+        cache_runtime_identity={"max_kv_size": 1},
+        template_renderer=processor,
+    )
+
+    cache = MemoryAwarePrefixCache(
+        **cache_kwargs,
+        cache_owner_context=context,
+    )
+    assert dict(cache._persistence_identity) == dict(context.persistence_identity)
+
+    mismatched_identity = dict(context.persistence_identity)
+    mismatched_identity["model"] = "0" * 64
+    mismatched_context = SimpleNamespace(persistence_identity=mismatched_identity)
+    with pytest.raises(ValueError, match="verified cache owner provenance"):
+        MemoryAwarePrefixCache(
+            **cache_kwargs,
+            cache_owner_context=mismatched_context,
+        )
+
+
+def test_owner_generic_persistence_requires_exact_identity(tmp_path, monkeypatch):
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    model, processor, target, cache_config, mode = _write_loaded_identity_fixture(
+        tmp_path
+    )
+    _patch_fixture_tokenizer_version(monkeypatch)
+    context = verify_loaded_model_cache_owner_context(
+        model,
+        processor,
+        str(tmp_path),
+        target,
+        cache_config=cache_config,
+        cache_runtime_identity={"max_kv_size": 1},
+        runtime_mode=mode,
+    )
+    cache = MemoryAwarePrefixCache(
+        model.language_model,
+        cache_config,
+        tokenizer=processor.tokenizer,
+        model_identity=str(tmp_path),
+        cache_runtime_identity={"max_kv_size": 1},
+        template_renderer=processor,
+        cache_owner_context=context,
+    )
+    index = {
+        "version": 4,
+        "model_fingerprint": cache._model_fingerprint,
+        "num_entries": 0,
+        "total_memory_bytes": 0,
+        "entries": [],
+    }
+    (tmp_path / "index.json").write_text(json.dumps(index))
+    cache.invalidate_owner_identity = MagicMock()
+
+    assert cache.load_from_disk(str(tmp_path)) == 0
+    cache.invalidate_owner_identity.assert_called_once_with()
+
+    index["persistence_identity"] = dict(context.persistence_identity)
+    (tmp_path / "index.json").write_text(json.dumps(index))
+    assert cache.load_from_disk(str(tmp_path)) == 0
+    assert cache.invalidate_owner_identity.call_count == 2
 
 
 def _plain(value):
@@ -490,7 +970,7 @@ def _write_loaded_identity_fixture(root: Path):
         ),
         expected_identity_fields=expected_fields,
         expected_persistence_identity=persistence,
-        runtime_composition_digest=build_loaded_runtime_composition_digest(),
+        runtime_composition_digest=_test_runtime_composition_digest(),
         cache_namespace="fixture-cache",
         registry_source="test:fixture",
         registry_complete=True,
@@ -723,6 +1203,8 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     scheduler.request_id_to_uid = {}
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     scheduler._ensure_batch_generator = MagicMock()
     if isinstance(insert_result, Exception):
@@ -730,7 +1212,11 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     else:
         scheduler.batch_generator.insert.return_value = insert_result
 
-    assert scheduler._schedule_waiting() == []
+    with pytest.raises(
+        RuntimeError,
+        match="mint failed|atomic UID commit",
+    ):
+        scheduler._schedule_waiting()
 
     assert list(scheduler.waiting) == [request]
     assert request.status is RequestStatus.WAITING
@@ -738,6 +1224,75 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     assert scheduler.running == {}
     assert scheduler.request_id_to_uid == {}
     assert scheduler.uid_to_request_id == {}
+    assert scheduler.total_prompt_tokens == 0
+
+
+@pytest.mark.parametrize("insert_result", [[True], [-1]])
+def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="request-1", prompt="hello")
+    request.num_prompt_tokens = 3
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(max_num_seqs=1)
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.insert.return_value = insert_result
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(RuntimeError, match="atomic UID commit"):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == [request]
+    assert request.status is RequestStatus.WAITING
+    assert request.batch_uid is None
+    assert scheduler.running == {}
+    assert scheduler.request_id_to_uid == {}
+    assert scheduler.uid_to_request_id == {}
+    assert scheduler.total_prompt_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("insert_result", "requests", "existing_uids"),
+    [
+        ([0, 0], ["request-1", "request-2"], {}),
+        ([7], ["request-1"], {7: "existing-request"}),
+    ],
+)
+def test_scheduler_rejects_duplicate_or_colliding_uids_transactionally(
+    insert_result, requests, existing_uids
+):
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    waiting = []
+    for request_id in requests:
+        request = MLLMRequest(request_id=request_id, prompt="hello")
+        request.num_prompt_tokens = 3
+        waiting.append(request)
+    scheduler.waiting = deque(waiting)
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(max_num_seqs=len(waiting))
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = dict(existing_uids)
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.insert.return_value = insert_result
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(RuntimeError, match="atomic UID commit"):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == waiting
+    assert all(request.status is RequestStatus.WAITING for request in waiting)
+    assert all(request.batch_uid is None for request in waiting)
+    assert scheduler.running == {}
+    assert scheduler.request_id_to_uid == {}
+    assert scheduler.uid_to_request_id == dict(existing_uids)
     assert scheduler.total_prompt_tokens == 0
 
 
@@ -843,7 +1398,11 @@ def test_batched_engine_lifecycle_invalidates_then_rebinds_owner(operation):
     events.attach_mock(batch_generator.finish_cache_owner_lifecycle_mutation, "finish")
     events.attach_mock(prefix_cache.load_from_disk, "load")
     events.attach_mock(prefix_cache.clear, "clear")
-    scheduler = MagicMock(batch_generator=batch_generator)
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.batch_generator = batch_generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._mllm_scheduler = scheduler
     engine._engine = None
@@ -868,10 +1427,21 @@ def test_batched_engine_lifecycle_invalidates_then_rebinds_owner(operation):
 def test_batched_engine_rebinds_owner_when_cache_load_fails():
     from vllm_mlx.engine.batched import BatchedEngine
 
+    events = MagicMock()
     prefix_cache = MagicMock()
     prefix_cache.load_from_disk.side_effect = RuntimeError("corrupt cache")
     batch_generator = MagicMock(prefix_cache=prefix_cache)
-    scheduler = MagicMock(batch_generator=batch_generator)
+    events.attach_mock(batch_generator.begin_cache_owner_lifecycle_mutation, "begin")
+    events.attach_mock(
+        batch_generator.recover_cache_owner_lifecycle_mutation, "recover"
+    )
+    events.attach_mock(batch_generator.finish_cache_owner_lifecycle_mutation, "finish")
+    events.attach_mock(prefix_cache.load_from_disk, "load")
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.batch_generator = batch_generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._mllm_scheduler = scheduler
     engine._engine = None
@@ -879,7 +1449,11 @@ def test_batched_engine_rebinds_owner_when_cache_load_fails():
     with pytest.raises(RuntimeError, match="corrupt cache"):
         engine.load_cache_from_disk("cache-dir")
 
-    batch_generator.begin_cache_owner_lifecycle_mutation.assert_called_once_with()
+    assert events.mock_calls == [
+        call.begin(),
+        call.load("cache-dir"),
+        call.recover(),
+    ]
     batch_generator.finish_cache_owner_lifecycle_mutation.assert_not_called()
 
 
@@ -905,9 +1479,27 @@ def test_scheduler_cache_clear_stops_before_mutation_when_owner_is_active():
         "owner active"
     )
     scheduler.batch_generator = batch_generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
 
     with pytest.raises(RuntimeError, match="owner active"):
         scheduler.clear_runtime_caches()
 
     prefix_cache.clear.assert_not_called()
     batch_generator.finish_cache_owner_lifecycle_mutation.assert_not_called()
+
+
+def test_scheduler_cache_lifecycle_rejects_off_owner_thread():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident() + 1
+    scheduler._ensure_batch_generator = MagicMock()
+    scheduler.batch_generator = MagicMock()
+    operation = MagicMock()
+
+    with pytest.raises(RuntimeError, match="owner thread"):
+        scheduler.run_cache_owner_lifecycle_mutation(operation)
+
+    operation.assert_not_called()
+    scheduler._ensure_batch_generator.assert_not_called()

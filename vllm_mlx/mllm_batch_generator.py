@@ -16,6 +16,7 @@ Architecture:
 3. Language model generation is batched using BatchKVCache (like LLM batching)
 """
 
+import copy
 import logging
 import math
 import os
@@ -348,6 +349,114 @@ class MLLMBatch:
         if self._row_filter_hook is not None and self.uids:
             self._row_filter_hook(list(self.uids), [])
 
+    @staticmethod
+    def _cache_transaction_snapshot(value: Any, memo: Optional[Dict[int, Any]] = None):
+        """Copy cache wrapper state without copying immutable MLX arrays.
+
+        Cache ``extend`` methods are in-place, and a later layer can fail after
+        an earlier layer has already extended successfully.  A structural
+        snapshot lets ``extend`` restore those Python-side mutations without
+        duplicating the potentially very large MLX buffers.
+        """
+        if memo is None:
+            memo = {}
+
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+
+        if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
+            return value
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            # MLX arrays are immutable values from the cache's perspective;
+            # cache extension replaces array attributes rather than mutating
+            # their storage in place.
+            return value
+        if isinstance(value, list):
+            list_snapshot: list[Any] = []
+            memo[value_id] = list_snapshot
+            list_snapshot.extend(
+                MLLMBatch._cache_transaction_snapshot(item, memo) for item in value
+            )
+            return list_snapshot
+        if isinstance(value, tuple):
+            tuple_snapshot = tuple(
+                MLLMBatch._cache_transaction_snapshot(item, memo) for item in value
+            )
+            memo[value_id] = tuple_snapshot
+            return tuple_snapshot
+        if isinstance(value, dict):
+            dict_snapshot: dict[Any, Any] = {}
+            memo[value_id] = dict_snapshot
+            dict_snapshot.update(
+                (
+                    key,
+                    MLLMBatch._cache_transaction_snapshot(item, memo),
+                )
+                for key, item in value.items()
+            )
+            return dict_snapshot
+        if isinstance(value, set):
+            set_snapshot = {
+                MLLMBatch._cache_transaction_snapshot(item, memo) for item in value
+            }
+            memo[value_id] = set_snapshot
+            return set_snapshot
+
+        try:
+            snapshot = copy.copy(value)
+        except Exception as exc:
+            raise TypeError(
+                f"cannot snapshot cache state for {type(value).__name__}"
+            ) from exc
+        memo[value_id] = snapshot
+
+        if hasattr(value, "__dict__"):
+            snapshot.__dict__.clear()
+            snapshot.__dict__.update(
+                (
+                    key,
+                    MLLMBatch._cache_transaction_snapshot(item, memo),
+                )
+                for key, item in value.__dict__.items()
+            )
+        else:
+            slots = getattr(type(value), "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot == "__weakref__" or not hasattr(value, slot):
+                    continue
+                setattr(
+                    snapshot,
+                    slot,
+                    MLLMBatch._cache_transaction_snapshot(getattr(value, slot), memo),
+                )
+        return snapshot
+
+    @staticmethod
+    def _restore_cache_transaction(value: Any, snapshot: Any) -> None:
+        """Restore one cache wrapper from ``_cache_transaction_snapshot``."""
+        if isinstance(value, list):
+            value[:] = snapshot
+            return
+        if isinstance(value, dict):
+            value.clear()
+            value.update(snapshot)
+            return
+        if hasattr(value, "__dict__") and hasattr(snapshot, "__dict__"):
+            value.__dict__.clear()
+            value.__dict__.update(snapshot.__dict__)
+            return
+
+        slots = getattr(type(value), "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot == "__weakref__" or not hasattr(snapshot, slot):
+                continue
+            setattr(value, slot, getattr(snapshot, slot))
+
     def extend(self, other: "MLLMBatch") -> None:
         """
         Extend this batch with another batch.
@@ -355,43 +464,75 @@ class MLLMBatch:
         Args:
             other: Batch to merge into this one
         """
-        self.uids.extend(other.uids)
-        self.request_ids.extend(other.request_ids)
-        self.y = mx.concatenate([self.y, other.y])
-        self.logprobs.extend(other.logprobs)
-        self.num_tokens.extend(other.num_tokens)
-        self.max_tokens.extend(other.max_tokens)
-        self.requests.extend(other.requests)
+        # Stage every operation that can fail before committing metadata.  In
+        # particular, MLX shape errors must not leave ``self`` with a longer
+        # UID/request list and a pre-concatenation token array.
+        self_len = len(self.uids)
+        other_len = len(other.uids)
+        uids = self.uids + other.uids
+        request_ids = self.request_ids + other.request_ids
+        y = mx.concatenate([self.y, other.y])
+        logprobs = self.logprobs + other.logprobs
+        num_tokens = self.num_tokens + other.num_tokens
+        max_tokens = self.max_tokens + other.max_tokens
+        requests = self.requests + other.requests
 
-        # Extend logits_processors
+        logits_processors = self.logits_processors
         if self.logits_processors is not None or other.logits_processors is not None:
-            # At this point self.uids already includes other.uids from extend above
-            self_len = len(self.uids) - len(other.uids)
             self_lp = self.logits_processors or [None] * self_len
-            other_lp = other.logits_processors or [None] * len(other.uids)
-            self.logits_processors = list(self_lp) + list(other_lp)
+            other_lp = other.logits_processors or [None] * other_len
+            logits_processors = list(self_lp) + list(other_lp)
 
-        # Extend samplers
+        samplers = self.samplers
         if self.samplers is not None or other.samplers is not None:
-            self_len = len(self.uids) - len(other.uids)
             self_s = self.samplers or [None] * self_len
-            other_s = other.samplers or [None] * len(other.uids)
-            self.samplers = list(self_s) + list(other_s)
+            other_s = other.samplers or [None] * other_len
+            samplers = list(self_s) + list(other_s)
+
+        if len(self.cache) != len(other.cache):
+            raise ValueError(
+                "cannot extend MLLM batches with different cache layer counts"
+            )
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5. Some
         # cache integrations, such as quantized SDPA caches, expose state only
-        # through empty()/extend() and do not publish .keys.
+        # through empty()/extend() and do not publish .keys.  Cache extension
+        # is transactional too: cache layers are in-place objects and a later
+        # layer may fail after an earlier layer has already changed.
+        cache_extensions = []
         for c, o in zip(self.cache, other.cache):
-            if c is not None and o is not None and hasattr(c, "extend"):
-                try:
-                    has_kv = hasattr(c, "keys") and c.keys is not None
-                    has_arrays = hasattr(c, "cache")
-                    has_extendable_state = hasattr(c, "empty") and not c.empty()
-                    if has_kv or has_arrays or has_extendable_state:
-                        c.extend(o)
-                except Exception as e:
-                    logger.warning(f"Failed to extend cache: {e}")
+            if c is None or o is None or not hasattr(c, "extend"):
+                continue
+            has_kv = hasattr(c, "keys") and c.keys is not None
+            has_arrays = hasattr(c, "cache")
+            has_extendable_state = hasattr(c, "empty") and not c.empty()
+            if has_kv or has_arrays or has_extendable_state:
+                cache_extensions.append((c, o))
+
+        snapshots = [
+            (c, self._cache_transaction_snapshot(c)) for c, _ in cache_extensions
+        ]
+        try:
+            for c, o in cache_extensions:
+                c.extend(o)
+        except Exception:
+            for c, snapshot in reversed(snapshots):
+                self._restore_cache_transaction(c, snapshot)
+            raise
+
+        # Commit only after token concatenation, metadata construction, and all
+        # cache extensions have succeeded.  Slice assignment preserves the
+        # existing list identities for callers that hold those lists.
+        self.uids[:] = uids
+        self.request_ids[:] = request_ids
+        self.y = y
+        self.logprobs[:] = logprobs
+        self.num_tokens[:] = num_tokens
+        self.max_tokens[:] = max_tokens
+        self.requests[:] = requests
+        self.logits_processors = logits_processors
+        self.samplers = samplers
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
@@ -622,6 +763,7 @@ class MLLMBatchGenerator:
         self._cache_owner_required = cache_owner_context is not None
         self._cache_owner_context = cache_owner_context
         self._cache_owner_requests: Dict[str, Any] = {}
+        self._cache_owner_lifecycle_mutating = False
 
         # Deferred removal queue — UIDs scheduled for removal from another
         # thread (typically the event loop on client disconnect).  The
@@ -822,6 +964,8 @@ class MLLMBatchGenerator:
         if not self._cache_owner_enabled():
             return
         with self._prefix_checkpoint_lock:
+            if getattr(self, "_cache_owner_lifecycle_mutating", False):
+                raise RuntimeError("owner-bound cache lifecycle mutation is active")
             live_bindings = bool(self._cache_owner_requests)
             live_checkpoints = bool(self._request_prefix_checkpoints)
         partial = getattr(self, "_partial", None)
@@ -835,11 +979,31 @@ class MLLMBatchGenerator:
             raise RuntimeError(
                 "owner-bound cache lifecycle mutation requires an idle generator"
             )
+        with self._prefix_checkpoint_lock:
+            if self._cache_owner_requests or self._request_prefix_checkpoints:
+                raise RuntimeError(
+                    "owner-bound cache lifecycle changed during mutation admission"
+                )
+            self._cache_owner_lifecycle_mutating = True
 
     def finish_cache_owner_lifecycle_mutation(self) -> None:
         """Rebind after a successful cache lifecycle mutation."""
 
         self.rebind_cache_owner_context()
+        with self._prefix_checkpoint_lock:
+            self._cache_owner_lifecycle_mutating = False
+
+    def recover_cache_owner_lifecycle_mutation(self) -> None:
+        """Recover a failed mutation to a known-empty, rebound owner state."""
+
+        if not self._cache_owner_enabled():
+            return
+        if self.prefix_cache is None:
+            raise RuntimeError("owner-bound prefix cache is unavailable")
+        self.prefix_cache.clear()
+        self.rebind_cache_owner_context()
+        with self._prefix_checkpoint_lock:
+            self._cache_owner_lifecycle_mutating = False
 
     def _prepare_prefix_store(
         self,
@@ -1036,6 +1200,8 @@ class MLLMBatchGenerator:
                 raise RuntimeError("owner-bound prefix cache is unavailable")
             request_ids = [request.request_id for request in requests]
             with self._prefix_checkpoint_lock:
+                if getattr(self, "_cache_owner_lifecycle_mutating", False):
+                    raise RuntimeError("owner-bound cache lifecycle mutation is active")
                 duplicate = len(set(request_ids)) != len(request_ids) or any(
                     request_id in self._cache_owner_requests
                     for request_id in request_ids
@@ -1373,7 +1539,7 @@ class MLLMBatchGenerator:
     def _clone_prefix_storage(self, cache_list):
         """Clone backing without authorizing use of a shared cache hit."""
 
-        clone = getattr(self.prefix_cache, "clone_for_replay", None)
+        clone = getattr(self.prefix_cache, "_clone_for_replay_unchecked", None)
         if callable(clone):
             return clone(cache_list)
         return self._copy_prefix_cache(cache_list)
@@ -4305,13 +4471,21 @@ def install_chunked_prefill_mllm(
                     if batch_gen._fetch_exact_prefix_auxiliary(
                         text_only_req.request_id, input_ids_list
                     ):
-                        batch_gen.unprocessed_requests.remove(text_only_req)
-                        new_batch = batch_gen._process_prompts([text_only_req])
-                        if new_batch is not None:
-                            if batch_gen.active_batch is not None:
-                                batch_gen.active_batch.extend(new_batch)
-                            else:
-                                batch_gen.active_batch = new_batch
+                        try:
+                            batch_gen.unprocessed_requests.remove(text_only_req)
+                            new_batch = batch_gen._process_prompts([text_only_req])
+                            if new_batch is not None:
+                                if batch_gen.active_batch is not None:
+                                    batch_gen.active_batch.extend(new_batch)
+                                else:
+                                    batch_gen.active_batch = new_batch
+                        except Exception as e:
+                            batch_gen._fail_inline_requests([text_only_req])
+                            logger.warning(
+                                f"[chunked-prefill-mllm] Failed to process "
+                                f"exact-auxiliary request "
+                                f"{text_only_req.request_id}: {e}"
+                            )
                         return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
@@ -4473,11 +4647,19 @@ def install_chunked_prefill_mllm(
     _orig_remove = batch_gen.remove
 
     def _patched_remove(uids: List[int]) -> None:
-        if batch_gen._partial is not None:
-            if batch_gen._partial["request"].uid in set(uids):
-                batch_gen._partial = None
-                mx.clear_cache()
+        uid_set = set(uids)
+        partial = batch_gen._partial
+        partial_uid = (
+            partial["request"].uid
+            if isinstance(partial, dict) and partial.get("request") is not None
+            else None
+        )
+        # Let the original remover discover the partial request and release its
+        # owner lease before clearing the only remaining request reference.
         _orig_remove(uids)
+        if partial_uid is not None and partial_uid in uid_set:
+            batch_gen._partial = None
+            mx.clear_cache()
 
     batch_gen.remove = _patched_remove
     batch_gen._next = _chunked_next

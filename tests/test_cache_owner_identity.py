@@ -232,6 +232,23 @@ def test_cache_callsite_rechecks_cancel_and_release_before_publication():
     assert committed == []
 
 
+def test_prepared_store_rechecks_revocation_before_handle_registration():
+    cache = _cache()
+    cache.bind_owner_context(cache._cache_owner_context)
+    request = cache.mint_owner_request(sequence_revision=1)
+
+    def prepare_store(self, tokens, *_args, **_kwargs):
+        self.cancel_owner_request(request)
+        return SimpleNamespace(tokens=tuple(tokens), cache=[object()], memory_bytes=16)
+
+    cache._prepare_store_unchecked = MethodType(prepare_store, cache)
+    decision, prepared = cache.prepare_owner_bound_store(request, [1, 2], [object()])
+
+    assert decision.reason == "cancellation"
+    assert prepared is None
+    assert cache._owner_prepared_entries == {}
+
+
 def test_cache_callsite_publishes_only_current_owner_request():
     cache = _cache()
     binding = cache.bind_owner_context(cache._cache_owner_context)
@@ -393,7 +410,7 @@ def test_cache_replay_rechecks_request_after_clone():
         cache.cancel_owner_request(request)
         return list(value)
 
-    cache.clone_for_replay = cancel_during_clone
+    cache._clone_for_replay_unchecked = cancel_during_clone
     decision, cloned = cache.clone_owner_bound_for_replay(request, ["state"])
 
     assert decision.reason == "cancellation"

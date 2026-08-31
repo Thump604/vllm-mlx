@@ -465,6 +465,7 @@ class BatchedEngine(BaseEngine):
 
         cache_owner_context = None
         cache_owner_target = getattr(self._scheduler_config, "cache_owner_target", None)
+        model_source = self._model_name
         if cache_owner_target is not None:
             if not enable_prefix_cache or not use_memory_aware_cache:
                 raise ValueError(
@@ -506,9 +507,12 @@ class BatchedEngine(BaseEngine):
             )
 
             normalize_prefix_cache_chat_template(self._processor)
-            model_source = getattr(self._mllm_instance, "resolved_model_path", None)
-            if not isinstance(model_source, str) or not model_source:
+            resolved_model_source = getattr(
+                self._mllm_instance, "resolved_model_path", None
+            )
+            if not isinstance(resolved_model_source, str) or not resolved_model_source:
                 raise ValueError("cache owner requires the loader-resolved model root")
+            model_source = resolved_model_source
             cache_config = MemoryCacheConfig(
                 max_memory_mb=prefix_cache_memory_mb,
                 kv_quantize=kv_quant,
@@ -543,7 +547,7 @@ class BatchedEngine(BaseEngine):
             max_kv_size=max_kv_size,
             ssd_cache_dir=ssd_cache_dir,
             ssd_cache_max_gb=ssd_cache_max_gb,
-            model_identity=self._model_name,
+            model_identity=model_source,
             cache_owner_context=cache_owner_context,
             **mllm_extra,
         )
@@ -1392,10 +1396,9 @@ class BatchedEngine(BaseEngine):
             batch_generator = self._mllm_scheduler.batch_generator
             pc = batch_generator.prefix_cache
             if pc is not None:
-                batch_generator.begin_cache_owner_lifecycle_mutation()
-                loaded = pc.load_from_disk(cache_dir)
-                batch_generator.finish_cache_owner_lifecycle_mutation()
-                return loaded
+                return self._mllm_scheduler.run_cache_owner_lifecycle_mutation(
+                    pc.load_from_disk, cache_dir
+                )
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0
@@ -1425,10 +1428,9 @@ class BatchedEngine(BaseEngine):
             snapshot = await self._run_cache_io(
                 pc.read_hybrid_persistence_snapshot, cache_dir
             )
-            batch_generator.begin_cache_owner_lifecycle_mutation()
-            loaded = pc.restore_hybrid_persistence_snapshot(snapshot)
-            batch_generator.finish_cache_owner_lifecycle_mutation()
-            return loaded
+            return self._mllm_scheduler.run_cache_owner_lifecycle_mutation(
+                pc.restore_hybrid_persistence_snapshot, snapshot
+            )
         return await self._run_cache_io(self.load_cache_from_disk, cache_dir)
 
     @staticmethod
@@ -1454,9 +1456,7 @@ class BatchedEngine(BaseEngine):
             batch_generator = self._mllm_scheduler.batch_generator
             pc = batch_generator.prefix_cache
             if pc is not None and hasattr(pc, "clear"):
-                batch_generator.begin_cache_owner_lifecycle_mutation()
-                pc.clear()
-                batch_generator.finish_cache_owner_lifecycle_mutation()
+                self._mllm_scheduler.run_cache_owner_lifecycle_mutation(pc.clear)
                 return
         if self._engine and hasattr(self._engine, "clear_prefix_cache"):
             self._engine.clear_prefix_cache()

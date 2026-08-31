@@ -120,6 +120,9 @@ class TestBatchedEngineCacheRestore:
             scheduler.batch_generator = MagicMock(prefix_cache=prefix_cache)
 
         scheduler._ensure_batch_generator.side_effect = ensure_batch_generator
+        scheduler.run_cache_owner_lifecycle_mutation.side_effect = (
+            lambda operation, *args: operation(*args)
+        )
         engine._mllm_scheduler = scheduler
 
         loaded = engine.load_cache_from_disk("/tmp/cache")
@@ -181,6 +184,9 @@ class TestBatchedEngineCacheRestore:
         prefix_cache.read_hybrid_persistence_snapshot.side_effect = read
         prefix_cache.restore_hybrid_persistence_snapshot.side_effect = restore
         scheduler = MagicMock(batch_generator=MagicMock(prefix_cache=prefix_cache))
+        scheduler.run_cache_owner_lifecycle_mutation.side_effect = (
+            lambda operation, *args: operation(*args)
+        )
         engine._mllm_scheduler = scheduler
 
         assert await engine.restore_cache_from_disk("/tmp/cache") == 1

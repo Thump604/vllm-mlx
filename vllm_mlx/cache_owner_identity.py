@@ -334,6 +334,7 @@ def build_loaded_runtime_composition_digest() -> str:
         "vllm_mlx.memory_cache",
         "vllm_mlx.mllm_batch_generator",
         "vllm_mlx.mllm_scheduler",
+        "vllm_mlx.scheduler",
         "vllm_mlx.engine.batched",
         "vllm_mlx.models.mllm",
     )

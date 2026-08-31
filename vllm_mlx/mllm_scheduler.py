@@ -20,6 +20,7 @@ Architecture:
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 
@@ -243,6 +244,10 @@ class MLLMScheduler:
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
+        # Scheduler state and generator insertion form one transaction.  This
+        # also serializes cache lifecycle mutations with request admission.
+        self._state_lock = threading.RLock()
+        self._owner_thread_id = threading.get_ident()
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
         self._detokenizer_pool: Dict[str, Any] = {}
@@ -445,6 +450,7 @@ class MLLMScheduler:
         Returns:
             Request ID for tracking
         """
+        self._assert_owner_thread()
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -482,8 +488,11 @@ class MLLMScheduler:
         except Exception:
             pass
 
-        self.requests[request_id] = request
-        self.waiting.append(request)
+        with self._state_lock:
+            if request_id in self.requests:
+                raise ValueError(f"duplicate MLLM request ID: {request_id}")
+            self.requests[request_id] = request
+            self.waiting.append(request)
 
         logger.debug(
             f"Added MLLM request {request_id}: "
@@ -493,6 +502,11 @@ class MLLMScheduler:
         return request_id
 
     def abort_request(self, request_id: str) -> bool:
+        self._assert_owner_thread()
+        with self._state_lock:
+            return self._abort_request_locked(request_id)
+
+    def _abort_request_locked(self, request_id: str) -> bool:
         """
         Abort a request.
 
@@ -590,71 +604,85 @@ class MLLMScheduler:
         Returns:
             List of requests that were scheduled
         """
-        self._ensure_batch_generator()
+        self._assert_owner_thread()
+        with self._state_lock:
+            self._ensure_batch_generator()
 
-        available = max(0, self.config.max_num_seqs - len(self.running))
-        scheduled = list(self.waiting)[:available]
-        batch_requests = []
-
-        for request in scheduled:
-
-            # Create batch request
-            batch_req = MLLMBatchRequest(
-                uid=-1,  # Will be assigned by batch generator
-                request_id=request.request_id,
-                prompt=request.prompt,
-                images=request.images,
-                videos=request.videos,
-                audio=request.audio,
-                max_tokens=request.sampling_params.max_tokens,
-                temperature=request.sampling_params.temperature,
-                top_p=request.sampling_params.top_p,
-                top_k=request.sampling_params.top_k,
-                min_p=request.sampling_params.min_p,
-                presence_penalty=request.sampling_params.presence_penalty,
-                repetition_penalty=request.sampling_params.repetition_penalty,
-                logits_processors=request.sampling_params.logits_processors,
-                mllm_draft=request.mllm_draft,
-            )
-            batch_requests.append(batch_req)
-
-        # The generator owns request bindings. Commit scheduler state only
-        # after it returns one UID for every selected request.
-        if batch_requests and self.batch_generator is None:
-            raise RuntimeError("MLLM batch generator is unavailable")
-        if batch_requests and self.batch_generator is not None:
-            try:
-                uids = self.batch_generator.insert(batch_requests)
-            except Exception as exc:
-                logger.error("Failed to insert waiting MLLM requests: %s", exc)
-                return []
-            if len(uids) != len(scheduled):
-                if uids:
-                    self.batch_generator.remove(list(uids))
-                logger.error(
-                    "MLLM generator returned %s UIDs for %s requests",
-                    len(uids),
-                    len(scheduled),
-                )
-                return []
+            available = max(0, self.config.max_num_seqs - len(self.running))
+            scheduled = list(self.waiting)[:available]
+            batch_requests = []
 
             for request in scheduled:
-                if not self.waiting or self.waiting[0] is not request:
-                    self.batch_generator.remove(list(uids))
-                    raise RuntimeError("MLLM waiting queue changed during insertion")
-                self.waiting.popleft()
 
-            for uid, request in zip(uids, scheduled):
-                request.status = RequestStatus.RUNNING
-                self.running[request.request_id] = request
-                self.request_id_to_uid[request.request_id] = uid
-                self.uid_to_request_id[uid] = request.request_id
-                request.batch_uid = uid
-                self.total_prompt_tokens += request.num_prompt_tokens
+                # Create batch request
+                batch_req = MLLMBatchRequest(
+                    uid=-1,  # Will be assigned by batch generator
+                    request_id=request.request_id,
+                    prompt=request.prompt,
+                    images=request.images,
+                    videos=request.videos,
+                    audio=request.audio,
+                    max_tokens=request.sampling_params.max_tokens,
+                    temperature=request.sampling_params.temperature,
+                    top_p=request.sampling_params.top_p,
+                    top_k=request.sampling_params.top_k,
+                    min_p=request.sampling_params.min_p,
+                    presence_penalty=request.sampling_params.presence_penalty,
+                    repetition_penalty=request.sampling_params.repetition_penalty,
+                    logits_processors=request.sampling_params.logits_processors,
+                    mllm_draft=request.mllm_draft,
+                )
+                batch_requests.append(batch_req)
 
-                logger.debug(f"Scheduled request {request.request_id} (uid={uid})")
+            # The generator owns request bindings. Commit scheduler state only
+            # after it returns one UID for every selected request.
+            if batch_requests and self.batch_generator is None:
+                raise RuntimeError("MLLM batch generator is unavailable")
+            if batch_requests and self.batch_generator is not None:
+                uids = self.batch_generator.insert(batch_requests)
+                valid_uids = (
+                    len(uids) == len(scheduled)
+                    and all(
+                        isinstance(uid, int) and not isinstance(uid, bool)
+                        for uid in uids
+                    )
+                    and all(uid >= 0 for uid in uids)
+                    and len(set(uids)) == len(uids)
+                    and not any(uid in self.uid_to_request_id for uid in uids)
+                )
+                queue_unchanged = list(self.waiting)[: len(scheduled)] == scheduled
+                if not valid_uids or not queue_unchanged:
+                    removable = [
+                        uid
+                        for uid in uids
+                        if isinstance(uid, int)
+                        and not isinstance(uid, bool)
+                        and uid >= 0
+                    ]
+                    if removable:
+                        self.batch_generator.remove(list(dict.fromkeys(removable)))
+                    raise RuntimeError(
+                        "MLLM generator insertion did not produce an atomic UID commit"
+                    )
+
+                for _ in scheduled:
+                    self.waiting.popleft()
+
+                for uid, request in zip(uids, scheduled):
+                    request.status = RequestStatus.RUNNING
+                    self.running[request.request_id] = request
+                    self.request_id_to_uid[request.request_id] = uid
+                    self.uid_to_request_id[uid] = request.request_id
+                    request.batch_uid = uid
+                    self.total_prompt_tokens += request.num_prompt_tokens
+
+                    logger.debug(f"Scheduled request {request.request_id} (uid={uid})")
 
         return scheduled
+
+    def _assert_owner_thread(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise RuntimeError("MLLM cache lifecycle must run on the owner thread")
 
     def _process_batch_responses(
         self, responses: List[MLLMBatchResponse]
@@ -1318,6 +1346,7 @@ class MLLMScheduler:
 
     def clear_runtime_caches(self) -> Dict[str, bool]:
         """Clear runtime caches without resetting scheduler/request state."""
+        self._assert_owner_thread()
         cleared = {
             "vision_cache": False,
             "prefix_cache": False,
@@ -1329,11 +1358,29 @@ class MLLMScheduler:
             self.batch_generator is not None
             and self.batch_generator.prefix_cache is not None
         ):
-            self.batch_generator.begin_cache_owner_lifecycle_mutation()
-            self.batch_generator.prefix_cache.clear()
-            self.batch_generator.finish_cache_owner_lifecycle_mutation()
+            self.run_cache_owner_lifecycle_mutation(
+                self.batch_generator.prefix_cache.clear
+            )
             cleared["prefix_cache"] = True
         return cleared
+
+    def run_cache_owner_lifecycle_mutation(self, operation, *args):
+        """Serialize one cache mutation on the MLLM model-owner thread."""
+
+        self._assert_owner_thread()
+        with self._state_lock:
+            self._ensure_batch_generator()
+            batch_generator = self.batch_generator
+            if batch_generator is None:
+                raise RuntimeError("MLLM batch generator is unavailable")
+            batch_generator.begin_cache_owner_lifecycle_mutation()
+            try:
+                result = operation(*args)
+            except BaseException:
+                batch_generator.recover_cache_owner_lifecycle_mutation()
+                raise
+            batch_generator.finish_cache_owner_lifecycle_mutation()
+            return result
 
     def reset(self) -> None:
         """Reset the scheduler state."""

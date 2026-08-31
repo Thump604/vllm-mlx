@@ -1447,27 +1447,36 @@ class MemoryAwarePrefixCache:
         self._cache_runtime_identity = dict(cache_runtime_identity or {})
         self._model_fingerprint = _compute_model_fingerprint(model)
         try:
-            if cache_owner_context is not None:
-                self._persistence_identity = dict(
-                    cache_owner_context.persistence_identity
+            if cache_owner_context is not None and not model_identity:
+                raise ValueError(
+                    "owner-bound cache requires the loader-resolved model identity"
                 )
-            else:
-                self._persistence_identity = {
-                    "model": (
-                        _compute_model_persistence_fingerprint(model, model_identity)
-                        if model_identity
-                        else ""
-                    ),
-                    "tokenizer": _compute_tokenizer_persistence_fingerprint(
-                        tokenizer, template_renderer
-                    ),
-                    "cache_layout": _cache_topology_fingerprint(
-                        _cache_topology(model),
-                        self._config,
-                        self._cache_runtime_identity,
-                    ),
-                }
+            self._persistence_identity = {
+                "model": (
+                    _compute_model_persistence_fingerprint(model, model_identity)
+                    if model_identity
+                    else ""
+                ),
+                "tokenizer": _compute_tokenizer_persistence_fingerprint(
+                    tokenizer, template_renderer
+                ),
+                "cache_layout": _cache_topology_fingerprint(
+                    _cache_topology(model),
+                    self._config,
+                    self._cache_runtime_identity,
+                ),
+            }
+            if (
+                cache_owner_context is not None
+                and dict(cache_owner_context.persistence_identity)
+                != self._persistence_identity
+            ):
+                raise ValueError(
+                    "verified cache owner provenance does not match live cache"
+                )
         except Exception as exc:
+            if cache_owner_context is not None:
+                raise
             logger.warning(
                 "[cache_persist] strict identity unavailable; restart persistence "
                 "disabled: %s: %s",
@@ -1880,8 +1889,20 @@ class MemoryAwarePrefixCache:
             tokens=tuple(entry.tokens),
             memory_bytes=int(entry.memory_bytes),
         )
-        with self._memory_lock:
-            self._owner_prepared_entries[prepared.handle_id] = (prepared, entry)
+
+        def register() -> bool:
+            with self._memory_lock:
+                self._owner_prepared_entries[prepared.handle_id] = (prepared, entry)
+            return True
+
+        owner = self._owner_identity
+        if owner is None:
+            return OwnerBindingDecision(False, "cache_unsafe"), None
+        decision = owner._commit_request(request_binding, register)
+        if not decision.accepted:
+            with self._memory_lock:
+                self._owner_prepared_entries.pop(prepared.handle_id, None)
+            return decision, None
         return decision, prepared
 
     def _resolve_owner_prepared_entry(
@@ -1943,7 +1964,7 @@ class MemoryAwarePrefixCache:
         decision = self.validate_owner_request(request_binding)
         if not decision.accepted:
             return decision, None
-        cloned = self.clone_for_replay(cache)
+        cloned = self._clone_for_replay_unchecked(cache)
         decision = self.validate_owner_request(request_binding)
         return (decision, cloned if decision.accepted else None)
 
@@ -2224,7 +2245,7 @@ class MemoryAwarePrefixCache:
         )
         return True
 
-    def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
+    def _clone_for_replay_unchecked(self, cache: list[Any]) -> list[Any] | None:
         """Return independently owned backing for a mutating model replay."""
         try:
             with self._copy_lock:
@@ -2875,6 +2896,11 @@ class MemoryAwarePrefixCache:
         index = {
             "version": _CACHE_PERSIST_VERSION,
             "model_fingerprint": self._model_fingerprint,
+            "persistence_identity": (
+                dict(self._persistence_identity)
+                if all(self._persistence_identity.values())
+                else None
+            ),
             "num_entries": len(self._entries),
             "total_memory_bytes": self._current_memory,
             "entries": [],
@@ -2963,6 +2989,20 @@ class MemoryAwarePrefixCache:
             )
             return 0
 
+        if self._cache_owner_context is not None:
+            disk_identity = index.get("persistence_identity")
+            if not isinstance(disk_identity, dict):
+                logger.warning(
+                    "[cache_persist] owner-bound cache rejects legacy weak identity"
+                )
+                return 0
+            if disk_identity != self._persistence_identity:
+                logger.warning(
+                    "[cache_persist] strict persistence identity mismatch; "
+                    "discarding incompatible cache"
+                )
+                return 0
+
         try:
             from mlx_lm.models.cache import load_prompt_cache
         except ImportError:
@@ -2977,7 +3017,6 @@ class MemoryAwarePrefixCache:
                 f"discarding incompatible cache"
             )
             return 0
-
         loaded = 0
         for entry_meta in index.get("entries", []):
             i = entry_meta["index"]
