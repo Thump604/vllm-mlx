@@ -241,12 +241,22 @@ def test_prepared_store_rechecks_revocation_before_handle_registration():
         self.cancel_owner_request(request)
         return SimpleNamespace(tokens=tuple(tokens), cache=[object()], memory_bytes=16)
 
+    class RecordingPreparedEntries(dict):
+        registrations = 0
+
+        def __setitem__(self, key, value):
+            self.registrations += 1
+            super().__setitem__(key, value)
+
+    prepared_entries = RecordingPreparedEntries()
+    cache._owner_prepared_entries = prepared_entries
     cache._prepare_store_unchecked = MethodType(prepare_store, cache)
     decision, prepared = cache.prepare_owner_bound_store(request, [1, 2], [object()])
 
     assert decision.reason == "cancellation"
     assert prepared is None
     assert cache._owner_prepared_entries == {}
+    assert prepared_entries.registrations == 0
 
 
 def test_prepared_store_removes_handle_when_revoked_during_registration():

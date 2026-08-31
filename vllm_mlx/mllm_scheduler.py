@@ -640,11 +640,7 @@ class MLLMScheduler:
                 raise RuntimeError("MLLM batch generator is unavailable")
             if batch_requests and self.batch_generator is not None:
                 request_ids = [request.request_id for request in scheduled]
-                try:
-                    uids = self.batch_generator.insert(batch_requests)
-                except BaseException:
-                    self.batch_generator.rollback_inserted_requests(request_ids)
-                    raise
+                uids = self.batch_generator.insert(batch_requests)
                 uid_sequence = isinstance(uids, (list, tuple))
                 valid_uids = (
                     uid_sequence

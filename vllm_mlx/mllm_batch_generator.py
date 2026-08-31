@@ -17,6 +17,7 @@ Architecture:
 """
 
 import copy
+from contextlib import nullcontext
 import logging
 import math
 import os
@@ -760,7 +761,7 @@ class MLLMBatchGenerator:
         self._aborted_request_ids: set = set()
         # Metadata-only synchronization between checkpoint publication and
         # cancellation. The lock is never held across MLX evaluation.
-        self._prefix_checkpoint_lock = threading.Lock()
+        self._prefix_checkpoint_lock = threading.RLock()
         self._request_prefix_checkpoints: Dict[str, Dict[str, Any]] = {}
         self._cache_owner_required = cache_owner_context is not None
         self._cache_owner_context = cache_owner_context
@@ -985,6 +986,10 @@ class MLLMBatchGenerator:
                 "owner-bound cache lifecycle mutation requires an idle generator"
             )
         with self._prefix_checkpoint_lock:
+            if getattr(self, "_cache_owner_lifecycle_failed", False):
+                raise RuntimeError("owner-bound cache lifecycle is terminally failed")
+            if getattr(self, "_cache_owner_lifecycle_mutating", False):
+                raise RuntimeError("owner-bound cache lifecycle mutation is active")
             if self._cache_owner_requests or self._request_prefix_checkpoints:
                 raise RuntimeError(
                     "owner-bound cache lifecycle changed during mutation admission"
@@ -1010,6 +1015,9 @@ class MLLMBatchGenerator:
         if not self._cache_owner_enabled():
             return
         if self.prefix_cache is None:
+            with self._prefix_checkpoint_lock:
+                self._cache_owner_lifecycle_failed = True
+                self._cache_owner_lifecycle_mutating = False
             raise RuntimeError("owner-bound prefix cache is unavailable")
         try:
             self.prefix_cache.clear()
@@ -1236,32 +1244,40 @@ class MLLMBatchGenerator:
         original_uid_counter = self.uid_counter
         uids = []
         minted_request_ids = []
-        try:
-            for req in requests:
-                req.uid = self.uid_counter
-                self.uid_counter += 1
-                if owner_enabled:
-                    assert prefix_cache is not None
-                    binding = prefix_cache.mint_owner_request(req.uid)
-                    with self._prefix_checkpoint_lock:
+        owner_lock = self._prefix_checkpoint_lock if owner_enabled else nullcontext()
+        with owner_lock:
+            if owner_enabled:
+                if getattr(self, "_cache_owner_lifecycle_failed", False):
+                    raise RuntimeError(
+                        "owner-bound cache lifecycle is terminally failed"
+                    )
+                if getattr(self, "_cache_owner_lifecycle_mutating", False):
+                    raise RuntimeError("owner-bound cache lifecycle mutation is active")
+            try:
+                for req in requests:
+                    req.uid = self.uid_counter
+                    self.uid_counter += 1
+                    if owner_enabled:
+                        assert prefix_cache is not None
+                        binding = prefix_cache.mint_owner_request(req.uid)
                         if req.request_id in self._cache_owner_requests:
                             prefix_cache.release_owner_request(binding)
                             raise RuntimeError("duplicate owner-bound request ID")
                         self._cache_owner_requests[req.request_id] = binding
-                    minted_request_ids.append(req.request_id)
-                self.unprocessed_requests.append(req)
-                uids.append(req.uid)
-        except BaseException:
-            self.uid_counter = original_uid_counter
-            inserted = set(uids)
-            self.unprocessed_requests = [
-                request
-                for request in self.unprocessed_requests
-                if request.uid not in inserted
-            ]
-            for request_id in minted_request_ids:
-                self._release_cache_owner_request(request_id)
-            raise
+                        minted_request_ids.append(req.request_id)
+                    self.unprocessed_requests.append(req)
+                    uids.append(req.uid)
+            except BaseException:
+                self.uid_counter = original_uid_counter
+                inserted = set(uids)
+                self.unprocessed_requests = [
+                    request
+                    for request in self.unprocessed_requests
+                    if request.uid not in inserted
+                ]
+                for request_id in minted_request_ids:
+                    self._release_cache_owner_request(request_id)
+                raise
 
         # Sort by estimated complexity (no images = simpler)
         self.unprocessed_requests = sorted(
@@ -1279,18 +1295,21 @@ class MLLMBatchGenerator:
         """Roll back generator state after a scheduler insertion breach."""
 
         request_id_set = set(request_ids)
+        tail_start = max(0, self.uid_counter - len(request_id_set))
         inserted = [
             request
             for request in self.unprocessed_requests
-            if request.request_id in request_id_set
+            if request.request_id in request_id_set and request.uid >= tail_start
         ]
         inserted_uids = {request.uid for request in inserted}
+        inserted_request_ids = {request.request_id for request in inserted}
+        inserted_object_ids = {id(request) for request in inserted}
         self.unprocessed_requests = [
             request
             for request in self.unprocessed_requests
-            if request.request_id not in request_id_set
+            if id(request) not in inserted_object_ids
         ]
-        for request_id in request_id_set:
+        for request_id in inserted_request_ids:
             self._discard_prefill_checkpoint(request_id)
             self._release_cache_owner_request(request_id)
         if inserted_uids:

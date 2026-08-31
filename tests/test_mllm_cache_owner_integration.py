@@ -45,7 +45,7 @@ def _generator(*, owner_required: bool = True):
     generator._cache_owner_required = owner_required
     generator._cache_owner_requests = {}
     generator._cache_owner_lifecycle_mutating = False
-    generator._prefix_checkpoint_lock = threading.Lock()
+    generator._prefix_checkpoint_lock = threading.RLock()
     generator._request_prefix_checkpoints = {}
     generator._aborted_request_ids = set()
     generator._pending_removal_lock = threading.Lock()
@@ -178,7 +178,9 @@ def test_batch_extend_later_cache_failure_rolls_back_every_layer():
     ("left", "right", "message"),
     [
         ([None], [], "different cache layer counts"),
+        ([], [None], "different cache layer counts"),
         ([None], [object()], "mismatched empty cache layers"),
+        ([object()], [None], "mismatched empty cache layers"),
     ],
 )
 def test_batch_extend_rejects_incompatible_cache_topology(left, right, message):
@@ -200,7 +202,7 @@ def _chunked_generator():
     generator._pending_error_responses = []
     generator._aborted_request_ids = set()
     generator._prefill_progress = {}
-    generator._prefix_checkpoint_lock = threading.Lock()
+    generator._prefix_checkpoint_lock = threading.RLock()
     generator._request_prefix_checkpoints = {}
     generator._cache_owner_required = True
     generator._cache_owner_requests = {}
@@ -1417,6 +1419,41 @@ def test_scheduler_base_exception_during_insert_rolls_back_real_generator():
     generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
 
 
+def test_scheduler_insert_exception_preserves_preexisting_generator_request():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    request = MLLMRequest(request_id="request-1", prompt="hello")
+    request.num_prompt_tokens = 3
+    scheduler.waiting = deque([request])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=object(),
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    existing = _request("request-1")
+    existing.uid = 0
+    binding = object()
+    generator.unprocessed_requests = [existing]
+    generator._cache_owner_requests = {existing.request_id: binding}
+    generator.uid_counter = 1
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+
+    with pytest.raises(RuntimeError, match="duplicate owner-bound request ID"):
+        scheduler._schedule_waiting()
+
+    assert list(scheduler.waiting) == [request]
+    assert generator.unprocessed_requests == [existing]
+    assert generator._cache_owner_requests == {existing.request_id: binding}
+    assert generator.uid_counter == 1
+    generator.prefix_cache.release_owner_request.assert_not_called()
+
+
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
 def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -1483,6 +1520,41 @@ def test_scheduler_rejects_duplicate_or_colliding_uids_transactionally(
     assert scheduler.running == {}
     assert scheduler.request_id_to_uid == {}
     assert scheduler.uid_to_request_id == dict(existing_uids)
+    assert scheduler.total_prompt_tokens == 0
+
+
+def test_scheduler_rejects_insert_that_mutates_waiting_queue():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    first = MLLMRequest(request_id="request-1", prompt="hello")
+    second = MLLMRequest(request_id="request-2", prompt="hello")
+    for request in (first, second):
+        request.num_prompt_tokens = 3
+    scheduler.waiting = deque([first, second])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(max_num_seqs=2)
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.batch_generator = MagicMock()
+    scheduler._ensure_batch_generator = MagicMock()
+
+    def mutate_queue(_requests):
+        scheduler.waiting.rotate(1)
+        return [10, 11]
+
+    scheduler.batch_generator.insert.side_effect = mutate_queue
+
+    with pytest.raises(RuntimeError, match="atomic UID commit"):
+        scheduler._schedule_waiting()
+
+    scheduler.batch_generator.rollback_inserted_requests.assert_called_once_with(
+        ["request-1", "request-2"]
+    )
+    assert scheduler.running == {}
+    assert scheduler.request_id_to_uid == {}
+    assert scheduler.uid_to_request_id == {}
     assert scheduler.total_prompt_tokens == 0
 
 
@@ -1663,13 +1735,178 @@ def test_owner_lifecycle_mutation_rejects_active_generator_work():
 
 def test_owner_lifecycle_rejects_a_concurrent_second_begin():
     generator = _generator()
-    generator.begin_cache_owner_lifecycle_mutation()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    errors = []
 
+    def hold_first_mutation():
+        try:
+            generator.begin_cache_owner_lifecycle_mutation()
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+            generator.finish_cache_owner_lifecycle_mutation()
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=hold_first_mutation)
+    worker.start()
+    assert first_entered.wait(timeout=2)
     with pytest.raises(RuntimeError, match="mutation is active"):
         generator.begin_cache_owner_lifecycle_mutation()
+    release_first.set()
+    worker.join(timeout=2)
 
-    generator.finish_cache_owner_lifecycle_mutation()
+    assert not worker.is_alive()
+    assert errors == []
     assert generator._cache_owner_lifecycle_mutating is False
+
+
+def test_owner_lifecycle_concurrent_admission_has_one_winner():
+    generator = _generator()
+    first_phase = threading.Barrier(2)
+
+    class FirstPhaseBarrierLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._counts = {}
+
+        def __enter__(self):
+            self._lock.acquire()
+            thread_id = threading.get_ident()
+            self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+            return self
+
+        def __exit__(self, *_args):
+            thread_id = threading.get_ident()
+            count = self._counts[thread_id]
+            self._lock.release()
+            if count == 1:
+                first_phase.wait(timeout=2)
+
+    generator._prefix_checkpoint_lock = FirstPhaseBarrierLock()
+    successes = []
+    errors = []
+
+    def begin():
+        try:
+            generator.begin_cache_owner_lifecycle_mutation()
+            successes.append(threading.get_ident())
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    workers = [threading.Thread(target=begin) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(successes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "mutation is active" in str(errors[0])
+    generator._prefix_checkpoint_lock = threading.RLock()
+    generator.finish_cache_owner_lifecycle_mutation()
+
+
+def test_owner_insert_cannot_cross_lifecycle_admission():
+    generator = _generator()
+    passed_initial_check = threading.Event()
+    allow_insert_to_continue = threading.Event()
+    insert_thread_id = []
+
+    class PausingRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._counts = {}
+
+        def __enter__(self):
+            self._lock.acquire()
+            thread_id = threading.get_ident()
+            self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+            return self
+
+        def __exit__(self, *_args):
+            thread_id = threading.get_ident()
+            count = self._counts[thread_id]
+            self._lock.release()
+            if insert_thread_id and thread_id == insert_thread_id[0] and count == 1:
+                passed_initial_check.set()
+                assert allow_insert_to_continue.wait(timeout=2)
+
+    generator._prefix_checkpoint_lock = PausingRLock()
+    errors = []
+
+    def insert():
+        insert_thread_id.append(threading.get_ident())
+        try:
+            generator.insert([_request("racing-insert")])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=insert)
+    worker.start()
+    assert passed_initial_check.wait(timeout=2)
+    generator.begin_cache_owner_lifecycle_mutation()
+    allow_insert_to_continue.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "mutation is active" in str(errors[0])
+    assert generator.unprocessed_requests == []
+    generator._prefix_checkpoint_lock = threading.RLock()
+    generator.finish_cache_owner_lifecycle_mutation()
+
+
+def test_scheduler_lifecycle_mutations_are_serialized_across_threads():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
+    batch_generator = MagicMock()
+    scheduler.batch_generator = batch_generator
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    errors = []
+
+    def first_operation():
+        first_entered.set()
+        assert release_first.wait(timeout=2)
+        return "first"
+
+    def run_first():
+        try:
+            scheduler.run_cache_owner_lifecycle_mutation(first_operation)
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    def run_second():
+        try:
+            scheduler.run_cache_owner_lifecycle_mutation(lambda: "second")
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+        finally:
+            second_finished.set()
+
+    first_thread = threading.Thread(target=run_first)
+    second_thread = threading.Thread(target=run_second)
+    first_thread.start()
+    assert first_entered.wait(timeout=2)
+    second_thread.start()
+    assert second_finished.wait(timeout=0.05) is False
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert errors == []
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert batch_generator.begin_cache_owner_lifecycle_mutation.call_count == 2
+    assert batch_generator.finish_cache_owner_lifecycle_mutation.call_count == 2
 
 
 @pytest.mark.parametrize("phase", ["finish", "recover"])
@@ -1697,6 +1934,42 @@ def test_owner_lifecycle_base_exception_clears_gate_and_fails_terminally(phase):
         generator.begin_cache_owner_lifecycle_mutation()
     with pytest.raises(RuntimeError, match="terminally failed"):
         generator.insert([_request("terminal")])
+
+
+def test_owner_lifecycle_missing_cache_clears_gate_and_fails_terminally():
+    generator = _generator()
+    generator.prefix_cache = None
+    generator._cache_owner_lifecycle_mutating = True
+
+    with pytest.raises(RuntimeError, match="prefix cache is unavailable"):
+        generator.recover_cache_owner_lifecycle_mutation()
+
+    assert generator._cache_owner_lifecycle_mutating is False
+    assert generator._cache_owner_lifecycle_failed is True
+    with pytest.raises(RuntimeError, match="terminally failed"):
+        generator.begin_cache_owner_lifecycle_mutation()
+
+
+def test_scheduler_lifecycle_wrapper_recovers_after_base_exception():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
+    batch_generator = MagicMock()
+    batch_generator.recover_cache_owner_lifecycle_mutation.side_effect = (
+        KeyboardInterrupt("recovery interrupted")
+    )
+    scheduler.batch_generator = batch_generator
+
+    with pytest.raises(KeyboardInterrupt, match="recovery interrupted"):
+        scheduler.run_cache_owner_lifecycle_mutation(
+            lambda: (_ for _ in ()).throw(KeyboardInterrupt("operation interrupted"))
+        )
+
+    batch_generator.begin_cache_owner_lifecycle_mutation.assert_called_once_with()
+    batch_generator.recover_cache_owner_lifecycle_mutation.assert_called_once_with()
+    batch_generator.finish_cache_owner_lifecycle_mutation.assert_not_called()
 
 
 def test_owner_replay_dispatch_never_uses_unchecked_clone():
@@ -1795,3 +2068,34 @@ def test_scheduler_disabled_owner_allows_cross_thread_admission():
     assert scheduler.uid_to_request_id == {7: request.request_id}
     assert request.status is RequestStatus.RUNNING
     assert request.batch_uid == 7
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda scheduler: scheduler.add_request("hello"),
+        lambda scheduler: scheduler.abort_request("request-1"),
+        lambda scheduler: scheduler.step(),
+        lambda scheduler: scheduler.clear_runtime_caches(),
+    ],
+)
+def test_owner_enabled_scheduler_public_mutations_reject_cross_thread(invoke):
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=object())
+    scheduler._owner_thread_id = threading.get_ident()
+    errors = []
+
+    def mutate_from_worker():
+        try:
+            invoke(scheduler)
+        except BaseException as exc:  # pragma: no cover - assertion below
+            errors.append(exc)
+
+    worker = threading.Thread(target=mutate_from_worker)
+    worker.start()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "owner thread" in str(errors[0])
