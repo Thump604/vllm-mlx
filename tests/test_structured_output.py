@@ -51,7 +51,9 @@ class TestOutlinesBackendAdmission:
             await _preflight_response_format_backend(RawRequest())
 
         assert excinfo.value.status_code == 422
-        assert "outlines is unavailable" in excinfo.value.detail
+        assert (
+            excinfo.value.detail == "response_format backend 'outlines' is unavailable"
+        )
 
     @pytest.mark.parametrize(
         "payload",
@@ -106,7 +108,9 @@ class TestOutlinesBackendAdmission:
             )
 
         assert excinfo.value.status_code == 422
-        assert "outlines is unavailable" in excinfo.value.detail
+        assert (
+            excinfo.value.detail == "response_format backend 'outlines' is unavailable"
+        )
 
     @pytest.mark.anyio
     async def test_chat_route_rejects_before_engine_acquisition(self, monkeypatch):
