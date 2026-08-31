@@ -62,6 +62,13 @@ def _request(request_id: str = "request-1") -> MLLMBatchRequest:
     return MLLMBatchRequest(uid=-1, request_id=request_id, prompt="hello")
 
 
+def _configure_mock_insert_transaction(generator, *, minimum_uid: int = 0):
+    transaction = MagicMock()
+    transaction.__enter__.return_value = minimum_uid
+    transaction.__exit__.return_value = False
+    generator.insertion_transaction.return_value = transaction
+
+
 def _batch_for_extend(*, uid: int, y, cache=None, request_id: str | None = None):
     request_id = request_id or f"request-{uid}"
     request = MLLMBatchRequest(uid=uid, request_id=request_id, prompt="hello")
@@ -1321,7 +1328,7 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
-    scheduler.batch_generator.capture_insert_boundary.return_value = 0
+    _configure_mock_insert_transaction(scheduler.batch_generator)
     scheduler._ensure_batch_generator = MagicMock()
     if isinstance(insert_result, Exception):
         scheduler.batch_generator.insert.side_effect = insert_result
@@ -1510,6 +1517,75 @@ def test_generator_insert_sort_failure_rolls_back_owner_state():
     generator.prefix_cache.release_owner_request.assert_called_once_with(binding)
 
 
+def test_scheduler_insert_validation_is_atomic_against_direct_insert():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduled = MLLMRequest(request_id="shared-request", prompt="hello")
+    scheduled.num_prompt_tokens = 3
+    scheduler.waiting = deque([scheduled])
+    scheduler.running = {}
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=None,
+    )
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    generator = _generator()
+    generator.prefix_cache.mint_owner_request.return_value = object()
+    scheduler.batch_generator = generator
+    scheduler._ensure_batch_generator = MagicMock()
+    scheduler_insert_entered = threading.Event()
+    release_scheduler_insert = threading.Event()
+    direct_finished = threading.Event()
+    scheduler_errors = []
+    direct_errors = []
+
+    def malformed_scheduler_insert(_requests):
+        scheduler_insert_entered.set()
+        assert release_scheduler_insert.wait(timeout=2)
+        return None
+
+    generator.insert = malformed_scheduler_insert
+
+    def schedule():
+        try:
+            scheduler._schedule_waiting()
+        except BaseException as exc:  # pragma: no cover - assertion below
+            scheduler_errors.append(exc)
+
+    def insert_directly():
+        try:
+            MLLMBatchGenerator.insert(generator, [_request("shared-request")])
+        except BaseException as exc:  # pragma: no cover - assertion below
+            direct_errors.append(exc)
+        finally:
+            direct_finished.set()
+
+    scheduler_worker = threading.Thread(target=schedule)
+    direct_worker = threading.Thread(target=insert_directly)
+    scheduler_worker.start()
+    assert scheduler_insert_entered.wait(timeout=2)
+    direct_worker.start()
+    assert direct_finished.wait(timeout=0.05) is False
+    release_scheduler_insert.set()
+    scheduler_worker.join(timeout=2)
+    direct_worker.join(timeout=2)
+
+    assert len(scheduler_errors) == 1
+    assert isinstance(scheduler_errors[0], RuntimeError)
+    assert "atomic UID commit" in str(scheduler_errors[0])
+    assert direct_errors == []
+    assert [request.request_id for request in generator.unprocessed_requests] == [
+        "shared-request"
+    ]
+    assert set(generator._cache_owner_requests) == {"shared-request"}
+    assert generator.uid_counter == 1
+    assert list(scheduler.waiting) == [scheduled]
+    assert scheduler.running == {}
+
+
 @pytest.mark.parametrize("insert_result", [[True], [-1]])
 def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
@@ -1524,7 +1600,7 @@ def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
-    scheduler.batch_generator.capture_insert_boundary.return_value = 0
+    _configure_mock_insert_transaction(scheduler.batch_generator)
     scheduler.batch_generator.insert.return_value = insert_result
     scheduler._ensure_batch_generator = MagicMock()
 
@@ -1565,7 +1641,7 @@ def test_scheduler_rejects_duplicate_or_colliding_uids_transactionally(
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
-    scheduler.batch_generator.capture_insert_boundary.return_value = 0
+    _configure_mock_insert_transaction(scheduler.batch_generator)
     scheduler.batch_generator.insert.return_value = insert_result
     scheduler._ensure_batch_generator = MagicMock()
 
@@ -1596,7 +1672,7 @@ def test_scheduler_rejects_insert_that_mutates_waiting_queue():
     scheduler._state_lock = threading.RLock()
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
-    scheduler.batch_generator.capture_insert_boundary.return_value = 0
+    _configure_mock_insert_transaction(scheduler.batch_generator)
     scheduler._ensure_batch_generator = MagicMock()
 
     def mutate_queue(_requests):
@@ -2151,6 +2227,7 @@ def test_scheduler_disabled_owner_allows_cross_thread_admission():
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     scheduler.batch_generator._cache_owner_required = False
+    _configure_mock_insert_transaction(scheduler.batch_generator)
     scheduler.batch_generator.insert.return_value = [7]
     scheduler._ensure_batch_generator = MagicMock()
     result = []

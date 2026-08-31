@@ -17,7 +17,7 @@ Architecture:
 """
 
 import copy
-from contextlib import nullcontext
+from contextlib import contextmanager
 import logging
 import math
 import os
@@ -1244,8 +1244,7 @@ class MLLMBatchGenerator:
         original_uid_counter = self.uid_counter
         uids = []
         minted_request_ids = []
-        owner_lock = self._prefix_checkpoint_lock if owner_enabled else nullcontext()
-        with owner_lock:
+        with self._prefix_checkpoint_lock:
             if owner_enabled:
                 if getattr(self, "_cache_owner_lifecycle_failed", False):
                     raise RuntimeError(
@@ -1293,10 +1292,12 @@ class MLLMBatchGenerator:
         logger.debug(f"Inserted {len(requests)} requests, UIDs: {uids}")
         return uids
 
-    def capture_insert_boundary(self) -> int:
-        """Return the first UID that a subsequent insert may allocate."""
+    @contextmanager
+    def insertion_transaction(self):
+        """Hold generator insertion state through scheduler validation."""
 
-        return self.uid_counter
+        with self._prefix_checkpoint_lock:
+            yield self.uid_counter
 
     def rollback_inserted_requests(
         self, request_ids: List[str], *, minimum_uid: int
