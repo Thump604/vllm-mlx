@@ -332,12 +332,12 @@ class CacheOwnerIdentity:
                 return _CANCELLED
             return decision
 
-    def commit_request(
+    def _commit_request(
         self,
         binding: ModelCacheRequestBinding,
         publish: Callable[[], bool],
     ) -> OwnerBindingDecision:
-        """Linearize final validation, publication, cancellation, and release."""
+        """Internal transaction for owner-aware cache publication."""
 
         with self._lock:
             decision = self.validate_request_binding(binding)
@@ -347,10 +347,10 @@ class CacheOwnerIdentity:
                 stored = bool(publish())
             except Exception:
                 return _RUNTIME_ERROR
-            if stored:
-                return _ACCEPTED
             decision = self.validate_request_binding(binding)
-            return decision if not decision.accepted else _RUNTIME_ERROR
+            if not decision.accepted:
+                return decision
+            return _ACCEPTED if stored else _RUNTIME_ERROR
 
     def release_request(
         self, binding: ModelCacheRequestBinding

@@ -1867,7 +1867,7 @@ class MemoryAwarePrefixCache:
             return OwnerBindingDecision(False, "cache_unsafe")
         commit_context = commit_lock if commit_lock is not None else nullcontext()
         with commit_context:
-            return self._owner_identity.commit_request(
+            return self._owner_identity._commit_request(
                 prepared.request,
                 lambda: self.commit_prepared(
                     prepared._entry,
@@ -2028,6 +2028,10 @@ class MemoryAwarePrefixCache:
                 ) and self._entries:
                     self._evict_lru()
 
+                # Eviction may call an external SSD tier. Recheck immediately
+                # before publication in case that callback revoked ownership.
+                if commit_guard is not None and not commit_guard():
+                    return False
                 self._entries[tokens_key] = entry
                 self._current_memory += entry.memory_bytes
                 bisect.insort(self._sorted_keys, tokens_key)
@@ -2476,6 +2480,7 @@ class MemoryAwarePrefixCache:
 
     def restore_hybrid_persistence_snapshot(self, loaded) -> int:
         """Reconstruct and atomically publish validated entries on owner thread."""
+        self.invalidate_owner_identity()
         if loaded is None:
             return 0
         if loaded.identity != self._persistence_identity:
@@ -2751,6 +2756,7 @@ class MemoryAwarePrefixCache:
 
         Returns the number of entries successfully loaded.
         """
+        self.invalidate_owner_identity()
         import json
         import os
         import time as _time

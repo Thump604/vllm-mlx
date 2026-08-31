@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
 import pickle
 import threading
@@ -345,6 +346,66 @@ def test_prepared_entry_version_is_fail_closed():
     )
 
     assert cache.commit_owner_bound_store(wrong_version).reason == "runtime_error"
+
+
+def test_reentrant_ssd_spill_revocation_blocks_final_publication():
+    cache = _cache()
+    cache._memory_lock = threading.RLock()
+    cache._entries = OrderedDict(
+        {(0,): SimpleNamespace(tokens=(0,), cache=[object()], memory_bytes=16)}
+    )
+    cache._sorted_keys = [(0,)]
+    cache._current_memory = 16
+    cache._max_memory = 20
+    cache._config = SimpleNamespace(max_entries=10)
+    cache._stats = SimpleNamespace(
+        store_rejections=0,
+        evictions=0,
+        entry_count=1,
+        current_memory_bytes=16,
+    )
+    cache.bind_owner_identity(
+        _manifest(),
+        cache_namespace="cache-a",
+        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
+        runtime_composition_digest=_RUNTIME_COMPOSITION,
+    )
+    request = cache.mint_owner_request(sequence_revision=1)
+
+    class RevokingTier:
+        def enqueue_spill(self, *_args):
+            cache.cancel_owner_request(request)
+
+    cache._ssd_tier = RevokingTier()
+    prepared = PreparedOwnerBoundCacheEntry(
+        owner=request.owner,
+        request=request,
+        _entry=SimpleNamespace(tokens=(1,), cache=[object()], memory_bytes=16),
+    )
+
+    result = cache.commit_owner_bound_store(prepared)
+
+    assert result.reason == "cancellation"
+    assert (1,) not in cache._entries
+    assert cache.validate_owner_request(request).reason == "cancellation"
+
+
+def test_in_place_restore_invalidates_live_owner_handles(tmp_path):
+    cache = _cache()
+    cache.bind_owner_identity(
+        _manifest(),
+        cache_namespace="cache-a",
+        governed_model_cache_identity_digest=_MODEL_CACHE_IDENTITY,
+        runtime_composition_digest=_RUNTIME_COMPOSITION,
+    )
+    request = cache.mint_owner_request(sequence_revision=1)
+
+    assert cache.restore_hybrid_persistence_snapshot(None) == 0
+    assert cache.validate_owner_request(request).reason == "cache_unsafe"
+
+    rebound = cache.mint_owner_request(sequence_revision=2)
+    assert cache.load_from_disk(str(tmp_path)) == 0
+    assert cache.validate_owner_request(rebound).reason == "cache_unsafe"
 
 
 def test_cache_binding_requires_complete_provenance_and_closes_permanently():
