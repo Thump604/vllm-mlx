@@ -1393,12 +1393,32 @@ class BatchedEngine(BaseEngine):
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
         if self._mllm_scheduler:
-            self._mllm_scheduler._assert_owner_thread()
-            self._mllm_scheduler._ensure_batch_generator()
-            batch_generator = self._mllm_scheduler.batch_generator
+            scheduler = self._mllm_scheduler
+            scheduler._assert_owner_thread()
+            scheduler_config = getattr(scheduler, "config", None)
+            owner_bound = (
+                hasattr(scheduler_config, "__dict__")
+                and vars(scheduler_config).get("cache_owner_context") is not None
+            )
+            batch_generator = getattr(scheduler, "batch_generator", None)
+            if not owner_bound and batch_generator is not None:
+                owner_bound = (
+                    getattr(batch_generator, "_cache_owner_required", False) is True
+                )
+                pc = getattr(batch_generator, "prefix_cache", None)
+                if not owner_bound and pc is not None and hasattr(pc, "__dict__"):
+                    owner_bound = vars(pc).get("_cache_owner_context") is not None
+            if owner_bound:
+                raise RuntimeError(
+                    "owner-bound caches require strict hybrid persistence; "
+                    "use restore_cache_from_disk()"
+                )
+
+            scheduler._ensure_batch_generator()
+            batch_generator = scheduler.batch_generator
             pc = batch_generator.prefix_cache
             if pc is not None:
-                return self._mllm_scheduler.run_cache_owner_lifecycle_mutation(
+                return scheduler.run_cache_owner_lifecycle_mutation(
                     pc.load_from_disk, cache_dir
                 )
         if self._engine:

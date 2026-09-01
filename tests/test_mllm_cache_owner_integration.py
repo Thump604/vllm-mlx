@@ -2483,6 +2483,236 @@ def test_batched_engine_rebinds_owner_when_cache_load_fails():
     batch_generator.finish_cache_owner_lifecycle_mutation.assert_not_called()
 
 
+def test_batched_engine_sync_load_rejects_owner_cache_before_recovery(
+    tmp_path, monkeypatch
+):
+    """Unsupported sync load must not clear a warm owner-bound cache."""
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    model, processor, target, cache_config, mode = _write_loaded_identity_fixture(
+        model_root
+    )
+    _patch_fixture_tokenizer_version(monkeypatch)
+    context = verify_loaded_model_cache_owner_context(
+        model,
+        processor,
+        str(model_root),
+        target,
+        cache_config=cache_config,
+        cache_runtime_identity={"max_kv_size": 1},
+        runtime_mode=mode,
+    )
+    prefix_cache = MemoryAwarePrefixCache(
+        model.language_model,
+        cache_config,
+        tokenizer=processor.tokenizer,
+        model_identity=str(model_root),
+        cache_runtime_identity={"max_kv_size": 1},
+        template_renderer=processor,
+        cache_owner_context=context,
+    )
+    owner_binding = prefix_cache.bind_owner_context(context)
+    request_binding = prefix_cache.mint_owner_request(sequence_revision=1)
+
+    class WarmCacheLayer:
+        def __init__(self):
+            self.keys = mx.arange(128 * 8, dtype=mx.float32).reshape((1, 1, 128, 8))
+            self.values = self.keys + 1
+            self.offset = 128
+
+    tokens = list(range(128))
+    decision, prepared = prefix_cache.prepare_owner_bound_store(
+        request_binding,
+        tokens,
+        [WarmCacheLayer()],
+    )
+    assert decision.accepted and prepared is not None
+    assert prefix_cache.commit_owner_bound_store(prepared).accepted
+
+    warm_entry = prefix_cache._entries[tuple(tokens)]
+    warm_content = tuple(
+        array.tolist()
+        for array in (warm_entry.cache[0].keys, warm_entry.cache[0].values)
+    )
+    warm_stats = prefix_cache.get_stats()
+    warm_memory = prefix_cache._current_memory
+
+    generator = _generator()
+    generator.prefix_cache = prefix_cache
+    generator._cache_owner_context = context
+    generator._cache_owner_lifecycle_failed = False
+    begin_lifecycle = MagicMock(wraps=generator.begin_cache_owner_lifecycle_mutation)
+    generator.begin_cache_owner_lifecycle_mutation = begin_lifecycle
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(
+        enable_prefix_cache=True,
+        use_memory_aware_cache=True,
+        cache_owner_context=context,
+    )
+    scheduler.batch_generator = generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock()
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        engine.load_cache_from_disk(str(tmp_path / "unsupported"))
+
+    assert len(prefix_cache) == 1
+    assert prefix_cache._entries[tuple(tokens)] is warm_entry
+    assert (
+        tuple(
+            array.tolist()
+            for array in (warm_entry.cache[0].keys, warm_entry.cache[0].values)
+        )
+        == warm_content
+    )
+    assert prefix_cache._current_memory == warm_memory
+    assert prefix_cache.get_stats() == warm_stats
+    assert prefix_cache.validate_owner_request(request_binding).accepted
+    assert prefix_cache._owner_identity.validate_owner_binding(owner_binding).accepted
+    begin_lifecycle.assert_not_called()
+    assert generator._cache_owner_lifecycle_mutating is False
+    assert generator._cache_owner_lifecycle_failed is False
+
+
+def test_batched_engine_sync_load_rejects_cold_owner_before_generator_construction():
+    """A lazy owner-bound scheduler must not construct its cache generator."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=object())
+    scheduler.batch_generator = None
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = MagicMock(
+        side_effect=AssertionError("cold owner load constructed a generator")
+    )
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        engine.load_cache_from_disk("unsupported")
+
+    scheduler._ensure_batch_generator.assert_not_called()
+
+
+def test_batched_engine_sync_load_rejects_context_bound_cache_without_owner_flag():
+    """A bound cache remains protected even if its generator flag is stale."""
+    from vllm_mlx.engine.batched import BatchedEngine
+    from vllm_mlx.memory_cache import MemoryAwarePrefixCache
+
+    prefix_cache = object.__new__(MemoryAwarePrefixCache)
+    prefix_cache._cache_owner_context = object()
+    generator = _generator(owner_required=False)
+    generator.prefix_cache = prefix_cache
+    begin_lifecycle = MagicMock(wraps=generator.begin_cache_owner_lifecycle_mutation)
+    generator.begin_cache_owner_lifecycle_mutation = begin_lifecycle
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler.batch_generator = generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = lambda: None
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    assert generator._cache_owner_required is False
+    with pytest.raises(RuntimeError, match="strict hybrid persistence"):
+        engine.load_cache_from_disk("unsupported")
+
+    begin_lifecycle.assert_not_called()
+
+
+def test_batched_engine_sync_load_preserves_non_owner_mllm_path():
+    """Legacy MLLM caches still use the synchronous load lifecycle."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    class LegacyPrefixCache:
+        _cache_owner_context = None
+
+        def __init__(self):
+            self.calls = []
+
+        def load_from_disk(self, cache_dir):
+            self.calls.append((threading.get_ident(), cache_dir))
+            return 7
+
+    prefix_cache = LegacyPrefixCache()
+    generator = _generator(owner_required=False)
+    generator.prefix_cache = prefix_cache
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=None)
+    scheduler.batch_generator = generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler._ensure_batch_generator = lambda: None
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    assert generator._cache_owner_required is False
+    assert engine.load_cache_from_disk("legacy") == 7
+    assert prefix_cache.calls == [(threading.get_ident(), "legacy")]
+
+
+@pytest.mark.anyio
+async def test_batched_engine_owner_async_restore_keeps_io_and_owner_handoff():
+    """Strict owner restore still reads off-owner and rebuilds on-owner."""
+    from vllm_mlx.engine.batched import BatchedEngine
+
+    owner_thread = threading.get_ident()
+    snapshot = object()
+    context = object()
+    calls = {}
+
+    class OwnerPrefixCache:
+        def __init__(self):
+            self._cache_owner_context = context
+
+        def read_hybrid_persistence_snapshot(self, cache_dir):
+            calls["read_thread"] = threading.get_ident()
+            calls["read_path"] = cache_dir
+            return snapshot
+
+        def restore_hybrid_persistence_snapshot(self, loaded):
+            calls["restore_thread"] = threading.get_ident()
+            calls["restore_value"] = loaded
+            return 1
+
+        def bind_owner_context(self, owner_context):
+            calls["bound_context"] = owner_context
+
+    generator = _generator(owner_required=True)
+    generator.prefix_cache = OwnerPrefixCache()
+    generator._cache_owner_context = context
+    generator._cache_owner_lifecycle_failed = False
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.config = MLLMSchedulerConfig(cache_owner_context=context)
+    scheduler.batch_generator = generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = owner_thread
+    scheduler._ensure_batch_generator = lambda: None
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._mllm_scheduler = scheduler
+    engine._engine = None
+
+    assert await engine.restore_cache_from_disk("hybrid") == 1
+    assert calls["read_thread"] != owner_thread
+    assert calls["restore_thread"] == owner_thread
+    assert calls["read_path"] == "hybrid"
+    assert calls["restore_value"] is snapshot
+    assert calls["bound_context"] is context
+    assert generator._cache_owner_lifecycle_mutating is False
+    assert generator._cache_owner_lifecycle_failed is False
+
+
 def test_owner_lifecycle_mutation_rejects_active_generator_work():
     generator = _generator()
     binding = object()
