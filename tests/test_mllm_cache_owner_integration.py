@@ -3,6 +3,7 @@
 
 import ast
 import asyncio
+from contextlib import nullcontext
 from collections import deque
 import hashlib
 from importlib import metadata as importlib_metadata
@@ -53,6 +54,7 @@ def _generator(*, owner_required: bool = True):
     generator._request_prefix_checkpoints = {}
     generator._aborted_request_ids = set()
     generator._pending_removal_lock = threading.Lock()
+    generator._pending_removal_request_ids = {}
     generator._pending_removal_uids = set()
     generator.unprocessed_requests = []
     generator.active_batch = None
@@ -646,6 +648,241 @@ def test_insert_mints_owner_request_and_abort_revokes_it():
 
     generator.abort_prefill(request.request_id)
     generator.prefix_cache.cancel_owner_request.assert_called_once_with(binding)
+
+
+def test_waiting_abort_does_not_poison_reused_request_id(monkeypatch):
+    """A queued abort must not mark a later same-ID request as aborted."""
+    from vllm_mlx.mllm_batch_generator import MLLMBatchStats
+
+    generator = _generator(owner_required=False)
+    generator.prefix_cache = None
+    generator._stats = MLLMBatchStats()
+    generator.max_kv_size = 0
+    generator.processor = SimpleNamespace()
+    generator.prefill_step_size = 512
+    generator.language_model = object()
+    generator.model = object()
+    generator.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+    generator.stop_tokens = set()
+
+    def preprocess(request):
+        request.input_ids = mx.array([[1, 2]])
+        request.is_text_only = True
+
+    generator._preprocess_request = preprocess
+    generator._derive_request_rope_deltas = lambda request: None
+    generator._run_chunked_text_prefill = lambda request, cache: mx.array(
+        [[[0.0, 1.0]]]
+    )
+    monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+
+    class MergeableCache:
+        def merge(self, caches):
+            return self
+
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        lambda *args, **kwargs: [MergeableCache()],
+    )
+    monkeypatch.setattr(
+        "mlx_lm.sample_utils.make_logits_processors", lambda **kwargs: []
+    )
+    monkeypatch.setattr(
+        "mlx_lm.sample_utils.make_sampler",
+        lambda **kwargs: generator.sampler,
+    )
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.batch_generator = generator
+    scheduler.config = MLLMSchedulerConfig(
+        max_num_seqs=1,
+        cache_owner_context=None,
+    )
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.waiting = deque()
+    scheduler.running = {}
+    scheduler.requests = {}
+    scheduler.request_id_to_uid = {}
+    scheduler.uid_to_request_id = {}
+    scheduler.total_prompt_tokens = 0
+    scheduler.finished_req_ids = set()
+    scheduler.output_queues = {}
+    scheduler._detokenizer_pool = {}
+
+    first = MLLMRequest(request_id="reused-id", prompt="first")
+    scheduler.requests[first.request_id] = first
+    scheduler.waiting.append(first)
+    assert scheduler._abort_request_locked(first.request_id)
+    assert generator._aborted_request_ids == set()
+
+    replacement = MLLMRequest(request_id="reused-id", prompt="replacement")
+    scheduler.requests[replacement.request_id] = replacement
+    scheduler.waiting.append(replacement)
+
+    scheduled = scheduler._schedule_waiting()
+    assert scheduled == [replacement]
+    assert generator.unprocessed_requests[0].request_id == replacement.request_id
+    assert (
+        MLLMBatchGenerator._process_prompts(generator, generator.unprocessed_requests)
+        is not None
+    )
+
+
+def test_running_abort_still_signals_batch_generator_prefill_abort():
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    generator = MagicMock()
+    request = MLLMRequest(request_id="running-id", prompt="running")
+    request.status = RequestStatus.RUNNING
+    scheduler.batch_generator = generator
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.waiting = deque()
+    scheduler.running = {request.request_id: request}
+    scheduler.requests = {request.request_id: request}
+    scheduler.request_id_to_uid = {request.request_id: 7}
+    scheduler.uid_to_request_id = {7: request.request_id}
+    scheduler.finished_req_ids = set()
+    scheduler.output_queues = {}
+    scheduler._detokenizer_pool = {}
+
+    assert scheduler._abort_request_locked(request.request_id)
+    generator.abort_prefill.assert_called_once_with(request.request_id)
+
+
+def test_running_abort_marker_clears_at_model_thread_removal_for_reuse():
+    generator = _generator(owner_required=False)
+    request_id = "running-reuse"
+    generator.active_batch = _batch_for_extend(
+        uid=7,
+        y=mx.array([1]),
+        request_id=request_id,
+    )
+
+    generator.abort_prefill(request_id)
+    assert request_id in generator._aborted_request_ids
+    generator.schedule_removal([7])
+    generator.process_pending_removals()
+
+    assert request_id not in generator._aborted_request_ids
+    assert generator.insert([_request(request_id)]) == [0]
+
+
+def test_partial_abort_marker_clears_after_deferred_removal_for_reuse():
+    generator = _generator(owner_required=False)
+    request_id = "partial-reuse"
+    request = _request(request_id)
+    request.uid = 11
+    generator._partial = {"request": request}
+
+    generator.abort_prefill(request_id)
+    assert request_id in generator._aborted_request_ids
+    generator.schedule_removal([request.uid])
+    generator.process_pending_removals()
+
+    assert request_id not in generator._aborted_request_ids
+    assert generator.insert([_request(request_id)]) == [0]
+
+
+def test_atomic_prefill_abort_marker_clears_after_removal_for_reuse():
+    generator = _generator(owner_required=False)
+    generator.prefix_cache.commit_prepared.return_value = True
+    request_id = "atomic-reuse"
+    request = _request(request_id)
+    request.uid = 13
+    generator.unprocessed_requests.append(request)
+
+    assert generator._publish_prefill_checkpoint(
+        request_id,
+        SimpleNamespace(tokens=(1, 2, 3)),
+    )
+    generator.abort_prefill(request_id)
+    assert request_id in generator._aborted_request_ids
+    generator.schedule_removal([request.uid])
+    generator.process_pending_removals()
+
+    assert request_id not in generator._aborted_request_ids
+    assert generator.insert([_request(request_id)]) == [0]
+
+
+def test_pending_old_uid_blocks_same_id_replacement_and_preserves_other_owner():
+    generator = _generator()
+    old_binding = object()
+    other_binding = object()
+    replacement_binding = object()
+    generator.prefix_cache.mint_owner_request.side_effect = [
+        old_binding,
+        other_binding,
+        replacement_binding,
+    ]
+    old = _request("generation-safe")
+    other = _request("unrelated")
+    assert generator.insert([old, other]) == [0, 1]
+
+    generator.abort_prefill(old.request_id)
+    generator._aborted_request_ids.add(other.request_id)
+    # Partial prefill retires the owner lease before deferred UID removal.
+    generator._release_cache_owner_request(old.request_id)
+    generator.schedule_removal([old.uid])
+    replacement = _request(old.request_id)
+
+    with pytest.raises(RuntimeError, match="pending removal"):
+        generator.insert([replacement])
+
+    assert old.request_id in generator._aborted_request_ids
+    assert replacement.uid == -1
+    assert generator.uid_counter == 2
+    assert replacement not in generator.unprocessed_requests
+    assert generator._cache_owner_requests == {other.request_id: other_binding}
+
+    generator.process_pending_removals()
+
+    assert old.request_id not in generator._aborted_request_ids
+    assert other.request_id in generator._aborted_request_ids
+    assert generator._pending_removal_request_ids == {}
+    assert generator._cache_owner_requests == {other.request_id: other_binding}
+    assert generator.insert([replacement]) == [2]
+    assert generator._cache_owner_requests == {
+        other.request_id: other_binding,
+        replacement.request_id: replacement_binding,
+    }
+
+
+def test_scheduler_rejects_same_id_until_old_uid_is_removed():
+    generator = _generator(owner_required=False)
+    old = _batch_for_extend(
+        uid=7,
+        y=mx.array([1]),
+        request_id="scheduler-generation-safe",
+    )
+    generator.active_batch = old
+
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.batch_generator = generator
+    scheduler.config = MLLMSchedulerConfig(max_num_seqs=1)
+    scheduler.processor = SimpleNamespace(encode=lambda prompt: [])
+    scheduler._state_lock = threading.RLock()
+    scheduler._owner_thread_id = threading.get_ident()
+    scheduler.waiting = deque()
+    request = MLLMRequest(request_id=old.requests[0].request_id, prompt="hello")
+    request.status = RequestStatus.RUNNING
+    scheduler.running = {request.request_id: request}
+    scheduler.requests = dict(scheduler.running)
+    scheduler.request_id_to_uid = {request.request_id: old.uids[0]}
+    scheduler.uid_to_request_id = {old.uids[0]: request.request_id}
+    scheduler.finished_req_ids = set()
+    scheduler.output_queues = {}
+    scheduler._detokenizer_pool = {}
+
+    request_id = request.request_id
+    assert scheduler._abort_request_locked(request_id)
+    with pytest.raises(ValueError, match="pending removal"):
+        scheduler.add_request("replacement", request_id=request_id)
+    assert request_id not in scheduler.requests
+    assert list(scheduler.waiting) == []
+
+    generator.process_pending_removals()
+    assert scheduler.add_request("replacement", request_id=request_id) == request_id
 
 
 def test_remove_releases_owner_request_after_scheduler_thread_removal():

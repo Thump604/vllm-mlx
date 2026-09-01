@@ -276,6 +276,94 @@ class TestMLLMSchedulerStopClosesSSDTier:
         assert sched._ssd_tier is tier
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("processing failed"),
+            KeyboardInterrupt("processing interrupted"),
+        ],
+    )
+    async def test_stop_cleans_up_after_processing_task_failure_and_reraises(
+        self, failure
+    ):
+        sched = self._bare_scheduler()
+        close_calls = []
+
+        class RecordingGenerator:
+            def close(self):
+                close_calls.append("generator")
+
+        class RecordingTier:
+            def close(self):
+                close_calls.append("ssd")
+
+        class FailedTask:
+            def cancel(self):
+                close_calls.append("cancel")
+
+            def __await__(self):
+                async def raise_failure():
+                    raise failure
+
+                return raise_failure().__await__()
+
+        sched._running = True
+        sched.batch_generator = RecordingGenerator()
+        sched._ssd_tier = RecordingTier()
+        sched._processing_task = FailedTask()
+
+        with pytest.raises(type(failure), match=str(failure)):
+            await sched.stop()
+
+        assert close_calls == ["cancel", "generator", "ssd"]
+        assert sched.batch_generator is None
+        assert sched._ssd_tier is None
+        assert sched._processing_task is None
+        assert sched._stopping is False
+
+        await sched.stop()
+        assert close_calls == ["cancel", "generator", "ssd"]
+
+    @pytest.mark.anyio
+    async def test_stop_preserves_processing_failure_when_cleanup_also_fails(self):
+        sched = self._bare_scheduler()
+        close_calls = []
+
+        class FailingGenerator:
+            def close(self):
+                close_calls.append("generator")
+                raise RuntimeError("generator close failed")
+
+        class FailingTier:
+            def close(self):
+                close_calls.append("ssd")
+                raise RuntimeError("ssd close failed")
+
+        class FailedTask:
+            def cancel(self):
+                close_calls.append("cancel")
+
+            def __await__(self):
+                async def raise_failure():
+                    raise KeyboardInterrupt("original processing failure")
+
+                return raise_failure().__await__()
+
+        generator = FailingGenerator()
+        tier = FailingTier()
+        sched._running = True
+        sched.batch_generator = generator
+        sched._ssd_tier = tier
+        sched._processing_task = FailedTask()
+
+        with pytest.raises(KeyboardInterrupt, match="original processing failure"):
+            await sched.stop()
+
+        assert close_calls == ["cancel", "generator", "ssd"]
+        assert sched.batch_generator is generator
+        assert sched._ssd_tier is tier
+
+    @pytest.mark.anyio
     async def test_stop_flushes_queued_spill(self, tmp_path):
         """A spill still sitting in the queue at shutdown must be written,
         not silently dropped."""

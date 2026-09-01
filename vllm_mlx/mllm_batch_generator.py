@@ -778,6 +778,7 @@ class MLLMBatchGenerator:
         # same stream concurrently.  See `schedule_removal` /
         # `process_pending_removals`.
         self._pending_removal_uids: set = set()
+        self._pending_removal_request_ids: Dict[int, str] = {}
         self._pending_removal_lock = threading.Lock()
 
         # Vision embedding cache for repeated images
@@ -1180,7 +1181,41 @@ class MLLMBatchGenerator:
                 )
             )
 
-    def schedule_removal(self, uids: List[int]) -> None:
+    def _request_ids_for_uids(self, uid_set: set[int]) -> Dict[int, str]:
+        """Snapshot request IDs for deferred-removal UIDs."""
+        request_ids: Dict[int, str] = {}
+        for request in getattr(self, "unprocessed_requests", []):
+            if request.uid in uid_set:
+                request_ids[request.uid] = request.request_id
+        active_batch = getattr(self, "active_batch", None)
+        if active_batch is not None:
+            for request in active_batch.requests:
+                if request.uid in uid_set:
+                    request_ids[request.uid] = request.request_id
+        partial = getattr(self, "_partial", None)
+        if isinstance(partial, dict):
+            request = partial.get("request")
+            if request is not None and request.uid in uid_set:
+                request_ids[request.uid] = request.request_id
+        return request_ids
+
+    def _pending_removal_request_ids_snapshot(self) -> set[str]:
+        pending_lock = getattr(self, "_pending_removal_lock", None)
+        pending = getattr(self, "_pending_removal_request_ids", {})
+        if pending_lock is None:
+            return set(pending.values())
+        with pending_lock:
+            return set(pending.values())
+
+    def has_pending_removal(self, request_id: str) -> bool:
+        """Return whether an old generation with this ID awaits removal."""
+        return request_id in self._pending_removal_request_ids_snapshot()
+
+    def schedule_removal(
+        self,
+        uids: List[int],
+        request_ids: Optional[List[str]] = None,
+    ) -> None:
         """Thread-safe deferred removal of UIDs from the batch.
 
         Safe to call from any thread (typically the event loop during
@@ -1190,9 +1225,29 @@ class MLLMBatchGenerator:
         batch boundary.  This avoids the Metal ``encodeSignalEvent:
         uncommitted encoder`` crash that occurs when two threads submit
         GPU work on the same stream concurrently.
+
+        ``request_ids`` records the generation associated with each UID so a
+        same-ID replacement cannot enter before the model thread retires it.
         """
-        with self._pending_removal_lock:
-            self._pending_removal_uids.update(uids)
+        uid_list = list(uids)
+        if request_ids is not None and len(request_ids) != len(uid_list):
+            raise ValueError("deferred removal IDs must match deferred removal UIDs")
+        request_ids_by_uid = (
+            dict(zip(uid_list, request_ids))
+            if request_ids is not None
+            else self._request_ids_for_uids(set(uid_list))
+        )
+        pending_request_ids = getattr(self, "_pending_removal_request_ids", None)
+        if pending_request_ids is None:
+            pending_request_ids = {}
+            self._pending_removal_request_ids = pending_request_ids
+        pending_lock = getattr(self, "_pending_removal_lock", None)
+        if pending_lock is None:
+            pending_lock = threading.Lock()
+            self._pending_removal_lock = pending_lock
+        with pending_lock:
+            self._pending_removal_uids.update(uid_list)
+            pending_request_ids.update(request_ids_by_uid)
 
     def process_pending_removals(self) -> None:
         """Remove any UIDs enqueued via :meth:`schedule_removal`.
@@ -1255,6 +1310,9 @@ class MLLMBatchGenerator:
         uids = []
         minted_request_ids = []
         with self._prefix_checkpoint_lock:
+            pending_request_ids = self._pending_removal_request_ids_snapshot()
+            if any(request.request_id in pending_request_ids for request in requests):
+                raise RuntimeError("request ID has pending removal")
             original_uid_counter = self.uid_counter
             if owner_enabled:
                 if getattr(self, "_cache_owner_lifecycle_failed", False):
@@ -1350,6 +1408,21 @@ class MLLMBatchGenerator:
             uids: List of UIDs to remove
         """
         uid_set = set(uids)
+        pending_lock = getattr(self, "_pending_removal_lock", None)
+        pending_request_ids = getattr(self, "_pending_removal_request_ids", {})
+        if pending_lock is None:
+            pending_request_ids_for_uids = {
+                uid: request_id
+                for uid, request_id in pending_request_ids.items()
+                if uid in uid_set
+            }
+        else:
+            with pending_lock:
+                pending_request_ids_for_uids = {
+                    uid: request_id
+                    for uid, request_id in pending_request_ids.items()
+                    if uid in uid_set
+                }
         removed_request_ids = {
             request.request_id
             for request in self.unprocessed_requests
@@ -1382,8 +1455,19 @@ class MLLMBatchGenerator:
         self.unprocessed_requests = [
             r for r in self.unprocessed_requests if r.uid not in uid_set
         ]
-        for request_id in removed_request_ids:
-            self._release_cache_owner_request(request_id)
+        retired_request_ids = set(pending_request_ids_for_uids.values())
+        retired_request_ids.update(removed_request_ids)
+        with self._prefix_checkpoint_lock:
+            for request_id in retired_request_ids:
+                self._aborted_request_ids.discard(request_id)
+                self._release_cache_owner_request(request_id)
+            if pending_lock is not None:
+                with pending_lock:
+                    for uid in uid_set:
+                        pending_request_ids.pop(uid, None)
+            else:
+                for uid in uid_set:
+                    pending_request_ids.pop(uid, None)
 
     def _compatible_pending_requests(
         self,

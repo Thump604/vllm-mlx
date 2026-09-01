@@ -492,6 +492,9 @@ class MLLMScheduler:
         with self._state_lock:
             if request_id in self.requests:
                 raise ValueError(f"duplicate MLLM request ID: {request_id}")
+            pending_removal = getattr(self.batch_generator, "has_pending_removal", None)
+            if callable(pending_removal) and pending_removal(request_id) is True:
+                raise ValueError(f"MLLM request ID has pending removal: {request_id}")
             self.requests[request_id] = request
             self.waiting.append(request)
 
@@ -521,10 +524,12 @@ class MLLMScheduler:
         if request is None:
             return False
 
-        # Signal batch generator to abort any in-progress prefill for this
-        # request.  The prefill loop checks _aborted_request_ids between
-        # chunks and raises PrefillAbortedError to exit early.
-        if self.batch_generator is not None:
+        # Signal the batch generator only after admission.  A request that is
+        # still waiting has not been inserted into the generator, so marking
+        # its ID would poison a later request that legitimately reuses it.
+        # The prefill loop checks _aborted_request_ids between chunks and
+        # raises PrefillAbortedError to exit early for admitted requests.
+        if request.status != RequestStatus.WAITING and self.batch_generator is not None:
             self.batch_generator.abort_prefill(request_id)
 
         # Remove from waiting queue
@@ -556,7 +561,7 @@ class MLLMScheduler:
         if request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
-                self.batch_generator.schedule_removal([uid])
+                self.batch_generator.schedule_removal([uid], request_ids=[request_id])
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
 
@@ -1010,31 +1015,66 @@ class MLLMScheduler:
             processing_task = self._processing_task
             if processing_task:
                 processing_task.cancel()
+        processing_error = None
+        cleanup_error = None
         try:
             if processing_task:
                 try:
                     await processing_task
                 except asyncio.CancelledError:
                     pass
+                except BaseException as error:
+                    # Cleanup must still run when the processing loop exits
+                    # with a non-Exception BaseException.  Re-raise the
+                    # processing failure after cleanup so teardown errors do
+                    # not hide the original cause.
+                    processing_error = error
 
             with self._state_lock:
                 if self._processing_task is processing_task:
                     self._processing_task = None
-                if self.batch_generator is not None:
-                    self.batch_generator.close()
-                    self.batch_generator = None
+                batch_generator = self.batch_generator
                 tier = self._ssd_tier
 
-            if tier is not None:
-                aclose = getattr(tier, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+            if batch_generator is not None:
+                try:
+                    batch_generator.close()
+                except BaseException as error:
+                    cleanup_error = error
                 else:
-                    await asyncio.to_thread(tier.close)
-                with self._state_lock:
-                    if self._ssd_tier is tier:
-                        self._ssd_tier = None
-                logger.info("SSD cache tier closed")
+                    with self._state_lock:
+                        if self.batch_generator is batch_generator:
+                            self.batch_generator = None
+
+            if tier is not None:
+                try:
+                    aclose = getattr(tier, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                    else:
+                        await asyncio.to_thread(tier.close)
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                else:
+                    with self._state_lock:
+                        if self._ssd_tier is tier:
+                            self._ssd_tier = None
+                    logger.info("SSD cache tier closed")
+
+            if processing_error is not None:
+                if cleanup_error is not None:
+                    logger.error(
+                        "Scheduler cleanup failed after processing failure",
+                        exc_info=(
+                            type(cleanup_error),
+                            cleanup_error,
+                            cleanup_error.__traceback__,
+                        ),
+                    )
+                raise processing_error
+            if cleanup_error is not None:
+                raise cleanup_error
         finally:
             with self._state_lock:
                 self._stopping = False
