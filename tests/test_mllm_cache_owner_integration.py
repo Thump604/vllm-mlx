@@ -1786,6 +1786,7 @@ def test_scheduler_threads_verified_owner_context(monkeypatch):
     scheduler.mm_processor = object()
     scheduler.stop_tokens = set()
     scheduler._ssd_tier = None
+    scheduler._owner_thread_id = threading.get_ident()
     captured = {}
 
     class FakeGenerator:

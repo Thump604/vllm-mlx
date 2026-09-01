@@ -353,6 +353,21 @@ class MLLMScheduler:
                 model_identity=self.config.model_identity,
                 cache_owner_context=self.config.cache_owner_context,
             )
+            owner_thread_id = getattr(self, "_owner_thread_id", None)
+            if owner_thread_id is None:
+                if self.config.cache_owner_context is not None:
+                    raise RuntimeError("MLLM scheduler owner thread marker is missing")
+                owner_thread_id = threading.get_ident()
+                self._owner_thread_id = owner_thread_id
+            if not isinstance(owner_thread_id, int) or isinstance(
+                owner_thread_id, bool
+            ):
+                raise RuntimeError("MLLM scheduler owner thread marker is missing")
+            # Keep the generator's MLX/SSD promotion guard aligned with the
+            # scheduler owner. The production generator initializes this
+            # marker itself; assignment also keeps lightweight test doubles
+            # and alternate constructors on the same contract.
+            self.batch_generator._owner_thread_id = owner_thread_id
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
             # standard Scheduler path (see scheduler.py ~1226).  Without this
@@ -360,18 +375,32 @@ class MLLMScheduler:
             # because the SSD tier was only ever attached to the standard
             # Scheduler's MemoryAwarePrefixCache.  No-op when the flag is unset.
             self._ssd_tier = None
+            self.batch_generator._ssd_tier = None
             prefix_cache = getattr(self.batch_generator, "prefix_cache", None)
             if self.config.ssd_cache_dir is not None and prefix_cache is not None:
                 from .ssd_cache import SSDCacheConfig, SSDCacheTier
 
-                ssd_config = SSDCacheConfig(
-                    cache_dir=self.config.ssd_cache_dir,
-                    max_size_gb=self.config.ssd_cache_max_gb,
-                )
+                ssd_identity = None
+                owner_context = self.config.cache_owner_context
+                if owner_context is not None:
+                    ssd_identity = dict(owner_context.persistence_identity)
+                ssd_config_kwargs = {
+                    "cache_dir": self.config.ssd_cache_dir,
+                    "max_size_gb": self.config.ssd_cache_max_gb,
+                }
+                if ssd_identity is not None:
+                    ssd_config_kwargs["persistence_identity"] = ssd_identity
+                ssd_config = SSDCacheConfig(**ssd_config_kwargs)
                 self._ssd_tier = SSDCacheTier(ssd_config)
-                self._ssd_tier.start_writer()
-                self._ssd_tier.reconcile()
-                prefix_cache.set_ssd_tier(self._ssd_tier)
+                try:
+                    self._ssd_tier.start_writer()
+                    self._ssd_tier.reconcile()
+                    prefix_cache.set_ssd_tier(self._ssd_tier)
+                except Exception:
+                    self._ssd_tier.close()
+                    self._ssd_tier = None
+                    raise
+                self.batch_generator._ssd_tier = self._ssd_tier
                 logger.info(
                     "[mllm] SSD cache tier enabled on MLLM prefix cache: "
                     "dir=%s, max=%sGB",

@@ -27,6 +27,7 @@ import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,63 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
 _PREFIX_FILTER_TOKENS = 16
+_PERSISTENCE_IDENTITY_KEYS = ("model", "tokenizer", "cache_layout")
+
+
+def _normalize_persistence_identity(
+    identity: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    """Return a strict, JSON-safe cache identity or reject it.
+
+    SSD entries are reusable only inside one exact model/tokenizer/cache-layout
+    namespace.  ``None`` is retained for legacy ownerless tiers; an attached
+    owner-bound cache binds a complete identity before its first spill.
+    """
+    if identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise ValueError("persistence identity must be a mapping")
+    normalized = dict(identity)
+    if set(normalized) != set(_PERSISTENCE_IDENTITY_KEYS):
+        raise ValueError(
+            "persistence identity requires model, tokenizer, and cache_layout"
+        )
+    if any(not isinstance(value, str) or not value for value in normalized.values()):
+        raise ValueError("persistence identity values must be non-empty strings")
+    return {key: normalized[key] for key in _PERSISTENCE_IDENTITY_KEYS}
+
+
+def _safe_entry_path(relative_path: Any) -> bool:
+    """Check that an index path names one direct SSD entry directory."""
+    if not isinstance(relative_path, str) or not relative_path:
+        return False
+    normalized = os.path.normpath(relative_path)
+    return not (
+        os.path.isabs(relative_path)
+        or normalized != relative_path
+        or normalized in (".", "..")
+        or normalized.startswith(f"..{os.sep}")
+        or os.path.basename(relative_path) != relative_path
+    )
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _decode_persistence_identity(value: Any) -> dict[str, str] | None:
+    """Decode an index identity; malformed/missing values remain unusable."""
+    if value is None:
+        return None
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+        return _normalize_persistence_identity(decoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -61,6 +119,9 @@ class SSDCacheConfig:
     dir_permissions: int = 0o700
     spill_queue_size: int = 64
     retention_seconds: int | None = None
+    # Exact model/tokenizer/cache-layout identity for owner-bound tiers.
+    # Legacy ownerless tiers may leave this unset.
+    persistence_identity: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.max_size_gb <= 0:
@@ -71,6 +132,11 @@ class SSDCacheConfig:
             raise ValueError(
                 f"spill_queue_size must be >= 1, got {self.spill_queue_size}"
             )
+        object.__setattr__(
+            self,
+            "persistence_identity",
+            _normalize_persistence_identity(self.persistence_identity),
+        )
 
     @property
     def max_size_bytes(self) -> int:
@@ -183,6 +249,7 @@ class SSDIndex:
                 num_tokens   INTEGER NOT NULL,
                 file_path    TEXT NOT NULL,
                 memory_bytes INTEGER NOT NULL,
+                persistence_identity TEXT,
                 created_at   REAL NOT NULL,
                 accessed_at  REAL NOT NULL
             );
@@ -190,6 +257,7 @@ class SSDIndex:
             """
         self._conn.executescript(schema_sql)
         self._ensure_column("entries", "prefix_hash", "TEXT")
+        self._ensure_column("entries", "persistence_identity", "TEXT")
         self._conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_entries_accessed
                 ON entries(accessed_at);
@@ -233,8 +301,15 @@ class SSDIndex:
         file_path: str,
         memory_bytes: int,
         num_tokens: int,
+        persistence_identity: Mapping[str, str] | None = None,
     ) -> None:
         """Insert or replace a cache entry in the index."""
+        normalized_identity = _normalize_persistence_identity(persistence_identity)
+        identity_json = (
+            json.dumps(normalized_identity, sort_keys=True, separators=(",", ":"))
+            if normalized_identity is not None
+            else None
+        )
         now = time.time()
         token_hash = _tokens_hash(tokens_key)
         prefix_hash = _prefix_hash(tokens_key)
@@ -244,8 +319,8 @@ class SSDIndex:
                 """
                 INSERT OR REPLACE INTO entries
                     (token_hash, tokens_blob, prefix_hash, num_tokens, file_path,
-                     memory_bytes, created_at, accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     memory_bytes, persistence_identity, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     token_hash,
@@ -254,6 +329,7 @@ class SSDIndex:
                     num_tokens,
                     file_path,
                     memory_bytes,
+                    identity_json,
                     now,
                     now,
                 ),
@@ -265,7 +341,8 @@ class SSDIndex:
         token_hash = _tokens_hash(tokens_key)
         with self._db_lock:
             cur = self._conn.execute(
-                "SELECT file_path, memory_bytes, num_tokens FROM entries WHERE token_hash = ?",
+                "SELECT file_path, memory_bytes, num_tokens, persistence_identity "
+                "FROM entries WHERE token_hash = ?",
                 (token_hash,),
             )
             row = cur.fetchone()
@@ -275,6 +352,9 @@ class SSDIndex:
             "file_path": row["file_path"],
             "memory_bytes": row["memory_bytes"],
             "num_tokens": row["num_tokens"],
+            "persistence_identity": _decode_persistence_identity(
+                row["persistence_identity"]
+            ),
         }
 
     def lookup_prefix(self, query_tokens: tuple[int, ...]) -> list[dict]:
@@ -298,7 +378,8 @@ class SSDIndex:
         with self._db_lock:
             placeholders = ",".join("?" for _ in prefix_hashes)
             cur = self._conn.execute(
-                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes "
+                "SELECT token_hash, tokens_blob, num_tokens, file_path, memory_bytes, "
+                "persistence_identity "
                 f"FROM entries WHERE num_tokens <= ? AND prefix_hash IN ({placeholders}) "
                 "ORDER BY num_tokens DESC",
                 (query_len, *prefix_hashes),
@@ -317,6 +398,9 @@ class SSDIndex:
                         "file_path": row["file_path"],
                         "memory_bytes": row["memory_bytes"],
                         "num_tokens": n,
+                        "persistence_identity": _decode_persistence_identity(
+                            row["persistence_identity"]
+                        ),
                     }
                 )
         return results
@@ -475,6 +559,7 @@ class KVCacheSerializer(LayerSerializer):
     # Extra attributes carried by RotatingKVCache (but not vanilla KVCache).
     # Stored in metadata so deserialize can faithfully reconstruct either type.
     _ROTATING_ATTRS = ("max_size", "keep", "step", "_idx")
+    _KV_ATTRS = ("_max_size", "step")
 
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
         keys_np, keys_orig_dtype = _mx_to_numpy_safe(layer.keys)
@@ -498,14 +583,25 @@ class KVCacheSerializer(LayerSerializer):
             "keys_np": keys_np,
             "values_np": values_np,
             "offset": layer.offset,
+            "layer_type": (
+                "RotatingKVCache"
+                if type(layer).__name__ == "RotatingKVCache"
+                or all(hasattr(layer, attr) for attr in ("max_size", "keep", "_idx"))
+                else "KVCache"
+            ),
         }
         if keys_orig_dtype is not None:
             snapshot["keys_original_dtype"] = keys_orig_dtype
         if values_orig_dtype is not None:
             snapshot["values_original_dtype"] = values_orig_dtype
 
-        # RotatingKVCache extras (plain Python scalars, no MLX).
-        for attr in self._ROTATING_ATTRS:
+        # Cache-shaping and rotating extras (plain Python scalars, no MLX).
+        attrs = (
+            self._ROTATING_ATTRS
+            if snapshot["layer_type"] == "RotatingKVCache"
+            else self._KV_ATTRS
+        )
+        for attr in attrs:
             if hasattr(layer, attr):
                 snapshot[attr] = getattr(layer, attr)
         return snapshot
@@ -522,14 +618,23 @@ class KVCacheSerializer(LayerSerializer):
         save_file(tensors, file_path)
 
         metadata = {
-            "layer_type": "KVCache",
+            "layer_type": snapshot.get("layer_type", "KVCache"),
             "layer_idx": layer_idx,
             "offset": snapshot["offset"],
+            "keys_shape": list(snapshot["keys_np"].shape),
+            "values_shape": list(snapshot["values_np"].shape),
+            "keys_dtype": str(snapshot["keys_np"].dtype),
+            "values_dtype": str(snapshot["values_np"].dtype),
         }
         for k in ("keys_original_dtype", "values_original_dtype"):
             if k in snapshot:
                 metadata[k] = snapshot[k]
-        for attr in self._ROTATING_ATTRS:
+        attrs = (
+            self._ROTATING_ATTRS
+            if metadata["layer_type"] == "RotatingKVCache"
+            else self._KV_ATTRS
+        )
+        for attr in attrs:
             if attr in snapshot:
                 metadata[attr] = snapshot[attr]
 
@@ -545,12 +650,22 @@ class KVCacheSerializer(LayerSerializer):
             "keys": tensors[f"layer_{layer_idx}_keys"],
             "values": tensors[f"layer_{layer_idx}_values"],
             "offset": metadata["offset"],
+            "layer_type": metadata["layer_type"],
+            "keys_shape": metadata["keys_shape"],
+            "values_shape": metadata["values_shape"],
+            "keys_dtype": metadata["keys_dtype"],
+            "values_dtype": metadata["values_dtype"],
         }
         # Dtype hints surfaced so _reconstruct_ssd_layers can cast back.
         for k in ("keys_original_dtype", "values_original_dtype"):
             if k in metadata:
                 result[k] = metadata[k]
-        for attr in self._ROTATING_ATTRS:
+        attrs = (
+            self._ROTATING_ATTRS
+            if metadata["layer_type"] == "RotatingKVCache"
+            else self._KV_ATTRS
+        )
+        for attr in attrs:
             if attr in metadata:
                 result[attr] = metadata[attr]
         return result
@@ -570,10 +685,29 @@ class ArraysCacheSerializer(LayerSerializer):
             state_np.append(np_arr)
             original_dtypes.append(orig)
 
-        snapshot: dict[str, Any] = {"state_np": state_np}
+        snapshot: dict[str, Any] = {
+            "state_np": state_np,
+            "layer_type": (
+                "MambaCache" if type(layer).__name__ == "MambaCache" else "ArraysCache"
+            ),
+        }
         # Skip the dtype list in the common (fp16/fp32) case.
         if any(d is not None for d in original_dtypes):
             snapshot["state_original_dtypes"] = original_dtypes
+        metadata_np: dict[str, np.ndarray] = {}
+        metadata_original_dtypes: dict[str, str | None] = {}
+        for attr in ("left_padding", "lengths"):
+            value = getattr(layer, attr, None)
+            if value is None:
+                continue
+            np_value, original_dtype = _mx_to_numpy_safe(value)
+            metadata_np[attr] = np_value
+            metadata_original_dtypes[attr] = original_dtype
+        if metadata_np:
+            snapshot["metadata_np"] = metadata_np
+            snapshot["metadata_original_dtypes"] = metadata_original_dtypes
+        if hasattr(layer, "meta_state"):
+            snapshot["meta_state"] = getattr(layer, "meta_state")
         return snapshot
 
     def serialize_layer(
@@ -586,15 +720,32 @@ class ArraysCacheSerializer(LayerSerializer):
         tensors = {
             f"layer_{layer_idx}_state_{i}": arr for i, arr in enumerate(state_np)
         }
+        metadata_np = snapshot.get("metadata_np", {})
+        tensors.update(
+            {f"layer_{layer_idx}_{name}": value for name, value in metadata_np.items()}
+        )
         save_file(tensors, file_path)
 
         metadata = {
-            "layer_type": "ArraysCache",
+            "layer_type": snapshot.get("layer_type", "ArraysCache"),
             "layer_idx": layer_idx,
             "num_arrays": len(state_np),
+            "state_shapes": [list(arr.shape) for arr in state_np],
+            "state_dtypes": [str(arr.dtype) for arr in state_np],
+            "metadata_arrays": sorted(metadata_np),
+            "metadata_shapes": {
+                name: list(value.shape) for name, value in metadata_np.items()
+            },
+            "metadata_dtypes": {
+                name: str(value.dtype) for name, value in metadata_np.items()
+            },
         }
         if "state_original_dtypes" in snapshot:
             metadata["state_original_dtypes"] = snapshot["state_original_dtypes"]
+        if "metadata_original_dtypes" in snapshot:
+            metadata["metadata_original_dtypes"] = snapshot["metadata_original_dtypes"]
+        if "meta_state" in snapshot:
+            metadata["meta_state"] = snapshot["meta_state"]
         return metadata
 
     def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
@@ -607,9 +758,25 @@ class ArraysCacheSerializer(LayerSerializer):
         state = []
         for i in range(num_arrays):
             state.append(tensors[f"layer_{layer_idx}_state_{i}"])
-        result = {"state": state}
+        metadata_values = {}
+        for name in metadata.get("metadata_arrays", []):
+            metadata_values[name] = tensors[f"layer_{layer_idx}_{name}"]
+        result = {
+            "state": state,
+            "layer_type": metadata["layer_type"],
+            "state_shapes": metadata["state_shapes"],
+            "state_dtypes": metadata["state_dtypes"],
+            "metadata": metadata_values,
+            "metadata_arrays": metadata.get("metadata_arrays", []),
+            "metadata_shapes": metadata.get("metadata_shapes", {}),
+            "metadata_dtypes": metadata.get("metadata_dtypes", {}),
+        }
         if "state_original_dtypes" in metadata:
             result["state_original_dtypes"] = metadata["state_original_dtypes"]
+        if "metadata_original_dtypes" in metadata:
+            result["metadata_original_dtypes"] = metadata["metadata_original_dtypes"]
+        if "meta_state" in metadata:
+            result["meta_state"] = metadata["meta_state"]
         return result
 
 
@@ -630,6 +797,310 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
         f"Unsupported cache layer type: {type(layer).__name__}. "
         f"Supported: {list(SERIALIZER_SUPPORT_MATRIX.keys())}"
     )
+
+
+@dataclass(frozen=True)
+class SSDReadResult:
+    """Validated SSD bytes ready for owner-thread reconstruction."""
+
+    tokens: tuple[int, ...]
+    file_path: str
+    memory_bytes: int
+    layers: list[dict[str, Any]]
+    read_bytes: int
+    latency_seconds: float
+
+
+def _strict_shape(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("layer shape must be a non-empty sequence")
+    shape = tuple(value)
+    if any(
+        not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape
+    ):
+        raise ValueError("layer shape dimensions must be positive integers")
+    return shape
+
+
+def _strict_dtype(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("layer dtype must be a non-empty string")
+    return value
+
+
+def _strict_original_dtype(value: Any) -> str:
+    dtype = _strict_dtype(value)
+    if dtype == "bfloat16":
+        return dtype
+    try:
+        np.dtype(dtype)
+    except TypeError as exc:
+        raise ValueError(f"unsupported original dtype {dtype!r}") from exc
+    return dtype
+
+
+def _strict_int(value: Any, name: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _validate_layer_manifest(
+    layer_meta: Any, layer_idx: int, layer_data: dict[str, Any]
+) -> None:
+    """Validate manifest metadata and deserialized arrays before publication."""
+    if not isinstance(layer_meta, dict) or not isinstance(layer_data, dict):
+        raise ValueError("layer metadata/data must be objects")
+    if _strict_int(layer_meta.get("layer_idx"), "layer_idx") != layer_idx:
+        raise ValueError("layer order is not contiguous")
+
+    layer_type = layer_meta.get("layer_type")
+    if layer_type in ("KVCache", "RotatingKVCache"):
+        required = {
+            "offset",
+            "keys_shape",
+            "values_shape",
+            "keys_dtype",
+            "values_dtype",
+        }
+        if not required.issubset(layer_meta):
+            raise ValueError("KV layer metadata is incomplete")
+        keys_shape = _strict_shape(layer_meta["keys_shape"])
+        values_shape = _strict_shape(layer_meta["values_shape"])
+        if len(keys_shape) < 3 or len(values_shape) < 3:
+            raise ValueError("KV layer arrays must have at least three dimensions")
+        if keys_shape[:3] != values_shape[:3]:
+            raise ValueError("KV key/value batch geometry differs")
+        if keys_shape[-2] != values_shape[-2]:
+            raise ValueError("KV key/value sequence geometry differs")
+        keys_dtype = _strict_dtype(layer_meta["keys_dtype"])
+        values_dtype = _strict_dtype(layer_meta["values_dtype"])
+        offset = _strict_int(layer_meta["offset"], "offset")
+        if layer_type == "KVCache" and offset > keys_shape[-2]:
+            raise ValueError("KV offset exceeds serialized sequence length")
+        if not isinstance(layer_data.get("keys"), np.ndarray) or not isinstance(
+            layer_data.get("values"), np.ndarray
+        ):
+            raise ValueError("KV layer arrays are not numpy arrays")
+        keys = layer_data["keys"]
+        values = layer_data["values"]
+        if tuple(keys.shape) != keys_shape or tuple(values.shape) != values_shape:
+            raise ValueError("KV layer shape does not match manifest")
+        if str(keys.dtype) != keys_dtype or str(values.dtype) != values_dtype:
+            raise ValueError("KV layer dtype does not match manifest")
+        for name in ("keys_original_dtype", "values_original_dtype"):
+            if name in layer_meta:
+                _strict_original_dtype(layer_meta[name])
+
+        if layer_type == "RotatingKVCache":
+            for name in ("max_size", "keep", "step", "_idx"):
+                if name not in layer_meta:
+                    raise ValueError("RotatingKVCache metadata is incomplete")
+            max_size = _strict_int(layer_meta["max_size"], "max_size", minimum=1)
+            keep = _strict_int(layer_meta["keep"], "keep")
+            step = _strict_int(layer_meta["step"], "step", minimum=1)
+            idx = _strict_int(layer_meta["_idx"], "_idx")
+            if keep >= max_size or idx > keys_shape[-2]:
+                raise ValueError("invalid RotatingKVCache geometry")
+            if _strict_int(layer_meta["offset"], "offset") < idx:
+                raise ValueError("invalid RotatingKVCache offset/index state")
+            if step < 1:
+                raise ValueError("invalid RotatingKVCache step")
+        else:
+            if "_max_size" in layer_meta and layer_meta["_max_size"] is not None:
+                _strict_int(layer_meta["_max_size"], "_max_size", minimum=1)
+            if "step" in layer_meta:
+                _strict_int(layer_meta["step"], "step", minimum=1)
+        return
+
+    if layer_type not in ("ArraysCache", "MambaCache"):
+        raise ValueError(f"unsupported layer type {layer_type!r}")
+    num_arrays = _strict_int(layer_meta.get("num_arrays"), "num_arrays", minimum=1)
+    state_shapes = layer_meta.get("state_shapes")
+    state_dtypes = layer_meta.get("state_dtypes")
+    state = layer_data.get("state")
+    if (
+        not isinstance(state, list)
+        or len(state) != num_arrays
+        or not isinstance(state_shapes, list)
+        or len(state_shapes) != num_arrays
+        or not isinstance(state_dtypes, list)
+        or len(state_dtypes) != num_arrays
+    ):
+        raise ValueError("ArraysCache metadata/state count mismatch")
+    original_dtypes = layer_meta.get("state_original_dtypes")
+    if original_dtypes is not None:
+        if not isinstance(original_dtypes, list) or len(original_dtypes) != num_arrays:
+            raise ValueError("ArraysCache original dtype count mismatch")
+        for dtype in original_dtypes:
+            if dtype is not None:
+                _strict_original_dtype(dtype)
+    for array, shape_meta, dtype_meta in zip(state, state_shapes, state_dtypes):
+        shape = _strict_shape(shape_meta)
+        dtype = _strict_dtype(dtype_meta)
+        if not isinstance(array, np.ndarray):
+            raise ValueError("ArraysCache state is not a numpy array")
+        if tuple(array.shape) != shape or str(array.dtype) != dtype:
+            raise ValueError("ArraysCache state does not match manifest")
+
+    required_metadata = {"metadata_arrays", "metadata_shapes", "metadata_dtypes"}
+    if not required_metadata.issubset(layer_meta):
+        raise ValueError("ArraysCache metadata is incomplete")
+    metadata_arrays = layer_meta["metadata_arrays"]
+    if (
+        not isinstance(metadata_arrays, list)
+        or len(set(metadata_arrays)) != len(metadata_arrays)
+        or any(name not in {"left_padding", "lengths"} for name in metadata_arrays)
+    ):
+        raise ValueError("ArraysCache metadata arrays are invalid")
+    metadata_shapes = layer_meta["metadata_shapes"]
+    metadata_dtypes = layer_meta["metadata_dtypes"]
+    metadata_values = layer_data.get("metadata", {})
+    if (
+        not isinstance(metadata_shapes, dict)
+        or not isinstance(metadata_dtypes, dict)
+        or not isinstance(metadata_values, dict)
+        or set(metadata_shapes) != set(metadata_arrays)
+        or set(metadata_dtypes) != set(metadata_arrays)
+        or set(metadata_values) != set(metadata_arrays)
+    ):
+        raise ValueError("ArraysCache metadata shape/count mismatch")
+    metadata_original_dtypes = layer_meta.get("metadata_original_dtypes", {})
+    if not isinstance(metadata_original_dtypes, dict) or not set(
+        metadata_original_dtypes
+    ).issubset(metadata_arrays):
+        raise ValueError("ArraysCache metadata dtype information is invalid")
+    for name in metadata_arrays:
+        shape = _strict_shape(metadata_shapes[name])
+        dtype = _strict_dtype(metadata_dtypes[name])
+        value = metadata_values[name]
+        if not isinstance(value, np.ndarray):
+            raise ValueError("ArraysCache metadata is not a numpy array")
+        if tuple(value.shape) != shape or str(value.dtype) != dtype:
+            raise ValueError("ArraysCache metadata does not match manifest")
+        original_dtype = metadata_original_dtypes.get(name)
+        if original_dtype is not None:
+            _strict_original_dtype(original_dtype)
+
+
+def reconstruct_ssd_layers(layer_dicts: list[dict[str, Any]]) -> list[Any] | None:
+    """Rebuild validated SSD layers on the caller's current MLX thread."""
+    try:
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        try:
+            from mlx_lm.models.cache import MambaCache
+        except ImportError:
+            MambaCache = None
+        try:
+            from mlx_lm.models.cache import RotatingKVCache
+        except ImportError:
+            RotatingKVCache = None
+
+        if not isinstance(layer_dicts, list) or not layer_dicts:
+            return None
+
+        def restore_dtype(array, dtype_name):
+            if dtype_name is None:
+                return array
+            dtype = getattr(mx, dtype_name, None)
+            if dtype is None:
+                return None
+            return array.astype(dtype)
+
+        result = []
+        for layer_dict in layer_dicts:
+            if not isinstance(layer_dict, dict):
+                return None
+            if "keys" in layer_dict and "values" in layer_dict:
+                layer_type = layer_dict.get("layer_type", "KVCache")
+                keys = mx.array(layer_dict["keys"])
+                values = mx.array(layer_dict["values"])
+                keys = restore_dtype(keys, layer_dict.get("keys_original_dtype"))
+                values = restore_dtype(values, layer_dict.get("values_original_dtype"))
+                if keys is None or values is None:
+                    return None
+                if layer_type == "RotatingKVCache":
+                    if RotatingKVCache is None:
+                        return None
+                    cache = RotatingKVCache(
+                        int(layer_dict["max_size"]), int(layer_dict["keep"])
+                    )
+                elif layer_type == "KVCache":
+                    max_size = layer_dict.get("_max_size")
+                    step = layer_dict.get("step")
+                    try:
+                        cache = KVCache(max_size=max_size, step=step)
+                    except TypeError:
+                        try:
+                            cache = KVCache(max_size=max_size)
+                        except TypeError:
+                            # Older governed mlx-lm releases expose only the
+                            # vanilla ``KVCache()`` constructor.  Instantiate
+                            # that public class first, then restore optional
+                            # shaping metadata on the object.
+                            cache = KVCache()
+                            if max_size is not None:
+                                cache._max_size = int(max_size)
+                            if step is not None:
+                                cache.step = int(step)
+                else:
+                    return None
+                cache.keys = keys
+                cache.values = values
+                cache.offset = int(layer_dict["offset"])
+                if layer_type == "RotatingKVCache":
+                    cache.max_size = int(layer_dict["max_size"])
+                    cache.keep = int(layer_dict["keep"])
+                    cache.step = int(layer_dict["step"])
+                    cache._idx = int(layer_dict["_idx"])
+                elif "_max_size" in layer_dict:
+                    cache._max_size = layer_dict["_max_size"]
+                if "step" in layer_dict:
+                    cache.step = int(layer_dict["step"])
+                result.append(cache)
+            elif "state" in layer_dict:
+                layer_type = layer_dict.get("layer_type", "ArraysCache")
+                if layer_type == "ArraysCache":
+                    cache = ArraysCache(len(layer_dict["state"]))
+                elif layer_type == "MambaCache" and MambaCache is not None:
+                    try:
+                        cache = MambaCache(len(layer_dict["state"]))
+                    except TypeError:
+                        cache = MambaCache()
+                else:
+                    return None
+                state = []
+                original_dtypes = layer_dict.get("state_original_dtypes")
+                for index, value in enumerate(layer_dict["state"]):
+                    array = mx.array(value)
+                    if original_dtypes is not None:
+                        dtype_name = original_dtypes[index]
+                        array = restore_dtype(array, dtype_name)
+                        if array is None:
+                            return None
+                    state.append(array)
+                cache.state = state
+                metadata_values = layer_dict.get("metadata", {})
+                metadata_original_dtypes = layer_dict.get(
+                    "metadata_original_dtypes", {}
+                )
+                for name, value in metadata_values.items():
+                    array = mx.array(value)
+                    array = restore_dtype(array, metadata_original_dtypes.get(name))
+                    if array is None:
+                        return None
+                    setattr(cache, name, array)
+                if "meta_state" in layer_dict:
+                    cache.meta_state = layer_dict["meta_state"]
+                result.append(cache)
+            else:
+                return None
+        return result
+    except Exception as exc:
+        logger.warning("[ssd_cache] reconstruction failed: %s", exc)
+        return None
 
 
 class SSDCacheTier:
@@ -674,6 +1145,7 @@ class SSDCacheTier:
             # Stats
             self._stats = SSDCacheStats()
             self._lock = threading.Lock()
+            self._persistence_identity = config.persistence_identity
 
             # Lifecycle state is independent from the stats lock: close() may
             # wait for a writer that still needs the stats lock to finish its
@@ -705,7 +1177,39 @@ class SSDCacheTier:
 
     def get_stats(self) -> dict:
         """Return current SSD cache statistics."""
-        return self._stats.to_dict()
+        with self._lock:
+            return self._stats.to_dict()
+
+    @property
+    def persistence_identity(self) -> dict[str, str] | None:
+        """Return the exact identity required for owner-bound entries."""
+        with self._lifecycle_lock:
+            return (
+                dict(self._persistence_identity)
+                if self._persistence_identity is not None
+                else None
+            )
+
+    def bind_persistence_identity(self, identity: Mapping[str, str]) -> None:
+        """Bind a tier to one exact cache identity before it accepts spills."""
+        normalized = _normalize_persistence_identity(identity)
+        if normalized is None:
+            raise ValueError("owner-bound SSD tiers require cache identity")
+        with self._lifecycle_lock:
+            current = self._persistence_identity
+            if current is not None and current != normalized:
+                raise ValueError("SSD tier cache identity cannot be changed")
+            self._persistence_identity = normalized
+
+    def record_lookup_miss(self) -> None:
+        """Record one metadata lookup that found no SSD candidate."""
+        with self._lock:
+            self._stats.ssd_misses += 1
+
+    def record_promotion_failure(self) -> None:
+        """Record one candidate promotion that did not publish to RAM."""
+        with self._lock:
+            self._stats.promotion_failures += 1
 
     def start_writer(self) -> None:
         """Start the background spill writer thread."""
@@ -890,6 +1394,7 @@ class SSDCacheTier:
         for i, (serializer, snapshot) in enumerate(layer_snapshots):
             layer_path = os.path.join(tmp_dir, f"layer_{i}.safetensors")
             metadata = serializer.serialize_layer(snapshot, i, layer_path)
+            metadata["file_sha256"] = _file_sha256(layer_path)
             layer_manifests.append(metadata)
 
             # Set file permissions
@@ -902,6 +1407,7 @@ class SSDCacheTier:
             "layers": layer_manifests,
             "memory_bytes": memory_bytes,
             "num_tokens": len(tokens_key),
+            "persistence_identity": self._persistence_identity,
         }
         manifest_path = os.path.join(tmp_dir, "manifest.json")
         with open(manifest_path, "w") as f:
@@ -927,6 +1433,7 @@ class SSDCacheTier:
             file_path=relative_path,
             memory_bytes=memory_bytes,
             num_tokens=len(tokens_key),
+            persistence_identity=self._persistence_identity,
         )
 
         # Update stats
@@ -966,6 +1473,142 @@ class SSDCacheTier:
             return results[0]  # Already sorted by num_tokens DESC
         return None
 
+    def lookup_candidate(self, tokens: tuple[int, ...]) -> dict | None:
+        """Return one exact/prefix candidate and account for metadata misses."""
+        tokens = tuple(tokens)
+        candidate = self.lookup_ssd(tokens)
+        if candidate is not None:
+            candidate["match_type"] = "exact"
+            candidate["matched_tokens"] = len(tokens)
+            candidate["matched_key"] = tokens
+            return candidate
+        candidate = self.lookup_ssd_prefix(tokens)
+        if candidate is not None:
+            candidate["match_type"] = "prefix"
+            candidate["matched_tokens"] = candidate["num_tokens"]
+            candidate["matched_key"] = tokens[: candidate["num_tokens"]]
+            return candidate
+        self.record_lookup_miss()
+        return None
+
+    def validate_candidate(
+        self, tokens: tuple[int, ...], candidate: dict
+    ) -> tuple[int, ...] | None:
+        """Validate candidate identity, token coverage, and entry path."""
+        if not isinstance(candidate, dict):
+            return None
+        query = tuple(tokens)
+        if not query:
+            return None
+        relative_path = candidate.get("file_path")
+        if not _safe_entry_path(relative_path):
+            return None
+
+        memory_bytes = candidate.get("memory_bytes")
+        if (
+            not isinstance(memory_bytes, int)
+            or isinstance(memory_bytes, bool)
+            or memory_bytes <= 0
+        ):
+            return None
+        matched_key = candidate.get("matched_key")
+        if matched_key is None:
+            matched_count = candidate.get("matched_tokens")
+            if (
+                not isinstance(matched_count, int)
+                or isinstance(matched_count, bool)
+                or matched_count <= 0
+            ):
+                return None
+            matched_key = query[:matched_count]
+        try:
+            matched = tuple(matched_key)
+        except TypeError:
+            return None
+        if not matched or len(matched) > len(query) or matched != query[: len(matched)]:
+            return None
+        num_tokens = candidate.get("num_tokens")
+        if (
+            not isinstance(num_tokens, int)
+            or isinstance(num_tokens, bool)
+            or num_tokens != len(matched)
+        ):
+            return None
+        matched_count = candidate.get("matched_tokens")
+        if matched_count is not None and matched_count != len(matched):
+            return None
+        match_type = candidate.get("match_type")
+        if match_type is not None and match_type not in ("exact", "prefix"):
+            return None
+        if relative_path != self._entry_hash(matched):
+            return None
+
+        expected_identity = self.persistence_identity
+        if expected_identity is not None:
+            if candidate.get("persistence_identity") != expected_identity:
+                return None
+        return matched
+
+    def read_validated_entry(
+        self, tokens: tuple[int, ...], candidate: dict
+    ) -> SSDReadResult | None:
+        """Read one candidate after validating its exact identity and layout.
+
+        The caller owns RAM reservation and any owner-thread reconstruction.
+        This method performs only validated disk I/O and returns metadata
+        needed for deterministic accounting.
+        """
+        matched = self.validate_candidate(tokens, candidate)
+        if matched is None:
+            self.record_promotion_failure()
+            return None
+        started = time.monotonic()
+        layers = self._read_entry(
+            matched,
+            candidate["file_path"],
+            expected_memory_bytes=candidate["memory_bytes"],
+            expected_persistence_identity=candidate.get("persistence_identity"),
+        )
+        if layers is None:
+            self.record_promotion_failure()
+            return None
+        return SSDReadResult(
+            tokens=matched,
+            file_path=candidate["file_path"],
+            memory_bytes=candidate["memory_bytes"],
+            layers=layers,
+            read_bytes=self._entry_read_bytes(candidate["file_path"], len(layers)),
+            latency_seconds=max(0.0, time.monotonic() - started),
+        )
+
+    def record_promotion_success(self, result: SSDReadResult) -> None:
+        """Account and touch one result only after RAM publication succeeds."""
+        if not isinstance(result, SSDReadResult):
+            raise TypeError("promotion result must be SSDReadResult")
+        with self._lock:
+            self._stats.ssd_hits += 1
+            self._stats.reload_latency_sum += result.latency_seconds
+            self._stats.reload_bytes += result.read_bytes
+        try:
+            self._index.touch(result.tokens)
+        except Exception:
+            logger.debug("[ssd_cache] failed to touch promoted entry", exc_info=True)
+
+    def _entry_read_bytes(self, relative_path: str, layer_count: int) -> int:
+        total = 0
+        for index in range(layer_count):
+            try:
+                total += os.path.getsize(
+                    os.path.join(
+                        self._data_dir,
+                        relative_path,
+                        f"layer_{index}.safetensors",
+                    )
+                )
+            except OSError:
+                pass
+        return total
+
     def remove(self, tokens: tuple[int, ...]) -> bool:
         """Remove an entry from both the SSD index and its data directory."""
         import shutil
@@ -995,7 +1638,10 @@ class SSDCacheTier:
         tokens: tuple[int, ...],
         reserve_budget_fn,
         release_budget_fn,
-    ) -> list | None:
+        *,
+        record_success: bool = True,
+        return_result: bool = False,
+    ) -> list | SSDReadResult | None:
         """Promote an entry from SSD to RAM asynchronously.
 
         CRITICAL: Reserves RAM budget BEFORE the disk read, to avoid
@@ -1010,22 +1656,31 @@ class SSDCacheTier:
 
         Returns:
             List of deserialized cache layers, or None if promotion failed.
+            When ``return_result`` is true, return the validated
+            :class:`SSDReadResult` so a caller can publish it before recording
+            a successful promotion.  Set ``record_success=False`` when that
+            caller owns publication accounting.
         """
         import asyncio
 
-        # Step 1: Look up metadata (fast, SQLite)
-        meta = self._index.lookup_exact(tokens)
-        if meta is None:
-            with self._lock:
-                self._stats.ssd_misses += 1
-            return None
+        if not record_success and not return_result:
+            raise ValueError(
+                "return_result is required when the caller owns promotion accounting"
+            )
 
-        memory_bytes = meta["memory_bytes"]
+        # Step 1: Look up and validate metadata (fast, SQLite)
+        candidate = self.lookup_candidate(tokens)
+        if candidate is None:
+            return None
+        matched = self.validate_candidate(tokens, candidate)
+        if matched is None:
+            self.record_promotion_failure()
+            return None
+        memory_bytes = candidate["memory_bytes"]
 
         # Step 2: Reserve RAM budget BEFORE disk read
         if not reserve_budget_fn(memory_bytes):
-            with self._lock:
-                self._stats.promotion_failures += 1
+            self.record_promotion_failure()
             logger.warning(
                 f"[ssd_cache] promotion denied: cannot reserve "
                 f"{memory_bytes} bytes RAM budget"
@@ -1035,12 +1690,11 @@ class SSDCacheTier:
         # Step 3: Read from disk (in thread pool to avoid blocking event loop)
         # Use shield-and-await-on-cancel per CLAUDE.md Golden Rule #4:
         # budget must be released even if the calling task is cancelled.
-        t0 = time.time()
         worker = asyncio.ensure_future(
-            asyncio.to_thread(self._read_entry, tokens, meta["file_path"])
+            asyncio.to_thread(self.read_validated_entry, tokens, candidate)
         )
         try:
-            cache_layers = await asyncio.shield(worker)
+            read_result = await asyncio.shield(worker)
         except asyncio.CancelledError:
             # Caller cancelled — still need to wait for the disk read
             # to finish, then release the budget
@@ -1053,95 +1707,126 @@ class SSDCacheTier:
         except Exception:
             # Release budget on read failure
             release_budget_fn(memory_bytes)
-            with self._lock:
-                self._stats.promotion_failures += 1
+            self.record_promotion_failure()
             logger.exception(
                 f"[ssd_cache] failed to read entry from disk "
-                f"({meta['num_tokens']} tokens)"
+                f"({candidate['num_tokens']} tokens)"
             )
             return None
 
-        if cache_layers is None:
-            # Corrupted entry — release budget, quarantine entry
+        if read_result is None:
+            # Corrupted entry — release budget; read_validated_entry recorded
+            # one deterministic promotion failure and quarantined the entry.
             release_budget_fn(memory_bytes)
-            with self._lock:
-                self._stats.promotion_failures += 1
             return None
 
-        dt = time.time() - t0
-        total_read_bytes = sum(
-            os.path.getsize(
-                os.path.join(
-                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
-                )
-            )
-            for i in range(len(cache_layers))
-            if os.path.exists(
-                os.path.join(
-                    self._data_dir, meta["file_path"], f"layer_{i}.safetensors"
-                )
-            )
-        )
-
-        with self._lock:
-            self._stats.ssd_hits += 1
-            self._stats.reload_latency_sum += dt
-            self._stats.reload_bytes += total_read_bytes
-
-        # Update access time in index
-        self._index.touch(tokens)
+        if record_success:
+            self.record_promotion_success(read_result)
 
         logger.info(
-            f"[ssd_cache] promoted entry: {meta['num_tokens']} tokens, "
-            f"{total_read_bytes} bytes, {dt*1000:.1f}ms"
+            f"[ssd_cache] promoted entry: {candidate['num_tokens']} tokens, "
+            f"{read_result.read_bytes} bytes, "
+            f"{read_result.latency_seconds * 1000:.1f}ms"
         )
 
-        return cache_layers
+        return read_result if return_result else read_result.layers
 
-    def _read_entry(self, tokens: tuple[int, ...], relative_path: str) -> list | None:
-        """Read a cache entry from disk. Called from thread pool.
+    def _read_entry(
+        self,
+        tokens: tuple[int, ...],
+        relative_path: str,
+        *,
+        expected_memory_bytes: int | None = None,
+        expected_persistence_identity: Mapping[str, str] | None = None,
+    ) -> list | None:
+        """Read and strictly validate one SSD entry before publication."""
+        tokens = tuple(tokens)
+        if not tokens or not _safe_entry_path(relative_path):
+            return None
+        if relative_path != self._entry_hash(tokens):
+            logger.warning("[ssd_cache] entry path does not match token key")
+            return None
 
-        Returns list of deserialized layer dicts, or None on corruption.
-        """
         entry_dir = os.path.join(self._data_dir, relative_path)
         manifest_path = os.path.join(entry_dir, "manifest.json")
-
         try:
             with open(manifest_path) as f:
                 manifest = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"[ssd_cache] corrupt manifest for {relative_path}: {e}")
-            self._quarantine_entry(tokens, relative_path)
-            return None
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest must be an object")
 
-        cache_layers = []
-        for layer_meta in manifest["layers"]:
-            layer_idx = layer_meta["layer_idx"]
-            layer_path = os.path.join(entry_dir, f"layer_{layer_idx}.safetensors")
-            layer_type = layer_meta["layer_type"]
+            expected_identity = self.persistence_identity
+            if (
+                expected_identity is not None
+                and manifest.get("persistence_identity") != expected_identity
+            ):
+                if expected_persistence_identity == expected_identity:
+                    # The index candidate was in this tier's namespace, so a
+                    # missing/changed manifest identity is corruption. Quarantine
+                    # before any layer can be published.
+                    raise ValueError("manifest cache identity mismatch")
+                # A shared tier may legitimately contain another model's
+                # entry. Reject it without quarantining a valid foreign entry.
+                logger.warning("[ssd_cache] entry cache identity mismatch")
+                return None
 
-            try:
+            num_tokens = _strict_int(
+                manifest.get("num_tokens"), "num_tokens", minimum=1
+            )
+            if num_tokens != len(tokens):
+                raise ValueError("manifest token count differs from lookup key")
+            memory_bytes = _strict_int(
+                manifest.get("memory_bytes"), "memory_bytes", minimum=1
+            )
+            if (
+                expected_memory_bytes is not None
+                and memory_bytes != expected_memory_bytes
+            ):
+                raise ValueError("manifest memory accounting differs from index")
+            num_layers = _strict_int(
+                manifest.get("num_layers"), "num_layers", minimum=1
+            )
+            layer_manifests = manifest.get("layers")
+            if (
+                not isinstance(layer_manifests, list)
+                or len(layer_manifests) != num_layers
+            ):
+                raise ValueError("manifest layer count is inconsistent")
+
+            tokens_path = os.path.join(entry_dir, "tokens.bin")
+            with open(tokens_path, "rb") as token_file:
+                stored_tokens = _blob_to_tokens(token_file.read())
+            if stored_tokens != tokens:
+                raise ValueError("serialized token key differs from lookup key")
+
+            cache_layers = []
+            for layer_idx, layer_meta in enumerate(layer_manifests):
+                if not isinstance(layer_meta, dict):
+                    raise ValueError("layer metadata must be an object")
+                layer_type = layer_meta.get("layer_type")
                 if layer_type in ("KVCache", "RotatingKVCache"):
                     serializer = KVCacheSerializer()
                 elif layer_type in ("ArraysCache", "MambaCache"):
                     serializer = ArraysCacheSerializer()
                 else:
-                    logger.warning(
-                        f"[ssd_cache] unknown layer type {layer_type}, skipping"
-                    )
-                    self._quarantine_entry(tokens, relative_path)
-                    return None
-
+                    raise ValueError(f"unknown layer type {layer_type!r}")
+                layer_path = os.path.join(entry_dir, f"layer_{layer_idx}.safetensors")
+                file_digest = layer_meta.get("file_sha256")
+                if (
+                    not isinstance(file_digest, str)
+                    or len(file_digest) != hashlib.sha256().digest_size * 2
+                    or any(char not in "0123456789abcdef" for char in file_digest)
+                    or _file_sha256(layer_path) != file_digest
+                ):
+                    raise ValueError("layer file digest does not match manifest")
                 layer_data = serializer.deserialize_layer(layer_path, layer_meta)
+                _validate_layer_manifest(layer_meta, layer_idx, layer_data)
                 cache_layers.append(layer_data)
-            except Exception as e:
-                logger.warning(
-                    f"[ssd_cache] corrupt layer {layer_idx} in {relative_path}: {e}"
-                )
-                self._quarantine_entry(tokens, relative_path)
-                return None
-
-        return cache_layers
+            return cache_layers
+        except Exception as exc:
+            logger.warning("[ssd_cache] corrupt entry %s: %s", relative_path, exc)
+            self._quarantine_entry(tokens, relative_path)
+            return None
 
     def _quarantine_entry(self, tokens: tuple[int, ...], relative_path: str) -> None:
         """Move a corrupt entry to quarantine and remove from index."""

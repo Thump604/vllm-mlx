@@ -765,9 +765,14 @@ class MLLMBatchGenerator:
         self._request_prefix_checkpoints: Dict[str, Dict[str, Any]] = {}
         self._cache_owner_required = cache_owner_context is not None
         self._cache_owner_context = cache_owner_context
+        # MLLM cache ownership follows the scheduler/model thread. SSD
+        # promotion reconstructs MLX cache objects, so keep an explicit
+        # owner-thread marker for the fail-closed fetch path below.
+        self._owner_thread_id = threading.get_ident()
         self._cache_owner_requests: Dict[str, Any] = {}
         self._cache_owner_lifecycle_mutating = False
         self._cache_owner_lifecycle_failed = False
+        self._ssd_tier = None
 
         # Deferred removal queue — UIDs scheduled for removal from another
         # thread (typically the event loop on client disconnect).  The
@@ -946,6 +951,18 @@ class MLLMBatchGenerator:
             raise RuntimeError(f"missing owner-bound request: {request_id}")
         return binding
 
+    def _assert_cache_owner_thread(self) -> None:
+        """Reject owner-bound cache work from a non-model-owning thread."""
+        if not self._cache_owner_enabled():
+            return
+        owner_thread_id = getattr(self, "_owner_thread_id", None)
+        if (
+            not isinstance(owner_thread_id, int)
+            or isinstance(owner_thread_id, bool)
+            or threading.get_ident() != owner_thread_id
+        ):
+            raise RuntimeError("MLLM cache promotion requires the exact owner thread")
+
     def _release_cache_owner_request(self, request_id: str) -> None:
         with self._prefix_checkpoint_lock:
             binding = getattr(self, "_cache_owner_requests", {}).pop(request_id, None)
@@ -1103,18 +1120,187 @@ class MLLMBatchGenerator:
         return cloned
 
     def _fetch_prefix_cache(
-        self, request_id: str, tokens: List[int]
+        self,
+        request_id: str,
+        tokens: List[int],
+        *,
+        allow_ssd_promotion: bool = False,
     ) -> Tuple[Any, List[int]]:
         if self.prefix_cache is None:
             return None, tokens
         if not self._cache_owner_enabled():
             return self.prefix_cache.fetch(tokens)
+        binding = self._owner_request_binding(request_id)
         decision, cache, remaining = self.prefix_cache.fetch_owner_bound(
-            self._owner_request_binding(request_id), tokens
+            binding, tokens
         )
         if decision.reason == "cancellation":
             raise PrefillAbortedError(request_id)
-        return (cache, remaining) if decision.accepted else (None, tokens)
+        if not decision.accepted:
+            return None, tokens
+        if cache is not None:
+            return cache, remaining
+        # Token IDs alone do not identify media-conditioned KV state. Keep
+        # SSD promotion restricted to the existing text-only eligibility
+        # contract; RAM lookup behavior remains unchanged for callers that
+        # already have a resident entry.
+        if not allow_ssd_promotion:
+            return None, tokens
+
+        self._assert_cache_owner_thread()
+        promoted = self._promote_owner_bound_ssd(request_id, binding, tokens)
+        return promoted if promoted is not None else (None, tokens)
+
+    def _promote_owner_bound_ssd(
+        self,
+        request_id: str,
+        binding: Any,
+        tokens: List[int],
+    ) -> Tuple[Any, List[int]] | None:
+        """Promote one validated SSD candidate on the MLLM owner thread.
+
+        The standard scheduler performs this same sequence synchronously:
+        reserve RAM, read the candidate, reconstruct MLX cache layers, then
+        publish. MLLM's synchronous ``next()``/``step()`` path is already
+        pinned to the model owner thread, so keeping reconstruction here avoids
+        handing MLX arrays across an executor boundary.
+        """
+        self._assert_cache_owner_thread()
+        prefix_cache = self.prefix_cache
+        tier = getattr(self, "_ssd_tier", None)
+        if tier is None and prefix_cache is not None:
+            # Direct generator users may attach a tier through the existing
+            # MemoryAwarePrefixCache API without going through MLLMScheduler.
+            tier = prefix_cache.get_ssd_tier()
+        if prefix_cache is None or tier is None:
+            return None
+
+        decision = prefix_cache.validate_owner_request(binding)
+        if decision.reason == "cancellation":
+            tier.record_promotion_failure()
+            raise PrefillAbortedError(request_id)
+        if not decision.accepted:
+            tier.record_promotion_failure()
+            return None
+
+        try:
+            candidate = prefix_cache.check_ssd(tokens)
+        except Exception:
+            tier.record_promotion_failure()
+            logger.exception("[mllm_ssd] SSD candidate lookup failed")
+            return None
+        if candidate is None:
+            return None
+
+        if tier.validate_candidate(tokens, candidate) is None:
+            tier.record_promotion_failure()
+            logger.warning("[mllm_ssd] rejecting malformed SSD candidate")
+            return None
+        memory_bytes = candidate["memory_bytes"]
+
+        try:
+            reserved = bool(prefix_cache.try_reserve_memory(memory_bytes))
+        except Exception:
+            tier.record_promotion_failure()
+            logger.exception("[mllm_ssd] RAM reservation failed")
+            return None
+        if not reserved:
+            tier.record_promotion_failure()
+            logger.info(
+                "[mllm_ssd] request=%s budget denied (%s bytes)",
+                request_id[:12],
+                memory_bytes,
+            )
+            return None
+
+        try:
+            try:
+                read_result = tier.read_validated_entry(tokens, candidate)
+            except Exception:
+                tier.record_promotion_failure()
+                logger.exception(
+                    "[mllm_ssd] request=%s disk read failed", request_id[:12]
+                )
+                return None
+            if read_result is None:
+                return None
+
+            # Recheck the request lease after disk I/O and before any MLX
+            # reconstruction. A cancellation cannot authorize stale state.
+            decision = prefix_cache.validate_owner_request(binding)
+            if decision.reason == "cancellation":
+                tier.record_promotion_failure()
+                raise PrefillAbortedError(request_id)
+            if not decision.accepted:
+                tier.record_promotion_failure()
+                return None
+
+            reconstructed = self._reconstruct_ssd_layers(read_result.layers)
+            if not reconstructed:
+                tier.record_promotion_failure()
+                return None
+
+            # Validate once more after MLX reconstruction. Publication below
+            # also has its own owner/epoch/request guard.
+            decision = prefix_cache.validate_owner_request(binding)
+            if decision.reason == "cancellation":
+                tier.record_promotion_failure()
+                raise PrefillAbortedError(request_id)
+            if not decision.accepted:
+                tier.record_promotion_failure()
+                return None
+        finally:
+            # The reservation is tentative; the owner-bound store accounts the
+            # detached entry itself. This finally keeps every read,
+            # corruption, reconstruction, and cancellation path balanced.
+            prefix_cache.release_reserved_memory(memory_bytes)
+
+        decision, prepared = prefix_cache.prepare_owner_bound_store(
+            binding,
+            list(read_result.tokens),
+            reconstructed,
+            auxiliary=None,
+            # SSD entries do not carry the exact-hit auxiliary state used by
+            # restart snapshots, so a promoted entry must not advertise
+            # hybrid restart-persistence eligibility.
+            persistence_eligible=False,
+        )
+        if decision.reason == "cancellation":
+            tier.record_promotion_failure()
+            raise PrefillAbortedError(request_id)
+        if not decision.accepted or prepared is None:
+            tier.record_promotion_failure()
+            return None
+
+        decision = prefix_cache.commit_owner_bound_store(
+            prepared,
+            evict_prefixes=False,
+        )
+        if decision.reason == "cancellation":
+            tier.record_promotion_failure()
+            raise PrefillAbortedError(request_id)
+        if not decision.accepted:
+            tier.record_promotion_failure()
+            return None
+
+        tier.record_promotion_success(read_result)
+
+        matched_count = len(read_result.tokens)
+        logger.info(
+            "[mllm_ssd] request=%s %s promote: %s/%s tokens from SSD, %s remaining",
+            request_id[:12],
+            candidate.get("match_type", "exact"),
+            matched_count,
+            len(tokens),
+            len(tokens) - matched_count,
+        )
+        return reconstructed, list(tokens[matched_count:])
+
+    def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
+        """Reconstruct SSD layers on the current owner thread."""
+        from .ssd_cache import reconstruct_ssd_layers
+
+        return reconstruct_ssd_layers(layer_dicts)
 
     def _fetch_exact_prefix_auxiliary(
         self, request_id: str, tokens: List[int]
@@ -2336,7 +2522,9 @@ class MLLMBatchGenerator:
                     )
                     if exact_aux is not None and "last_logits" in exact_aux:
                         cached_kv, remaining_ids = self._fetch_prefix_cache(
-                            req.request_id, input_ids_list
+                            req.request_id,
+                            input_ids_list,
+                            allow_ssd_promotion=req.is_text_only,
                         )
                         cached_last_logits = exact_aux["last_logits"]
                     else:
@@ -2345,7 +2533,9 @@ class MLLMBatchGenerator:
                         S = self._think_suffix_len
                         lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                         cached_kv, remaining_ids = self._fetch_prefix_cache(
-                            req.request_id, lookup_ids
+                            req.request_id,
+                            lookup_ids,
+                            allow_ssd_promotion=req.is_text_only,
                         )
                         if cached_kv is not None and S > 0:
                             remaining_ids = list(remaining_ids) + input_ids_list[-S:]
@@ -3136,7 +3326,14 @@ class MLLMBatchGenerator:
     def get_prefix_cache_stats(self) -> Dict[str, Any]:
         """Get KV prefix cache statistics."""
         if self.prefix_cache is not None:
-            return self.prefix_cache.get_stats()
+            stats = self.prefix_cache.get_stats()
+            get_ssd_stats = getattr(self.prefix_cache, "get_ssd_stats", None)
+            if callable(get_ssd_stats):
+                ssd_stats = get_ssd_stats()
+                if ssd_stats is not None:
+                    stats = dict(stats)
+                    stats["ssd"] = ssd_stats
+            return stats
         return {
             "hits": 0,
             "misses": 0,
@@ -4671,9 +4868,29 @@ def install_chunked_prefill_mllm(
                         return _generation_step()
                     S = batch_gen._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
-                    cached_kv, remaining_ids = batch_gen._fetch_prefix_cache(
-                        text_only_req.request_id, lookup_ids
-                    )
+                    if text_only_req.is_text_only:
+                        try:
+                            cached_kv, remaining_ids = batch_gen._fetch_prefix_cache(
+                                text_only_req.request_id,
+                                lookup_ids,
+                                allow_ssd_promotion=True,
+                            )
+                        except TypeError as exc:
+                            # Keep lightweight legacy test doubles with the
+                            # historical two-argument seam working; the
+                            # production method always accepts the explicit
+                            # text-only SSD gate above.
+                            if "allow_ssd_promotion" not in str(exc):
+                                raise
+                            cached_kv, remaining_ids = batch_gen._fetch_prefix_cache(
+                                text_only_req.request_id, lookup_ids
+                            )
+                    else:
+                        cached_kv, remaining_ids = batch_gen._fetch_prefix_cache(
+                            text_only_req.request_id,
+                            lookup_ids,
+                            allow_ssd_promotion=False,
+                        )
                     if cached_kv is not None and S > 0:
                         remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 

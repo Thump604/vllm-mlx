@@ -2362,7 +2362,17 @@ class MemoryAwarePrefixCache:
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
-        return self._stats.to_dict()
+        stats = self._stats.to_dict()
+        ssd_stats = self.get_ssd_stats()
+        if ssd_stats is not None:
+            stats["ssd"] = ssd_stats
+        return stats
+
+    def get_ssd_stats(self) -> dict[str, Any] | None:
+        """Return attached SSD statistics without exposing tier internals."""
+        tier = self._ssd_tier
+        get_stats = getattr(tier, "get_stats", None) if tier is not None else None
+        return get_stats() if callable(get_stats) else None
 
     def reset_stats(self) -> None:
         """Reset statistics while preserving cache contents."""
@@ -2414,9 +2424,18 @@ class MemoryAwarePrefixCache:
         Args:
             ssd_tier: An SSDCacheTier instance (or None to disable).
         """
+        if ssd_tier is not None and self._cache_owner_context is not None:
+            bind_identity = getattr(ssd_tier, "bind_persistence_identity", None)
+            if not callable(bind_identity):
+                raise RuntimeError("owner-bound SSD tier lacks identity binding")
+            bind_identity(self._persistence_identity)
         self._ssd_tier = ssd_tier
         if ssd_tier is not None:
             logger.info("[memory_cache] SSD tier attached for eviction spilling")
+
+    def get_ssd_tier(self):
+        """Return the attached SSD tier through the cache's public seam."""
+        return self._ssd_tier
 
     def check_ssd(self, tokens: list[int]) -> dict | None:
         """Check if tokens have an SSD cache hit (without reading data).
@@ -2438,7 +2457,26 @@ class MemoryAwarePrefixCache:
         if tokens_key in self._entries:
             return None
 
-        # Check SSD tier — exact match first, then prefix
+        # Check SSD tier — exact match first, then prefix. The tier owns
+        # lookup accounting so a miss is counted once after both probes.
+        # Inspect the type so dynamic mocks/proxies cannot manufacture the
+        # new API and bypass the compatibility path.
+        lookup_candidate_impl = getattr(type(self._ssd_tier), "lookup_candidate", None)
+        if callable(lookup_candidate_impl):
+            lookup_candidate = self._ssd_tier.lookup_candidate
+            candidate = lookup_candidate(tokens_key)
+            validate_candidate = getattr(type(self._ssd_tier), "validate_candidate", None)
+            if candidate is not None and callable(validate_candidate):
+                if self._ssd_tier.validate_candidate(tokens_key, candidate) is None:
+                    record_failure = getattr(
+                        self._ssd_tier, "record_promotion_failure", None
+                    )
+                    if callable(record_failure):
+                        record_failure()
+                    return None
+            return candidate
+
+        # Compatibility fallback for lightweight legacy test doubles.
         candidate = self._ssd_tier.lookup_ssd(tokens_key)
         if candidate is not None:
             candidate["match_type"] = "exact"

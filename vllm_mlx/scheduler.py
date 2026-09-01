@@ -3526,6 +3526,7 @@ class Scheduler:
         Called from _schedule_waiting() before requests are moved to running.
         Reads SSD entries synchronously (disk I/O stays out of fetch() per spec).
         """
+        tier = self._ssd_tier
         for request in self.waiting:
             if getattr(request, "cache_hit_type", None) != "ssd_pending":
                 continue
@@ -3534,6 +3535,16 @@ class Scheduler:
             if candidate is None:
                 continue
 
+            # Keep candidate validation and disk I/O behind the SSD tier's
+            # public seam.  The scheduler owns only the RAM reservation and
+            # owner-thread reconstruction/publication.
+            matched_tokens = tier.validate_candidate(
+                request.prompt_token_ids, candidate
+            )
+            if matched_tokens is None:
+                tier.record_promotion_failure()
+                request.cache_hit_type = "miss"
+                continue
             memory_bytes = candidate["memory_bytes"]
 
             # Check RAM budget availability
@@ -3542,7 +3553,7 @@ class Scheduler:
                 continue
 
             if not self.memory_aware_cache.try_reserve_memory(memory_bytes):
-                self._ssd_tier._stats.promotion_failures += 1
+                tier.record_promotion_failure()
                 request.cache_hit_type = "miss"
                 logger.info(
                     f"[ssd_promote] request={request.request_id[:12]} "
@@ -3550,48 +3561,41 @@ class Scheduler:
                 )
                 continue
 
-            # Use the SSD entry's actual token count for read and store,
-            # NOT the full prompt tokens. For prefix hits these differ.
-            matched_tokens = tuple(
-                candidate.get(
-                    "matched_key",
-                    request.prompt_token_ids[: candidate["matched_tokens"]],
-                )
-            )
             matched_count = len(matched_tokens)
 
             try:
-                cache_layers = self._ssd_tier._read_entry(
-                    matched_tokens, candidate["file_path"]
+                read_result = tier.read_validated_entry(
+                    request.prompt_token_ids, candidate
                 )
             except Exception:
                 self.memory_aware_cache.release_reserved_memory(memory_bytes)
-                self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
+                tier.record_promotion_failure()
                 logger.exception(
                     f"[ssd_promote] request={request.request_id[:12]} "
                     f"disk read failed"
                 )
                 continue
 
-            if cache_layers is None:
+            if read_result is None:
+                request.cache_hit_type = "miss"
                 self.memory_aware_cache.release_reserved_memory(memory_bytes)
-                self._ssd_tier._stats.promotion_failures += 1
-                request.cache_hit_type = "miss"
                 continue
 
-            # Release tentative budget (store() will account properly)
-            self.memory_aware_cache.release_reserved_memory(memory_bytes)
-
-            # Reconstruct and store under the matched prefix tokens
-            reconstructed = self._reconstruct_ssd_layers(cache_layers)
-            if reconstructed is None:
-                request.cache_hit_type = "miss"
-                continue
-
-            self.memory_aware_cache.store(
-                list(matched_tokens), reconstructed, evict_prefixes=False
-            )
+            try:
+                # Reconstruct and store under the matched prefix tokens.  MLX
+                # reconstruction stays on the scheduler's owner thread.
+                reconstructed = self._reconstruct_ssd_layers(read_result.layers)
+                if not reconstructed or not self.memory_aware_cache.store(
+                    list(matched_tokens), reconstructed, evict_prefixes=False
+                ):
+                    tier.record_promotion_failure()
+                    request.cache_hit_type = "miss"
+                    continue
+            finally:
+                # store() accounts the published entry itself; the tentative
+                # reservation must be balanced on every reconstruction path.
+                self.memory_aware_cache.release_reserved_memory(memory_bytes)
 
             request.prompt_cache = reconstructed
             request.prompt_cache_key = list(matched_tokens)
@@ -3599,8 +3603,7 @@ class Scheduler:
             request.remaining_tokens = request.prompt_token_ids[matched_count:]
             request.cache_hit_type = "ssd_hit"
 
-            self._ssd_tier._stats.ssd_hits += 1
-            self._ssd_tier._index.touch(matched_tokens)
+            tier.record_promotion_success(read_result)
 
             logger.info(
                 f"[ssd_promote] request={request.request_id[:12]} "
@@ -3645,33 +3648,56 @@ class Scheduler:
         )
         matched_count = len(matched_tokens)
 
-        cache_layers = await self._ssd_tier.async_promote(
-            matched_tokens, reserve_budget, release_budget
+        read_result = await self._ssd_tier.async_promote(
+            matched_tokens,
+            reserve_budget,
+            release_budget,
+            record_success=False,
+            return_result=True,
         )
 
-        if cache_layers is None:
+        if read_result is None:
             request.cache_hit_type = "miss"
             return False
 
-        # Release tentative budget — store() will account properly
-        release_budget(candidate["memory_bytes"])
-
-        # Reconstruct cache objects from deserialized layer dicts
-        reconstructed = self._reconstruct_ssd_layers(cache_layers)
-        if reconstructed is None:
+        # Reconstruct cache objects from deserialized layer dicts.  Keep MLX
+        # reconstruction on this scheduler thread, but release the tentative
+        # reservation before store() accounts the published entry.
+        try:
+            reconstructed = self._reconstruct_ssd_layers(read_result.layers)
+        except Exception:
+            release_budget(read_result.memory_bytes)
+            self._ssd_tier.record_promotion_failure()
+            request.cache_hit_type = "miss"
+            return False
+        release_budget(read_result.memory_bytes)
+        if not reconstructed:
+            self._ssd_tier.record_promotion_failure()
             request.cache_hit_type = "miss"
             return False
 
         # Store in RAM cache under the matched prefix tokens
-        self.memory_aware_cache.store(
-            list(matched_tokens), reconstructed, evict_prefixes=False
-        )
+        try:
+            stored = self.memory_aware_cache.store(
+                list(matched_tokens), reconstructed, evict_prefixes=False
+            )
+        except Exception:
+            self._ssd_tier.record_promotion_failure()
+            request.cache_hit_type = "miss"
+            return False
+        if not stored:
+            self._ssd_tier.record_promotion_failure()
+            request.cache_hit_type = "miss"
+            return False
 
         request.prompt_cache = reconstructed
         request.prompt_cache_key = list(matched_tokens)
         request.cached_tokens = matched_count
         request.remaining_tokens = request.prompt_token_ids[matched_count:]
         request.cache_hit_type = "ssd_hit"
+
+        # The SSD hit is real only after reconstruction and RAM publication.
+        self._ssd_tier.record_promotion_success(read_result)
 
         logger.info(
             f"[ssd_promote] request={request.request_id[:12]} "
@@ -3682,59 +3708,7 @@ class Scheduler:
         return True
 
     def _reconstruct_ssd_layers(self, layer_dicts: list[dict]) -> list | None:
-        """Reconstruct cache objects from deserialized layer dicts.
+        """Reconstruct SSD layers on the scheduler's current thread."""
+        from .ssd_cache import reconstruct_ssd_layers
 
-        Converts numpy arrays back to MLX arrays and creates KVCache objects.
-        """
-        try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
-
-            # Cast restored arrays back to their original dtype if the spill
-            # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
-            # dtype on this version; accept default from mx.array(np_fp32).
-            def _mx_dtype_from_name(name: str):
-                return getattr(mx, name, None)
-
-            result = []
-            for ld in layer_dicts:
-                if "keys" in ld and "values" in ld:
-                    kv = KVCache()
-                    kv.keys = mx.array(ld["keys"])
-                    kv.values = mx.array(ld["values"])
-                    keys_orig = ld.get("keys_original_dtype")
-                    if keys_orig is not None:
-                        dt = _mx_dtype_from_name(keys_orig)
-                        if dt is not None:
-                            kv.keys = kv.keys.astype(dt)
-                    values_orig = ld.get("values_original_dtype")
-                    if values_orig is not None:
-                        dt = _mx_dtype_from_name(values_orig)
-                        if dt is not None:
-                            kv.values = kv.values.astype(dt)
-                    kv.offset = ld["offset"]
-                    for attr in ("max_size", "keep", "step", "_idx"):
-                        if attr in ld:
-                            setattr(kv, attr, ld[attr])
-                    result.append(kv)
-                elif "state" in ld:
-                    state_arrays = [mx.array(a) for a in ld["state"]]
-                    state_dtypes = ld.get("state_original_dtypes")
-                    if state_dtypes is not None:
-                        for i, dtype_name in enumerate(state_dtypes):
-                            if dtype_name is None:
-                                continue
-                            dt = _mx_dtype_from_name(dtype_name)
-                            if dt is not None:
-                                state_arrays[i] = state_arrays[i].astype(dt)
-                    layer_obj = ArraysCache(len(state_arrays))
-                    layer_obj.state = state_arrays
-                    result.append(layer_obj)
-                else:
-                    logger.warning(
-                        f"[ssd_promote] unknown layer dict format: {list(ld.keys())}"
-                    )
-                    return None
-            return result
-        except Exception as e:
-            logger.warning(f"[ssd_promote] reconstruction failed: {e}")
-            return None
+        return reconstruct_ssd_layers(layer_dicts)
