@@ -403,6 +403,23 @@ class TestMemoryAwarePrefixCache:
         assert replay[0].values is not stored.values
         assert replay[0].index_keys is not stored.index_keys
         assert replay[0].index_position_ids is not stored.index_position_ids
+        assert cache.commit_prepared(prepared)
+
+        exact, remaining = cache.fetch([1, 2])
+        assert exact is prepared.cache
+        assert remaining == []
+
+        prefix, remaining = cache.fetch([1, 2, 3])
+        assert prefix is prepared.cache
+        assert remaining == [3]
+
+        lcp, remaining = cache.fetch([1, 3])
+        assert lcp is None
+        assert remaining == [1, 3]
+
+        supersequence, remaining = cache.fetch([1])
+        assert supersequence is None
+        assert remaining == [1]
 
     def test_prepare_store_rejects_auxiliary_over_memory_limit(
         self, small_cache, mock_kv_cache
