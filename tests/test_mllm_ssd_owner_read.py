@@ -409,6 +409,80 @@ def test_owner_bound_short_ram_promotion_cancellation_after_read_releases():
     generator.prefix_cache.commit_owner_bound_store.assert_not_called()
 
 
+def test_owner_bound_short_ram_fallback_rejects_cache_unsafe_lease():
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    generator.prefix_cache.check_ssd.return_value = None
+    generator.prefix_cache.validate_owner_request.return_value = OwnerBindingDecision(
+        False, "cache_unsafe"
+    )
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache is None
+    assert remaining == _TOKENS
+    generator.prefix_cache.validate_owner_request.assert_called_once_with(binding)
+    tier.read_validated_entry.assert_not_called()
+
+
+@pytest.mark.parametrize("matched_tokens", [0, 1])
+def test_owner_bound_short_ram_fallback_observes_cancellation_without_promotion(
+    matched_tokens,
+):
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    generator.prefix_cache.check_ssd.return_value = _candidate(
+        matched_tokens=matched_tokens
+    )
+    generator.prefix_cache.validate_owner_request.return_value = OwnerBindingDecision(
+        False, "cancellation"
+    )
+
+    with pytest.raises(PrefillAbortedError):
+        generator._fetch_prefix_cache("request-1", _TOKENS, allow_ssd_promotion=True)
+
+    generator.prefix_cache.validate_owner_request.assert_called_once_with(binding)
+    tier.read_validated_entry.assert_not_called()
+
+
+def test_owner_bound_short_ram_failed_promotion_revalidates_before_fallback():
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    _configure_hit(generator, tier)
+    tier.read_validated_entry.return_value = None
+    generator.prefix_cache.validate_owner_request.side_effect = [
+        OwnerBindingDecision(True, "none"),
+        OwnerBindingDecision(False, "cache_unsafe"),
+    ]
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache is None
+    assert remaining == _TOKENS
+    assert generator.prefix_cache.validate_owner_request.call_args_list == [
+        call(binding),
+        call(binding),
+    ]
+    generator.prefix_cache.release_reserved_memory.assert_called_once_with(32)
+    tier.record_promotion_success.assert_not_called()
+
+
 def test_owner_bound_corrupt_ssd_candidate_is_a_miss_and_releases_reservation():
     generator, _binding, tier = _generator()
     _configure_hit(generator, tier, layers=None)

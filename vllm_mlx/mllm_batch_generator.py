@@ -1191,6 +1191,14 @@ class MLLMBatchGenerator:
                             )
                             if promoted is not None:
                                 return promoted
+                # SSD lookup/promotion can cross a cancellation or owner
+                # invalidation boundary. Revalidate before falling back to the
+                # RAM snapshot fetched before that work began.
+                decision = self.prefix_cache.validate_owner_request(binding)
+                if decision.reason == "cancellation":
+                    raise PrefillAbortedError(request_id)
+                if not decision.accepted:
+                    return None, tokens
             return cache, remaining
         # Token IDs alone do not identify media-conditioned KV state. Keep
         # SSD promotion restricted to the existing text-only eligibility
