@@ -85,7 +85,10 @@ def _install_fake_mlx_vlm(monkeypatch, drafter_module):
     monkeypatch.setitem(
         sys.modules,
         "mlx_vlm.utils",
-        SimpleNamespace(load_config=lambda path: {"model_type": "qwen4_exp"}),
+        SimpleNamespace(
+            get_model_path=lambda path: path,
+            load_config=lambda path: {"model_type": "qwen4_exp"},
+        ),
     )
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", drafter_module)
     return target
