@@ -140,6 +140,12 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             # pair or an arbitrarily nested container/mapping — walk it
             # recursively like the .state-property branch below.
             total_bytes += _nested_array_memory(layer_cache["state"])
+        elif getattr(layer_cache, "preserve_auxiliary_kv_state", False):
+            # Some attention caches carry state required for replay beyond
+            # keys/values (for example QSA's raw index keys and text/MRoPE
+            # positions).  Their explicit state protocol is authoritative:
+            # pricing only keys/values would let an entry exceed the hard cap.
+            total_bytes += _nested_array_memory(layer_cache.state)
         # Handle QuantizedKVCache: keys/values are tuples of (data, scales, biases)
         elif hasattr(layer_cache, "keys") and isinstance(
             getattr(layer_cache, "keys", None), (list, tuple)
@@ -528,6 +534,11 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
 
 def _needs_kv_trim(layer: Any) -> bool:
     """Check if a cache layer has oversized KV arrays (duck-typed, no MLX import)."""
+    if getattr(layer, "preserve_auxiliary_kv_state", False):
+        # The layer's state getter owns coordinated trimming of keys/values
+        # and any auxiliary arrays. Rebuilding it as a plain KVCache would
+        # silently discard those arrays.
+        return False
     keys = getattr(layer, "keys", None)
     offset = getattr(layer, "offset", None)
     if keys is None or offset is None:
@@ -764,6 +775,19 @@ def _detach_cache_for_storage(
             return layer
         # copy.copy (not __new__ + __dict__.update) so classes using
         # __slots__ (e.g. _QuantizedCacheWrapper) snapshot correctly too.
+        if getattr(layer, "preserve_auxiliary_kv_state", False):
+            # Cache implementations opt into this protocol when replay needs
+            # state beyond the ordinary keys/values pair.  Copying through
+            # the complete state getter/setter keeps those arrays coordinated
+            # and lets the verified postcondition catch omissions.
+            if not hasattr(layer, "state"):
+                raise UndetachableCacheError(
+                    f"{type(layer).__name__} declares auxiliary KV state "
+                    "without exposing a state protocol"
+                )
+            snap = copy.copy(layer)
+            snap.state = _detach_container(layer.state)
+            return snap
         if hasattr(layer, "keys") and not callable(getattr(layer, "keys")):
             # KVCache / RotatingKVCache / _QuantizedCacheWrapper style.
             snap = copy.copy(layer)
@@ -1183,7 +1207,12 @@ def _cache_topology(model: Any) -> tuple[tuple[str, int], ...] | None:
     topology = []
     for layer in cache:
         layer_type = f"{type(layer).__module__}.{type(layer).__qualname__}"
-        if hasattr(layer, "state") and isinstance(layer.state, list):
+        if getattr(layer, "preserve_auxiliary_kv_state", False):
+            state = getattr(layer, "state", None)
+            if not isinstance(state, (list, tuple)):
+                return None
+            arity = len(state)
+        elif hasattr(layer, "state") and isinstance(layer.state, list):
             arity = len(layer.state)
         elif hasattr(layer, "keys") and hasattr(layer, "values"):
             arity = 2

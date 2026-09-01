@@ -15,7 +15,9 @@ from vllm_mlx.memory_cache import (
     MemoryCacheConfig,
     _CacheEntry,
     _array_memory,
+    _cache_topology,
     _get_available_memory,
+    _needs_kv_trim,
     estimate_kv_cache_memory,
 )
 
@@ -329,8 +331,8 @@ class TestMemoryAwarePrefixCache:
             preserve_auxiliary_kv_state = True
 
             def __init__(self):
-                self.keys = FakeArray((2, 4))
-                self.values = FakeArray((2, 4))
+                self.keys = FakeArray((1, 1, 4, 2))
+                self.values = FakeArray((1, 1, 4, 2))
                 self.index_keys = FakeArray((2, 2))
                 self.index_position_ids = FakeArray((2, 2))
                 self.offset = 2
@@ -352,7 +354,7 @@ class TestMemoryAwarePrefixCache:
                     self.index_keys,
                     self.index_position_ids,
                 ) = value
-                self.offset = 0 if self.keys is None else self.keys.shape[0]
+                self.offset = 0 if self.keys is None else self.keys.shape[2]
 
         fake_mlx = types.ModuleType("mlx")
         fake_core = types.ModuleType("mlx.core")
@@ -361,8 +363,14 @@ class TestMemoryAwarePrefixCache:
         fake_mlx.core = fake_core
 
         live = QSAKVCache()
+        assert _needs_kv_trim(live) is False
+        model = MagicMock()
+        model.make_cache.return_value = [QSAKVCache()]
+        assert _cache_topology(model) == (
+            (f"{QSAKVCache.__module__}.{QSAKVCache.__qualname__}", 4),
+        )
         cache = MemoryAwarePrefixCache(
-            MagicMock(),
+            model,
             MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
         )
         with patch.dict(
@@ -371,14 +379,20 @@ class TestMemoryAwarePrefixCache:
             clear=False,
         ):
             prepared = cache.prepare_store([1, 2], [live])
+            assert prepared is not None
+            replay = cache.clone_for_replay(prepared.cache)
 
-        assert prepared is not None
         stored = prepared.cache[0]
         assert stored.keys is not live.keys
         assert stored.values is not live.values
         assert stored.index_keys is not live.index_keys
         assert stored.index_position_ids is not live.index_position_ids
         assert prepared.memory_bytes == 48
+        assert replay is not None
+        assert replay[0].keys is not stored.keys
+        assert replay[0].values is not stored.values
+        assert replay[0].index_keys is not stored.index_keys
+        assert replay[0].index_position_ids is not stored.index_position_ids
 
     def test_prepare_store_rejects_auxiliary_over_memory_limit(
         self, small_cache, mock_kv_cache
