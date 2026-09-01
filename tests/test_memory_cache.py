@@ -17,6 +17,7 @@ from vllm_mlx.memory_cache import (
     _array_memory,
     _cache_topology,
     _get_available_memory,
+    _is_cache_layer_trimmable,
     _needs_kv_trim,
     estimate_kv_cache_memory,
 )
@@ -322,6 +323,14 @@ class TestMemoryAwarePrefixCache:
                 assert value == 0
                 return FakeArray(self.shape)
 
+            def __getitem__(self, item):
+                shape = list(self.shape)
+                if isinstance(item, tuple) and len(shape) >= 3:
+                    sequence_slice = item[-2]
+                    if isinstance(sequence_slice, slice):
+                        shape[-2] = min(sequence_slice.stop, shape[-2])
+                return FakeArray(tuple(shape))
+
             def astype(self, dtype):
                 result = FakeArray(self.shape)
                 result.dtype = dtype
@@ -340,8 +349,8 @@ class TestMemoryAwarePrefixCache:
             @property
             def state(self):
                 return (
-                    self.keys,
-                    self.values,
+                    self.keys[..., : self.offset, :],
+                    self.values[..., : self.offset, :],
                     self.index_keys,
                     self.index_position_ids,
                 )
@@ -363,6 +372,7 @@ class TestMemoryAwarePrefixCache:
         fake_mlx.core = fake_core
 
         live = QSAKVCache()
+        assert _is_cache_layer_trimmable(live) is False
         assert _needs_kv_trim(live) is False
         model = MagicMock()
         model.make_cache.return_value = [QSAKVCache()]
@@ -387,7 +397,7 @@ class TestMemoryAwarePrefixCache:
         assert stored.values is not live.values
         assert stored.index_keys is not live.index_keys
         assert stored.index_position_ids is not live.index_position_ids
-        assert prepared.memory_bytes == 48
+        assert prepared.memory_bytes == 32
         assert replay is not None
         assert replay[0].keys is not stored.keys
         assert replay[0].values is not stored.values

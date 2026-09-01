@@ -340,6 +340,11 @@ class _CacheEntry:
 
 def _is_cache_layer_trimmable(layer_cache: Any) -> bool:
     """Return whether a cache layer can safely be rewound for partial reuse."""
+    if getattr(layer_cache, "preserve_auxiliary_kv_state", False):
+        # Generic rewind reconstructs KV-like layers from keys/values only.
+        # Auxiliary-state caches require a class-specific coordinated trim;
+        # until that protocol exists, admit exact hits but reject partial reuse.
+        return False
     if isinstance(layer_cache, _QuantizedCacheWrapper):
         if "max_size" in layer_cache.orig_attrs:
             return False
