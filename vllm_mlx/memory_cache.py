@@ -1968,6 +1968,12 @@ class MemoryAwarePrefixCache:
         decision = self.validate_owner_request(request_binding)
         return (decision, cloned if decision.accepted else None)
 
+    def clone_for_replay(self, cache: list[Any]) -> list[Any] | None:
+        """Preserve legacy replay cloning only for non-owner-bound caches."""
+        if self._cache_owner_context is not None:
+            return None
+        return self._clone_for_replay_unchecked(cache)
+
     def fetch_exact_auxiliary_owner_bound(
         self,
         request_binding: ModelCacheRequestBinding,

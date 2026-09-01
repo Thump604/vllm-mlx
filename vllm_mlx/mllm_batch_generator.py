@@ -973,7 +973,11 @@ class MLLMBatchGenerator:
             raise RuntimeError("MLLM cache promotion requires the exact owner thread")
 
     def _release_cache_owner_request(self, request_id: str) -> None:
-        with self._prefix_checkpoint_lock:
+        prefix_lock = getattr(self, "_prefix_checkpoint_lock", None)
+        if prefix_lock is None:
+            prefix_lock = threading.RLock()
+            self._prefix_checkpoint_lock = prefix_lock
+        with prefix_lock:
             binding = getattr(self, "_cache_owner_requests", {}).pop(request_id, None)
         if binding is None or not self._cache_owner_enabled():
             return
@@ -1652,10 +1656,18 @@ class MLLMBatchGenerator:
         ]
         retired_request_ids = set(pending_request_ids_for_uids.values())
         retired_request_ids.update(removed_request_ids)
-        with self._prefix_checkpoint_lock:
+        prefix_lock = getattr(self, "_prefix_checkpoint_lock", None)
+        if prefix_lock is None:
+            prefix_lock = threading.RLock()
+            self._prefix_checkpoint_lock = prefix_lock
+        aborted_request_ids = getattr(self, "_aborted_request_ids", None)
+        if aborted_request_ids is None:
+            aborted_request_ids = set()
+            self._aborted_request_ids = aborted_request_ids
+        with prefix_lock:
             for request_id in retired_request_ids:
-                self._aborted_request_ids.discard(request_id)
-                self._release_cache_owner_request(request_id)
+                aborted_request_ids.discard(request_id)
+                MLLMBatchGenerator._release_cache_owner_request(self, request_id)
             if pending_lock is not None:
                 with pending_lock:
                     for uid in uid_set:
