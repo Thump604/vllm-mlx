@@ -2471,7 +2471,9 @@ class MemoryAwarePrefixCache:
         if callable(lookup_candidate_impl):
             lookup_candidate = self._ssd_tier.lookup_candidate
             candidate = lookup_candidate(tokens_key)
-            validate_candidate = getattr(type(self._ssd_tier), "validate_candidate", None)
+            validate_candidate = getattr(
+                type(self._ssd_tier), "validate_candidate", None
+            )
             if candidate is not None and callable(validate_candidate):
                 if self._ssd_tier.validate_candidate(tokens_key, candidate) is None:
                     record_failure = getattr(
