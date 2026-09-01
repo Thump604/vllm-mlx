@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for memory-aware prefix cache."""
 
+import sys
 import threading
 import time
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -305,6 +307,78 @@ class TestMemoryAwarePrefixCache:
         cache = MemoryAwarePrefixCache(model, config)
         assert len(cache) == 0
         assert cache.memory_limit_mb == 100.0
+
+    def test_prepare_store_owns_qsa_auxiliary_index_state(self):
+        """Qwen4Exp QSA state must cross the real publication boundary owned."""
+
+        class FakeArray:
+            def __init__(self, shape):
+                self.shape = shape
+                self.dtype = MockDtype(2)
+
+            def __add__(self, value):
+                assert value == 0
+                return FakeArray(self.shape)
+
+            def astype(self, dtype):
+                result = FakeArray(self.shape)
+                result.dtype = dtype
+                return result
+
+        class QSAKVCache:
+            preserve_auxiliary_kv_state = True
+
+            def __init__(self):
+                self.keys = FakeArray((2, 4))
+                self.values = FakeArray((2, 4))
+                self.index_keys = FakeArray((2, 2))
+                self.index_position_ids = FakeArray((2, 2))
+                self.offset = 2
+
+            @property
+            def state(self):
+                return (
+                    self.keys,
+                    self.values,
+                    self.index_keys,
+                    self.index_position_ids,
+                )
+
+            @state.setter
+            def state(self, value):
+                (
+                    self.keys,
+                    self.values,
+                    self.index_keys,
+                    self.index_position_ids,
+                ) = value
+                self.offset = 0 if self.keys is None else self.keys.shape[0]
+
+        fake_mlx = types.ModuleType("mlx")
+        fake_core = types.ModuleType("mlx.core")
+        fake_core.array = FakeArray
+        fake_core.eval = lambda *arrays: None
+        fake_mlx.core = fake_core
+
+        live = QSAKVCache()
+        cache = MemoryAwarePrefixCache(
+            MagicMock(),
+            MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1),
+        )
+        with patch.dict(
+            sys.modules,
+            {"mlx": fake_mlx, "mlx.core": fake_core},
+            clear=False,
+        ):
+            prepared = cache.prepare_store([1, 2], [live])
+
+        assert prepared is not None
+        stored = prepared.cache[0]
+        assert stored.keys is not live.keys
+        assert stored.values is not live.values
+        assert stored.index_keys is not live.index_keys
+        assert stored.index_position_ids is not live.index_position_ids
+        assert prepared.memory_bytes == 48
 
     def test_prepare_store_rejects_auxiliary_over_memory_limit(
         self, small_cache, mock_kv_cache
