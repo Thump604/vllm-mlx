@@ -1172,9 +1172,11 @@ class MLLMBatchGenerator:
                         if candidate is not None:
                             try:
                                 raw_match = candidate["matched_tokens"]
-                                if isinstance(raw_match, bool):
-                                    raise ValueError("boolean matched_tokens")
-                                ssd_match = int(raw_match)
+                                if isinstance(raw_match, bool) or not isinstance(
+                                    raw_match, int
+                                ):
+                                    raise ValueError("matched_tokens is not an integer")
+                                ssd_match = raw_match
                                 if ssd_match < 0 or ssd_match > len(tokens):
                                     raise ValueError("matched_tokens outside request")
                             except (KeyError, TypeError, ValueError, OverflowError):

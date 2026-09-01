@@ -8,7 +8,7 @@ import json
 from types import SimpleNamespace
 import time
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -258,7 +258,7 @@ def test_owner_bound_fetch_keeps_longer_ram_prefix_without_reading_ssd():
     tier.read_validated_entry.assert_not_called()
 
 
-@pytest.mark.parametrize("matched_tokens", [None, True, -1, len(_TOKENS) + 1])
+@pytest.mark.parametrize("matched_tokens", [None, True, 1.5, "2", -1, len(_TOKENS) + 1])
 def test_owner_bound_fetch_rejects_malformed_ssd_arbitration_candidate(
     matched_tokens,
 ):
@@ -340,6 +340,73 @@ def test_owner_bound_short_ram_is_preserved_when_ssd_promotion_fails():
     assert remaining == list(_TOKENS[1:])
     generator.prefix_cache.release_reserved_memory.assert_called_once_with(32)
     tier.record_promotion_success.assert_not_called()
+
+
+def test_owner_bound_short_ram_lookup_error_is_counted_and_falls_back():
+    generator, _binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    generator.prefix_cache.check_ssd.side_effect = OSError("lookup failed")
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["short-ram-cache"]
+    assert remaining == list(_TOKENS[1:])
+    assert tier._stats.promotion_failures == 1
+    tier.read_validated_entry.assert_not_called()
+
+
+def test_owner_bound_short_ram_promotion_cancellation_before_read_aborts():
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    _configure_hit(generator, tier)
+    generator.prefix_cache.validate_owner_request.return_value = OwnerBindingDecision(
+        False, "cancellation"
+    )
+
+    with pytest.raises(PrefillAbortedError):
+        generator._fetch_prefix_cache("request-1", _TOKENS, allow_ssd_promotion=True)
+
+    generator.prefix_cache.validate_owner_request.assert_called_once_with(binding)
+    tier.read_validated_entry.assert_not_called()
+    assert tier._stats.promotion_failures == 1
+    generator.prefix_cache.commit_owner_bound_store.assert_not_called()
+
+
+def test_owner_bound_short_ram_promotion_cancellation_after_read_releases():
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    _configure_hit(generator, tier)
+    generator.prefix_cache.validate_owner_request.side_effect = [
+        OwnerBindingDecision(True, "none"),
+        OwnerBindingDecision(False, "cancellation"),
+    ]
+
+    with pytest.raises(PrefillAbortedError):
+        generator._fetch_prefix_cache("request-1", _TOKENS, allow_ssd_promotion=True)
+
+    assert generator.prefix_cache.validate_owner_request.call_args_list == [
+        call(binding),
+        call(binding),
+    ]
+    tier.read_validated_entry.assert_called_once()
+    generator.prefix_cache.release_reserved_memory.assert_called_once_with(32)
+    assert tier._stats.promotion_failures == 1
+    generator.prefix_cache.prepare_owner_bound_store.assert_not_called()
+    generator.prefix_cache.commit_owner_bound_store.assert_not_called()
 
 
 def test_owner_bound_corrupt_ssd_candidate_is_a_miss_and_releases_reservation():
