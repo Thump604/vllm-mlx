@@ -254,7 +254,7 @@ class MLLMBatchRequest:
     image_grid_thw: Optional[mx.array] = None
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    # Text-only flag (no images/videos — eligible for prefix cache)
+    # Text-only flag (no images/videos/audio — eligible for prefix cache)
     is_text_only: bool = False
 
     # Generation state
@@ -661,6 +661,15 @@ class MLLMBatchGenerator:
 
     # Generation stream for async eval
     _stream = None
+
+    @staticmethod
+    def _prefix_cache_eligible(request: MLLMBatchRequest) -> bool:
+        """Return whether token IDs fully identify this request's KV state."""
+        return bool(getattr(request, "is_text_only", False)) and not bool(
+            getattr(request, "images", None)
+            or getattr(request, "videos", None)
+            or getattr(request, "audio", None)
+        )
 
     def __init__(
         self,
@@ -1688,6 +1697,12 @@ class MLLMBatchGenerator:
         Args:
             request: Request to preprocess
         """
+        # Eligibility follows declared modality even when token IDs were
+        # prepared by an earlier stage. Never trust a stale mutable flag.
+        request.is_text_only = not bool(
+            request.images or request.videos or request.audio
+        )
+
         # Already preprocessed (e.g. by early executor offloading in
         # _process_loop or chunked prefill interleaving).  Only skip for
         # text-only requests; media requests need pixel/audio cache lookup
@@ -1819,10 +1834,6 @@ class MLLMBatchGenerator:
         # Persistence eligibility follows the declared request modality, not
         # successful media decoding. A failed image/video/audio conversion
         # must never turn a multimodal request into restart-persistable text.
-        request.is_text_only = not bool(
-            request.images or request.videos or request.audio
-        )
-
         logger.debug(
             f"Preprocessed request {request.request_id}: "
             f"{len(all_images)} images, {len(all_audio)} audio clips, "
@@ -2237,7 +2248,9 @@ class MLLMBatchGenerator:
                 # after the remaining prefill succeeds.
                 _eval_prompt_cache(cache)
                 checkpoint_snapshot = self._rewind_prefix_cache(cache, 0)
-                if checkpoint_snapshot is not None:
+                if checkpoint_snapshot is not None and self._prefix_cache_eligible(
+                    request
+                ):
                     checkpoint_entry = self._prepare_prefix_store(
                         request.request_id,
                         checkpoint_key,
@@ -2506,16 +2519,17 @@ class MLLMBatchGenerator:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
 
-                # Try prefix cache for all requests (text-only and multimodal).
-                # VLM forward writes the same KV state as language model forward
-                # for text tokens, so cached KV from a previous VLM run is valid.
-                # However, if the remaining (uncached) tokens contain image
-                # placeholders, we must fall back to VLM forward instead of
-                # running them through the language model alone.
+                # Token IDs do not identify media-conditioned KV state. Until
+                # cache keys include immutable media identity, prefix caching
+                # is restricted to requests that are defensively text-only.
                 cached_kv = None
                 remaining_ids = None
                 cached_last_logits = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                if (
+                    self.prefix_cache is not None
+                    and req.input_ids is not None
+                    and self._prefix_cache_eligible(req)
+                ):
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     exact_aux = self._fetch_exact_prefix_auxiliary(
                         req.request_id, input_ids_list
@@ -2782,6 +2796,7 @@ class MLLMBatchGenerator:
 
                         if (
                             self.prefix_cache is not None
+                            and self._prefix_cache_eligible(req)
                             and self._needs_prefill_checkpoint(request_cache)
                         ):
                             entry = self._prepare_prefix_store(
@@ -3044,7 +3059,11 @@ class MLLMBatchGenerator:
             self, "_allow_mid_batch_extend", True
         ):
             text_only = self._compatible_pending_requests(
-                [r for r in self.unprocessed_requests if not r.images and not r.videos],
+                [
+                    r
+                    for r in self.unprocessed_requests
+                    if not r.images and not r.videos and not r.audio
+                ],
                 self.completion_batch_size,
             )
 
@@ -3290,7 +3309,7 @@ class MLLMBatchGenerator:
             req = batch.requests[i]
             self._discard_prefill_checkpoint(req.request_id)
             try:
-                if req.input_ids is not None:
+                if req.input_ids is not None and self._prefix_cache_eligible(req):
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Store prompt-only KV: trim generated tokens (+ think
@@ -3693,7 +3712,9 @@ def install_mtp_mllm(
             logits_processors
         )
         mrope_media_bypass = external_drafter and any(
-            getattr(request, "images", None) or getattr(request, "videos", None)
+            getattr(request, "images", None)
+            or getattr(request, "videos", None)
+            or getattr(request, "audio", None)
             for request in active_requests
         )
         assistant_not_requested_bypass = external_drafter and (
@@ -4491,6 +4512,7 @@ def install_chunked_prefill_mllm(
                 if (
                     checkpoint_at is not None
                     and partial["cached_count"] + partial["processed"] == checkpoint_at
+                    and batch_gen._prefix_cache_eligible(req)
                 ):
                     checkpoint_snapshot = batch_gen._rewind_prefix_cache(
                         partial["cache"], 0
@@ -4540,7 +4562,7 @@ def install_chunked_prefill_mllm(
                         else req
                     )
                     for r in batch_gen.unprocessed_requests:
-                        if r.images or r.videos:
+                        if r.images or r.videos or r.audio:
                             continue
                         if not batch_gen._compatible_pending_requests(
                             [r], 1, reference=reference
@@ -4624,6 +4646,7 @@ def install_chunked_prefill_mllm(
                 # request-local processors are applied.
                 if (
                     getattr(batch_gen, "prefix_cache", None) is not None
+                    and batch_gen._prefix_cache_eligible(req)
                     and batch_gen._needs_prefill_checkpoint(partial["cache"])
                     and req.input_ids is not None
                 ):
@@ -4760,6 +4783,7 @@ def install_chunked_prefill_mllm(
                     checkpoint_entry is None
                     and batch_gen.prefix_cache is not None
                     and req.input_ids is not None
+                    and batch_gen._prefix_cache_eligible(req)
                 ):
                     try:
                         input_ids_list = req.input_ids.reshape(-1).tolist()
@@ -4806,7 +4830,7 @@ def install_chunked_prefill_mllm(
                 len(batch_gen.unprocessed_requests),
             )
             for r in compatible_pending:
-                if not r.images and not r.videos:
+                if not r.images and not r.videos and not r.audio:
                     text_only_req = r
                     break
 
@@ -4996,7 +5020,11 @@ def install_chunked_prefill_mllm(
                     batch_gen._partial["remaining_ids"] = remaining[:, take:]
                     batch_gen._partial["processed"] = take
                     batch_gen._partial["chunk_count"] = 1
-                    if checkpoint_at is not None and take == checkpoint_at:
+                    if (
+                        checkpoint_at is not None
+                        and take == checkpoint_at
+                        and batch_gen._prefix_cache_eligible(text_only_req)
+                    ):
                         assert checkpoint_key is not None
                         checkpoint_snapshot = batch_gen._rewind_prefix_cache(
                             request_cache, 0

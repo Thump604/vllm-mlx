@@ -1028,6 +1028,86 @@ if __name__ == "__main__":
 
 
 class TestMLLMBatchGeneratorMTPGuards:
+    @pytest.mark.parametrize(
+        ("media_field", "first_media", "second_media"),
+        [
+            ("images", "a.png", "b.png"),
+            ("videos", "a.mp4", "b.mp4"),
+            ("audio", "a.wav", "b.wav"),
+        ],
+    )
+    def test_multimodal_requests_skip_token_only_prefix_cache(
+        self, monkeypatch, media_field, first_media, second_media
+    ):
+        """Different media with identical tokens must both run vision prefill."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        class FakeCache:
+            def merge(self, _caches):
+                return self
+
+        monkeypatch.setattr(mx, "stream", lambda _stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache", lambda *_a, **_k: [FakeCache()]
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_sampler",
+            lambda **_kwargs: lambda scores: mx.argmax(scores, axis=-1),
+        )
+        monkeypatch.setattr(
+            "mlx_lm.sample_utils.make_logits_processors", lambda **_kwargs: []
+        )
+
+        prefix_cache = MagicMock()
+        prefix_cache.fetch_exact_auxiliary.return_value = None
+        prefix_cache.fetch.return_value = (None, [1, 2, 3])
+        prefix_cache.prepare_store.return_value = None
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.max_kv_size = 0
+        generator._stats = MLLMBatchStats()
+        generator._pending_error_responses = []
+        generator._aborted_request_ids = set()
+        generator._prefill_progress = {}
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        generator.prefill_step_size = 512
+        generator._think_suffix_len = 0
+        generator.language_model = MagicMock()
+        generator.model = MagicMock()
+        generator.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        generator.prefix_cache = prefix_cache
+        generator._preprocess_request = lambda _request: None
+        generator._needs_prefill_checkpoint = lambda _cache: True
+        vision_prefill = MagicMock(
+            return_value=mx.array([[[0.0, 1.0]]], dtype=mx.float32)
+        )
+        generator._run_vision_encoding = vision_prefill
+
+        def request(request_id, media):
+            req = MLLMBatchRequest(
+                uid=1,
+                request_id=request_id,
+                prompt="same rendered prompt",
+                **{media_field: [media]},
+            )
+            req.input_ids = mx.array([[1, 2, 3]])
+            req.is_text_only = False
+            return req
+
+        first = generator._process_prompts([request("media-a", first_media)])
+        second = generator._process_prompts([request("media-b", second_media)])
+
+        assert first.y.tolist() == second.y.tolist() == [1]
+        assert vision_prefill.call_count == 2
+        prefix_cache.fetch_exact_auxiliary.assert_not_called()
+        prefix_cache.fetch.assert_not_called()
+        prefix_cache.prepare_store.assert_not_called()
+
     def test_process_prompts_rejects_unsafe_exact_rotating_hit(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 
@@ -1816,7 +1896,8 @@ class TestMLLMBatchGeneratorMTPGuards:
             batch_gen.get_mtp_stats()["bypass_counts"]["assistant_not_requested"] == 1
         )
 
-    def test_external_media_mtp_bypass_preserves_target_mrope(self):
+    @pytest.mark.parametrize("media_field", ["images", "videos", "audio"])
+    def test_external_media_mtp_bypass_preserves_target_mrope(self, media_field):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchRequest,
             install_mtp_mllm,
@@ -1829,7 +1910,7 @@ class TestMLLMBatchGeneratorMTPGuards:
             uid=1,
             request_id="media",
             prompt="prompt",
-            images=["image"],
+            **{media_field: ["media"]},
             mllm_draft=True,
             rope_deltas=rope_deltas,
         )
@@ -3532,6 +3613,30 @@ class TestPreprocessIdempotent:
         assert req.input_ids.tolist() == [[1, 2, 3]]
         assert req.is_text_only is False
 
+    def test_pretokenized_request_recomputes_text_only_eligibility(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        text = MLLMBatchRequest(uid=0, request_id="text", prompt="text")
+        text.input_ids = mx.array([[1, 2, 3]])
+        MLLMBatchGenerator._preprocess_request(gen, text)
+        assert text.is_text_only is True
+
+        media = MLLMBatchRequest(
+            uid=1,
+            request_id="media",
+            prompt="media",
+            audio=["clip.wav"],
+            is_text_only=True,
+        )
+        media.input_ids = mx.array([[1, 2, 3]])
+        with pytest.raises(Exception):
+            MLLMBatchGenerator._preprocess_request(gen, media)
+        assert media.is_text_only is False
+
 
 class TestChunkedPrefillCacheHandling:
     """Tests for chunked prefill prefix cache handling paths."""
@@ -3751,6 +3856,52 @@ class TestChunkedPrefillCacheHandling:
         abort_responses = [r for r in responses if r.finish_reason == "abort"]
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
+
+    def test_interleaved_prefill_does_not_inline_audio_request(self):
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        gen = self._make_fake_batch_gen()
+        gen.prefix_cache = None
+        gen.language_model = lambda tokens, cache, **kwargs: mx.zeros(
+            (1, tokens.shape[1], 4)
+        )
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=2)
+
+        active = MLLMBatchRequest(uid=3, request_id="active", prompt="long text")
+        active.input_ids = mx.array([[1, 2, 3, 4, 5]])
+        active.is_text_only = True
+        gen._partial = {
+            "request": active,
+            "cache": [self._make_fake_kv_cache(offset=2)],
+            "remaining_ids": mx.array([[3, 4, 5]]),
+            "processed": 2,
+            "total": 5,
+            "cached_count": 0,
+            "chunk_count": 1,
+            "checkpoint_at": None,
+            "checkpoint_key": None,
+            "checkpoint_entry": None,
+        }
+        audio = MLLMBatchRequest(
+            uid=4,
+            request_id="audio",
+            prompt="audio",
+            audio=["clip.wav"],
+        )
+        audio.input_ids = mx.array([[9]])
+        gen.unprocessed_requests = [audio]
+        gen._process_prompts = MagicMock(
+            side_effect=AssertionError("audio must not enter text-only inline prefill")
+        )
+
+        gen._next()
+
+        gen._process_prompts.assert_not_called()
+        assert gen.unprocessed_requests == [audio]
 
     def test_interleaved_hybrid_publishes_boundary_checkpoint(self, monkeypatch):
         from mlx_lm.models.cache import ArraysCache, KVCache

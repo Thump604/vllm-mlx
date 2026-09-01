@@ -599,9 +599,11 @@ class TestMLLMCompletionCacheStore:
         generator.prefix_cache = MagicMock()
         generator._think_suffix_len = 0
         generator._prefix_checkpoint_lock = threading.Lock()
-        generator._request_prefix_checkpoints = {}
+        generator._request_prefix_checkpoints = {"vision": {"cancelled": False}}
         request = SimpleNamespace(
-            request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
+            request_id="saturated",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
         )
         batch = SimpleNamespace(
             requests=[request],
@@ -633,7 +635,11 @@ class TestMLLMCompletionCacheStore:
         generator._think_suffix_len = 0
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
-        request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
+        request = SimpleNamespace(
+            request_id="flat",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[4],
@@ -662,7 +668,11 @@ class TestMLLMCompletionCacheStore:
         generator._think_suffix_len = 0
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
-        request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
+        request = SimpleNamespace(
+            request_id="plain",
+            input_ids=mx.array([[1, 2, 3]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[1],
@@ -675,6 +685,38 @@ class TestMLLMCompletionCacheStore:
         _, stored = generator.prefix_cache.store.call_args.args
         assert estimate_kv_cache_memory(stored) > 0
         assert [child.offset for child in stored[0].caches] == [3, 3]
+
+    def test_multimodal_completion_is_not_stored(self):
+        """Token-only cache keys must never publish vision-conditioned KV."""
+        mx = pytest.importorskip("mlx.core")
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator.prefix_cache = MagicMock()
+        generator._think_suffix_len = 0
+        generator._prefix_checkpoint_lock = threading.Lock()
+        generator._request_prefix_checkpoints = {}
+        request = SimpleNamespace(
+            request_id="vision",
+            input_ids=mx.array([[1, 2, 3]]),
+            is_text_only=False,
+            images=["image-a"],
+            videos=[],
+            audio=[],
+        )
+        extract_cache = MagicMock(side_effect=AssertionError("must not extract"))
+        batch = SimpleNamespace(
+            requests=[request],
+            num_tokens=[1],
+            extract_cache=extract_cache,
+        )
+
+        generator._maybe_store_prefix_cache(batch, [0])
+
+        extract_cache.assert_not_called()
+        generator.prefix_cache.store.assert_not_called()
+        assert generator._request_prefix_checkpoints == {}
 
     def test_zero_trim_flat_snapshot_does_not_alias_live_cache(self):
         mx = pytest.importorskip("mlx.core")
