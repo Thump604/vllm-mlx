@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from types import SimpleNamespace
 import time
@@ -255,6 +256,90 @@ def test_owner_bound_fetch_keeps_longer_ram_prefix_without_reading_ssd():
     generator.prefix_cache.fetch_owner_bound.assert_called_once_with(binding, _TOKENS)
     generator.prefix_cache.check_ssd.assert_called_once_with(_TOKENS)
     tier.read_validated_entry.assert_not_called()
+
+
+@pytest.mark.parametrize("matched_tokens", [None, True, -1, len(_TOKENS) + 1])
+def test_owner_bound_fetch_rejects_malformed_ssd_arbitration_candidate(
+    matched_tokens,
+):
+    generator, _binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    generator.prefix_cache.check_ssd.return_value = _candidate(
+        matched_tokens=matched_tokens
+    )
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["ram-cache"]
+    assert remaining == list(_TOKENS[1:])
+    assert tier._stats.promotion_failures == 1
+    tier.read_validated_entry.assert_not_called()
+
+
+def test_owner_bound_fetch_keeps_ram_on_equal_length_ssd_match():
+    generator, _binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["ram-cache"],
+        list(_TOKENS[2:]),
+    )
+    generator.prefix_cache.check_ssd.return_value = _candidate(matched_tokens=2)
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["ram-cache"]
+    assert remaining == list(_TOKENS[2:])
+    tier.read_validated_entry.assert_not_called()
+
+
+def test_owner_bound_short_ram_ssd_lookup_requires_owner_thread():
+    generator, _binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            generator._fetch_prefix_cache,
+            "request-1",
+            _TOKENS,
+            allow_ssd_promotion=True,
+        )
+        with pytest.raises(RuntimeError, match="owner thread"):
+            future.result()
+
+    generator.prefix_cache.check_ssd.assert_not_called()
+    tier.read_validated_entry.assert_not_called()
+
+
+def test_owner_bound_short_ram_is_preserved_when_ssd_promotion_fails():
+    generator, _binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    _configure_hit(generator, tier, layers=None)
+    tier.read_validated_entry.return_value = None
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["short-ram-cache"]
+    assert remaining == list(_TOKENS[1:])
+    generator.prefix_cache.release_reserved_memory.assert_called_once_with(32)
+    tier.record_promotion_success.assert_not_called()
 
 
 def test_owner_bound_corrupt_ssd_candidate_is_a_miss_and_releases_reservation():

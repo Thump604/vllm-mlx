@@ -1168,11 +1168,21 @@ class MLLMBatchGenerator:
                         logger.exception("[mllm_ssd] SSD candidate lookup failed")
                     else:
                         ram_match = len(tokens) - len(remaining)
-                        ssd_match = (
-                            int(candidate.get("matched_tokens", 0))
-                            if candidate is not None
-                            else 0
-                        )
+                        ssd_match = 0
+                        if candidate is not None:
+                            try:
+                                raw_match = candidate["matched_tokens"]
+                                if isinstance(raw_match, bool):
+                                    raise ValueError("boolean matched_tokens")
+                                ssd_match = int(raw_match)
+                                if ssd_match < 0 or ssd_match > len(tokens):
+                                    raise ValueError("matched_tokens outside request")
+                            except (KeyError, TypeError, ValueError, OverflowError):
+                                tier.record_promotion_failure()
+                                logger.warning(
+                                    "[mllm_ssd] rejecting malformed arbitration candidate"
+                                )
+                                ssd_match = 0
                         if ssd_match > ram_match:
                             promoted = self._promote_owner_bound_ssd(
                                 request_id, binding, tokens, candidate=candidate
