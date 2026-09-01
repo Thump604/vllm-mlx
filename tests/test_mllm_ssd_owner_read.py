@@ -210,6 +210,53 @@ def test_owner_bound_production_fetch_promotes_ssd_after_ram_miss(tmp_path: Path
     tier.record_promotion_success.assert_called_once()
 
 
+def test_owner_bound_fetch_prefers_longer_ssd_match_over_short_ram_prefix(
+    tmp_path: Path,
+):
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["short-ram-cache"],
+        list(_TOKENS[1:]),
+    )
+    _configure_hit(generator, tier)
+    entry_dir = tmp_path / "entry-a"
+    entry_dir.mkdir()
+    (entry_dir / "layer_0.safetensors").write_bytes(b"bytes")
+    tier._data_dir = str(tmp_path)
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["restored-cache"]
+    assert remaining == [33]
+    generator.prefix_cache.fetch_owner_bound.assert_called_once_with(binding, _TOKENS)
+    generator.prefix_cache.check_ssd.assert_called_once_with(_TOKENS)
+    tier.read_validated_entry.assert_called_once()
+    tier.record_promotion_success.assert_called_once()
+
+
+def test_owner_bound_fetch_keeps_longer_ram_prefix_without_reading_ssd():
+    generator, binding, tier = _generator()
+    generator.prefix_cache.fetch_owner_bound.return_value = (
+        OwnerBindingDecision(True, "none"),
+        ["longer-ram-cache"],
+        [],
+    )
+    generator.prefix_cache.check_ssd.return_value = _candidate(matched_tokens=2)
+
+    cache, remaining = generator._fetch_prefix_cache(
+        "request-1", _TOKENS, allow_ssd_promotion=True
+    )
+
+    assert cache == ["longer-ram-cache"]
+    assert remaining == []
+    generator.prefix_cache.fetch_owner_bound.assert_called_once_with(binding, _TOKENS)
+    generator.prefix_cache.check_ssd.assert_called_once_with(_TOKENS)
+    tier.read_validated_entry.assert_not_called()
+
+
 def test_owner_bound_corrupt_ssd_candidate_is_a_miss_and_releases_reservation():
     generator, _binding, tier = _generator()
     _configure_hit(generator, tier, layers=None)

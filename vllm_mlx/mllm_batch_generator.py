@@ -1152,6 +1152,33 @@ class MLLMBatchGenerator:
         if not decision.accepted:
             return None, tokens
         if cache is not None:
+            # A resident entry may be only a short common prefix while SSD
+            # holds a much longer evicted match. Prefer the longer tier result
+            # instead of silently turning every such request into a RAM hit.
+            if allow_ssd_promotion:
+                self._assert_cache_owner_thread()
+                tier = getattr(self, "_ssd_tier", None)
+                if tier is None:
+                    tier = self.prefix_cache.get_ssd_tier()
+                if tier is not None:
+                    try:
+                        candidate = self.prefix_cache.check_ssd(tokens)
+                    except Exception:
+                        tier.record_promotion_failure()
+                        logger.exception("[mllm_ssd] SSD candidate lookup failed")
+                    else:
+                        ram_match = len(tokens) - len(remaining)
+                        ssd_match = (
+                            int(candidate.get("matched_tokens", 0))
+                            if candidate is not None
+                            else 0
+                        )
+                        if ssd_match > ram_match:
+                            promoted = self._promote_owner_bound_ssd(
+                                request_id, binding, tokens, candidate=candidate
+                            )
+                            if promoted is not None:
+                                return promoted
             return cache, remaining
         # Token IDs alone do not identify media-conditioned KV state. Keep
         # SSD promotion restricted to the existing text-only eligibility
@@ -1169,6 +1196,8 @@ class MLLMBatchGenerator:
         request_id: str,
         binding: Any,
         tokens: List[int],
+        *,
+        candidate: dict | None = None,
     ) -> Tuple[Any, List[int]] | None:
         """Promote one validated SSD candidate on the MLLM owner thread.
 
@@ -1196,12 +1225,13 @@ class MLLMBatchGenerator:
             tier.record_promotion_failure()
             return None
 
-        try:
-            candidate = prefix_cache.check_ssd(tokens)
-        except Exception:
-            tier.record_promotion_failure()
-            logger.exception("[mllm_ssd] SSD candidate lookup failed")
-            return None
+        if candidate is None:
+            try:
+                candidate = prefix_cache.check_ssd(tokens)
+            except Exception:
+                tier.record_promotion_failure()
+                logger.exception("[mllm_ssd] SSD candidate lookup failed")
+                return None
         if candidate is None:
             return None
 
