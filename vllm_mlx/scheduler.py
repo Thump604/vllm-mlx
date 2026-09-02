@@ -3680,7 +3680,7 @@ class Scheduler:
         Converts numpy arrays back to MLX arrays and creates KVCache objects.
         """
         try:
-            from mlx_lm.models.cache import ArraysCache, KVCache
+            from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
             # Cast restored arrays back to their original dtype if the spill
             # path upcast for numpy (bf16 → fp32). None = mlx lacks the named
@@ -3688,27 +3688,34 @@ class Scheduler:
             def _mx_dtype_from_name(name: str):
                 return getattr(mx, name, None)
 
+            def _mk_kv(d: dict):
+                """Rebuild a KVCache from a deserialized layer/sub dict."""
+                kv = KVCache()
+                kv.keys = mx.array(d["keys"])
+                kv.values = mx.array(d["values"])
+                keys_orig = d.get("keys_original_dtype")
+                if keys_orig is not None:
+                    dt = _mx_dtype_from_name(keys_orig)
+                    if dt is not None:
+                        kv.keys = kv.keys.astype(dt)
+                values_orig = d.get("values_original_dtype")
+                if values_orig is not None:
+                    dt = _mx_dtype_from_name(values_orig)
+                    if dt is not None:
+                        kv.values = kv.values.astype(dt)
+                kv.offset = d["offset"]
+                for attr in ("max_size", "keep", "step", "_idx"):
+                    if attr in d:
+                        setattr(kv, attr, d[attr])
+                return kv
+
             result = []
             for ld in layer_dicts:
                 if "keys" in ld and "values" in ld:
-                    kv = KVCache()
-                    kv.keys = mx.array(ld["keys"])
-                    kv.values = mx.array(ld["values"])
-                    keys_orig = ld.get("keys_original_dtype")
-                    if keys_orig is not None:
-                        dt = _mx_dtype_from_name(keys_orig)
-                        if dt is not None:
-                            kv.keys = kv.keys.astype(dt)
-                    values_orig = ld.get("values_original_dtype")
-                    if values_orig is not None:
-                        dt = _mx_dtype_from_name(values_orig)
-                        if dt is not None:
-                            kv.values = kv.values.astype(dt)
-                    kv.offset = ld["offset"]
-                    for attr in ("max_size", "keep", "step", "_idx"):
-                        if attr in ld:
-                            setattr(kv, attr, ld[attr])
-                    result.append(kv)
+                    result.append(_mk_kv(ld))
+                elif "cachelist_subs" in ld:
+                    # DSA CacheList: rebuild each KVCache sub and re-wrap.
+                    result.append(CacheList(*[_mk_kv(s) for s in ld["cachelist_subs"]]))
                 elif "state" in ld:
                     state_arrays = [mx.array(a) for a in ld["state"]]
                     state_dtypes = ld.get("state_original_dtypes")

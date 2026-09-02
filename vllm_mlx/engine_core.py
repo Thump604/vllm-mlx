@@ -343,12 +343,22 @@ class EngineCore:
                                     if use_simple_streaming:
                                         collector.put(req_output)
                                     else:
+                                        # Always put so the collector accumulates
+                                        # every step's new_text; only *release*
+                                        # (notify) on the interval boundary or on
+                                        # finish. Gating the put instead would drop
+                                        # the in-between tokens' text entirely.
                                         state = states.get(rid)
-                                        if state and state.should_send(
-                                            req_output.completion_tokens,
-                                            req_output.finished,
-                                        ):
-                                            collector.put(req_output)
+                                        send = (
+                                            state.should_send(
+                                                req_output.completion_tokens,
+                                                req_output.finished,
+                                            )
+                                            if state
+                                            else True
+                                        )
+                                        collector.put(req_output, notify=send)
+                                        if send and state:
                                             state.mark_sent(
                                                 req_output.completion_tokens
                                             )

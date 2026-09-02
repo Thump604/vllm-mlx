@@ -40,6 +40,7 @@ The server provides:
 import argparse
 import asyncio
 import copy
+import hashlib
 from dataclasses import dataclass
 import json
 import logging
@@ -1167,6 +1168,137 @@ def _build_reasoning_parser(engine: BaseEngine | None = None):
         return type(_reasoning_parser)()
 
 
+# Keyed partly on request-supplied chat_template_kwargs, so an adversarial or
+# merely varied client can mint unbounded entries. Bound it FIFO, same shape as
+# _responses_store above. Templates-per-model is tiny in practice; this is a
+# safety net, not a working-set limit.
+_IMPLICIT_THINKING_CACHE_MAX_SIZE: int = 256
+_implicit_thinking_cache: dict[tuple, bool] = {}
+
+
+def _template_signature(engine: BaseEngine) -> str | None:
+    """Stable identity for the chat template the engine will render with.
+
+    ``model_name`` is only a proxy for the template: a local override, a
+    re-pull, or a swapped tokenizer changes what ``<think>`` behaviour the
+    template has while the name stays put, and a verdict cached under the name
+    would outlive the template that produced it.
+
+    Both the processor's and the tokenizer's templates are hashed, rather than
+    re-deriving which one ``_apply_chat_template`` will actually pick. That
+    selection is engine-private (``_is_mllm`` and processor capability), and a
+    copy of it here is a second place to drift. Hashing both can only cost a
+    spurious re-probe if the unused one changes; missing a change would cost a
+    stale verdict, which is the bug this guards.
+
+    Returns ``None`` when no template is reachable -- the caller must then skip
+    the cache entirely, since there is nothing to invalidate against.
+    """
+    sources = []
+    for attr in ("_processor", "tokenizer"):
+        template = getattr(getattr(engine, attr, None), "chat_template", None)
+        if template is not None:
+            sources.append(f"{attr}={template!r}")
+    if not sources:
+        return None
+    joined = "\x00".join(sources).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(joined).hexdigest()
+
+
+def _tool_signature(tools: list | None) -> tuple[str, ...] | None:
+    """Stable, low-cardinality identity for a request's tool set.
+
+    Used in the implicit-thinking cache key. Tool *names* are what a chat
+    template can plausibly branch on; ordering is normalized so two requests
+    offering the same tools in a different order share one entry.
+    """
+    if not tools:
+        return None
+    names = []
+    for tool in tools:
+        name = _tool_name(tool) if isinstance(tool, dict) else None
+        names.append(name or repr(tool))
+    return tuple(sorted(names))
+
+
+def _detect_implicit_thinking(engine: BaseEngine, chat_kwargs: dict | None) -> bool:
+    """Return True iff the chat template injects an open ``<think>``.
+
+    GLM-5.2/5.3 templates end the rendered prompt with ``<think>``, so
+    generation starts INSIDE the reasoning block and the model only ever
+    emits the closing tag. A streaming parser that defaults untagged output
+    to content would put the whole chain-of-thought in ``content``.
+
+    This is a property of the template, not of the conversation, so it is
+    probed once per (model, chat_template_kwargs) with a throwaway message
+    and cached -- rendering the real prompt on every request would put a
+    second template application in the hot path.
+
+    ``tools`` are forwarded and keyed on: a template may gate the ``<think>``
+    injection on tool presence, and ``chat_kwargs["tools"]`` is per-request.
+    The key carries the sorted tool *names*, not the full schemas -- enough to
+    separate "tools" from "no tools" and one tool set from another, without
+    minting a fresh entry (and a fresh template render) for every argument
+    schema a client happens to send. A template that opened ``<think>`` based
+    on a tool's *parameters* rather than its name would still be misread.
+
+    The key carries a hash of the chat template itself, not just the model
+    name: two engines can share a name and render differently, and the same
+    engine's template can be swapped underneath it. See ``_template_signature``.
+    A template that cannot be identified is probed every time rather than
+    cached under an identity that could go stale.
+
+    ``enable_thinking`` is forwarded and keyed on because it is resolved
+    per-request: ``_apply_forced_tool_choice`` sets it to ``False`` on
+    ``chat_kwargs`` directly, not inside ``chat_template_kwargs``. Probing
+    without it would let the engine default (``"coder" not in model_name``)
+    disagree with the flag the real prompt render is about to use.
+    """
+    apply_template = getattr(engine, "_apply_chat_template", None)
+    if apply_template is None:
+        return False
+
+    ctk = (chat_kwargs or {}).get("chat_template_kwargs") or {}
+    # Absent means "let the engine pick its default", which is not the same as
+    # False -- forward only what the request actually resolved.
+    enable_thinking = (chat_kwargs or {}).get("enable_thinking")
+    tools = (chat_kwargs or {}).get("tools") or None
+    template_sig = _template_signature(engine)
+    key = (
+        getattr(engine, "model_name", None),
+        template_sig,
+        repr(sorted(ctk.items())),
+        enable_thinking,
+        _tool_signature(tools),
+    )
+    if template_sig is not None:
+        cached = _implicit_thinking_cache.get(key)
+        if cached is not None:
+            return cached
+
+    probe_kwargs: dict[str, object] = {"chat_template_kwargs": dict(ctk) or None}
+    if enable_thinking is not None:
+        probe_kwargs["enable_thinking"] = enable_thinking
+    if tools:
+        probe_kwargs["tools"] = tools
+
+    try:
+        prompt = apply_template([{"role": "user", "content": "hi"}], **probe_kwargs)
+    except Exception:
+        # A template that won't render for the probe is not evidence either
+        # way -- don't cache, and leave the existing default in place.
+        logger.debug("implicit-thinking probe failed", exc_info=True)
+        return False
+
+    result = bool(prompt) and prompt.rstrip().endswith("<think>")
+    if template_sig is None:
+        return result
+    _implicit_thinking_cache[key] = result
+    while len(_implicit_thinking_cache) > _IMPLICIT_THINKING_CACHE_MAX_SIZE:
+        _implicit_thinking_cache.pop(next(iter(_implicit_thinking_cache)))
+    return result
+
+
 def _prepare_streaming_reasoning_parser(
     engine: BaseEngine,
     request: ChatCompletionRequest | ResponsesRequest | None,
@@ -1179,7 +1311,7 @@ def _prepare_streaming_reasoning_parser(
         return None
     parser = _build_reasoning_parser(engine)
     if parser is not None:
-        parser.reset_state()
+        parser.reset_state(implicit_mode=_detect_implicit_thinking(engine, chat_kwargs))
     return parser
 
 
