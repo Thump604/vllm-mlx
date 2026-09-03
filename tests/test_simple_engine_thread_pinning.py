@@ -76,6 +76,11 @@ def _install_mlx_stubs() -> None:
 _install_mlx_stubs()
 
 
+def _thread_label(thread: threading.Thread | None) -> str:
+    """Readable identity for failure messages; None means never bound."""
+    return "—" if thread is None else f"{thread.name}/{thread.ident}"
+
+
 class _Chunk:
     def __init__(self, text: str, finish_reason: str | None = None) -> None:
         self.text = text
@@ -516,15 +521,21 @@ def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkey
     is faked so the check runs on machines without MLX, matching the rest of
     this module.
     """
-    owner_of: dict[int, int] = {}
-    cross_thread: list[tuple[int, int | None, int]] = []
+    # Keyed by Thread object, not ident: this test retires a worker and starts
+    # another, which is exactly the window in which the OS may hand the new
+    # thread the dead one's ident. Comparing idents would then read a
+    # cross-thread bind as same-thread and silently stop catching the
+    # regression. Same reason as 36deafe1 for the neighbouring test.
+    owner_of: dict[int, threading.Thread] = {}
+    cross_thread: list[tuple[int, str, str]] = []
     issued = [0]
 
     def fake_bind(stream=None):
-        me = threading.get_ident()
+        me = threading.current_thread()
         if stream is not None:
-            if owner_of.get(stream) != me:
-                cross_thread.append((stream, owner_of.get(stream), me))
+            owner = owner_of.get(stream)
+            if owner is not me:
+                cross_thread.append((stream, _thread_label(owner), _thread_label(me)))
             return stream
         issued[0] += 1
         owner_of[issued[0]] = me
@@ -570,5 +581,5 @@ def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkey
 
     assert not cross_thread, (
         "a thread bound a stream created by another thread: "
-        f"{cross_thread} (stream, owner_ident, binder_ident)"
+        f"{cross_thread} (stream, owner, binder)"
     )
