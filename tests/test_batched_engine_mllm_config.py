@@ -87,11 +87,26 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
     assert captured["config_kwargs"]["model_identity"] == "fake-qwen"
 
 
-def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
+def _run_start_mllm_with_external_drafter(monkeypatch, tmp_path, loaded_drafter):
     from vllm_mlx.engine.batched import BatchedEngine
     import vllm_mlx.models.mllm as mllm_mod
 
     captured = {}
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "gemma4_assistant"}', encoding="utf-8"
+    )
+    target_model = object()
+    compatibility_calls = []
+
+    def validate_fixture(target, drafter, kind):
+        compatibility_calls.append((target, drafter, kind))
+
+    # Test forwarding, not numerical compatibility of synthetic model objects.
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(validate_drafter_compatibility=validate_fixture),
+    )
 
     def load_released_gemma_fixture(model_path):
         captured["loader_path"] = model_path
@@ -106,7 +121,7 @@ def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
 
         def __init__(self, model_name, trust_remote_code=True, **kwargs):
             captured["model_kwargs"] = kwargs
-            self.model = object()
+            self.model = target_model
             self.processor = object()
             self.draft_kind = kwargs["draft_kind"]
             self.draft_model_path = kwargs["draft_model"]
@@ -145,16 +160,21 @@ def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
         model_name="gemma4",
         scheduler_config=_base_scheduler_config(enable_mtp=False),
         force_mllm=True,
-        mllm_draft_model="assistant",
+        mllm_draft_model=str(tmp_path),
         mllm_draft_kind="mtp",
         mllm_draft_block_size=6,
     )
     asyncio.run(engine._start_mllm())
+    assert len(compatibility_calls) == 1
+    target, drafter, kind = compatibility_calls[0]
+    assert target is target_model
+    assert drafter is loaded_drafter
+    assert kind == "mtp"
     captured["stats"] = engine.get_stats()
     return captured
 
 
-def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
+def test_start_mllm_forwards_external_assistant_drafter(monkeypatch, tmp_path):
     # Released mlx-vlm v0.6.5 (84f43753) and v0.6.6 (c9e27b08):
     # gemma4_assistant.Gemma4AssistantDraftModel has no capability marker.
     # This models that attribute contract only; no weights are loaded and no
@@ -163,10 +183,12 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         pass
 
     loaded_drafter = ReleasedGemmaDrafter()
-    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+    captured = _run_start_mllm_with_external_drafter(
+        monkeypatch, tmp_path, loaded_drafter
+    )
 
-    assert captured["loader_path"] == "assistant"
-    assert captured["model_kwargs"]["draft_model"] == "assistant"
+    assert captured["loader_path"] == str(tmp_path)
+    assert captured["model_kwargs"]["draft_model"] == str(tmp_path)
     assert captured["model_kwargs"]["draft_kind"] == "mtp"
     assert captured["model_kwargs"]["draft_block_size"] == 6
     assert captured["scheduler_kwargs"] == {
@@ -189,9 +211,11 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
     ],
 )
 def test_capability_reporting_does_not_change_startup_admission(
-    monkeypatch, loaded_drafter
+    monkeypatch, tmp_path, loaded_drafter
 ):
-    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+    captured = _run_start_mllm_with_external_drafter(
+        monkeypatch, tmp_path, loaded_drafter
+    )
     assert captured["scheduler_kwargs"]["draft_model"] is loaded_drafter
 
 
