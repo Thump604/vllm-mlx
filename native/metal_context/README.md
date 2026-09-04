@@ -30,6 +30,15 @@ entries may be `-1`; live entries may not be.  The shader repeats the
 page-bound guard so a malformed low-level dispatch cannot read outside the
 page buffer, while the host remains responsible for surfacing the error.
 
+## Known execution limitation
+
+Parallelism is across `(request, query_head)` only. Each threadgroup walks
+the sequence serially, one token at a time, with ten threadgroup barriers per
+token (including the seven-step dot-product reduction). This is a correctness
+and ABI reference, not a long-context serving-performance-qualified kernel.
+The host dispatches `(128, 1, 1)` threads per group; the shader uniformly
+rejects other actual group dimensions before scratch access or barriers.
+
 ## Building
 
 Normal installs remain pure Python/MLX.  On a macOS/Xcode builder, opt in to

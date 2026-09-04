@@ -53,13 +53,17 @@ kernel void metal_context_paged_decode(
     device float* output [[buffer(5)]],
     constant PagedDecodeParams& p [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint3 tg_pos [[threadgroup_position_in_grid]]) {
-  // The host dispatches exactly one 128-thread group per output vector.  A
-  // guard remains here because it is cheap and prevents accidental writes if
-  // a future caller uses a larger grid.
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 group_size [[threads_per_threadgroup]]) {
+  // Reject unsupported actual geometry uniformly: every lane must either
+  // return here or participate in all barriers and the 128-element scratch.
+  if (group_size.x != 128 || group_size.y != 1 || group_size.z != 1 ||
+      p.query_heads == 0) {
+    return;
+  }
   const uint request = tg_pos.x / p.query_heads;
   const uint query_head = tg_pos.x % p.query_heads;
-  if (request >= p.batch_size || query_head >= p.query_heads || tid >= 128) {
+  if (request >= p.batch_size || query_head >= p.query_heads) {
     return;
   }
 
