@@ -1366,6 +1366,56 @@ class TestHybridRestartPersistence:
 
             return [QSAKVCache()]
 
+    class _Qwen4PLEModel:
+        def __init__(self):
+            self.args = TestHybridRestartPersistence._Args()
+            self.args.model_type = "qwen4_exp"
+            self.args.num_hidden_layers = 3
+            self.args.layer_types = [
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ]
+            self.args.hidden_size = 8
+            self.args.hc_count = 4
+            self.args.ple_conv_kernel_size = 4
+            self.args.ngram_size = 3
+
+        def make_cache(self):
+            from mlx_vlm.models.cache import ArraysCache
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+            return [ArraysCache(size=2), ArraysCache(size=4), QSAKVCache()]
+
+    @staticmethod
+    def _qwen4_ple_state():
+        import mlx.core as mx
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        linear = ArraysCache(size=2)
+        linear.state = [
+            mx.zeros((1, 2, 16), dtype=mx.float32),
+            mx.zeros((1, 2, 4, 4), dtype=mx.float32),
+        ]
+        ple = ArraysCache(size=4)
+        ple.state = [
+            mx.ones((1, 2, 16), dtype=mx.float32),
+            mx.ones((1, 2, 4, 4), dtype=mx.float32),
+            mx.ones((1, 9, 32), dtype=mx.float32),
+            mx.array([[7, 9]], dtype=mx.int64),
+        ]
+        qsa = QSAKVCache()
+        qsa.state = (
+            mx.ones((1, 1, 4, 4), dtype=mx.float32),
+            mx.ones((1, 1, 4, 4), dtype=mx.float32),
+            mx.ones((1, 4, 4), dtype=mx.float32),
+            mx.arange(4, dtype=mx.int32).reshape(1, 4),
+        )
+        logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+        mx.eval(*linear.state, *ple.state, *qsa.state, logits)
+        return [linear, ple, qsa], logits
+
     @staticmethod
     def _state(*, vlm=False):
         import mlx.core as mx
@@ -1497,6 +1547,42 @@ class TestHybridRestartPersistence:
         for actual, expected in zip(fetched[0].state, state[0].state, strict=True):
             assert mx.array_equal(actual, expected).item()
         assert restored._current_memory == source._current_memory
+
+    def test_real_qwen4_ple_and_qsa_round_trip_through_disk(self, tmp_path):
+        import mlx.core as mx
+
+        model = self._Qwen4PLEModel()
+        source = self._cache(model=model)
+        state, logits = self._qwen4_ple_state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert snapshot is not None
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+        restored = self._cache(model=model)
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        fetched, remaining = restored.fetch([1, 2, 3, 4])
+        assert remaining == []
+        assert [type(layer).__name__ for layer in fetched] == [
+            "ArraysCache",
+            "ArraysCache",
+            "QSAKVCache",
+        ]
+        for actual_layer, expected_layer in zip(fetched, state, strict=True):
+            for actual, expected in zip(
+                actual_layer.state, expected_layer.state, strict=True
+            ):
+                assert actual.dtype == expected.dtype
+                assert mx.array_equal(actual, expected).item()
+        assert fetched[1].state[3].dtype == mx.int64
+        assert restored._current_memory == source._current_memory
+        assert restored._current_memory <= restored._max_memory
 
     @pytest.mark.parametrize("text_config_as_mapping", [False, True])
     def test_round_trip_uses_nested_vlm_text_config_geometry(

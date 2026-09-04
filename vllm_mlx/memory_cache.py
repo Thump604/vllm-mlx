@@ -2725,7 +2725,10 @@ class MemoryAwarePrefixCache:
             state = []
             for index in range(num_arrays):
                 value = tensors[f"state_{index}"]
-                if value.size == 0 or value.dtype.kind != "f":
+                allowed_kinds = {"f"}
+                if num_arrays == 4 and index == 3:
+                    allowed_kinds.add("i")
+                if value.size == 0 or value.dtype.kind not in allowed_kinds:
                     raise ValueError("ArraysCache tensor is invalid")
                 state.append(restore_dtype(mx.array(value), dtype_names[index]))
             layer = cls(num_arrays)
@@ -2943,7 +2946,10 @@ class MemoryAwarePrefixCache:
                             for index in range(num_arrays)
                         )
                         if tuple(value.shape for value in values) != layer_shapes:
-                            raise ValueError("persisted ArraysCache geometry mismatch")
+                            raise ValueError(
+                                "persisted ArraysCache geometry mismatch: "
+                                f"{tuple(value.shape for value in values)} != {layer_shapes}"
+                            )
                         if tuple(value.dtype.kind for value in values) != layer_kinds:
                             raise ValueError("persisted ArraysCache dtype mismatch")
                 logits_np = persisted.auxiliary.get("last_logits")
