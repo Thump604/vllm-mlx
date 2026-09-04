@@ -269,7 +269,9 @@ class MLLMBatch:
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
     samplers: Optional[List[Optional[Callable]]] = None
-    _row_filter_hook: Optional[Callable[[List[int], List[int]], None]] = None
+    _row_filter_hook: Optional[Callable[[List[int], List[int]], None]] = field(
+        default=None, repr=False
+    )
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -2262,13 +2264,28 @@ def install_mtp_mllm(
         if external_drafter
         else False
     )
-    if external_drafter and type(reconciliation_marker) is not bool:
+    if reconciliation_marker is not None and type(reconciliation_marker) is not bool:
         raise TypeError(
             "Assistant drafter must declare "
             "requires_verified_token_reconciliation as a literal boolean"
         )
     stateful_external_drafter = reconciliation_marker is True
     if external_drafter:
+        if reconciliation_marker is None:
+            # Released drafters predate the declaration. These hooks identify
+            # state reconciliation, not numerical continuous-batching support.
+            absent = object()
+            hooks = [
+                getattr(draft_model, name, absent)
+                for name in ("accept_verified_tokens_batch", "filter_batch")
+            ]
+            if all(callable(hook) for hook in hooks):
+                stateful_external_drafter = True
+            elif not all(hook is absent for hook in hooks):
+                raise TypeError(
+                    "Assistant drafter must provide both callable lifecycle hooks "
+                    "accept_verified_tokens_batch and filter_batch, or neither"
+                )
         batch_gen._require_uniform_mllm_draft = True
         batch_gen._allow_mid_batch_extend = False
         if stateful_external_drafter:

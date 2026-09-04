@@ -2394,7 +2394,7 @@ class TestMLLMBatchGeneratorMTPGuards:
         ):
             install_mtp_mllm(generator, object(), draft_model=drafter)
 
-    @pytest.mark.parametrize("marker", [None, "false", 1])
+    @pytest.mark.parametrize("marker", ["false", 1])
     def test_external_mtp_reconciliation_marker_fails_closed(self, marker):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
 
@@ -2408,6 +2408,38 @@ class TestMLLMBatchGeneratorMTPGuards:
 
         with pytest.raises(TypeError, match="literal boolean"):
             install_mtp_mllm(generator, object(), draft_model=drafter)
+
+    @pytest.mark.parametrize("declared", ["absent", None, True, False])
+    @pytest.mark.parametrize("hooks", ["absent", "callable", "partial", "noncallable"])
+    def test_external_mtp_selects_released_lifecycle_contract(self, declared, hooks):
+        from vllm_mlx.mllm_batch_generator import install_mtp_mllm
+
+        # v0.6.5/v0.6.6 Gemma has neither hook; Qwen3.5/DeepSeek/Eagle
+        # have both. This is an attribute/lifecycle fixture, not weight loading.
+        drafter = SimpleNamespace(reset=MagicMock())
+        if declared != "absent":
+            drafter.requires_verified_token_reconciliation = declared
+        if hooks != "absent":
+            drafter.accept_verified_tokens_batch = MagicMock()
+        if hooks == "callable":
+            drafter.filter_batch = MagicMock()
+        elif hooks == "noncallable":
+            drafter.filter_batch = None
+        batch = SimpleNamespace(_row_filter_hook=None)
+        generator = SimpleNamespace(
+            model=object(), active_batch=batch, _step=MagicMock(), _next=MagicMock()
+        )
+        invalid = declared is True and hooks != "callable"
+        invalid |= declared in ("absent", None) and hooks in ("partial", "noncallable")
+        if invalid:
+            with pytest.raises(TypeError, match="lifecycle hook"):
+                install_mtp_mllm(generator, object(), draft_model=drafter)
+            drafter.reset.assert_not_called()
+        else:
+            install_mtp_mllm(generator, object(), draft_model=drafter)
+            drafter.reset.assert_called_once_with(generator.model)
+            stateful = declared is not False and hooks == "callable"
+            assert callable(batch._row_filter_hook) is stateful
 
     def test_stateful_external_mtp_filter_failure_clears_lifecycle(self):
         from vllm_mlx.mllm_batch_generator import install_mtp_mllm
@@ -3312,45 +3344,99 @@ def test_external_mtp_drafts_mixed_position_rows_independently():
     assert draft_model.set_calls[-1]["kv_offset"] == 10377
 
 
-def test_scheduler_step_error_fails_every_request_once():
-    """A poisoned shared batch must not be retried behind SSE heartbeats."""
-    import inspect
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_scheduler_loop_verification_error_and_cleanup_boundary(
+    monkeypatch, cleanup_fails
+):
+    """Characterize fanout and the existing unhandled cleanup-error boundary."""
+    import threading
+    from collections import deque
 
-    from vllm_mlx.mllm_scheduler import MLLMScheduler
+    import vllm_mlx.mllm_scheduler as scheduler_mod
+    from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+    from vllm_mlx.mllm_scheduler import MLLMScheduler, RequestStatus
 
-    scheduler = MLLMScheduler.__new__(MLLMScheduler)
-    scheduler.requests = {
-        request_id: SimpleNamespace(
-            output_tokens=[1, 2],
-            output_text="partial",
-            num_prompt_tokens=10327,
-            num_output_tokens=2,
-            mtp_drafts=10,
-            mtp_accepted=6,
+    monkeypatch.setattr(scheduler_mod, "bind_generation_streams", lambda: None)
+
+    async def run():
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._running = True
+        scheduler.requests = {
+            request_id: SimpleNamespace(
+                request_id=request_id,
+                status=status,
+                output_tokens=[1],
+                output_text="partial",
+                num_prompt_tokens=3,
+                num_output_tokens=1,
+                mtp_drafts=1,
+                mtp_accepted=0,
+            )
+            for request_id, status in (
+                ("active", RequestStatus.RUNNING),
+                ("waiting", RequestStatus.WAITING),
+            )
+        }
+        scheduler.running = {"active": scheduler.requests["active"]}
+        scheduler.waiting = deque([scheduler.requests["waiting"]])
+        scheduler.request_id_to_uid = {"active": 7}
+        scheduler.uid_to_request_id = {7: "active"}
+        scheduler.finished_req_ids = set()
+        scheduler._detokenizer_pool = {}
+        scheduler.total_completion_tokens = scheduler.total_prompt_tokens = 0
+        scheduler.output_queues = {key: asyncio.Queue() for key in scheduler.requests}
+        scheduler._schedule_waiting = lambda: []
+        drained = asyncio.Event()
+
+        def notify_removed():
+            drained.set()
+            if cleanup_fails:
+                raise RuntimeError("cleanup callback failed")
+
+        generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        generator._old_wired_limit = None
+        generator._pending_removal_lock = threading.Lock()
+        generator._pending_removal_uids = set()
+        generator._aborted_request_ids = set()
+        generator.unprocessed_requests = []
+        generator.active_batch = SimpleNamespace(
+            uids=[7], notify_all_rows_removed=notify_removed
         )
-        for request_id in ("older", "joining")
-    }
-    scheduler.output_queues = {
-        request_id: asyncio.Queue() for request_id in scheduler.requests
-    }
-    scheduler.batch_generator = SimpleNamespace(process_pending_removals=MagicMock())
+        poisoned_batch = generator.active_batch
+        calls = []
 
-    def abort(request_id):
-        scheduler.requests.pop(request_id, None)
-        return True
+        def failed_verify():
+            calls.append("verify")
+            raise RuntimeError("target cache may have advanced")
 
-    scheduler.abort_request = MagicMock(side_effect=abort)
-    scheduler._fail_requests_after_step_error(ValueError("negative dimensions"))
+        generator.next = failed_verify
+        scheduler.batch_generator = generator
+        task = asyncio.create_task(scheduler._process_loop())
+        try:
+            await asyncio.wait_for(drained.wait(), timeout=1)
+            if cleanup_fails:
+                with pytest.raises(RuntimeError, match="cleanup callback failed"):
+                    await asyncio.wait_for(task, timeout=1)
+                # Existing limitation: cleanup escapes the loop and retains the
+                # poisoned batch. This is not a recovery/reusability assertion.
+                assert generator.active_batch is poisoned_batch
+            else:
+                assert not task.done()
+                assert generator.active_batch is None
+        finally:
+            scheduler._running = False
+            if not task.done():
+                await asyncio.wait_for(task, timeout=1)
+        assert calls == ["verify"]
+        assert scheduler.requests == scheduler.running == {}
+        assert not scheduler.waiting
+        assert not scheduler.request_id_to_uid and not scheduler.uid_to_request_id
+        assert generator._aborted_request_ids == {"active", "waiting"}
+        for queue in scheduler.output_queues.values():
+            output = queue.get_nowait()
+            assert output.finished and output.finish_reason == "error"
+            assert output.output_text == "partial"
+            assert queue.get_nowait() is None
+            assert queue.empty()
 
-    assert scheduler.requests == {}
-    assert scheduler.abort_request.call_count == 2
-    scheduler.batch_generator.process_pending_removals.assert_called_once_with()
-    for queue in scheduler.output_queues.values():
-        output = queue.get_nowait()
-        assert output.finished is True
-        assert output.finish_reason == "error"
-        assert output.output_text == "partial"
-
-    assert "_fail_requests_after_step_error(e)" in inspect.getsource(
-        MLLMScheduler._process_loop
-    )
+    asyncio.run(run())
