@@ -4276,8 +4276,10 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         scheduler.output_queues = {key: asyncio.Queue() for key in scheduler.requests}
         scheduler._schedule_waiting = lambda: []
         drained = asyncio.Event()
+        abort_markers_at_cleanup = []
 
         def notify_removed():
+            abort_markers_at_cleanup.append(set(generator._aborted_request_ids))
             drained.set()
             if cleanup_fails:
                 raise RuntimeError("cleanup callback failed")
@@ -4286,10 +4288,16 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         generator._old_wired_limit = None
         generator._pending_removal_lock = threading.Lock()
         generator._pending_removal_uids = set()
+        generator._pending_removal_request_ids = {}
+        generator._prefix_checkpoint_lock = threading.RLock()
+        generator._request_prefix_checkpoints = {}
+        generator._cache_owner_requests = {}
         generator._aborted_request_ids = set()
         generator.unprocessed_requests = []
         generator.active_batch = SimpleNamespace(
-            uids=[7], notify_all_rows_removed=notify_removed
+            uids=[7],
+            requests=[SimpleNamespace(uid=7, request_id="active")],
+            notify_all_rows_removed=notify_removed,
         )
         poisoned_batch = generator.active_batch
         calls = []
@@ -4320,7 +4328,10 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         assert scheduler.requests == scheduler.running == {}
         assert not scheduler.waiting
         assert not scheduler.request_id_to_uid and not scheduler.uid_to_request_id
-        assert generator._aborted_request_ids == {"active"}
+        assert abort_markers_at_cleanup == [{"active"}]
+        assert generator._aborted_request_ids == (
+            {"active"} if cleanup_fails else set()
+        )
         for queue in scheduler.output_queues.values():
             output = queue.get_nowait()
             assert output.finished and output.finish_reason == "error"
