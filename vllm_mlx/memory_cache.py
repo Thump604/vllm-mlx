@@ -1394,7 +1394,11 @@ class MemoryAwarePrefixCache:
         commit_lock: Any = None,
         commit_guard: Callable[[], bool] | None = None,
     ) -> bool:
-        """Atomically publish an entry returned by :meth:`prepare_store`."""
+        """Atomically publish an entry returned by :meth:`prepare_store`.
+
+        ``commit_lock`` is acquired inside ``_memory_lock``. Callers must not
+        call cache methods while holding the caller-supplied ``commit_lock``.
+        """
         tokens_key = entry.tokens
         commit_context = commit_lock if commit_lock is not None else nullcontext()
         try:
