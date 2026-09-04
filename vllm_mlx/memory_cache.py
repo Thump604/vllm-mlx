@@ -1217,6 +1217,21 @@ def _compute_tokenizer_persistence_fingerprint(
     return digest.hexdigest()
 
 
+def _cache_layer_topology(layer: Any) -> tuple[str, int] | None:
+    """Describe one cache layer using its exact replay-state contract."""
+    layer_type = f"{type(layer).__module__}.{type(layer).__qualname__}"
+    state = getattr(layer, "state", None)
+    if getattr(layer, "preserve_auxiliary_kv_state", False):
+        if not isinstance(state, (list, tuple)):
+            return None
+        return layer_type, len(state)
+    if isinstance(state, list):
+        return layer_type, len(state)
+    if hasattr(layer, "keys") and hasattr(layer, "values"):
+        return layer_type, 2
+    return None
+
+
 def _cache_topology(model: Any) -> tuple[tuple[str, int], ...] | None:
     """Describe the ordered empty-cache topology without sequence state."""
     make_cache = getattr(model, "make_cache", None)
@@ -1227,22 +1242,10 @@ def _cache_topology(model: Any) -> tuple[tuple[str, int], ...] | None:
     except Exception:
         logger.debug("Failed to construct cache topology", exc_info=True)
         return None
-    topology = []
-    for layer in cache:
-        layer_type = f"{type(layer).__module__}.{type(layer).__qualname__}"
-        if getattr(layer, "preserve_auxiliary_kv_state", False):
-            state = getattr(layer, "state", None)
-            if not isinstance(state, (list, tuple)):
-                return None
-            arity = len(state)
-        elif hasattr(layer, "state") and isinstance(layer.state, list):
-            arity = len(layer.state)
-        elif hasattr(layer, "keys") and hasattr(layer, "values"):
-            arity = 2
-        else:
-            return None
-        topology.append((layer_type, arity))
-    return tuple(topology) or None
+    topology = tuple(_cache_layer_topology(layer) for layer in cache)
+    if not topology or any(layer is None for layer in topology):
+        return None
+    return topology
 
 
 def _cache_topology_fingerprint(
@@ -1329,6 +1332,31 @@ def _snapshot_hybrid_layer(layer: Any):
     from .cache_persistence import HybridLayerSnapshot
 
     layer_type = type(layer).__name__
+    if getattr(layer, "preserve_auxiliary_kv_state", False):
+        qualified_name = f"{type(layer).__module__}.{type(layer).__qualname__}"
+        state = getattr(layer, "state", None)
+        if (
+            qualified_name != "mlx_vlm.models.qwen4_exp.language.QSAKVCache"
+            or not isinstance(state, tuple)
+            or len(state) != 4
+            or any(value is None for value in state)
+        ):
+            raise ValueError(f"unsupported persisted {layer_type} state")
+        tensors = {}
+        original_dtypes = []
+        for index, value in enumerate(state):
+            array, original_dtype = _mx_array_to_numpy(value)
+            tensors[f"state_{index}"] = array
+            original_dtypes.append(original_dtype)
+        return HybridLayerSnapshot(
+            layer_type,
+            tensors,
+            {
+                "num_arrays": len(state),
+                "state_original_dtypes": original_dtypes,
+                "state_container": "tuple",
+            },
+        )
     if layer_type in {"KVCache", "RotatingKVCache"}:
         keys = getattr(layer, "keys", None)
         values = getattr(layer, "values", None)
@@ -1383,6 +1411,11 @@ def _snapshot_hybrid_layer(layer: Any):
 
 
 def _iter_cache_arrays(layer: Any):
+    if getattr(layer, "preserve_auxiliary_kv_state", False):
+        state = getattr(layer, "state", None)
+        if isinstance(state, (list, tuple)):
+            yield from (value for value in state if value is not None)
+        return
     if hasattr(layer, "state") and isinstance(layer.state, list):
         yield from (value for value in layer.state if value is not None)
         for attr in ("left_padding", "lengths"):
@@ -2534,17 +2567,9 @@ class MemoryAwarePrefixCache:
             for entry in entries:
                 if set(entry.auxiliary or {}) != {"last_logits"}:
                     raise ValueError("hybrid entry is missing exact last_logits")
-                topology = tuple(
-                    (
-                        f"{type(layer).__module__}.{type(layer).__qualname__}",
-                        (
-                            len(layer.state)
-                            if hasattr(layer, "state") and isinstance(layer.state, list)
-                            else 2
-                        ),
-                    )
-                    for layer in entry.cache
-                )
+                topology = tuple(_cache_layer_topology(layer) for layer in entry.cache)
+                if any(layer is None for layer in topology):
+                    raise ValueError("cache layout contains an unsupported layer")
                 if (
                     _cache_topology_fingerprint(
                         topology, self._config, self._cache_runtime_identity
@@ -2613,7 +2638,7 @@ class MemoryAwarePrefixCache:
             return None
 
     @staticmethod
-    def _restore_hybrid_layer(layer_snapshot, expected_qualified_name: str):
+    def _restore_hybrid_layer(layer_snapshot, expected_layer: Any):
         """Reconstruct one validated layer on the model-owning thread."""
         import mlx.core as mx
 
@@ -2621,17 +2646,8 @@ class MemoryAwarePrefixCache:
         tensors = layer_snapshot.tensors
         metadata = layer_snapshot.metadata
 
-        if expected_qualified_name.startswith("mlx_lm.models.cache."):
-            from mlx_lm.models import cache as cache_module
-        elif expected_qualified_name.startswith("mlx_vlm.models.cache."):
-            from mlx_vlm.models import cache as cache_module
-        else:
-            raise ValueError("unsupported cache layer implementation")
-        cls = getattr(cache_module, layer_type, None)
-        if (
-            cls is None
-            or f"{cls.__module__}.{cls.__qualname__}" != expected_qualified_name
-        ):
+        cls = type(expected_layer)
+        if cls.__name__ != layer_type:
             raise ValueError("cache layer implementation mismatch")
 
         def restore_dtype(value, dtype_name):
@@ -2727,6 +2743,29 @@ class MemoryAwarePrefixCache:
                 )
             layer.meta_state = metadata["meta_state"]
             return layer
+        if layer_type == "QSAKVCache":
+            if (
+                not getattr(expected_layer, "preserve_auxiliary_kv_state", False)
+                or f"{cls.__module__}.{cls.__qualname__}"
+                != "mlx_vlm.models.qwen4_exp.language.QSAKVCache"
+                or set(metadata)
+                != {"num_arrays", "state_original_dtypes", "state_container"}
+                or metadata.get("num_arrays") != 4
+                or metadata.get("state_container") != "tuple"
+            ):
+                raise ValueError("QSAKVCache restore contract is invalid")
+            dtype_names = metadata.get("state_original_dtypes")
+            if not isinstance(dtype_names, list) or len(dtype_names) != 4:
+                raise ValueError("QSAKVCache dtype metadata is invalid")
+            if set(tensors) != {f"state_{index}" for index in range(4)}:
+                raise ValueError("QSAKVCache tensor names are invalid")
+            state = tuple(
+                restore_dtype(mx.array(tensors[f"state_{index}"]), dtype_names[index])
+                for index in range(4)
+            )
+            layer = cls()
+            layer.state = state
+            return layer
         raise ValueError(f"unsupported cache layer: {layer_type}")
 
     def restore_hybrid_persistence_snapshot(self, loaded) -> int:
@@ -2739,6 +2778,9 @@ class MemoryAwarePrefixCache:
             return 0
 
         expected_qualified_topology = _cache_topology(self._model) or ()
+        make_cache = getattr(self._model, "make_cache", None)
+        if not callable(make_cache):
+            return 0
         expected_topology = tuple(
             (qualified_name.rsplit(".", 1)[-1], arity)
             for qualified_name, arity in expected_qualified_topology
@@ -2785,6 +2827,33 @@ class MemoryAwarePrefixCache:
                         and shape[-1] != expected_head_dim
                     ):
                         raise ValueError("persisted KV dimension mismatch")
+                qsa_layers = [
+                    layer
+                    for layer in persisted.layers
+                    if layer.layer_type == "QSAKVCache"
+                ]
+                for layer in qsa_layers:
+                    keys = layer.tensors["state_0"]
+                    index_keys = layer.tensors["state_2"]
+                    position_ids = layer.tensors["state_3"]
+                    if (
+                        keys.shape[-2] != len(persisted.tokens)
+                        or index_keys.shape[1] != len(persisted.tokens)
+                        or position_ids.shape[-1] != len(persisted.tokens)
+                    ):
+                        raise ValueError("persisted QSA/token length mismatch")
+                    if keys.shape[0] != 1:
+                        raise ValueError("persisted QSA batch geometry mismatch")
+                    if (
+                        isinstance(expected_kv_heads, int)
+                        and keys.shape[-3] != expected_kv_heads
+                    ):
+                        raise ValueError("persisted QSA head geometry mismatch")
+                    if (
+                        isinstance(expected_head_dim, int)
+                        and keys.shape[-1] != expected_head_dim
+                    ):
+                        raise ValueError("persisted QSA dimension mismatch")
                 arrays_layers = [
                     layer
                     for layer in persisted.layers
@@ -2853,8 +2922,11 @@ class MemoryAwarePrefixCache:
                     )
                 ):
                     raise ValueError("persisted last_logits shape or dtype is invalid")
+                expected_cache = list(make_cache())
+                if len(expected_cache) != len(persisted.layers):
+                    raise ValueError("loaded cache topology changed during restore")
                 cache = [
-                    self._restore_hybrid_layer(layer, expected_qualified_topology[i][0])
+                    self._restore_hybrid_layer(layer, expected_cache[i])
                     for i, layer in enumerate(persisted.layers)
                 ]
                 import mlx.core as mx

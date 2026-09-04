@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from vllm_mlx.cache_persistence import (
+    HYBRID_CACHE_PERSIST_VERSION,
     HybridCachePersistenceError,
     HybridCacheSnapshot,
     HybridEntrySnapshot,
@@ -63,9 +64,62 @@ def _snapshot(*, model="model-a", tokenizer="tokenizer-a"):
     )
 
 
+def _qsa_snapshot():
+    return HybridCacheSnapshot(
+        identity={
+            "model": "qwen4-exp-model",
+            "tokenizer": "qwen4-exp-tokenizer",
+            "cache_layout": "qwen4-exp-qsa-layout",
+        },
+        entries=(
+            HybridEntrySnapshot(
+                tokens=(1, 2, 3, 4),
+                memory_bytes=272,
+                layers=(
+                    HybridLayerSnapshot(
+                        "QSAKVCache",
+                        {
+                            "state_0": np.arange(16, dtype=np.float32).reshape(
+                                1, 1, 4, 4
+                            ),
+                            "state_1": np.ones((1, 1, 4, 4), dtype=np.float32),
+                            "state_2": np.arange(16, dtype=np.float32).reshape(1, 4, 4),
+                            "state_3": np.arange(4, dtype=np.int32).reshape(1, 4),
+                        },
+                        {
+                            "num_arrays": 4,
+                            "state_original_dtypes": [None, None, None, None],
+                            "state_container": "tuple",
+                        },
+                    ),
+                ),
+                auxiliary={
+                    "last_logits": np.arange(16, dtype=np.float32).reshape(1, 16)
+                },
+                auxiliary_original_dtypes={"last_logits": None},
+            ),
+        ),
+    )
+
+
 def _generation_dir(tmp_path):
     pointer = json.loads((tmp_path / "index.json").read_text())
     return tmp_path / pointer["generation"]
+
+
+def _rewrite_manifest(tmp_path, mutate):
+    import hashlib
+
+    manifest_path = _generation_dir(tmp_path) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    mutate(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    )
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
 
 
 def test_hybrid_snapshot_round_trip_preserves_layers_tokens_and_logits(tmp_path):
@@ -85,6 +139,93 @@ def test_hybrid_snapshot_round_trip_preserves_layers_tokens_and_logits(tmp_path)
         loaded.entries[0].auxiliary["last_logits"],
         source.entries[0].auxiliary["last_logits"],
     )
+
+
+def test_qsa_snapshot_uses_v2_and_round_trips(tmp_path):
+    assert HYBRID_CACHE_PERSIST_VERSION == 2
+    source = _qsa_snapshot()
+    assert write_hybrid_snapshot(str(tmp_path), source)
+
+    pointer = json.loads((tmp_path / "index.json").read_text())
+    manifest = json.loads((_generation_dir(tmp_path) / "manifest.json").read_text())
+    loaded = read_hybrid_snapshot(str(tmp_path))
+
+    assert pointer["version"] == 2
+    assert manifest["version"] == 2
+    assert loaded.entries[0].layers[0].layer_type == "QSAKVCache"
+    assert loaded.entries[0].layers[0].metadata["num_arrays"] == 4
+
+
+def test_v1_arrays_and_kv_generation_remains_readable(tmp_path):
+    assert write_hybrid_snapshot(str(tmp_path), _snapshot())
+    _rewrite_manifest(tmp_path, lambda manifest: manifest.update(version=1))
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["version"] = 1
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
+
+    loaded = read_hybrid_snapshot(str(tmp_path))
+
+    assert [layer.layer_type for layer in loaded.entries[0].layers] == [
+        "ArraysCache",
+        "KVCache",
+    ]
+
+
+def test_v1_generation_rejects_qsa_layer(tmp_path):
+    assert write_hybrid_snapshot(str(tmp_path), _qsa_snapshot())
+    _rewrite_manifest(tmp_path, lambda manifest: manifest.update(version=1))
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["version"] = 1
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(HybridCachePersistenceError, match="unsupported cache layer"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_unknown_generation_version_fails_closed(tmp_path):
+    assert write_hybrid_snapshot(str(tmp_path), _snapshot())
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["version"] = 99
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(HybridCachePersistenceError, match="unsupported hybrid"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+@pytest.mark.parametrize("version", [True, 1.0])
+def test_non_integer_generation_version_fails_closed(tmp_path, version):
+    assert write_hybrid_snapshot(str(tmp_path), _snapshot())
+    _rewrite_manifest(tmp_path, lambda manifest: manifest.update(version=version))
+    pointer_path = tmp_path / "index.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["version"] = version
+    pointer_path.write_text(json.dumps(pointer, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(HybridCachePersistenceError, match="unsupported hybrid"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("num_arrays", 3),
+        ("state_container", "list"),
+        ("state_original_dtypes", [None, None, None, "float64"]),
+    ],
+)
+def test_qsa_generation_rejects_invalid_state_metadata(tmp_path, field, value):
+    assert write_hybrid_snapshot(str(tmp_path), _qsa_snapshot())
+
+    def mutate(manifest):
+        manifest["entries"][0]["layers"][0]["metadata"][field] = value
+
+    _rewrite_manifest(tmp_path, mutate)
+
+    with pytest.raises(HybridCachePersistenceError, match="QSAKVCache"):
+        read_hybrid_snapshot(str(tmp_path))
 
 
 @pytest.mark.parametrize(

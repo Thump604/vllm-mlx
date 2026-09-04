@@ -23,9 +23,14 @@ from typing import Any
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-HYBRID_CACHE_PERSIST_VERSION = 1
+HYBRID_CACHE_PERSIST_VERSION = 2
+_READABLE_HYBRID_CACHE_VERSIONS = {1, HYBRID_CACHE_PERSIST_VERSION}
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
-_SUPPORTED_LAYERS = {"KVCache", "RotatingKVCache", "ArraysCache"}
+_V1_SUPPORTED_LAYERS = {"KVCache", "RotatingKVCache", "ArraysCache"}
+_SUPPORTED_LAYERS_BY_VERSION = {
+    1: _V1_SUPPORTED_LAYERS,
+    2: _V1_SUPPORTED_LAYERS | {"QSAKVCache"},
+}
 _SUPPORTED_AUXILIARY = {"last_logits"}
 _SUPPORTED_ORIGINAL_DTYPES = {None, "bfloat16", "float16", "float32"}
 _ABSOLUTE_MAX_TOKENS = 16 * 1024 * 1024
@@ -208,7 +213,18 @@ def _validate_identity(identity: Any) -> dict[str, str]:
     return {key: identity[key] for key in sorted(expected)}
 
 
-def _validate_snapshot(snapshot: HybridCacheSnapshot) -> None:
+def _validate_snapshot(
+    snapshot: HybridCacheSnapshot, *, version: int = HYBRID_CACHE_PERSIST_VERSION
+) -> None:
+    if type(version) is not int:
+        raise HybridCachePersistenceError(
+            f"unsupported hybrid cache version: {version!r}"
+        )
+    supported_layers = _SUPPORTED_LAYERS_BY_VERSION.get(version)
+    if supported_layers is None:
+        raise HybridCachePersistenceError(
+            f"unsupported hybrid cache version: {version!r}"
+        )
     _validate_identity(snapshot.identity)
     if not snapshot.entries:
         raise HybridCachePersistenceError("snapshot has no entries")
@@ -247,7 +263,7 @@ def _validate_snapshot(snapshot: HybridCacheSnapshot) -> None:
         ):
             raise HybridCachePersistenceError("auxiliary dtype metadata is invalid")
         for layer in entry.layers:
-            if layer.layer_type not in _SUPPORTED_LAYERS:
+            if layer.layer_type not in supported_layers:
                 raise HybridCachePersistenceError(
                     f"unsupported cache layer: {layer.layer_type}"
                 )
@@ -258,7 +274,12 @@ def _validate_snapshot(snapshot: HybridCacheSnapshot) -> None:
                 raise HybridCachePersistenceError(
                     "layer tensors must be nonempty arrays"
                 )
-            _validate_layer_payload(layer.layer_type, layer.tensors, layer.metadata)
+            _validate_layer_payload(
+                layer.layer_type,
+                layer.tensors,
+                layer.metadata,
+                version=version,
+            )
         if (
             _entry_logical_nbytes(
                 entry.layers, entry.auxiliary, entry.auxiliary_original_dtypes
@@ -269,9 +290,17 @@ def _validate_snapshot(snapshot: HybridCacheSnapshot) -> None:
 
 
 def _validate_layer_payload(
-    layer_type: str, tensors: dict[str, np.ndarray], metadata: dict[str, Any]
+    layer_type: str,
+    tensors: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    *,
+    version: int = HYBRID_CACHE_PERSIST_VERSION,
 ) -> None:
     """Validate one layer before it can cross the owner-thread boundary."""
+    if layer_type not in _SUPPORTED_LAYERS_BY_VERSION.get(version, set()):
+        raise HybridCachePersistenceError(
+            f"unsupported cache layer for version {version}: {layer_type}"
+        )
     if layer_type in {"KVCache", "RotatingKVCache"}:
         allowed = {
             "offset",
@@ -358,6 +387,45 @@ def _validate_layer_payload(
                 raise HybridCachePersistenceError("invalid ArraysCache metadata tensor")
         return
 
+    if layer_type == "QSAKVCache":
+        expected_metadata = {
+            "num_arrays",
+            "state_original_dtypes",
+            "state_container",
+        }
+        if not isinstance(metadata, dict) or set(metadata) != expected_metadata:
+            raise HybridCachePersistenceError("invalid QSAKVCache metadata")
+        num_arrays = metadata["num_arrays"]
+        state_dtypes = metadata["state_original_dtypes"]
+        if num_arrays != 4 or metadata["state_container"] != "tuple":
+            raise HybridCachePersistenceError("invalid QSAKVCache state contract")
+        if (
+            not isinstance(state_dtypes, list)
+            or len(state_dtypes) != num_arrays
+            or any(dtype not in _SUPPORTED_ORIGINAL_DTYPES for dtype in state_dtypes)
+        ):
+            raise HybridCachePersistenceError("invalid QSAKVCache state dtypes")
+        if set(tensors) != {f"state_{index}" for index in range(num_arrays)}:
+            raise HybridCachePersistenceError("invalid QSAKVCache tensor names")
+        keys, values, index_keys, position_ids = (
+            tensors[f"state_{index}"] for index in range(num_arrays)
+        )
+        if (
+            keys.ndim != 4
+            or values.shape != keys.shape
+            or keys.dtype.kind != "f"
+            or values.dtype.kind != "f"
+            or index_keys.ndim < 2
+            or index_keys.dtype.kind != "f"
+            or position_ids.ndim not in {2, 3}
+            or position_ids.dtype.kind not in {"i", "u"}
+            or index_keys.shape[0] != keys.shape[0]
+            or index_keys.shape[1] != keys.shape[-2]
+            or position_ids.shape[-1] != keys.shape[-2]
+        ):
+            raise HybridCachePersistenceError("invalid QSAKVCache state shape or dtype")
+        return
+
     raise HybridCachePersistenceError(f"unsupported cache layer: {layer_type}")
 
 
@@ -388,6 +456,8 @@ def _entry_logical_nbytes(
             continue
         for index, dtype in enumerate(layer.metadata["state_original_dtypes"]):
             total += _logical_nbytes(layer.tensors[f"state_{index}"], dtype)
+        if layer.layer_type == "QSAKVCache":
+            continue
         for name, dtype in layer.metadata["metadata_original_dtypes"].items():
             total += _logical_nbytes(layer.tensors[name], dtype)
     return total
@@ -408,7 +478,7 @@ def _prune_old_generations(root: Path, current: str) -> None:
 
 def write_hybrid_snapshot(cache_dir: str, snapshot: HybridCacheSnapshot) -> bool:
     """Atomically publish a complete immutable generation."""
-    _validate_snapshot(snapshot)
+    _validate_snapshot(snapshot, version=HYBRID_CACHE_PERSIST_VERSION)
     root = Path(cache_dir)
     if root.is_symlink():
         raise HybridCachePersistenceError("cache root must not be a symlink")
@@ -524,9 +594,10 @@ def read_hybrid_snapshot(
         return None
     pointer = _load_json(pointer_path)
     _require_keys(pointer, {"version", "generation", "manifest_sha256"}, "index")
-    if pointer["version"] != HYBRID_CACHE_PERSIST_VERSION:
+    version = pointer["version"]
+    if type(version) is not int or version not in _READABLE_HYBRID_CACHE_VERSIONS:
         raise HybridCachePersistenceError(
-            f"unsupported hybrid cache version: {pointer['version']!r}"
+            f"unsupported hybrid cache version: {version!r}"
         )
     generation = _safe_component(pointer["generation"], "generation")
     generation_dir = root / generation
@@ -544,7 +615,7 @@ def read_hybrid_snapshot(
     )
     manifest = _load_json(manifest_path)
     _require_keys(manifest, {"version", "identity", "entries"}, "manifest")
-    if manifest["version"] != HYBRID_CACHE_PERSIST_VERSION:
+    if type(manifest["version"]) is not int or manifest["version"] != version:
         raise HybridCachePersistenceError("manifest version mismatch")
     identity = _validate_identity(manifest["identity"])
     raw_entries = manifest["entries"]
@@ -653,7 +724,7 @@ def read_hybrid_snapshot(
                 f"layer {layer_index}",
             )
             layer_type = layer_record["layer_type"]
-            if layer_type not in _SUPPORTED_LAYERS:
+            if layer_type not in _SUPPORTED_LAYERS_BY_VERSION[version]:
                 raise HybridCachePersistenceError(
                     f"unsupported cache layer: {layer_type!r}"
                 )
@@ -678,7 +749,12 @@ def read_hybrid_snapshot(
             if not tensors or any(array.size == 0 for array in tensors.values()):
                 raise HybridCachePersistenceError("invalid empty layer tensor")
             metadata = layer_record["metadata"]
-            _validate_layer_payload(layer_type, tensors, metadata)
+            _validate_layer_payload(
+                layer_type,
+                tensors,
+                metadata,
+                version=version,
+            )
             layers.append(HybridLayerSnapshot(layer_type, tensors, metadata))
 
         auxiliary_path = _checked_file(

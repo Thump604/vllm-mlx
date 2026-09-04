@@ -1354,6 +1354,18 @@ class TestHybridRestartPersistence:
 
             return [ArraysCache(size=2), KVCache()]
 
+    class _QSAModel:
+        def __init__(self):
+            self.args = TestHybridRestartPersistence._Args()
+            self.args.model_type = "qwen4_exp"
+            self.args.num_hidden_layers = 1
+            self.args.layer_types = ["full_attention"]
+
+        def make_cache(self):
+            from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+            return [QSAKVCache()]
+
     @staticmethod
     def _state(*, vlm=False):
         import mlx.core as mx
@@ -1377,6 +1389,22 @@ class TestHybridRestartPersistence:
         logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
         mx.eval(*arrays.state, kv.keys, kv.values, logits)
         return [arrays, kv], logits
+
+    @staticmethod
+    def _qsa_state():
+        import mlx.core as mx
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        qsa = QSAKVCache()
+        qsa.state = (
+            mx.arange(16, dtype=mx.float32).reshape(1, 1, 4, 4),
+            mx.full((1, 1, 4, 4), 2, dtype=mx.float32),
+            mx.arange(16, dtype=mx.float32).reshape(1, 4, 4),
+            mx.arange(4, dtype=mx.int32).reshape(1, 4),
+        )
+        logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
+        mx.eval(*qsa.state, logits)
+        return [qsa], logits
 
     def _cache(self, tokenizer=None, renderer=None, model_identity=None, model=None):
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -1437,6 +1465,38 @@ class TestHybridRestartPersistence:
         assert fetched[1].offset == state[1].offset
         assert mx.array_equal(fetched[1].keys, state[1].keys).item()
         assert mx.array_equal(fetched[1].values, state[1].values).item()
+
+    def test_real_qsa_tuple_state_round_trips_with_owned_accounting(self, tmp_path):
+        import mlx.core as mx
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        model = self._QSAModel()
+        source = self._cache(model=model)
+        state, logits = self._qsa_state()
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert snapshot is not None
+        assert snapshot.entries[0].layers[0].layer_type == "QSAKVCache"
+        assert snapshot.entries[0].layers[0].metadata["num_arrays"] == 4
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = self._cache(model=model)
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        fetched, remaining = restored.fetch([1, 2, 3, 4])
+
+        assert remaining == []
+        assert isinstance(fetched[0], QSAKVCache)
+        for actual, expected in zip(fetched[0].state, state[0].state, strict=True):
+            assert mx.array_equal(actual, expected).item()
+        assert restored._current_memory == source._current_memory
 
     @pytest.mark.parametrize("text_config_as_mapping", [False, True])
     def test_round_trip_uses_nested_vlm_text_config_geometry(
