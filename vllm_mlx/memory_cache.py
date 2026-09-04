@@ -931,17 +931,35 @@ class _QuantizedCacheWrapper:
 def _quantize_cache(cache: list[Any], bits: int = 8, group_size: int = 64) -> list[Any]:
     """Quantize KV cache layers to reduce memory.
 
-    Only plain KVCache layers are quantized. RotatingKVCache (sliding window)
-    is left as-is because its internal _idx/rotation state is tightly coupled
-    with update_and_fetch logic and cannot survive quantize/dequantize roundtrip.
-    RotatingKVCache is typically small (max_size=1024) so skipping it is fine.
+    Plain KVCache and the exact Qwen4 QSAKVCache contract are supported.
+    RotatingKVCache (sliding window) is left as-is because its internal
+    _idx/rotation state is tightly coupled with update_and_fetch logic and
+    cannot survive quantize/dequantize roundtrip. RotatingKVCache is typically
+    small (max_size=1024) so skipping it is fine.
     """
     from mlx_lm.models.cache import KVCache
+
+    try:
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+    except ImportError:
+        QSAKVCache = None
 
     quantized = []
     for layer in cache:
         if type(layer) is KVCache and getattr(layer, "keys", None) is not None:
             quantized.append(_QuantizedCacheWrapper(layer, bits, group_size))
+        elif QSAKVCache is not None and type(layer) is QSAKVCache:
+            if bits != 8 or group_size != 64:
+                quantized.append(layer)
+                continue
+            if (
+                layer.keys is None
+                or layer.values is None
+                or layer.index_keys is None
+                or layer.index_position_ids is None
+            ):
+                raise ValueError("Qwen4 QSA cache state is incomplete")
+            quantized.append(layer.to_quantized(group_size=group_size, bits=bits))
         else:
             quantized.append(layer)
     return quantized
@@ -955,8 +973,32 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     """
     import mlx.core as mx
 
+    try:
+        from mlx_vlm.models.qwen4_exp.language import (
+            QSAKVCache,
+            QSAQuantizedKVCache,
+        )
+    except ImportError:
+        QSAKVCache = None
+        QSAQuantizedKVCache = None
+
     result = []
     for layer in cache:
+        if QSAQuantizedKVCache is not None and type(layer) is QSAQuantizedKVCache:
+            if layer.bits != 8 or layer.group_size != 64:
+                raise ValueError("unsupported Qwen4 QSA quantization contract")
+            if layer.keys is None or layer.values is None:
+                raise ValueError("quantized Qwen4 QSA K/V state is incomplete")
+            if layer.index_keys is None or layer.index_position_ids is None:
+                raise ValueError("quantized Qwen4 QSA indexer state is incomplete")
+            restored = QSAKVCache()
+            restored.keys = mx.dequantize(*layer.keys, group_size=64, bits=8)
+            restored.values = mx.dequantize(*layer.values, group_size=64, bits=8)
+            restored.offset = layer.offset
+            restored.index_keys = mx.array(layer.index_keys)
+            restored.index_position_ids = mx.array(layer.index_position_ids)
+            result.append(restored)
+            continue
         if isinstance(layer, _QuantizedCacheWrapper):
             # Reconstruct original cache type from quantized data
             orig_cls = layer.orig_type
@@ -2567,7 +2609,14 @@ class MemoryAwarePrefixCache:
             for entry in entries:
                 if set(entry.auxiliary or {}) != {"last_logits"}:
                     raise ValueError("hybrid entry is missing exact last_logits")
-                topology = tuple(_cache_layer_topology(layer) for layer in entry.cache)
+                persist_cache = (
+                    _dequantize_cache(entry.cache)
+                    if self._config.kv_quantize
+                    else entry.cache
+                )
+                topology = tuple(
+                    _cache_layer_topology(layer) for layer in persist_cache
+                )
                 if any(layer is None for layer in topology):
                     raise ValueError("cache layout contains an unsupported layer")
                 if (
@@ -2577,7 +2626,7 @@ class MemoryAwarePrefixCache:
                     != expected_layout
                 ):
                     raise ValueError("cache layout differs from the loaded model")
-                layers = tuple(_snapshot_hybrid_layer(layer) for layer in entry.cache)
+                layers = tuple(_snapshot_hybrid_layer(layer) for layer in persist_cache)
                 last_logits, logits_dtype = _mx_array_to_numpy(
                     entry.auxiliary["last_logits"]
                 )

@@ -1447,21 +1447,36 @@ class TestHybridRestartPersistence:
 
         qsa = QSAKVCache()
         qsa.state = (
-            mx.arange(16, dtype=mx.float32).reshape(1, 1, 4, 4),
-            mx.full((1, 1, 4, 4), 2, dtype=mx.float32),
-            mx.arange(16, dtype=mx.float32).reshape(1, 4, 4),
+            mx.arange(256, dtype=mx.float32).reshape(1, 1, 4, 64),
+            mx.full((1, 1, 4, 64), 2, dtype=mx.float32),
+            mx.arange(256, dtype=mx.float32).reshape(1, 4, 64),
             mx.arange(4, dtype=mx.int32).reshape(1, 4),
         )
         logits = mx.arange(16, dtype=mx.float32).reshape(1, 16)
         mx.eval(*qsa.state, logits)
         return [qsa], logits
 
-    def _cache(self, tokenizer=None, renderer=None, model_identity=None, model=None):
+    def _cache(
+        self,
+        tokenizer=None,
+        renderer=None,
+        model_identity=None,
+        model=None,
+        *,
+        kv_quantize=False,
+    ):
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 
         return MemoryAwarePrefixCache(
             model or self._Model(),
-            MemoryCacheConfig(max_memory_mb=8, min_prefix_tokens=1),
+            MemoryCacheConfig(
+                max_memory_mb=8,
+                min_prefix_tokens=1,
+                kv_quantize=kv_quantize,
+                kv_bits=8,
+                kv_group_size=64,
+                kv_min_quantize_tokens=1,
+            ),
             tokenizer=tokenizer or self._Tokenizer(),
             model_identity=model_identity or "qualified-model@revision",
             template_renderer=renderer or self._Renderer(),
@@ -1547,6 +1562,67 @@ class TestHybridRestartPersistence:
         for actual, expected in zip(fetched[0].state, state[0].state, strict=True):
             assert mx.array_equal(actual, expected).item()
         assert restored._current_memory == source._current_memory
+
+    def test_qwen4_qsa_prefix_storage_quantizes_and_reconstructs_exact_state(self):
+        import mlx.core as mx
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache, QSAQuantizedKVCache
+        from vllm_mlx.memory_cache import _dequantize_cache, _quantize_cache
+
+        state, _ = self._qsa_state()
+        quantized = _quantize_cache(state, bits=8, group_size=64)
+        assert isinstance(quantized[0], QSAQuantizedKVCache)
+        assert quantized[0].bits == 8
+        assert quantized[0].group_size == 64
+
+        restored = _dequantize_cache(quantized)
+        assert type(restored[0]) is QSAKVCache
+        assert restored[0].offset == state[0].offset
+        for actual, expected in zip(restored[0].state, state[0].state, strict=True):
+            assert actual.dtype == expected.dtype
+            assert mx.allclose(actual, expected, rtol=0.02, atol=0.1).item()
+
+    def test_qwen4_qsa_quantized_prefix_rejects_malformed_contract(self):
+        from vllm_mlx.memory_cache import _dequantize_cache, _quantize_cache
+
+        state, _ = self._qsa_state()
+        assert _quantize_cache(state, bits=4, group_size=64)[0] is state[0]
+
+        quantized = _quantize_cache(state, bits=8, group_size=64)
+        quantized[0].bits = 4
+        with pytest.raises(ValueError, match="unsupported Qwen4 QSA quantization"):
+            _dequantize_cache(quantized)
+
+        quantized = _quantize_cache(state, bits=8, group_size=64)
+        quantized[0].index_keys = None
+        with pytest.raises(ValueError, match="Qwen4 QSA indexer state is incomplete"):
+            _dequantize_cache(quantized)
+
+    def test_qwen4_qsa_quantized_ram_uses_float_v2_persistence_contract(self):
+        from mlx_vlm.models.qwen4_exp.language import QSAQuantizedKVCache
+
+        from vllm_mlx.memory_cache import estimate_kv_cache_memory
+
+        source = self._cache(model=self._QSAModel(), kv_quantize=True)
+        state, logits = self._qsa_state()
+        full_precision_bytes = estimate_kv_cache_memory(state)
+        prepared = source.prepare_store(
+            [1, 2, 3, 4],
+            state,
+            auxiliary={"last_logits": logits},
+            persistence_eligible=True,
+        )
+        assert prepared is not None and source.commit_prepared(prepared)
+        stored = source._entries[(1, 2, 3, 4)]
+        assert type(stored.cache[0]) is QSAQuantizedKVCache
+        assert stored.memory_bytes < full_precision_bytes
+        assert stored.cache[0].index_keys is not state[0].index_keys
+        assert stored.cache[0].index_position_ids is not state[0].index_position_ids
+
+        snapshot = source.prepare_hybrid_persistence_snapshot()
+        assert snapshot is not None
+        layer = snapshot.entries[0].layers[0]
+        assert layer.layer_type == "QSAKVCache"
+        assert set(layer.tensors) == {"state_0", "state_1", "state_2", "state_3"}
 
     def test_real_qwen4_ple_and_qsa_round_trip_through_disk(self, tmp_path):
         import mlx.core as mx
