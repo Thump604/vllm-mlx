@@ -6,7 +6,6 @@ from vllm_mlx.server import (
     _coerce_tool_arguments,
     _finalize_streaming_tool_calls,
     _merge_streaming_tool_call_fragments,
-    _requires_buffered_tool_argument_coercion,
 )
 
 
@@ -198,18 +197,23 @@ def test_buffers_typed_stream_fragments_until_complete_json_is_available():
         {"index": 0, "function": {"arguments": '"timeout_seconds": "1"}'}},
     ]
 
-    assert _requires_buffered_tool_argument_coercion(tools) is True
+    identities = []
     for fragment in fragments:
-        _merge_streaming_tool_call_fragments(calls, [fragment])
+        identities.extend(_merge_streaming_tool_call_fragments(calls, [fragment]))
+    assert identities == [
+        {
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "terminal"},
+        }
+    ]
 
     finalized = _finalize_streaming_tool_calls(calls, tools)
     assert finalized == [
         {
             "index": 0,
-            "id": "call_1",
-            "type": "function",
             "function": {
-                "name": "terminal",
                 "arguments": json.dumps(
                     {"argv": ["printf"], "timeout_seconds": 1},
                     ensure_ascii=False,
@@ -219,13 +223,44 @@ def test_buffers_typed_stream_fragments_until_complete_json_is_available():
     ]
 
 
-def test_string_only_schema_preserves_incremental_streaming():
+def test_recovery_defaults_to_none():
+    from vllm_mlx.api.models import ChatCompletionRequest
+
+    request = ChatCompletionRequest(model="test", messages=[])
+    assert request.tool_argument_recovery == "none"
+
+
+@pytest.mark.parametrize(
+    "value", [None, True, False, 0, 1, "true", "BUFFERED", "unknown", {}, []]
+)
+def test_invalid_recovery_selector_is_rejected(value):
+    from pydantic import ValidationError
+    from vllm_mlx.api.models import ChatCompletionRequest
+
+    with pytest.raises(ValidationError) as exc:
+        ChatCompletionRequest(model="test", messages=[], tool_argument_recovery=value)
+    assert exc.value.errors()[0]["loc"] == ("tool_argument_recovery",)
+
+
+def test_buffered_identity_is_not_repeated_for_interleaved_calls():
+    calls = {}
+    first = {"index": 0, "id": "a", "function": {"name": "terminal", "arguments": "{"}}
+    second = {
+        "index": 1,
+        "id": "b",
+        "function": {"name": "terminal", "arguments": "{}"},
+    }
+    assert len(_merge_streaming_tool_call_fragments(calls, [first, second])) == 2
     assert (
-        _requires_buffered_tool_argument_coercion(
-            _tool_schema({"content": {"type": "string"}})
+        _merge_streaming_tool_call_fragments(
+            calls, [{**first, "function": {"name": "terminal", "arguments": "}"}}]
         )
-        is False
+        == []
     )
+    assert _finalize_streaming_tool_calls(calls, None) == [
+        {"index": 0, "function": {"arguments": "{}"}},
+        {"index": 1, "function": {"arguments": "{}"}},
+    ]
 
 
 @pytest.mark.anyio
@@ -284,6 +319,7 @@ async def test_stream_buffers_fragments_before_schema_coercion(monkeypatch):
             {"argv": {"type": "array"}, "timeout_seconds": {"type": "integer"}}
         ),
         stream=True,
+        tool_argument_recovery="buffered",
     )
     chunks = [
         chunk
@@ -302,19 +338,49 @@ async def test_stream_buffers_fragments_before_schema_coercion(monkeypatch):
         if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
     ]
 
-    assert len(tool_payloads) == 1
-    call = tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert len(tool_payloads) == 2
+    assert tool_payloads[0]["choices"][0]["delta"]["tool_calls"] == [
+        {
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "terminal"},
+        }
+    ]
+    call = tool_payloads[-1]["choices"][0]["delta"]["tool_calls"][0]
     assert json.loads(call["function"]["arguments"]) == {
         "argv": ["printf"],
         "timeout_seconds": 1,
     }
-    assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+    assert tool_payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("use_reasoning_parser", [False, True])
+@pytest.mark.parametrize("recovery", [None, "none", "buffered"])
+@pytest.mark.parametrize(
+    "arguments,properties,normalized",
+    [
+        (
+            '{"argv": "[\\"printf\\"]"}',
+            {"argv": {"type": "array"}},
+            {"argv": ["printf"]},
+        ),
+        (
+            '{"value": "[1, {\\"nested\\": 1e999}]"}',
+            {"value": {"type": "array"}},
+            {"value": '[1, {"nested": 1e999}]'},
+        ),
+        ('{ "content": "café" }', {"content": {"type": "string"}}, {"content": "café"}),
+        (
+            '{"content": {"b": "café", "a": 1}}',
+            {"content": {"type": "string"}},
+            {"content": '{"b":"café","a":1}'},
+        ),
+    ],
+)
 async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_call(
-    monkeypatch, use_reasoning_parser
+    monkeypatch, use_reasoning_parser, recovery, arguments, properties, normalized
 ):
     from types import SimpleNamespace
 
@@ -325,8 +391,8 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
 
     fragments = [
         {"index": 0, "id": "call_1", "function": {"name": "terminal"}},
-        {"index": 0, "function": {"arguments": '{"argv": '}},
-        {"index": 0, "function": {"arguments": '"[\\"printf\\"]"}'}},
+        {"index": 0, "function": {"arguments": arguments[:5]}},
+        {"index": 0, "function": {"arguments": arguments[5:]}},
     ]
     parser_results = [
         {"tool_calls": [fragments[0]], "content": "sibling content"},
@@ -391,8 +457,9 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
     request = ChatCompletionRequest(
         model="served-model",
         messages=[Message(role="user", content="run it")],
-        tools=_tool_schema({"argv": {"type": "array"}}),
+        tools=_tool_schema(properties),
         stream=True,
+        **({"tool_argument_recovery": recovery} if recovery is not None else {}),
     )
     chunks = [
         chunk
@@ -424,8 +491,27 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
 
     assert content_deltas == ["sibling content"]
     assert reasoning_deltas == (["sibling reasoning"] if use_reasoning_parser else [])
-    assert len(tool_payloads) == 1
-    tool_index = payloads.index(tool_payloads[0])
+    assert len(tool_payloads) == (2 if recovery == "buffered" else 3)
+    all_calls = [
+        call
+        for payload in tool_payloads
+        for call in payload["choices"][0]["delta"]["tool_calls"]
+    ]
+    assert [call["id"] for call in all_calls if "id" in call] == ["call_1"]
+    assert [
+        call["function"]["name"]
+        for call in all_calls
+        if "name" in call.get("function", {})
+    ] == ["terminal"]
+    argument_payloads = [
+        payload
+        for payload in tool_payloads
+        if any(
+            "arguments" in call.get("function", {})
+            for call in payload["choices"][0]["delta"]["tool_calls"]
+        )
+    ]
+    tool_index = payloads.index(argument_payloads[0])
     sibling_index = next(
         index
         for index, payload in enumerate(payloads)
@@ -433,6 +519,19 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
         and payload["choices"][0]["delta"].get("content") == "sibling content"
     )
     assert sibling_index < tool_index
-    call = tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]
-    assert json.loads(call["function"]["arguments"]) == {"argv": ["printf"]}
-    assert tool_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+    assert payloads.index(tool_payloads[0]) == sibling_index
+    emitted_arguments = "".join(
+        call.get("function", {}).get("arguments", "") for call in all_calls
+    )
+    if recovery == "buffered":
+        assert len(argument_payloads) == 1
+        assert json.loads(emitted_arguments) == normalized
+        assert argument_payloads[0]["choices"][0]["finish_reason"] == "tool_calls"
+        if json.loads(arguments) == normalized:
+            assert emitted_arguments == arguments
+    else:
+        assert emitted_arguments == arguments
+        assert all(
+            payload["choices"][0]["finish_reason"] is None
+            for payload in argument_payloads
+        )
