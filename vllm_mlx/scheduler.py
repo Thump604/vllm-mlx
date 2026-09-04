@@ -143,6 +143,8 @@ class SchedulerConfig:
     def __post_init__(self) -> None:
         if self.cache_owner_target is not None and not self.enable_prefix_cache:
             raise ValueError("cache owner target requires prefix cache")
+        if self.prefill_step_size <= 0:
+            raise ValueError("prefill_step_size must be > 0")
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 

@@ -241,11 +241,15 @@ class ModelLease:
         await self.release()
 
 
-def _clone_scheduler_config(config: SchedulerConfig | None) -> SchedulerConfig | None:
+def _clone_scheduler_config(
+    config: SchedulerConfig | None, *, prefill_step_size: int
+) -> SchedulerConfig | None:
     """Clone a SchedulerConfig so per-model overrides do not mutate globals."""
     if config is None:
         return None
-    return SchedulerConfig(**vars(config))
+    values = vars(config).copy()
+    values["prefill_step_size"] = prefill_step_size
+    return SchedulerConfig(**values)
 
 
 def _parse_memory_budget_bytes(value: Any) -> int:
@@ -1228,8 +1232,6 @@ class ModelManager:
     def _resolve_model_config(
         self, entry: RegisteredModel, resolved_source: str
     ) -> ResolvedModelConfig:
-        scheduler_config = _clone_scheduler_config(self._defaults.scheduler_config)
-
         continuous_batching = (
             entry.continuous_batching
             if entry.continuous_batching is not None
@@ -1249,6 +1251,9 @@ class ModelManager:
             entry.prefill_step_size
             if entry.prefill_step_size is not None
             else self._defaults.prefill_step_size
+        )
+        scheduler_config = _clone_scheduler_config(
+            self._defaults.scheduler_config, prefill_step_size=prefill_step_size
         )
         specprefill_enabled = (
             entry.specprefill_enabled

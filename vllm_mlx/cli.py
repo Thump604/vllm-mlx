@@ -1292,7 +1292,7 @@ Examples:
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=make_positive_int_arg_parser("--prefill-step-size"),
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
