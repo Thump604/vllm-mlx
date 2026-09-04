@@ -2588,7 +2588,11 @@ class MemoryAwarePrefixCache:
         ``last_logits``. Unsupported or incomplete entries reject the whole
         snapshot rather than silently degrading a restored hit to prefill.
         """
-        from .cache_persistence import HybridCacheSnapshot, HybridEntrySnapshot
+        from .cache_persistence import (
+            HybridCacheSnapshot,
+            HybridEntrySnapshot,
+            _entry_logical_nbytes,
+        )
 
         if any(not value for value in self._persistence_identity.values()):
             logger.warning(
@@ -2630,13 +2634,17 @@ class MemoryAwarePrefixCache:
                 last_logits, logits_dtype = _mx_array_to_numpy(
                     entry.auxiliary["last_logits"]
                 )
+                auxiliary_snapshot = {"last_logits": last_logits}
+                auxiliary_dtypes = {"last_logits": logits_dtype}
                 snapshots.append(
                     HybridEntrySnapshot(
                         tokens=entry.tokens,
-                        memory_bytes=entry.memory_bytes,
+                        memory_bytes=_entry_logical_nbytes(
+                            layers, auxiliary_snapshot, auxiliary_dtypes
+                        ),
                         layers=layers,
-                        auxiliary={"last_logits": last_logits},
-                        auxiliary_original_dtypes={"last_logits": logits_dtype},
+                        auxiliary=auxiliary_snapshot,
+                        auxiliary_original_dtypes=auxiliary_dtypes,
                     )
                 )
             return HybridCacheSnapshot(
@@ -3021,6 +3029,13 @@ class MemoryAwarePrefixCache:
                     self._restore_hybrid_layer(layer, expected_cache[i])
                     for i, layer in enumerate(persisted.layers)
                 ]
+                if (
+                    self._config.kv_quantize
+                    and len(persisted.tokens) >= self._config.kv_min_quantize_tokens
+                ):
+                    cache = _quantize_cache(
+                        cache, self._config.kv_bits, self._config.kv_group_size
+                    )
                 import mlx.core as mx
 
                 logits = mx.array(logits_np)

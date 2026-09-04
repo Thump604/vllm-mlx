@@ -1359,6 +1359,7 @@ class TestHybridRestartPersistence:
             self.args = TestHybridRestartPersistence._Args()
             self.args.model_type = "qwen4_exp"
             self.args.num_hidden_layers = 1
+            self.args.head_dim = 64
             self.args.layer_types = ["full_attention"]
 
         def make_cache(self):
@@ -1597,7 +1598,8 @@ class TestHybridRestartPersistence:
         with pytest.raises(ValueError, match="Qwen4 QSA indexer state is incomplete"):
             _dequantize_cache(quantized)
 
-    def test_qwen4_qsa_quantized_ram_uses_float_v2_persistence_contract(self):
+    def test_qwen4_qsa_quantized_ram_uses_float_v2_persistence_contract(self, tmp_path):
+        import mlx.core as mx
         from mlx_vlm.models.qwen4_exp.language import QSAQuantizedKVCache
 
         from vllm_mlx.memory_cache import estimate_kv_cache_memory
@@ -1623,6 +1625,39 @@ class TestHybridRestartPersistence:
         layer = snapshot.entries[0].layers[0]
         assert layer.layer_type == "QSAKVCache"
         assert set(layer.tensors) == {"state_0", "state_1", "state_2", "state_3"}
+        assert snapshot.entries[0].memory_bytes > stored.memory_bytes
+        assert source.write_hybrid_persistence_snapshot(str(tmp_path), snapshot)
+
+        restored = self._cache(model=self._QSAModel(), kv_quantize=True)
+        loaded = restored.read_hybrid_persistence_snapshot(str(tmp_path))
+        assert restored.restore_hybrid_persistence_snapshot(loaded) == 1
+        restored_entry = restored._entries[(1, 2, 3, 4)]
+        restored_qsa = restored_entry.cache[0]
+        assert type(restored_qsa) is QSAQuantizedKVCache
+        assert restored_entry.memory_bytes < snapshot.entries[0].memory_bytes
+        assert restored._current_memory == restored_entry.memory_bytes
+        assert mx.array_equal(restored_qsa.index_keys, state[0].index_keys).item()
+        assert mx.array_equal(
+            restored_qsa.index_position_ids, state[0].index_position_ids
+        ).item()
+
+        fetched, remaining = restored.fetch([1, 2, 3, 4])
+        assert remaining == []
+        assert mx.array_equal(fetched[0].index_keys, state[0].index_keys).item()
+        assert mx.array_equal(
+            fetched[0].index_position_ids, state[0].index_position_ids
+        ).item()
+
+        next_snapshot = restored.prepare_hybrid_persistence_snapshot()
+        assert next_snapshot is not None
+        next_layer = next_snapshot.entries[0].layers[0]
+        assert next_layer.layer_type == "QSAKVCache"
+        assert next_layer.metadata["state_container"] == "tuple"
+        assert next_layer.metadata["num_arrays"] == 4
+        assert next_snapshot.entries[0].memory_bytes == snapshot.entries[0].memory_bytes
+        assert restored.write_hybrid_persistence_snapshot(
+            str(tmp_path / "next"), next_snapshot
+        )
 
     def test_real_qwen4_ple_and_qsa_round_trip_through_disk(self, tmp_path):
         import mlx.core as mx
