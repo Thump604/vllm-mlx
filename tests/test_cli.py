@@ -191,6 +191,36 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_serve_parser_rejects_nonpositive_prefill_step_size(value, capsys):
+    from vllm_mlx.cli import create_parser
+
+    with pytest.raises(SystemExit) as exc:
+        create_parser().parse_args(
+            ["serve", "--model", "local-test-model", "--prefill-step-size", value]
+        )
+
+    assert exc.value.code == 2
+    assert "--prefill-step-size must be a positive integer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [1, 512, 2048])
+def test_serve_parser_accepts_positive_prefill_step_size(value):
+    from vllm_mlx.cli import create_parser
+
+    args = create_parser().parse_args(
+        ["serve", "--model", "local-test-model", "--prefill-step-size", str(value)]
+    )
+    assert args.prefill_step_size == value
+
+
+def test_serve_parser_defaults_prefill_step_size():
+    from vllm_mlx.cli import create_parser
+
+    args = create_parser().parse_args(["serve", "--model", "local-test-model"])
+    assert args.prefill_step_size == 2048
+
+
 def test_serve_parser_accepts_registered_step3p5_tool_parser():
     from vllm_mlx import cli
 

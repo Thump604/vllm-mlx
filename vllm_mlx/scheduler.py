@@ -136,6 +136,8 @@ class SchedulerConfig:
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
     def __post_init__(self) -> None:
+        if self.prefill_step_size <= 0:
+            raise ValueError("prefill_step_size must be > 0")
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
