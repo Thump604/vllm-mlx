@@ -430,8 +430,9 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
         def __init__(self, tokenizer=None):
             self.index = 0
 
-        def reset_state(self):
+        def reset_state(self, implicit_mode: bool = False):
             self.index = 0
+            self._implicit_mode = implicit_mode
 
         def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
             if self.index == 0:
@@ -441,6 +442,15 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
                 )
             self.index += 1
             return SimpleNamespace(reasoning=None, content=delta_text)
+
+    # Bind the current server's keyword call even on older no-argument routes.
+    reset_probe = FakeReasoningParser()
+    reset_probe.index = 7
+    reset_probe.reset_state(implicit_mode=True)
+    assert reset_probe.index == 0 and reset_probe._implicit_mode is True
+    reset_probe.index = 7
+    reset_probe.reset_state()
+    assert reset_probe.index == 0 and reset_probe._implicit_mode is False
 
     monkeypatch.setattr(server, "_model_name", "served-model")
     monkeypatch.setattr(
