@@ -4247,6 +4247,8 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
 
     async def run():
         scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._state_lock = threading.RLock()
+        scheduler._owner_thread_id = threading.get_ident()
         scheduler._running = True
         scheduler.requests = {
             request_id: SimpleNamespace(
@@ -4318,7 +4320,7 @@ def test_scheduler_loop_verification_error_and_cleanup_boundary(
         assert scheduler.requests == scheduler.running == {}
         assert not scheduler.waiting
         assert not scheduler.request_id_to_uid and not scheduler.uid_to_request_id
-        assert generator._aborted_request_ids == {"active", "waiting"}
+        assert generator._aborted_request_ids == {"active"}
         for queue in scheduler.output_queues.values():
             output = queue.get_nowait()
             assert output.finished and output.finish_reason == "error"
