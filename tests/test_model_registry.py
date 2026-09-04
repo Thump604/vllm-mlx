@@ -10,6 +10,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -454,6 +455,73 @@ GB = 1024**3
 def _defaults_with(**overrides: Any) -> RegistryServeDefaults:
     base = _defaults()
     return dataclasses.replace(base, **overrides)
+
+
+@pytest.mark.parametrize("override", [None, 1, 2048])
+def test_batched_engine_receives_resolved_prefill_step_size(
+    tmp_path, monkeypatch, override
+):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1, "beta": 1})
+    registry["alpha"] = dataclasses.replace(
+        registry["alpha"], prefill_step_size=override
+    )
+    shared = SchedulerConfig(prefill_step_size=512, mllm_prefill_step_size=256)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True, prefill_step_size=512, scheduler_config=shared
+        ),
+    )
+    engine = MagicMock()
+    engine.start = AsyncMock()
+    constructor = MagicMock(return_value=engine)
+    monkeypatch.setattr("vllm_mlx.model_registry.BatchedEngine", constructor)
+
+    async def _run():
+        for entry in registry.values():
+            await manager._instantiate_model(entry, entry.source)
+
+    asyncio.run(_run())
+    alpha, beta = [
+        call.kwargs["scheduler_config"] for call in constructor.call_args_list
+    ]
+    assert alpha.prefill_step_size == (512 if override is None else override)
+    assert beta.prefill_step_size == 512
+    assert alpha is not beta and alpha is not shared and beta is not shared
+    assert shared.prefill_step_size == 512
+    assert alpha.mllm_prefill_step_size == beta.mllm_prefill_step_size == 256
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_registry_rejects_nonpositive_prefill_override(tmp_path, value):
+    from vllm_mlx.scheduler import SchedulerConfig
+
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=value)
+    manager = ModelManager(
+        _manager_config(budget_gb=8),
+        registry,
+        _defaults_with(
+            continuous_batching=True,
+            prefill_step_size=512,
+            scheduler_config=SchedulerConfig(prefill_step_size=512),
+        ),
+    )
+    with pytest.raises(ValueError, match="prefill_step_size must be > 0"):
+        manager._resolve_model_config(entry, entry.source)
+
+
+def test_registry_prefill_override_preserves_absent_scheduler_config(tmp_path):
+    registry = _registry(tmp_path, {"alpha": 1})
+    entry = dataclasses.replace(registry["alpha"], prefill_step_size=512)
+    manager = ModelManager(_manager_config(budget_gb=8), registry, _defaults())
+
+    resolved = manager._resolve_model_config(entry, entry.source)
+    assert resolved.prefill_step_size == 512
+    assert resolved.scheduler_config is None
 
 
 def test_budget_report_flags_budget_above_allocation_ceiling(tmp_path):
