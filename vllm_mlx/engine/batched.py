@@ -487,14 +487,8 @@ class BatchedEngine(BaseEngine):
         # Create and start MLLM scheduler
         scheduler_kwargs = {}
         if self._mllm_draft_model is not None:
-            loaded_drafter = getattr(self._mllm_instance, "_draft_model", None)
-            if continuous_batching_capability(loaded_drafter) is not True:
-                raise ValueError(
-                    "Continuous batching requires an MLLM MTP drafter that "
-                    "explicitly declares supports_continuous_batching=True"
-                )
             scheduler_kwargs = {
-                "draft_model": loaded_drafter,
+                "draft_model": getattr(self._mllm_instance, "_draft_model", None),
                 "draft_kind": self._mllm_draft_kind,
                 "draft_block_size": self._mllm_draft_block_size,
             }

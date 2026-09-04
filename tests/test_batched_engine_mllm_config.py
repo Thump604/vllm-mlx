@@ -1,6 +1,7 @@
 """BatchedEngine MLLM scheduler configuration wiring tests.
 
-These tests avoid model loading and MLX imports. They validate that CLI-level
+These tests avoid model loading; importing the real loader may import MLX.
+They validate that CLI-level
 SchedulerConfig fields survive the BatchedEngine -> MLLMSchedulerConfig bridge.
 """
 
@@ -87,18 +88,30 @@ def test_start_mllm_forwards_prefix_cache_disable_to_mllm_scheduler(monkeypatch)
 
 def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
     from vllm_mlx.engine.batched import BatchedEngine
+    import vllm_mlx.models.mllm as mllm_mod
 
     captured = {}
 
+    def load_released_gemma_fixture(model_path):
+        captured["loader_path"] = model_path
+        return loaded_drafter
+
+    monkeypatch.setattr(
+        mllm_mod, "load_gemma4_assistant_drafter", load_released_gemma_fixture
+    )
+
     class FakeMLXMultimodalLM:
+        _load_draft_model = mllm_mod.MLXMultimodalLM._load_draft_model
+
         def __init__(self, model_name, trust_remote_code=True, **kwargs):
             captured["model_kwargs"] = kwargs
             self.model = object()
             self.processor = object()
-            self._draft_model = loaded_drafter
+            self.draft_kind = kwargs["draft_kind"]
+            self.draft_model_path = kwargs["draft_model"]
 
         def load(self):
-            return None
+            self._draft_model = self._load_draft_model()
 
     class FakeMLLMSchedulerConfig:
         def __init__(self, **kwargs):
@@ -110,6 +123,9 @@ def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
 
         async def start(self):
             return None
+
+        def get_stats(self):
+            return {}
 
     import vllm_mlx.engine.batched as batched_mod
 
@@ -133,13 +149,22 @@ def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
         mllm_draft_block_size=6,
     )
     asyncio.run(engine._start_mllm())
+    captured["stats"] = engine.get_stats()
     return captured
 
 
 def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
-    loaded_drafter = SimpleNamespace(supports_continuous_batching=True)
+    # Released mlx-vlm v0.6.5 (84f43753) and v0.6.6 (c9e27b08):
+    # gemma4_assistant.Gemma4AssistantDraftModel has no capability marker.
+    # This models that attribute contract only; no weights are loaded and no
+    # numerical Gemma support is certified by this fixture.
+    class ReleasedGemmaDrafter:
+        pass
+
+    loaded_drafter = ReleasedGemmaDrafter()
     captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
 
+    assert captured["loader_path"] == "assistant"
     assert captured["model_kwargs"]["draft_model"] == "assistant"
     assert captured["model_kwargs"]["draft_kind"] == "mtp"
     assert captured["model_kwargs"]["draft_block_size"] == 6
@@ -148,6 +173,8 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         "draft_kind": "mtp",
         "draft_block_size": 6,
     }
+    assert captured["stats"]["mtp"]["continuous_batching_supported"] is None
+    assert not hasattr(loaded_drafter, "supports_continuous_batching")
 
 
 @pytest.mark.parametrize(
@@ -160,9 +187,11 @@ def test_start_mllm_forwards_external_assistant_drafter(monkeypatch):
         SimpleNamespace(supports_continuous_batching=False),
     ],
 )
-def test_start_mllm_rejects_unqualified_external_drafter(monkeypatch, loaded_drafter):
-    with pytest.raises(ValueError, match="explicitly declares"):
-        _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+def test_capability_reporting_does_not_change_startup_admission(
+    monkeypatch, loaded_drafter
+):
+    captured = _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter)
+    assert captured["scheduler_kwargs"]["draft_model"] is loaded_drafter
 
 
 def _generation_output():
