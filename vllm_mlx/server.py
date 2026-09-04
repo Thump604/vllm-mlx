@@ -1856,7 +1856,11 @@ def _coerce_tool_arguments(
             changed = True
 
     if changed:
-        return json.dumps(arguments, ensure_ascii=False)
+        try:
+            return json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            # Do not replace non-JSON numbers or alter an invalid source payload.
+            return arguments_json
 
     return arguments_json
 
@@ -1873,7 +1877,12 @@ def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
         return value
 
     if "string" in expected_types and isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        try:
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        except ValueError:
+            return value
 
     if not isinstance(value, str):
         return value
@@ -1890,7 +1899,10 @@ def _decode_tool_argument_string(value: str, expected_type: str) -> object:
         return value
     try:
         decoded = json.loads(value)
-    except (json.JSONDecodeError, TypeError):
+        # Check nested values too: Python accepts NaN/Infinity and overflow
+        # during loads, but these must not become newly emitted JSON numbers.
+        json.dumps(decoded, allow_nan=False)
+    except (ValueError, TypeError):
         return value
     return decoded
 
@@ -6711,10 +6723,13 @@ async def stream_chat_completion(
                                     buffered_tool_calls, emitted_tool_calls
                                 )
                                 if not output.finished:
-                                    continue
-                                emitted_tool_calls = _finalize_streaming_tool_calls(
-                                    buffered_tool_calls, tools_dict
-                                )
+                                    emitted_tool_calls = []
+                                    if not tool_result.get("content") and not reasoning:
+                                        continue
+                                else:
+                                    emitted_tool_calls = _finalize_streaming_tool_calls(
+                                        buffered_tool_calls, tools_dict
+                                    )
                             elif tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
@@ -6728,7 +6743,7 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=emitted_tool_calls,
+                                            tool_calls=emitted_tool_calls or None,
                                             content=tool_result.get("content") or None,
                                             reasoning=reasoning,
                                         ),
@@ -6863,10 +6878,13 @@ async def stream_chat_completion(
                                     buffered_tool_calls, emitted_tool_calls
                                 )
                                 if not output.finished:
-                                    continue
-                                emitted_tool_calls = _finalize_streaming_tool_calls(
-                                    buffered_tool_calls, tools_dict
-                                )
+                                    emitted_tool_calls = []
+                                    if not tool_result.get("content"):
+                                        continue
+                                else:
+                                    emitted_tool_calls = _finalize_streaming_tool_calls(
+                                        buffered_tool_calls, tools_dict
+                                    )
                             elif tools_dict:
                                 for tc in tool_result["tool_calls"]:
                                     fn = tc.get("function", {})
@@ -6880,7 +6898,7 @@ async def stream_chat_completion(
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=emitted_tool_calls,
+                                            tool_calls=emitted_tool_calls or None,
                                             content=tool_result.get("content") or None,
                                         ),
                                         finish_reason=(
