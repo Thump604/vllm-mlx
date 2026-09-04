@@ -2863,7 +2863,7 @@ class MemoryAwarePrefixCache:
                     model_type = str(
                         _identity_attr(cfg or self._model, "model_type") or ""
                     ).replace(".", "_")
-                    if not model_type.startswith(("qwen3_5", "qwen3_8")):
+                    if not model_type.startswith(("qwen3_5", "qwen3_8", "qwen4_exp")):
                         raise ValueError("unsupported ArraysCache model geometry")
                     linear_k_heads = _identity_attr(
                         cfg or self._model, "linear_num_key_heads"
@@ -2901,14 +2901,51 @@ class MemoryAwarePrefixCache:
                     )
                     for layer in arrays_layers:
                         num_arrays = layer.metadata.get("num_arrays")
-                        if num_arrays != len(expected_arrays_shapes):
+                        layer_shapes = expected_arrays_shapes
+                        layer_kinds = ("f", "f")
+                        if model_type.startswith("qwen4_exp") and num_arrays == 4:
+                            ple_conv_kernel = _identity_attr(
+                                cfg or self._model, "ple_conv_kernel_size"
+                            )
+                            ngram_size = _identity_attr(
+                                cfg or self._model, "ngram_size"
+                            )
+                            hidden_size = _identity_attr(
+                                cfg or self._model, "hidden_size"
+                            )
+                            hc_count = _identity_attr(cfg or self._model, "hc_count")
+                            ple_geometry = (
+                                ple_conv_kernel,
+                                ngram_size,
+                                hidden_size,
+                                hc_count,
+                            )
+                            if not all(
+                                isinstance(value, int) and value > 0
+                                for value in ple_geometry
+                            ):
+                                raise ValueError(
+                                    "missing PLE ArraysCache model geometry"
+                                )
+                            layer_shapes += (
+                                (
+                                    1,
+                                    (ple_conv_kernel - 1) * ngram_size,
+                                    hc_count * hidden_size,
+                                ),
+                                (1, ngram_size - 1),
+                            )
+                            layer_kinds += ("f", "i")
+                        if num_arrays != len(layer_shapes):
                             raise ValueError("persisted ArraysCache arity mismatch")
-                        shapes = tuple(
-                            layer.tensors[f"state_{index}"].shape
+                        values = tuple(
+                            layer.tensors[f"state_{index}"]
                             for index in range(num_arrays)
                         )
-                        if shapes != expected_arrays_shapes:
+                        if tuple(value.shape for value in values) != layer_shapes:
                             raise ValueError("persisted ArraysCache geometry mismatch")
+                        if tuple(value.dtype.kind for value in values) != layer_kinds:
+                            raise ValueError("persisted ArraysCache dtype mismatch")
                 logits_np = persisted.auxiliary.get("last_logits")
                 if (
                     logits_np is None

@@ -379,7 +379,10 @@ def _validate_layer_payload(
             raise HybridCachePersistenceError("invalid ArraysCache tensor names")
         for index in range(num_arrays):
             value = tensors[f"state_{index}"]
-            if value.size == 0 or value.dtype.kind != "f":
+            allowed_kinds = {"f"}
+            if version == 2 and num_arrays == 4 and index == 3:
+                allowed_kinds.add("i")
+            if value.size == 0 or value.dtype.kind not in allowed_kinds:
                 raise HybridCachePersistenceError("invalid ArraysCache state tensor")
         for name in names:
             value = tensors[name]

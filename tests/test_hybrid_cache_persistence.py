@@ -102,6 +102,44 @@ def _qsa_snapshot():
     )
 
 
+def _qwen4_ple_snapshot():
+    snapshot = _qsa_snapshot()
+    entry = snapshot.entries[0]
+    ple = HybridLayerSnapshot(
+        "ArraysCache",
+        {
+            "state_0": np.zeros((1, 3, 8), dtype=np.float32),
+            "state_1": np.zeros((1, 2, 4, 4), dtype=np.float32),
+            "state_2": np.zeros((1, 9, 32), dtype=np.float32),
+            "state_3": np.zeros((1, 2), dtype=np.int64),
+        },
+        {
+            "num_arrays": 4,
+            "state_original_dtypes": [None, None, None, None],
+            "metadata_arrays": [],
+            "metadata_original_dtypes": {},
+            "meta_state": "",
+        },
+    )
+    memory_bytes = sum(value.nbytes for value in ple.tensors.values())
+    memory_bytes += sum(
+        value.nbytes for layer in entry.layers for value in layer.tensors.values()
+    )
+    memory_bytes += sum(value.nbytes for value in entry.auxiliary.values())
+    return HybridCacheSnapshot(
+        snapshot.identity,
+        (
+            HybridEntrySnapshot(
+                entry.tokens,
+                memory_bytes,
+                (ple, *entry.layers),
+                entry.auxiliary,
+                entry.auxiliary_original_dtypes,
+            ),
+        ),
+    )
+
+
 def _generation_dir(tmp_path):
     pointer = json.loads((tmp_path / "index.json").read_text())
     return tmp_path / pointer["generation"]
@@ -154,6 +192,17 @@ def test_qsa_snapshot_uses_v2_and_round_trips(tmp_path):
     assert manifest["version"] == 2
     assert loaded.entries[0].layers[0].layer_type == "QSAKVCache"
     assert loaded.entries[0].layers[0].metadata["num_arrays"] == 4
+
+
+def test_v2_qwen4_ple_arrays_cache_preserves_integer_token_history(tmp_path):
+    source = _qwen4_ple_snapshot()
+    assert write_hybrid_snapshot(str(tmp_path), source)
+    loaded = read_hybrid_snapshot(str(tmp_path))
+    ple = loaded.entries[0].layers[0]
+    assert ple.layer_type == "ArraysCache"
+    assert ple.metadata["num_arrays"] == 4
+    assert ple.tensors["state_3"].dtype == np.int64
+    np.testing.assert_array_equal(ple.tensors["state_3"], [[0, 0]])
 
 
 def test_v1_arrays_and_kv_generation_remains_readable(tmp_path):
