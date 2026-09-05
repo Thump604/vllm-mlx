@@ -99,6 +99,7 @@ def _make_scheduler(*, max_num_seqs=16):
     scheduler.num_requests_processed = 0
     scheduler.total_prompt_tokens = 0
     scheduler.total_completion_tokens = 0
+    scheduler._steps_executed = 0
     scheduler._step_count = 0
     scheduler._clear_cache_interval = 100
     return scheduler

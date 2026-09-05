@@ -288,6 +288,8 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Completed scheduler steps; _step_count tracks cache clearing.
+        self._steps_executed = 0
 
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
@@ -1132,6 +1134,9 @@ class MLLMScheduler:
         # Clear finished tracking for next step
         self.finished_req_ids = set()
 
+        # Count only steps that reach a successful return.
+        self._steps_executed += 1
+
         return output
 
     def _fail_requests_after_step_error(self, error: Exception) -> None:
@@ -1630,6 +1635,7 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
         }
 
