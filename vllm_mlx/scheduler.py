@@ -139,6 +139,10 @@ class SchedulerConfig:
     # Complete independent target used by BatchedEngine to verify and mint one
     # opaque owner context after the real model and MTP composition are loaded.
     cache_owner_target: Optional[CacheOwnerGovernanceTarget] = None
+    # Optional MLLM-only logical admission limits (None = unlimited).  These
+    # are appended to preserve positional SchedulerConfig callers.
+    mllm_max_inflight_requests: Optional[int] = None
+    mllm_max_inflight_prompt_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.cache_owner_target is not None and not self.enable_prefix_cache:

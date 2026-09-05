@@ -8,6 +8,24 @@ Continuous batching enables higher throughput when serving multiple concurrent u
 vllm-mlx serve mlx-community/Qwen3-0.6B-8bit --continuous-batching
 ```
 
+## MLLM Admission Limits
+
+With both `--mllm` and `--continuous-batching`, optional
+`--mllm-max-inflight-requests` and `--mllm-max-inflight-prompt-tokens`
+limits bound scheduler-owned waiting plus running requests and their text
+prompt tokens. Both default to unlimited and accept positive integers.
+Reservations end when the scheduler releases a completed or aborted request.
+These are logical admission limits, not bounds on media-expanded tokens,
+deferred generator cleanup, KV cache, or total process memory.
+
+A temporarily full scheduler rejects non-streaming requests with HTTP 429
+and `Retry-After: 1`. A prompt that alone exceeds the configured token budget
+receives HTTP 413. Both identify `scheduler_capacity_exceeded` in the error.
+Streams whose headers have already been sent emit a protocol error event
+instead of reporting a successful empty completion. Clients should retry
+temporary capacity errors after a delay; an oversized prompt must be reduced
+or the server budget changed.
+
 ## With Paged Cache
 
 For memory-efficient prefix sharing:

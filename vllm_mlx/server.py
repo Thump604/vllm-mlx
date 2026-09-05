@@ -52,11 +52,11 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
@@ -154,6 +154,7 @@ from .audio_limits import (
     save_upload_with_limit,
     validate_tts_input_length,
 )
+from .admission import AdmissionCapacityError
 from .cli_arg_types import (
     make_auto_or_positive_int_arg_parser,
     make_json_object_arg_parser,
@@ -1144,6 +1145,46 @@ def _raise_engine_busy(exc: EngineBusy) -> None:
     ) from exc
 
 
+def _admission_error(exc: AdmissionCapacityError) -> tuple[int, dict]:
+    retryable = exc.requested <= exc.limit
+    return (429 if retryable else 413), {
+        "message": (
+            f"Scheduler capacity temporarily unavailable: {exc}"
+            if retryable
+            else f"Request exceeds scheduler admission limit: {exc}"
+        ),
+        "type": "rate_limit_error" if retryable else "invalid_request_error",
+        "code": exc.code,
+        "param": exc.resource,
+        "limit": exc.limit,
+        "current": exc.current,
+        "requested": exc.requested,
+    }
+
+
+def _admission_error_frame(
+    exc: AdmissionCapacityError, *, protocol: str = "openai", sequence: int = 0
+) -> str:
+    status_code, error = _admission_error(exc)
+    if protocol == "anthropic":
+        error["type"] = (
+            "overloaded_error" if status_code == 429 else "invalid_request_error"
+        )
+        return (
+            f"event: error\ndata: {json.dumps({'type': 'error', 'error': error})}\n\n"
+        )
+    if protocol == "responses":
+        event = {
+            "type": "error",
+            "code": error["code"],
+            "message": error["message"],
+            "param": error["param"],
+            "sequence_number": sequence,
+        }
+        return f"event: error\ndata: {json.dumps(event)}\n\n"
+    return f"data: {json.dumps({'error': error})}\n\n"
+
+
 @dataclass
 class RequestModelContext:
     """Request-scoped engine/lease context."""
@@ -1769,6 +1810,17 @@ app = FastAPI(
     version="0.4.1",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(AdmissionCapacityError)
+async def _handle_admission_error(request: Request, exc: AdmissionCapacityError):
+    status_code, error = _admission_error(exc)
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": error},
+        headers={"Retry-After": "1"} if status_code == 429 else None,
+    )
+
 
 security = HTTPBearer(auto_error=False)
 
@@ -4753,6 +4805,21 @@ async def _collect_stream_chunks(generator: AsyncIterator[str]) -> list[str]:
     return [chunk async for chunk in generator]
 
 
+async def _responses_admission_errors(
+    generator: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    sequence = 0
+    async with aclosing(generator):
+        try:
+            async for chunk in generator:
+                sequence += 1
+                yield chunk
+        except AdmissionCapacityError as exc:
+            yield _admission_error_frame(
+                exc, protocol="responses", sequence=sequence + 1
+            )
+
+
 async def _build_chat_streaming_response(
     engine,
     messages,
@@ -5719,7 +5786,10 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
             chat_request = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
             return StreamingResponse(
-                _disconnect_guard(_stream_responses_request(request), raw_request),
+                _disconnect_guard(
+                    _responses_admission_errors(_stream_responses_request(request)),
+                    raw_request,
+                ),
                 media_type="text/event-stream",
             )
 
@@ -6534,6 +6604,10 @@ async def _stream_anthropic_messages(
 
         # Emit message_stop
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    except AdmissionCapacityError as exc:
+        result_label = "busy"
+        yield _admission_error_frame(exc, protocol="anthropic")
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
     except HTTPException as exc:
         result_label = _metrics_result_from_status(exc.status_code)
         raise
@@ -6625,6 +6699,9 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+    except AdmissionCapacityError as exc:
+        result = "busy"
+        yield _admission_error_frame(exc)
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -7187,6 +7264,10 @@ async def stream_chat_completion(
             )
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        yield "data: [DONE]\n\n"
+    except AdmissionCapacityError as exc:
+        result_label = "busy"
+        yield _admission_error_frame(exc)
         yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result_label = _metrics_result_from_status(exc.status_code)

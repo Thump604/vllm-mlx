@@ -422,6 +422,12 @@ class BatchedEngine(BaseEngine):
         completion_batch_size = getattr(
             self._scheduler_config, "completion_batch_size", 16
         )
+        max_inflight_requests = getattr(
+            self._scheduler_config, "mllm_max_inflight_requests", None
+        )
+        max_inflight_prompt_tokens = getattr(
+            self._scheduler_config, "mllm_max_inflight_prompt_tokens", None
+        )
 
         cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
         max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
@@ -531,6 +537,8 @@ class BatchedEngine(BaseEngine):
             )
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
+            max_inflight_requests=max_inflight_requests,
+            max_inflight_prompt_tokens=max_inflight_prompt_tokens,
             prefill_batch_size=prefill_batch_size,
             completion_batch_size=completion_batch_size,
             enable_vision_cache=True,

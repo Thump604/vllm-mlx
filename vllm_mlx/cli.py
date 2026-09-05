@@ -48,9 +48,23 @@ def _add_tool_calling_args(serve_parser: argparse.ArgumentParser) -> None:
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
+    mllm_max_inflight_requests = getattr(args, "mllm_max_inflight_requests", None)
+    mllm_max_inflight_prompt_tokens = getattr(
+        args, "mllm_max_inflight_prompt_tokens", None
+    )
+    if (
+        mllm_max_inflight_requests is not None
+        or mllm_max_inflight_prompt_tokens is not None
+    ) and not (
+        getattr(args, "mllm", False) and getattr(args, "continuous_batching", False)
+    ):
+        print(
+            "Error: --mllm-max-inflight-* requires --mllm and " "--continuous-batching"
+        )
+        sys.exit(1)
+
     import logging
     import os
-    import sys
 
     import uvicorn
 
@@ -328,6 +342,8 @@ def serve_command(args):
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
+            mllm_max_inflight_requests=mllm_max_inflight_requests,
+            mllm_max_inflight_prompt_tokens=mllm_max_inflight_prompt_tokens,
             # SSD cache tiering
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
@@ -1114,6 +1130,18 @@ Examples:
         type=int,
         default=0,
         help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
+    )
+    serve_parser.add_argument(
+        "--mllm-max-inflight-requests",
+        type=make_positive_int_arg_parser("--mllm-max-inflight-requests"),
+        default=None,
+        help="Maximum logical MLLM requests admitted at once.",
+    )
+    serve_parser.add_argument(
+        "--mllm-max-inflight-prompt-tokens",
+        type=make_positive_int_arg_parser("--mllm-max-inflight-prompt-tokens"),
+        default=None,
+        help="Maximum TEXT prompt tokens across logical MLLM requests.",
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",

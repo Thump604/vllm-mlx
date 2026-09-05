@@ -31,6 +31,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
+from .admission import AdmissionController
 from .cache_owner_identity import VerifiedCacheOwnerContext
 from .mllm_batch_generator import (
     MLLMBatchGenerator,
@@ -96,6 +97,12 @@ class MLLMSchedulerConfig:
     model_identity: Optional[str] = None
     # Optional process-local ownership already verified by BatchedEngine.
     cache_owner_context: Optional[VerifiedCacheOwnerContext] = None
+    # Optional MLLM-only logical admission limits (None = unlimited).  A
+    # reservation covers the scheduler-owned request lifetime while waiting
+    # or running; it is not a generator-cleanup or total-memory guarantee.
+    # These fields are appended to preserve positional callers.
+    max_inflight_requests: Optional[int] = None
+    max_inflight_prompt_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.cache_owner_context is not None and not self.enable_prefix_cache:
@@ -136,6 +143,10 @@ class MLLMRequest:
 
     # Timing
     first_token_time: Optional[float] = None
+
+    # Scheduler-local admission ownership.  ``init=False`` keeps the public
+    # request constructor positional shape unchanged.
+    _admission_reserved: bool = field(default=False, init=False, repr=False)
 
 
 @dataclass
@@ -244,6 +255,10 @@ class MLLMScheduler:
         # and cache lifecycle transitions.
         self._state_lock = threading.RLock()
         self._request_lock = self._state_lock
+        self._admission = AdmissionController(
+            max_requests=getattr(self.config, "max_inflight_requests", None),
+            max_prompt_tokens=getattr(self.config, "max_inflight_prompt_tokens", None),
+        )
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: Dict[str, int] = {}
@@ -274,6 +289,17 @@ class MLLMScheduler:
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
         self._clear_cache_interval = 32
+
+    def _release_admission_locked(self, request: MLLMRequest) -> bool:
+        """Release exactly once for the accepted request object."""
+        if not getattr(request, "_admission_reserved", False):
+            return False
+        admission = getattr(self, "_admission", None)
+        if admission is None:
+            return False
+        released = admission.release(request.request_id)
+        request._admission_reserved = False
+        return released
 
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer and generation_config.json."""
@@ -507,9 +533,8 @@ class MLLMScheduler:
             mllm_draft=bool(kwargs.pop("mllm_draft", False)),
         )
 
-        # Estimate prompt token count for monitoring (text tokens only;
-        # vision tokens are added during prefill but this gives a useful
-        # approximation for the status endpoint).
+        # Admission intentionally counts text prompt tokens only.  Vision and
+        # audio expansion, and total memory, require separate envelopes.
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
@@ -517,8 +542,11 @@ class MLLMScheduler:
         )
         try:
             request.num_prompt_tokens = len(tokenizer.encode(prompt))
-        except Exception:
-            pass
+        except Exception as error:
+            if getattr(self.config, "max_inflight_prompt_tokens", None) is not None:
+                raise ValueError(
+                    "Prompt token count is required when token admission is enabled"
+                ) from error
 
         with self._request_lock:
             if request_id in self.requests:
@@ -526,6 +554,17 @@ class MLLMScheduler:
             pending_removal = getattr(self.batch_generator, "has_pending_removal", None)
             if callable(pending_removal) and pending_removal(request_id) is True:
                 raise ValueError(f"MLLM request ID has pending removal: {request_id}")
+            admission = getattr(self, "_admission", None)
+            if admission is None:
+                admission = AdmissionController(
+                    max_requests=getattr(self.config, "max_inflight_requests", None),
+                    max_prompt_tokens=getattr(
+                        self.config, "max_inflight_prompt_tokens", None
+                    ),
+                )
+                self._admission = admission
+            admission.reserve(request_id, request.num_prompt_tokens)
+            request._admission_reserved = True
             self.requests[request_id] = request
             self.waiting.append(request)
 
@@ -635,6 +674,7 @@ class MLLMScheduler:
         request.status = RequestStatus.FINISHED_ABORTED
         self.finished_req_ids.add(request_id)
         self.requests.pop(request_id, None)
+        self._release_admission_locked(request)
 
         self._detokenizer_pool.pop(request_id, None)
 
@@ -956,6 +996,7 @@ class MLLMScheduler:
     ) -> None:
         """Clean up finished requests owned by expected request instances."""
         for request_id in finished_ids:
+            request = self.requests.get(request_id)
             if expected_owners is not None and request_id in expected_owners:
                 expected_request, expected_uid = expected_owners[request_id]
                 if self.requests.get(request_id) is not expected_request:
@@ -985,6 +1026,8 @@ class MLLMScheduler:
             # Track as finished
             self.finished_req_ids.add(request_id)
             self.requests.pop(request_id, None)
+            if request is not None:
+                self._release_admission_locked(request)
 
         # Clear Metal buffer pool after cleanup to release memory
         if finished_ids:
