@@ -16,10 +16,12 @@ import re
 import shutil
 import stat
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import fcntl
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
@@ -37,6 +39,7 @@ _ABSOLUTE_MAX_TOKENS = 16 * 1024 * 1024
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_JSON_DEPTH = 16
 _MAX_JSON_NODES = 100_000
+_CACHE_LOCK_NAME = ".hybrid-cache.lock"
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +81,59 @@ class LoadedHybridEntry:
 class LoadedHybridCache:
     identity: dict[str, str]
     entries: tuple[LoadedHybridEntry, ...]
+
+
+@contextmanager
+def _cache_file_lock(root: Path, *, exclusive: bool):
+    """Serialize cooperating persistence callers for one cache root.
+
+    The cache directory is private runtime state, normally created with mode
+    0700. As with POSIX advisory locks generally, a same-UID process that
+    deliberately replaces the lock inode is outside this coordination
+    contract.
+    """
+    lock_path = root / _CACHE_LOCK_NAME
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    locked = False
+    try:
+        try:
+            lock_stat = os.lstat(lock_path)
+        except FileNotFoundError:
+            lock_stat = None
+        except OSError as exc:
+            raise HybridCachePersistenceError(f"invalid cache lock: {exc}") from exc
+        if lock_stat is not None and stat.S_ISLNK(lock_stat.st_mode):
+            raise HybridCachePersistenceError("cache lock must not be a symlink")
+        if lock_stat is not None and not stat.S_ISREG(lock_stat.st_mode):
+            raise HybridCachePersistenceError("cache lock must be a regular file")
+
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise HybridCachePersistenceError(f"invalid cache lock: {exc}") from exc
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise HybridCachePersistenceError("cache lock must be a regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        except OSError as exc:
+            raise HybridCachePersistenceError(
+                f"unable to acquire cache lock: {exc}"
+            ) from exc
+        locked = True
+        yield
+    finally:
+        if descriptor is not None:
+            if locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    logger.warning("Unable to release cache lock %s", lock_path)
+            try:
+                os.close(descriptor)
+            except OSError:
+                logger.warning("Unable to close cache lock %s", lock_path)
 
 
 def _sha256(path: Path) -> str:
@@ -486,6 +542,13 @@ def write_hybrid_snapshot(cache_dir: str, snapshot: HybridCacheSnapshot) -> bool
     if root.is_symlink():
         raise HybridCachePersistenceError("cache root must not be a symlink")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise HybridCachePersistenceError("cache root must be a directory")
+    with _cache_file_lock(root, exclusive=True):
+        return _write_hybrid_snapshot_locked(root, snapshot)
+
+
+def _write_hybrid_snapshot_locked(root: Path, snapshot: HybridCacheSnapshot) -> bool:
     generation = f"generation-{uuid.uuid4().hex}"
     temporary = root / f".{generation}.tmp"
     published = root / generation
@@ -588,9 +651,35 @@ def read_hybrid_snapshot(
 ) -> LoadedHybridCache | None:
     """Load and fully validate one committed generation without importing MLX."""
     root = Path(cache_dir)
-    pointer_path = root / "index.json"
     if root.is_symlink():
         raise HybridCachePersistenceError("cache root must not be a symlink")
+    if not root.is_dir():
+        return None
+    # Preserve the historical empty-cache read contract without requiring
+    # write access merely to report a miss. A cooperating writer creates the
+    # lock before starting publication, so the presence of either the lock or
+    # an existing index requires the normal shared-lock path below.
+    lock_path = root / _CACHE_LOCK_NAME
+    pointer_path = root / "index.json"
+    if not os.path.lexists(lock_path) and not os.path.lexists(pointer_path):
+        return None
+    with _cache_file_lock(root, exclusive=False):
+        return _read_hybrid_snapshot_locked(
+            root,
+            max_memory_bytes=max_memory_bytes,
+            max_entries=max_entries,
+            max_tokens=max_tokens,
+        )
+
+
+def _read_hybrid_snapshot_locked(
+    root: Path,
+    *,
+    max_memory_bytes: int | None,
+    max_entries: int | None,
+    max_tokens: int | None,
+) -> LoadedHybridCache | None:
+    pointer_path = root / "index.json"
     if pointer_path.is_symlink():
         raise HybridCachePersistenceError("cache index must not be a symlink")
     if not pointer_path.is_file():

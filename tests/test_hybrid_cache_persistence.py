@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import numpy as np
 import pytest
@@ -446,6 +447,129 @@ def test_hybrid_snapshot_prunes_stale_generations_after_commit(tmp_path):
     assert first != second
     assert not first.exists()
     assert second.is_dir()
+
+
+def test_hybrid_snapshot_serializes_writers_for_same_root(tmp_path, monkeypatch):
+    """A second publisher must not enter the generation write concurrently."""
+    import vllm_mlx.cache_persistence as persistence
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    original_write_bytes = persistence._write_bytes
+
+    def controlled_write_bytes(path, payload):
+        if threading.current_thread().name == "hybrid-writer-first":
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        elif threading.current_thread().name == "hybrid-writer-second":
+            second_entered.set()
+        return original_write_bytes(path, payload)
+
+    monkeypatch.setattr(persistence, "_write_bytes", controlled_write_bytes)
+    errors = []
+
+    def publish(model):
+        try:
+            write_hybrid_snapshot(str(tmp_path), _snapshot(model=model))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(
+        target=publish, args=("model-first",), name="hybrid-writer-first"
+    )
+    second = threading.Thread(
+        target=publish, args=("model-second",), name="hybrid-writer-second"
+    )
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    try:
+        assert not second_entered.wait(timeout=0.25)
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    loaded = read_hybrid_snapshot(str(tmp_path))
+    assert loaded is not None
+    assert loaded.identity["model"] == "model-second"
+
+
+def test_hybrid_snapshot_reader_waits_for_same_root_writer(tmp_path, monkeypatch):
+    """A reader must not traverse generations while publication may prune them."""
+    import vllm_mlx.cache_persistence as persistence
+
+    write_hybrid_snapshot(str(tmp_path), _snapshot(model="model-first"))
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    reader_entered = threading.Event()
+    original_write_bytes = persistence._write_bytes
+    original_load_json = persistence._load_json
+
+    def controlled_write_bytes(path, payload):
+        if threading.current_thread().name == "hybrid-writer":
+            writer_entered.set()
+            assert release_writer.wait(timeout=5)
+        return original_write_bytes(path, payload)
+
+    def observed_load_json(path):
+        if threading.current_thread().name == "hybrid-reader":
+            reader_entered.set()
+        return original_load_json(path)
+
+    monkeypatch.setattr(persistence, "_write_bytes", controlled_write_bytes)
+    monkeypatch.setattr(persistence, "_load_json", observed_load_json)
+    errors = []
+    loaded = []
+
+    def publish():
+        try:
+            write_hybrid_snapshot(str(tmp_path), _snapshot(model="model-second"))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def restore():
+        try:
+            loaded.append(read_hybrid_snapshot(str(tmp_path)))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    writer = threading.Thread(target=publish, name="hybrid-writer")
+    reader = threading.Thread(target=restore, name="hybrid-reader")
+    writer.start()
+    assert writer_entered.wait(timeout=5)
+    reader.start()
+    try:
+        assert not reader_entered.wait(timeout=0.25)
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+        reader.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert errors == []
+    assert len(loaded) == 1
+    assert loaded[0] is not None
+    assert loaded[0].identity["model"] == "model-second"
+
+
+def test_hybrid_snapshot_rejects_symlinked_lock_file(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-lock"
+    outside.write_text("not a lock")
+    (tmp_path / ".hybrid-cache.lock").symlink_to(outside)
+
+    with pytest.raises(HybridCachePersistenceError, match="lock must not be a symlink"):
+        read_hybrid_snapshot(str(tmp_path))
+
+
+def test_empty_snapshot_read_does_not_create_lock_file(tmp_path):
+    assert read_hybrid_snapshot(str(tmp_path)) is None
+    assert not (tmp_path / ".hybrid-cache.lock").exists()
 
 
 def test_hybrid_snapshot_rejects_invalid_layer_metadata(tmp_path):
