@@ -144,6 +144,9 @@ class MLLMRequest:
     # Timing
     first_token_time: Optional[float] = None
 
+    # Request-owned prompt positions supplied from a validated cache.
+    cached_tokens: Optional[int] = 0
+
     # Scheduler-local admission ownership.  ``init=False`` keeps the public
     # request constructor positional shape unchanged.
     _admission_reserved: bool = field(default=False, init=False, repr=False)
@@ -594,6 +597,10 @@ class MLLMScheduler:
         if request is None:
             return False
 
+        # An interrupted request must not report a cache hit as a successful
+        # request result.
+        request.cached_tokens = 0
+
         first_cleanup_error: Optional[Exception] = None
 
         def record_cleanup_error(action: str, error: Exception) -> None:
@@ -893,6 +900,7 @@ class MLLMScheduler:
 
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
+                request.cached_tokens = 0
                 output = RequestOutput(
                     request_id=request_id,
                     new_token_ids=[],
@@ -902,6 +910,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    cached_tokens=0,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -913,6 +922,10 @@ class MLLMScheduler:
                 continue
 
             # Append token to request
+            cached_tokens = getattr(response, "cached_tokens", None)
+            if type(cached_tokens) is not int:
+                cached_tokens = None
+            request.cached_tokens = cached_tokens
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
             if response.mtp_attempted:
@@ -945,6 +958,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                cached_tokens=request.cached_tokens,
             )
 
             # Check if finished
@@ -1145,6 +1159,8 @@ class MLLMScheduler:
         for request_id in request_ids:
             request = self.requests.get(request_id)
             queue = self.output_queues.get(request_id)
+            if request is not None:
+                request.cached_tokens = 0
             if request is not None and queue is not None:
                 try:
                     queue.put_nowait(
@@ -1158,6 +1174,7 @@ class MLLMScheduler:
                             completion_tokens=request.num_output_tokens,
                             mtp_drafts=request.mtp_drafts,
                             mtp_accepted=request.mtp_accepted,
+                            cached_tokens=0,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1522,6 +1539,7 @@ class MLLMScheduler:
                 output_text="",
                 finished=True,
                 finish_reason="error",
+                cached_tokens=0,
             )
 
         # Cleanup
@@ -1552,7 +1570,7 @@ class MLLMScheduler:
                     "tokens_per_second": None,
                     "ttft_s": None,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 
@@ -1597,7 +1615,7 @@ class MLLMScheduler:
                     "tokens_per_second": tok_s,
                     "ttft_s": ttft,
                     "cache_hit_type": None,
-                    "cached_tokens": 0,
+                    "cached_tokens": req.cached_tokens,
                 }
             )
 

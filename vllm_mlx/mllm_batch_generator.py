@@ -272,6 +272,9 @@ class MLLMBatchRequest:
     cross_attention_states: Optional[Any] = None  # For models that use cross-attention
     encoder_outputs: Optional[Any] = None  # For encoder-decoder models
 
+    # Prompt positions actually supplied from a validated prefix cache.
+    cached_tokens: int = 0
+
 
 @dataclass
 class MLLMBatchResponse:
@@ -290,6 +293,7 @@ class MLLMBatchResponse:
     from_draft: bool = False  # True when this response is an accepted MTP draft
     mtp_attempted: bool = False  # True when the primary step attempted MTP
     mtp_attempted_count: int = 0  # Number of draft tokens attempted
+    cached_tokens: int = 0  # Request-owned cached prompt positions
 
 
 @dataclass
@@ -1534,6 +1538,7 @@ class MLLMBatchGenerator:
             if request.uid not in failed_uids
         ]
         for request in requests:
+            request.cached_tokens = 0
             self._discard_prefill_checkpoint(request.request_id)
             self._release_cache_owner_request(request.request_id)
             self._pending_error_responses.append(
@@ -2630,11 +2635,13 @@ class MLLMBatchGenerator:
                     f"Failed to preprocess request {req.request_id}: "
                     f"{type(e).__name__}: {e}"
                 )
+                req.cached_tokens = 0
                 failed_requests.append(req)
 
         # Remove failed requests from batch and create error responses
         if failed_requests:
             for req in failed_requests:
+                req.cached_tokens = 0
                 requests.remove(req)
                 self._release_cache_owner_request(req.request_id)
                 self._pending_error_responses.append(
@@ -2734,6 +2741,8 @@ class MLLMBatchGenerator:
 
         aborted_requests = []
         for req in requests:
+            # Reused request objects must not retain an earlier cache result.
+            req.cached_tokens = 0
             try:
                 # Check abort before starting prefill
                 if self._consume_prefill_abort(req):
@@ -2848,6 +2857,7 @@ class MLLMBatchGenerator:
                     first_tokens.append(sampled.item())
                     all_logprobs.append(logprobs.squeeze(0))
                     per_request_caches.append(request_cache)
+                    req.cached_tokens = len(input_ids_list)
                     req.vision_encoded = True
                     self._prefill_progress[req.request_id] = (
                         len(input_ids_list),
@@ -2941,6 +2951,7 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+                    req.cached_tokens = cached_count
                     req.vision_encoded = True
                     logger.debug(
                         f"Prefix cache hit for {req.request_id}: "
@@ -2957,6 +2968,7 @@ class MLLMBatchGenerator:
                     request_cache = prepared_cache
                     last_token = req.input_ids[:, -1:]
                     total_tokens = len(input_ids_list)
+                    cached_count = total_tokens - 1
                     self._prefill_progress[req.request_id] = (
                         total_tokens,
                         total_tokens,
@@ -2967,7 +2979,7 @@ class MLLMBatchGenerator:
                             last_token,
                             cache=request_cache,
                             **self._language_model_kwargs(
-                                req, total_tokens - 1, total_tokens
+                                req, cached_count, total_tokens
                             ),
                         )
                         if hasattr(logits, "logits"):
@@ -2981,10 +2993,11 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+                    req.cached_tokens = cached_count
                     req.vision_encoded = True
                     logger.debug(
                         f"Prefix cache exact hit for {req.request_id}: "
-                        f"all {total_tokens} tokens cached"
+                        f"cached={cached_count}, last token replayed"
                     )
 
                 else:
@@ -3034,6 +3047,7 @@ class MLLMBatchGenerator:
                     per_request_caches.append(request_cache)
 
             except PrefillAbortedError:
+                req.cached_tokens = 0
                 aborted_requests.append(req)
                 self._discard_prefill_checkpoint(req.request_id)
                 self._prefill_progress.pop(req.request_id, None)
@@ -3258,6 +3272,7 @@ class MLLMBatchGenerator:
                     r for r in self.unprocessed_requests if r.uid not in requested_uids
                 ]
                 for req in requests:
+                    req.cached_tokens = 0
                     self._discard_prefill_checkpoint(req.request_id)
                     self._release_cache_owner_request(req.request_id)
                     self._pending_error_responses.append(
@@ -3314,6 +3329,7 @@ class MLLMBatchGenerator:
                         for response in self._pending_error_responses
                     }
                     for req in selected_requests:
+                        req.cached_tokens = 0
                         self._discard_prefill_checkpoint(req.request_id)
                         self._release_cache_owner_request(req.request_id)
                         if req.request_id not in pending_error_ids:
@@ -3437,6 +3453,7 @@ class MLLMBatchGenerator:
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
                     prompt_cache=cache_fn,
+                    cached_tokens=req.cached_tokens,
                 )
             )
 
@@ -4475,6 +4492,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason="stop",
                                 from_draft=from_draft,
+                                cached_tokens=r.cached_tokens,
                             )
                         )
                         draft_end_uids.add(uid)
@@ -4499,6 +4517,7 @@ def install_mtp_mllm(
                                 logprobs=draft_lp,
                                 finish_reason=draft_finish,
                                 from_draft=from_draft,
+                                cached_tokens=r.cached_tokens,
                             )
                         )
 
@@ -4674,6 +4693,7 @@ def install_chunked_prefill_mllm(
                         if finish_reason is not None
                         else None
                     ),
+                    cached_tokens=req.cached_tokens,
                 )
             )
 
@@ -4701,6 +4721,7 @@ def install_chunked_prefill_mllm(
 
             # Abort check
             if batch_gen._consume_prefill_abort(req):
+                req.cached_tokens = 0
                 batch_gen._partial = None
                 mx.clear_cache()
                 batch_gen._prefill_progress.pop(req.request_id, None)
@@ -4896,6 +4917,7 @@ def install_chunked_prefill_mllm(
                                 req.request_id, full_prompt_entry
                             )
                         except PrefillAbortedError:
+                            req.cached_tokens = 0
                             batch_gen._partial = None
                             batch_gen._prefill_progress.pop(req.request_id, None)
                             batch_gen._release_cache_owner_request(req.request_id)
@@ -4918,6 +4940,7 @@ def install_chunked_prefill_mllm(
                             req.request_id, checkpoint_entry
                         )
                     except PrefillAbortedError:
+                        req.cached_tokens = 0
                         batch_gen._partial = None
                         batch_gen._prefill_progress.pop(req.request_id, None)
                         batch_gen._release_cache_owner_request(req.request_id)
@@ -5044,6 +5067,7 @@ def install_chunked_prefill_mllm(
                     f"for {req.request_id[:12]}: "
                     f"{partial['total']} tokens in {partial['chunk_count']} chunks"
                 )
+                req.cached_tokens = partial["cached_count"]
                 req.prompt_position_ids = None
                 batch_gen._partial = None
                 mx.clear_cache()
@@ -5068,6 +5092,7 @@ def install_chunked_prefill_mllm(
                     break
 
             if text_only_req is not None:
+                text_only_req.cached_tokens = 0
                 try:
                     # Preprocess to get input_ids
                     batch_gen._preprocess_request(text_only_req)
@@ -5205,6 +5230,11 @@ def install_chunked_prefill_mllm(
                     cached_count = 0
                     remaining_count = total_tokens
 
+                # The cache lookup and replay validation above establish the
+                # request-owned count; later completion paths may reset it on
+                # fallback or abort.
+                text_only_req.cached_tokens = cached_count
+
                 checkpoint_at = None
                 checkpoint_key = None
                 if cached_count == 0:
@@ -5320,6 +5350,7 @@ def install_chunked_prefill_mllm(
         # progress so deferred removal remains a complete retry.
         _orig_remove(uids)
         if partial_uid in uid_set:
+            partial_request.cached_tokens = 0
             batch_gen._partial = None
             prefill_progress = getattr(batch_gen, "_prefill_progress", None)
             if prefill_progress is not None:

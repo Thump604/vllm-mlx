@@ -363,6 +363,7 @@ class TestMLLMBatchResponse:
         mock_request.output_tokens = []
         mock_request.num_output_tokens = 0
         mock_request.num_prompt_tokens = 10
+        mock_request.cached_tokens = 9
         mock_request.status = RequestStatus.RUNNING
         scheduler.running = {"req-err": mock_request}
 
@@ -382,6 +383,8 @@ class TestMLLMBatchResponse:
         assert "req-err" not in scheduler._detokenizer_pool
         assert len(outputs) == 1
         assert outputs[0].new_text == ""
+        assert mock_request.cached_tokens == 0
+        assert outputs[0].cached_tokens == 0
 
 
 class TestMLLMBatch:
@@ -678,6 +681,7 @@ class TestMLLMRequest:
         assert req.status == RequestStatus.WAITING
         assert req.mllm_draft is False
         assert req.output_text == ""
+        assert req.cached_tokens == 0
 
 
 class TestMLLMSchedulerOutput:
@@ -1344,11 +1348,15 @@ class TestMLLMBatchGeneratorMTPGuards:
             req.is_text_only = True
             return req
 
-        cold = generator._process_prompts([request("cold")])
+        cold_request = request("cold")
+        cold = generator._process_prompts([cold_request])
         generator.prefix_cache.warm = True
-        warm = generator._process_prompts([request("warm")])
+        warm_request = request("warm")
+        warm = generator._process_prompts([warm_request])
 
         assert cold.y.tolist() == warm.y.tolist() == [2]
+        assert cold_request.cached_tokens == 0
+        assert warm_request.cached_tokens == 3
         assert generator.language_model.calls == [
             (
                 [[1, 2, 3, 4]],
@@ -3771,6 +3779,7 @@ class TestChunkedPrefillCacheHandling:
         gen._next()
 
         assert rewind_calls == [1]
+        assert req.cached_tokens == 4
 
     def test_saturated_rotating_exact_hit_falls_back(self, monkeypatch):
         from mlx_lm.models.cache import CacheList, RotatingKVCache
@@ -3813,6 +3822,7 @@ class TestChunkedPrefillCacheHandling:
         make_cache.assert_called_once()
         original_next.assert_called_once()
         assert [child.offset for child in stored[0].caches] == [6, 6]
+        assert request.cached_tokens == 0
 
     def test_partial_hit_uses_copy_prefix_cache(self, monkeypatch):
         """A partial hit clones storage and does not use exact-hit rewind."""
@@ -3858,6 +3868,7 @@ class TestChunkedPrefillCacheHandling:
             1
         ], f"Expected _copy_prefix_cache called once, got {copy_calls}"
         assert rewind_calls == []
+        assert req.cached_tokens == 3
 
     def test_abort_cleans_up_partial_prefill(self):
         """Aborting a request during chunked prefill must clean up _partial."""
@@ -3901,6 +3912,7 @@ class TestChunkedPrefillCacheHandling:
         abort_responses = [r for r in responses if r.finish_reason == "abort"]
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
+        assert req.cached_tokens == 0
 
     def test_interleaved_prefill_does_not_inline_audio_request(self):
         from vllm_mlx.mllm_batch_generator import (
@@ -4073,6 +4085,19 @@ class TestChunkedPrefillCacheHandling:
         assert stored[1].offset == 10
         assert stored[1].keys.shape[2] == 10
         assert stored[1].keys.reshape(-1).tolist() == list(range(1, 11))
+
+        # Reuse the published auxiliary-logit entry through the real chunked
+        # lookup path; an exact hit owns the full prompt count.
+        gen.prefill_step_size = 4
+        gen._clone_prefix_for_replay = lambda _request_id, cache: cache
+        reused = MLLMBatchRequest(uid=6, request_id="hybrid-reused", prompt="x")
+        reused.input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+        reused.is_text_only = True
+        reused.temperature = 0.0
+        reused.top_p = 1.0
+        gen.unprocessed_requests.append(reused)
+        assert gen._next()
+        assert reused.cached_tokens == 10
 
     def test_interleaved_abort_during_checkpoint_commit_is_request_local(self):
         from types import SimpleNamespace

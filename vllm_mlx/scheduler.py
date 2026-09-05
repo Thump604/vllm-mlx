@@ -2822,6 +2822,7 @@ class Scheduler:
                 output_token_ids=request.output_token_ids,
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
+                cached_tokens=request.cached_tokens,
             )
 
             # Check if finished
@@ -3215,6 +3216,7 @@ class Scheduler:
                             request_id=rid,
                             finished=True,
                             finish_reason="error",
+                            cached_tokens=None,
                         )
                     )
                 output.finished_request_ids = aborted_ids
