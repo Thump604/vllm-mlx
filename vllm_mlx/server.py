@@ -3798,8 +3798,11 @@ async def metrics():
     if not _metrics.enabled:
         raise HTTPException(status_code=404, detail="Metrics endpoint is disabled")
 
+    engine = (
+        _model_manager.get_metrics_engine() if _model_manager is not None else _engine
+    )
     payload, content_type = _metrics.render_metrics(
-        engine=_engine,
+        engine=engine,
         mcp_manager=_mcp_manager,
     )
     return Response(content=payload, headers={"Content-Type": content_type})
