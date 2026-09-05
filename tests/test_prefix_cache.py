@@ -770,6 +770,7 @@ class TestMLLMHybridPrefillCheckpoint:
     @staticmethod
     def _request(input_ids):
         return SimpleNamespace(
+            uid=0,
             request_id="hybrid-prefill",
             input_ids=input_ids,
             vision_encoded=False,
@@ -794,6 +795,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 2
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -827,6 +829,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 2
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -863,6 +866,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 0
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -903,6 +907,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 2
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -943,6 +948,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 2
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
@@ -986,6 +992,7 @@ class TestMLLMHybridPrefillCheckpoint:
         generator.prefill_step_size = 32
         generator._think_suffix_len = 2
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}

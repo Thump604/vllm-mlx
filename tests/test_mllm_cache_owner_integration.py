@@ -53,6 +53,7 @@ def _generator(*, owner_required: bool = True):
     generator._prefix_checkpoint_lock = threading.RLock()
     generator._request_prefix_checkpoints = {}
     generator._aborted_request_ids = set()
+    generator._aborted_request_uids = set()
     generator._pending_removal_lock = threading.Lock()
     generator._pending_removal_request_ids = {}
     generator._pending_removal_uids = set()
@@ -246,6 +247,7 @@ def _chunked_generator():
     generator._stats = MLLMBatchStats()
     generator._pending_error_responses = []
     generator._aborted_request_ids = set()
+    generator._aborted_request_uids = set()
     generator._prefill_progress = {}
     generator._prefix_checkpoint_lock = threading.RLock()
     generator._request_prefix_checkpoints = {}
@@ -699,6 +701,7 @@ def test_waiting_abort_does_not_poison_reused_request_id(monkeypatch):
         cache_owner_context=None,
     )
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.waiting = deque()
     scheduler.running = {}
@@ -713,7 +716,7 @@ def test_waiting_abort_does_not_poison_reused_request_id(monkeypatch):
     first = MLLMRequest(request_id="reused-id", prompt="first")
     scheduler.requests[first.request_id] = first
     scheduler.waiting.append(first)
-    assert scheduler._abort_request_locked(first.request_id)
+    assert scheduler._abort_request(first.request_id)
     assert generator._aborted_request_ids == set()
 
     replacement = MLLMRequest(request_id="reused-id", prompt="replacement")
@@ -736,6 +739,7 @@ def test_running_abort_still_signals_batch_generator_prefill_abort():
     request.status = RequestStatus.RUNNING
     scheduler.batch_generator = generator
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.waiting = deque()
     scheduler.running = {request.request_id: request}
@@ -746,8 +750,8 @@ def test_running_abort_still_signals_batch_generator_prefill_abort():
     scheduler.output_queues = {}
     scheduler._detokenizer_pool = {}
 
-    assert scheduler._abort_request_locked(request.request_id)
-    generator.abort_prefill.assert_called_once_with(request.request_id)
+    assert scheduler._abort_request(request.request_id)
+    generator.abort_prefill.assert_called_once_with(request.request_id, 7)
 
 
 def test_running_abort_marker_clears_at_model_thread_removal_for_reuse():
@@ -862,6 +866,7 @@ def test_scheduler_rejects_same_id_until_old_uid_is_removed():
     scheduler.config = MLLMSchedulerConfig(max_num_seqs=1)
     scheduler.processor = SimpleNamespace(encode=lambda prompt: [])
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.waiting = deque()
     request = MLLMRequest(request_id=old.requests[0].request_id, prompt="hello")
@@ -875,7 +880,7 @@ def test_scheduler_rejects_same_id_until_old_uid_is_removed():
     scheduler._detokenizer_pool = {}
 
     request_id = request.request_id
-    assert scheduler._abort_request_locked(request_id)
+    assert scheduler._abort_request(request_id)
     with pytest.raises(ValueError, match="pending removal"):
         scheduler.add_request("replacement", request_id=request_id)
     assert request_id not in scheduler.requests
@@ -1815,6 +1820,7 @@ def test_scheduler_insert_failure_leaves_waiting_state_transactional(insert_resu
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     _configure_mock_insert_transaction(scheduler.batch_generator)
@@ -1854,6 +1860,7 @@ def test_scheduler_malformed_insert_result_rolls_back_real_generator(malformed):
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     binding = object()
@@ -1896,6 +1903,7 @@ def test_scheduler_base_exception_during_insert_rolls_back_real_generator():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     binding = object()
@@ -1930,6 +1938,7 @@ def test_scheduler_insert_exception_preserves_preexisting_generator_request():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     existing = _request("request-1")
@@ -1965,6 +1974,7 @@ def test_scheduler_malformed_noop_insert_preserves_preexisting_generator_request
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     existing = _request("request-1")
@@ -2007,6 +2017,7 @@ def test_generator_insert_sort_failure_rolls_back_owner_state():
 
 
 def test_generator_insert_failure_cannot_restore_stale_uid_counter():
+    # The stale-UID guard intentionally precedes sorting; the adjacent test covers post-mint sort failure.
     class ExplodingMedia:
         def __bool__(self):
             raise RuntimeError("sort failure")
@@ -2058,7 +2069,7 @@ def test_generator_insert_failure_cannot_restore_stale_uid_counter():
 
     assert len(failures) == 1
     assert isinstance(failures[0], RuntimeError)
-    assert str(failures[0]) == "sort failure"
+    assert str(failures[0]) == "MLLM UID counter overlaps live generator work"
     assert normal_uids == [0]
     assert [
         (request.request_id, request.uid) for request in generator.unprocessed_requests
@@ -2115,6 +2126,7 @@ def test_scheduler_insert_validation_is_atomic_against_direct_insert():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     generator.prefix_cache.mint_owner_request.return_value = object()
@@ -2186,6 +2198,7 @@ def test_scheduler_commit_failure_rolls_back_generator_and_scheduler_state():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     generator = _generator()
     bindings = [object(), object()]
@@ -2226,6 +2239,7 @@ def test_scheduler_rejects_malformed_uids_without_state_mutation(insert_result):
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     _configure_mock_insert_transaction(scheduler.batch_generator)
@@ -2267,6 +2281,7 @@ def test_scheduler_rejects_duplicate_or_colliding_uids_transactionally(
     scheduler.uid_to_request_id = dict(existing_uids)
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     _configure_mock_insert_transaction(scheduler.batch_generator)
@@ -2298,6 +2313,7 @@ def test_scheduler_rejects_insert_that_mutates_waiting_queue():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     _configure_mock_insert_transaction(scheduler.batch_generator)
@@ -3208,6 +3224,7 @@ def test_scheduler_disabled_owner_allows_cross_thread_admission():
     scheduler.uid_to_request_id = {}
     scheduler.total_prompt_tokens = 0
     scheduler._state_lock = threading.RLock()
+    scheduler._request_lock = scheduler._state_lock
     scheduler._owner_thread_id = threading.get_ident()
     scheduler.batch_generator = MagicMock()
     scheduler.batch_generator._cache_owner_required = False
