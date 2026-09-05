@@ -363,6 +363,25 @@ class MLLMBatch:
             setattr(copied, name, value)
         return copied
 
+    @staticmethod
+    def _sync_reshuffle_metadata(cache: List[Any]) -> None:
+        """Materialize cache metadata rebuilt by a batch membership change."""
+        metadata = []
+        stack = list(cache)
+        while stack:
+            layer = stack.pop()
+            if layer is None:
+                continue
+            children = getattr(layer, "caches", None)
+            if children is not None:
+                stack.extend(children)
+            for name in ("offset", "left_padding", "lengths"):
+                value = getattr(layer, name, None)
+                if isinstance(value, mx.array):
+                    metadata.append(value)
+        if metadata:
+            mx.eval(*metadata)
+
     def filter(self, keep_idx: List[int]) -> None:
         """
         Filter batch to keep only requests at specified indices.
@@ -394,6 +413,8 @@ class MLLMBatch:
         for cache in staged_cache:
             if hasattr(cache, "filter"):
                 cache.filter(keep_idx_array)
+
+        self._sync_reshuffle_metadata(staged_cache)
 
         (
             self.uids,
@@ -596,6 +617,7 @@ class MLLMBatch:
         try:
             for c, o in cache_extensions:
                 c.extend(o)
+            self._sync_reshuffle_metadata(self.cache)
         except BaseException:
             for c, snapshot in reversed(snapshots):
                 self._restore_cache_transaction(c, snapshot)
