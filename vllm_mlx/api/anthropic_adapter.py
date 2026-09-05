@@ -9,7 +9,6 @@ Handles translation of:
 """
 
 import json
-import re
 import uuid
 
 from .anthropic_models import (
@@ -26,6 +25,7 @@ from .models import (
     Message,
     ToolDefinition,
 )
+from .prompt_canonicalize import canonicalize_system_prompt
 
 
 def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
@@ -64,7 +64,13 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         # Strip per-request billing/tracking headers injected by some
         # clients (e.g. Claude Code).  These contain a per-request hash
         # that prevents prefix-cache reuse across turn boundaries.
-        system_text = re.sub(r"x-anthropic-billing-header:[^\n]*\n?", "", system_text)
+        #
+        # Use the shared canonicalizer rather than an inline pattern. The
+        # local one was unanchored, so it deleted the header text wherever
+        # it appeared -- including mid-sentence in a user's own prompt --
+        # and this pass runs before canonicalize_system_messages(), which
+        # cannot restore what was already removed.
+        system_text = canonicalize_system_prompt(system_text) or ""
         messages.append(Message(role="system", content=system_text))
 
     # Convert each message
