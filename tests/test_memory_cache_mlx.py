@@ -2021,6 +2021,7 @@ class TestHybridRestartPersistence:
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
         generator._aborted_request_ids = set()
+        generator._aborted_request_uids = set()
         generator._prefill_progress = {}
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
