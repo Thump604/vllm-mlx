@@ -690,6 +690,7 @@ class MLLMScheduler:
             cached_tokens = getattr(response, "cached_tokens", None)
             if type(cached_tokens) is not int:
                 cached_tokens = None
+            # Error responses continue above; normal token responses carry cache usage.
             request.cached_tokens = cached_tokens
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
