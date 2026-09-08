@@ -28,6 +28,12 @@ If port 8000 is occupied, choose a free port and change it in every URL; do not
 terminate an unfamiliar process. Keep the host on loopback for local use.
 Stop the server with Ctrl-C before starting a different model.
 
+The minimal command uses the default engine without continuous batching.
+After the first response, stop it and add `--continuous-batching` to the same
+serve command to try that engine. See the
+[continuous-batching guide](../guides/continuous-batching.md) for its cache
+options and supported configurations.
+
 If a CLI flag is unrecognized, check `vllm-mlx serve --help` in the same
 environment and the installed release. Do not copy options from newer source
 documentation into an older wheel. Download/authentication failures belong to

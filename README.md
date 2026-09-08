@@ -24,10 +24,17 @@ and [first-response check](docs/getting-started/quickstart.md#first-response).
 The example below assumes that environment is activated. Initial model
 download/loading time depends on the machine and connection.
 
+The version below is this walkthrough's pinned reference release, not an
+automatically updated latest version.
+
 ```bash
 python -m pip install 'vllm-mlx==0.4.1'
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --host 127.0.0.1 --port 8000
 ```
+
+After the first response, restart with `--continuous-batching` to try
+[continuous batching and its cache options](docs/guides/continuous-batching.md).
+The minimal command above uses the default engine without that flag.
 
 **OpenAI SDK:**
 

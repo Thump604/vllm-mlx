@@ -9,6 +9,10 @@
 
 For a first run, use a fresh environment rather than an editable checkout.
 This walkthrough targets [v0.4.1](https://github.com/waybarrios/vllm-mlx/releases/tag/v0.4.1).
+This is a pinned reference release, not a promise to install the latest version.
+When updating this walkthrough for a release, update the pins and expected
+version in the README and this page together, and recheck the quickstart's
+CLI flags and first-response request against that release.
 Changes merged into `main` after that release are not included just because
 their PR is closed. Check the release containing a required fix before choosing
 a model or enabling an advanced feature.
