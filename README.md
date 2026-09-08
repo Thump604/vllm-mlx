@@ -31,6 +31,9 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --host 127.0.0.1 --port 
 
 **OpenAI SDK:**
 
+Install `openai` in your Python client environment first; it is not installed
+by the server package. See the [client setup](docs/getting-started/quickstart.md#option-1-openai-compatible-server).
+
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")

@@ -75,6 +75,13 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 
 Use with OpenAI Python SDK:
 
+Leave the server running. In another terminal, install the SDK in your Python
+client environment (the server package does not install `openai`):
+
+```bash
+python -m pip install openai
+```
+
 ```python
 from openai import OpenAI
 
