@@ -2,6 +2,7 @@
 """Focused MCP SDK compatibility and failed-connect cleanup tests."""
 
 from types import SimpleNamespace
+import asyncio
 
 import pytest
 
@@ -39,12 +40,11 @@ def _client() -> MCPClient:
 async def test_initialize_session_accepts_both_sdk_field_styles(result, caplog):
     client = _client()
     caplog.set_level("DEBUG")
-    client._session = SimpleNamespace(initialize=lambda: result)
 
     async def initialize():
         return result
 
-    client._session.initialize = initialize
+    client._session = SimpleNamespace(initialize=initialize)
     await client._initialize_session()
     assert "initialized" in caplog.text
 
@@ -56,7 +56,7 @@ async def test_initialize_session_accepts_both_sdk_field_styles(result, caplog):
         SimpleNamespace(
             name="snake",
             description="snake schema",
-            input_schema={"type": "object"},
+            input_schema={},
         ),
         SimpleNamespace(
             name="camel",
@@ -74,37 +74,44 @@ async def test_discover_tools_accepts_both_sdk_field_styles(tool):
 
     client._session.list_tools = list_tools
     await client._discover_tools()
-    assert client.tools[0].input_schema == {"type": "object"}
+    expected = getattr(tool, "input_schema", getattr(tool, "inputSchema", {}))
+    assert client.tools[0].input_schema == expected
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("field", ["is_error", "isError"])
-async def test_call_tool_accepts_both_sdk_field_styles(field):
+@pytest.mark.parametrize(
+    "field,value", [("is_error", True), ("isError", True), ("is_error", False)]
+)
+async def test_call_tool_accepts_both_sdk_field_styles(field, value):
     client = _client()
     client._state = MCPServerState.CONNECTED
-    result = SimpleNamespace(content=[], **{field: True})
+    result = SimpleNamespace(content=[], **{field: value})
 
     async def call_tool(_name, _arguments):
         return result
 
     client._session = SimpleNamespace(call_tool=call_tool)
     outcome = await client.call_tool("tool", {})
-    assert outcome.is_error is True
+    assert outcome.is_error is value
 
 
 @pytest.mark.anyio
 async def test_connect_closes_partial_contexts_and_returns_promptly(monkeypatch):
     client = _client()
+    client._tools = [SimpleNamespace(name="stale")]
 
     class Context:
-        def __init__(self):
+        def __init__(self, raises=False):
             self.exited = 0
+            self.raises = raises
 
         async def __aexit__(self, *_args):
             self.exited += 1
+            if self.raises:
+                raise RuntimeError("close failed")
 
     session_context = Context()
-    stdio_context = Context()
+    stdio_context = Context(raises=True)
 
     async def connect_stdio():
         client._stdio_client = stdio_context
@@ -116,9 +123,10 @@ async def test_connect_closes_partial_contexts_and_returns_promptly(monkeypatch)
     monkeypatch.setattr(client, "_connect_stdio", connect_stdio)
     monkeypatch.setattr(client, "_initialize_session", initialize_session)
 
-    assert await client.connect() is False
+    assert await asyncio.wait_for(client.connect(), timeout=1) is False
     assert client.state is MCPServerState.ERROR
     assert client._session is None
     assert client._stdio_client is None
+    assert client._tools == []
     assert session_context.exited == 1
     assert stdio_context.exited == 1

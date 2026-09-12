@@ -132,6 +132,7 @@ class MCPClient:
 
             except Exception as e:
                 await self._close_connection()
+                self._tools = []
                 self._state = MCPServerState.ERROR
                 self._error = str(e)
                 logger.error(f"Failed to connect to MCP server '{self.name}': {e}")
