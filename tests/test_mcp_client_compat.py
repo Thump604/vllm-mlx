@@ -110,8 +110,8 @@ async def test_connect_closes_partial_contexts_and_returns_promptly(monkeypatch)
             if self.raises:
                 raise RuntimeError("close failed")
 
-    session_context = Context()
-    stdio_context = Context(raises=True)
+    session_context = Context(raises=True)
+    stdio_context = Context()
 
     async def connect_stdio():
         client._stdio_client = stdio_context
