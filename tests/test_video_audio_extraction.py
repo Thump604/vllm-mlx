@@ -66,3 +66,85 @@ def test_ffprobe_never_reads_the_terminal(captured_runs, tmp_path):
     ffprobe = [c for c in captured_runs if c["argv"][0] == "ffprobe"]
     assert len(ffprobe) == 1
     assert ffprobe[0]["kwargs"].get("stdin") is subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# The extracted audio must also reach the chat template as a placeholder.
+#
+# Extraction alone is not enough: the file goes to generate(audio=...) and the
+# encoder produces N features, but the model splices those into N placeholder
+# tokens that only the chat template emits - and it emits one per audio content
+# PART. The video branch used to insert frames and nothing else, so an Omni
+# model got N features and zero slots:
+#   ValueError: Sound token count (0) does not match feature count (36)
+# ---------------------------------------------------------------------------
+
+
+def _parts(messages, *, frames, audio):
+    built = mllm._build_mllm_chat_messages(
+        messages,
+        all_image_urls=[],
+        video_frame_counts=frames,
+        video_audio_counts=audio,
+    )
+    return [p["type"] for p in built[0]["content"]]
+
+
+VIDEO_MSG = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe vision and sound"},
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
+        ],
+    }
+]
+
+
+def test_auto_extracted_audio_gets_a_template_placeholder():
+    parts = _parts(VIDEO_MSG, frames={0: 4}, audio={0: 1})
+    assert parts == ["text", "image", "image", "image", "image", "audio"]
+
+
+def test_video_without_audio_track_adds_no_placeholder():
+    parts = _parts(VIDEO_MSG, frames={0: 4}, audio={})
+    assert parts == ["text", "image", "image", "image", "image"]
+
+
+def test_second_video_part_does_not_duplicate_the_placeholder():
+    two_videos = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,AAAA"},
+                },
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "data:video/mp4;base64,BBBB"},
+                },
+            ],
+        }
+    ]
+    parts = _parts(two_videos, frames={0: 2}, audio={0: 1})
+    assert (
+        parts.count("audio") == 1
+    ), "audio placeholder is consumed by the first video part"
+
+
+def test_explicit_audio_part_still_renders_independently():
+    msg = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "data:audio/wav;base64,AAAA"},
+                },
+                {"type": "text", "text": "what is this"},
+            ],
+        }
+    ]
+    parts = _parts(msg, frames={}, audio={})
+    assert parts == ["audio", "text"]
