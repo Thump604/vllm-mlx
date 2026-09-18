@@ -1185,6 +1185,7 @@ def _video_has_audio_track(video_path: str) -> bool:
                 "csv=p=0",
                 video_path,
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=30,
             text=True,
@@ -1232,6 +1233,12 @@ def extract_audio_from_video(video_path: str) -> str | None:
         r = subprocess.run(
             [
                 "ffmpeg",
+                # ffmpeg polls stdin for interactive keys. Under a job-control
+                # launcher the server sits in a background process group, and
+                # a background read of the terminal raises SIGTTIN against the
+                # WHOLE group - server included - freezing every request with
+                # 0% CPU until the 600s timeout silently drops the audio.
+                "-nostdin",
                 "-y",
                 "-i",
                 video_path,
@@ -1244,6 +1251,7 @@ def extract_audio_from_video(video_path: str) -> str | None:
                 "pcm_s16le",
                 out_path,
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=600,
