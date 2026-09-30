@@ -299,6 +299,7 @@ def serve_command(args):
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
+            prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
@@ -1288,7 +1289,7 @@ Examples:
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=make_positive_int_arg_parser("--prefill-step-size"),
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
@@ -1300,7 +1301,8 @@ Examples:
         default=False,
         help="Enable SpecPrefill: use a small draft model to score token importance, "
         "then sparse-prefill only the important tokens on the target model. "
-        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+        "Reduces TTFT on long prompts. Supported Qwen media routes preserve "
+        "visual embeddings and MRoPE state. Requires --specprefill-draft-model.",
     )
     serve_parser.add_argument(
         "--specprefill-threshold",
