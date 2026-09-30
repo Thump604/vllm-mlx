@@ -351,6 +351,52 @@ class TestMemoryAwarePrefixCache:
         assert result[0].values is kv[0].values
         assert remaining == [4, 5, 6]
 
+    def test_fetch_retains_the_actual_supersequence_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 4]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == []
+        assert small_cache._last_matched_key == tuple(stored_tokens)
+
+    def test_fetch_retains_the_actual_lcp_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 9]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3, 8])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == [8]
+        assert small_cache._last_matched_key == tuple(stored_tokens)
+
     def test_fetch_miss(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3]
         kv = mock_kv_cache(1000)
@@ -427,6 +473,31 @@ class TestMemoryAwarePrefixCache:
         assert small_cache.remove(tokens) is True
         assert len(small_cache) == 0
         assert small_cache.remove(tokens) is False  # Already removed
+
+    def test_remove_can_evict_the_same_key_from_ssd(self, small_cache, mock_kv_cache):
+        tokens = [1, 2, 3]
+        ssd_tier = MagicMock()
+        ssd_tier.remove.return_value = True
+        small_cache.set_ssd_tier(ssd_tier)
+        small_cache.store(tokens, mock_kv_cache(1000))
+
+        assert small_cache.remove(tokens, include_ssd=True) is True
+        assert tokens not in small_cache
+        ssd_tier.remove.assert_called_once_with(tuple(tokens))
+
+    def test_ssd_prefix_candidate_includes_the_actual_key(self, small_cache):
+        ssd_tier = MagicMock()
+        ssd_tier.lookup_ssd.return_value = None
+        ssd_tier.lookup_ssd_prefix.return_value = {
+            "num_tokens": 3,
+            "memory_bytes": 128,
+            "file_path": "entry",
+        }
+        small_cache.set_ssd_tier(ssd_tier)
+
+        candidate = small_cache.check_ssd([1, 2, 3, 4, 5])
+
+        assert candidate["matched_key"] == (1, 2, 3)
 
     def test_clear(self, small_cache, mock_kv_cache):
         for i in range(3):

@@ -134,11 +134,15 @@ def serve_command(args):
     mllm_draft_model = getattr(args, "mllm_draft_model", None)
     mllm_draft_kind = getattr(args, "mllm_draft_kind", None)
     mllm_draft_block_size = getattr(args, "mllm_draft_block_size", None)
+    default_mllm_draft = getattr(args, "default_mllm_draft", False)
     if mllm_draft_model and models_config:
         print("Error: --mllm-draft-model cannot be used with --models-config")
         sys.exit(1)
     if mllm_draft_model and not getattr(args, "mllm", False):
         print("Error: --mllm-draft-model requires --mllm")
+        sys.exit(1)
+    if default_mllm_draft and not mllm_draft_model:
+        print("Error: --default-mllm-draft requires --mllm-draft-model")
         sys.exit(1)
     if mllm_draft_model and args.continuous_batching and mllm_draft_kind != "mtp":
         print(
@@ -325,6 +329,7 @@ def serve_command(args):
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
+            prefill_step_size=args.prefill_step_size,
             completion_batch_size=args.completion_batch_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
@@ -413,7 +418,8 @@ def serve_command(args):
             print(
                 "MLLM draft model: enabled "
                 f"(draft={mllm_draft_model}, kind={mllm_draft_kind}, "
-                f"block_size={mllm_draft_block_size})"
+                f"block_size={mllm_draft_block_size}, "
+                f"default_enabled={default_mllm_draft})"
             )
 
     if models_config:
@@ -468,6 +474,7 @@ def serve_command(args):
             mllm_draft_model=mllm_draft_model,
             mllm_draft_kind=mllm_draft_kind,
             mllm_draft_block_size=mllm_draft_block_size,
+            default_mllm_draft=default_mllm_draft,
             warm_prompts_path=getattr(args, "warm_prompts", None),
             auto_unload_idle_seconds=args.auto_unload_idle_seconds,
             lazy_load_model=args.lazy_load_model,
@@ -1323,7 +1330,7 @@ Examples:
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=make_positive_int_arg_parser("--prefill-step-size"),
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
         "but can improve prefill throughput. (default: 2048)",
@@ -1335,7 +1342,8 @@ Examples:
         default=False,
         help="Enable SpecPrefill: use a small draft model to score token importance, "
         "then sparse-prefill only the important tokens on the target model. "
-        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+        "Reduces TTFT on long prompts. Supported Qwen media routes preserve "
+        "visual embeddings and MRoPE state. Requires --specprefill-draft-model.",
     )
     serve_parser.add_argument(
         "--specprefill-threshold",
@@ -1406,6 +1414,14 @@ Examples:
         type=make_positive_int_arg_parser("--mllm-draft-block-size"),
         default=None,
         help="Draft block size passed to mlx-vlm for --mllm-draft-model.",
+    )
+    serve_parser.add_argument(
+        "--default-mllm-draft",
+        action="store_true",
+        help=(
+            "Enable a configured MLLM assistant drafter by default. "
+            "Requests may opt out with mllm_draft=false."
+        ),
     )
     # MCP options
     serve_parser.add_argument(

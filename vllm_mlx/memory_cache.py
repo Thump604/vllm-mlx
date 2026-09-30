@@ -33,6 +33,15 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+
+def is_text_only_prefix_cache_request(request: Any) -> bool:
+    """Return whether a request can safely use the token-only prefix cache."""
+    return (
+        bool(getattr(request, "is_text_only", False))
+        and getattr(request, "input_ids", None) is not None
+    )
+
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -1040,6 +1049,7 @@ class MemoryAwarePrefixCache:
 
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
+        self._last_matched_key: tuple[int, ...] | None = None
 
         # Optional SSD cold tier (set via set_ssd_tier())
         self._ssd_tier = None
@@ -1069,6 +1079,7 @@ class MemoryAwarePrefixCache:
             - cache: Cached KV state if found, None otherwise
             - remaining_tokens: Tokens that still need processing
         """
+        self._last_matched_key = None
         if not tokens:
             self._stats.misses += 1
             self._last_match_type = "miss"
@@ -1087,6 +1098,7 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
+            self._last_matched_key = tokens_key
             cache_out = (
                 _dequantize_cache(entry.cache)
                 if self._config.kv_quantize
@@ -1161,6 +1173,7 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
+                self._last_matched_key = best_super.tokens
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
                     if self._config.kv_quantize
@@ -1172,6 +1185,7 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
+                self._last_matched_key = best_super.tokens
                 cache_out = (
                     _dequantize_cache(best_super.cache)
                     if self._config.kv_quantize
@@ -1186,6 +1200,7 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             self._last_match_type = "prefix"
+            self._last_matched_key = best_match.tokens
             cache_out = (
                 _dequantize_cache(best_match.cache)
                 if self._config.kv_quantize
@@ -1269,6 +1284,7 @@ class MemoryAwarePrefixCache:
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
                 self._last_match_type = "lcp"
+                self._last_matched_key = best_lcp_entry.tokens
                 trimmed_cache = (
                     _dequantize_cache(trimmed_cache)
                     if self._config.kv_quantize
@@ -1487,26 +1503,32 @@ class MemoryAwarePrefixCache:
             f"{'  (spilled to SSD)' if self._ssd_tier is not None else ''}"
         )
 
-    def remove(self, tokens: list[int]) -> bool:
+    def remove(self, tokens: list[int], *, include_ssd: bool = False) -> bool:
         """
         Remove a specific cache entry.
 
         Args:
             tokens: Token sequence to remove.
+            include_ssd: Also remove the same entry from the attached SSD tier.
 
         Returns:
             True if entry was found and removed.
         """
+        tokens_key = tuple(tokens)
+        removed = False
         with self._memory_lock:
-            tokens_key = tuple(tokens)
             entry = self._entries.pop(tokens_key, None)
             if entry is not None:
                 self._current_memory -= entry.memory_bytes
                 self._remove_from_sorted(tokens_key)
                 self._stats.entry_count = len(self._entries)
                 self._stats.current_memory_bytes = self._current_memory
-                return True
-            return False
+                removed = True
+
+        if include_ssd and self._ssd_tier is not None:
+            removed = self._ssd_tier.remove(tokens_key) or removed
+
+        return removed
 
     def clear(self) -> None:
         """Clear all cached entries."""
@@ -1600,12 +1622,14 @@ class MemoryAwarePrefixCache:
         if candidate is not None:
             candidate["match_type"] = "exact"
             candidate["matched_tokens"] = len(tokens)
+            candidate["matched_key"] = tokens_key
             return candidate
 
         prefix = self._ssd_tier.lookup_ssd_prefix(tokens_key)
         if prefix is not None:
             prefix["match_type"] = "prefix"
             prefix["matched_tokens"] = prefix["num_tokens"]
+            prefix["matched_key"] = tokens_key[: prefix["num_tokens"]]
             return prefix
 
         return None

@@ -33,6 +33,10 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--timeout` | Request timeout in seconds | 300 |
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
+| `--mllm-draft-model` | Configured mlx-vlm assistant/draft model path. Requires `--mllm`. | None |
+| `--mllm-draft-kind` | Assistant drafter kind. Use `mtp` for continuous batching. | None |
+| `--mllm-draft-block-size` | Speculative block size passed to mlx-vlm. | None |
+| `--default-mllm-draft` | Enable the configured assistant by default. Requests can override with `mllm_draft`. | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--no-memory-aware-cache` | Use legacy entry-count cache | False |

@@ -26,7 +26,7 @@ import uuid
 import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -38,6 +38,9 @@ from .mllm_batch_generator import (
 from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
+
+if TYPE_CHECKING:
+    from .mllm_specprefill import SpecPrefillOutcome, SpecPrefillRequestConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +80,8 @@ class MLLMSchedulerConfig:
     use_memory_aware_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # Fraction of available memory used when no explicit MB limit is configured
+    prefix_cache_memory_percent: float = 0.20
     # KV cache quantization for prefix cache store/fetch
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
@@ -90,6 +95,11 @@ class MLLMSchedulerConfig:
     # evicted entries to disk and promotes them back on hit.
     ssd_cache_dir: Optional[str] = None
     ssd_cache_max_gb: float = 10.0
+    # Attention-based sparse prefill for eligible media-bearing requests.
+    specprefill_enabled: bool = False
+    specprefill_threshold: int = 8192
+    specprefill_keep_pct: float = 0.3
+    specprefill_backbone_pct: float = 0.0
 
 
 @dataclass
@@ -107,6 +117,8 @@ class MLLMRequest:
     audio: Optional[List[str]] = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     mllm_draft: bool = False
+    specprefill_config: Optional["SpecPrefillRequestConfig"] = None
+    specprefill_outcome: Optional["SpecPrefillOutcome"] = None
     arrival_time: float = field(default_factory=time.time)
 
     # Batch generator UID (assigned when scheduled)
@@ -189,6 +201,7 @@ class MLLMScheduler:
         draft_model: Any = None,
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
+        specprefill_draft_model: Optional[Any] = None,
     ):
         """
         Initialize MLLM scheduler.
@@ -197,6 +210,7 @@ class MLLMScheduler:
             model: The VLM model
             processor: The VLM processor
             config: Scheduler configuration
+            specprefill_draft_model: Loaded draft model used for token scoring
         """
         self.model = model
         self.processor = processor
@@ -204,6 +218,7 @@ class MLLMScheduler:
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.specprefill_draft_model = specprefill_draft_model
 
         # Get model config
         self.model_config = getattr(model, "config", None)
@@ -253,52 +268,29 @@ class MLLMScheduler:
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        # Count of step() calls, mirroring AsyncEngineCore._steps_executed
+        # (engine_core.py) for the plain-LLM path -- surfaced via get_stats()
+        # as vllm_mlx_engine_steps_executed (see #746).
+        self._steps_executed = 0
 
         # Memory management: periodic mx.clear_cache() to free Metal buffers
         self._step_count = 0
         self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer and generation_config.json."""
-        stop_tokens = set()
+        """Get stop token IDs from tokenizer and config/generation_config.
+
+        (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS, declared
+        only in the config EOS list — never as ``tokenizer.eos_token``.)
+        """
+        from .utils.tokenizer import collect_eos_token_ids
+
         tokenizer = (
             self.processor.tokenizer
             if hasattr(self.processor, "tokenizer")
             else self.processor
         )
-
-        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
-            if isinstance(tokenizer.eos_token_id, list):
-                stop_tokens.update(tokenizer.eos_token_id)
-            else:
-                stop_tokens.add(tokenizer.eos_token_id)
-
-        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
-            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
-                stop_tokens.update(tokenizer.eos_token_ids)
-            else:
-                stop_tokens.add(tokenizer.eos_token_ids)
-
-        # Also read generation_config.json which may have additional EOS tokens
-        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
-        model_path = getattr(tokenizer, "name_or_path", None)
-        if model_path:
-            import json
-            from pathlib import Path
-
-            gc_path = Path(model_path) / "generation_config.json"
-            if gc_path.exists():
-                try:
-                    gc = json.loads(gc_path.read_text())
-                    gc_eos = gc.get("eos_token_id")
-                    if isinstance(gc_eos, list):
-                        stop_tokens.update(gc_eos)
-                    elif gc_eos is not None:
-                        stop_tokens.add(gc_eos)
-                except Exception:
-                    pass
-
-        return stop_tokens
+        return collect_eos_token_ids(tokenizer)
 
     def _ensure_batch_generator(self) -> None:
         """Ensure batch generator exists."""
@@ -318,6 +310,7 @@ class MLLMScheduler:
             if self.config.enable_prefix_cache and self.config.use_memory_aware_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    max_memory_percent=self.config.prefix_cache_memory_percent,
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
@@ -335,6 +328,20 @@ class MLLMScheduler:
                 prefill_step_size=self.config.prefill_step_size,
                 prefix_cache_config=prefix_cache_config,
                 max_kv_size=self.config.max_kv_size,
+                specprefill_draft_model=getattr(self, "specprefill_draft_model", None),
+                specprefill_enabled=self.config.specprefill_enabled,
+                specprefill_threshold=self.config.specprefill_threshold,
+                specprefill_keep_pct=self.config.specprefill_keep_pct,
+                specprefill_backbone_pct=self.config.specprefill_backbone_pct,
+                specprefill_runtime_reason=(
+                    "chunked_prefill_incompatible"
+                    if self.config.chunked_prefill_tokens > 0
+                    else (
+                        "rotating_cache_incompatible"
+                        if self.config.max_kv_size > 0
+                        else None
+                    )
+                ),
             )
 
             # Wire the SSD cold tier onto the MLLM prefix cache, mirroring the
@@ -437,6 +444,14 @@ class MLLMScheduler:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
+        from .mllm_specprefill import SpecPrefillRequestConfig
+
+        specprefill_config = SpecPrefillRequestConfig(
+            enabled=kwargs.pop("specprefill", None),
+            keep_pct=kwargs.pop("specprefill_keep_pct", None),
+            backbone_pct=kwargs.pop("specprefill_backbone_pct", None),
+        )
+
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -456,6 +471,7 @@ class MLLMScheduler:
             audio=audio,
             sampling_params=sampling_params,
             mllm_draft=bool(kwargs.pop("mllm_draft", False)),
+            specprefill_config=specprefill_config,
         )
 
         # Estimate prompt token count for monitoring (text tokens only;
@@ -604,6 +620,7 @@ class MLLMScheduler:
                 repetition_penalty=request.sampling_params.repetition_penalty,
                 logits_processors=request.sampling_params.logits_processors,
                 mllm_draft=request.mllm_draft,
+                specprefill_config=request.specprefill_config,
             )
             batch_requests.append(batch_req)
 
@@ -656,6 +673,9 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            if response.specprefill_outcome is not None:
+                request.specprefill_outcome = response.specprefill_outcome
+
             # Handle error responses from failed preprocessing
             if response.finish_reason == "error":
                 output = RequestOutput(
@@ -667,6 +687,7 @@ class MLLMScheduler:
                     completion_tokens=0,
                     finished=True,
                     finish_reason="error",
+                    specprefill_outcome=request.specprefill_outcome,
                 )
                 request.status = RequestStatus.FINISHED_ABORTED
                 request.output_text = ""
@@ -710,6 +731,7 @@ class MLLMScheduler:
                 completion_tokens=request.num_output_tokens,
                 mtp_drafts=request.mtp_drafts,
                 mtp_accepted=request.mtp_accepted,
+                specprefill_outcome=request.specprefill_outcome,
             )
 
             # Check if finished
@@ -839,6 +861,16 @@ class MLLMScheduler:
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
+
+        # Count only steps that complete without raising, mirroring
+        # AsyncEngineCore._steps_executed (engine_core.py), which increments
+        # after self.scheduler.step() returns successfully rather than
+        # before calling it. A step that raises partway through (e.g. an
+        # unrecoverable forward-pass error -- see
+        # _fail_requests_after_step_error) never did the scheduling/
+        # generation work "steps_executed" is meant to count, so it must
+        # not be counted.
+        self._steps_executed += 1
 
         return output
 
@@ -1242,6 +1274,7 @@ class MLLMScheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "steps_executed": self._steps_executed,
             "requests": self.get_running_requests_info(),
         }
 
@@ -1253,6 +1286,7 @@ class MLLMScheduler:
             stats["vision_embedding_cache"] = vec_stats
             if hasattr(self.batch_generator, "get_mtp_stats"):
                 stats["mtp"] = self.batch_generator.get_mtp_stats()
+            stats["specprefill"] = self.batch_generator.get_specprefill_stats()
 
         # Include Metal memory stats
         try:
@@ -1292,8 +1326,11 @@ class MLLMScheduler:
             "vision_cache": False,
             "prefix_cache": False,
         }
-        if self.vision_cache:
-            self.vision_cache.clear()
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.vision_cache is not None
+        ):
+            self.batch_generator.vision_cache.clear()
             cleared["vision_cache"] = True
         if (
             self.batch_generator is not None
@@ -1318,8 +1355,7 @@ class MLLMScheduler:
         self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
+            if self.batch_generator.vision_cache is not None:
+                self.batch_generator.vision_cache.clear()
             self.batch_generator.close()
             self.batch_generator = None
-
-        if self.vision_cache:
-            self.vision_cache.clear()

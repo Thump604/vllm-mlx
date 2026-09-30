@@ -15,9 +15,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 
 # Re-entrancy guard for SimpleEngine._track_request_stream so that
@@ -40,8 +40,12 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    shield_task,
 )
-from .chat_template_safety import normalize_messages_for_chat_template
+from .chat_template_safety import (
+    build_system_prompt_cache_prefix,
+    normalize_messages_for_chat_template,
+)
 from ..mlx_streams import (
     bind_generation_streams,
     restore_generation_streams,
@@ -168,6 +172,7 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache: bool = False,
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
+        default_mllm_draft: bool = False,
     ):
         """
         Initialize the simple engine.
@@ -193,6 +198,8 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache: Enable mlx-lm LRUPromptCache on pure-LLM stream_chat
             prefix_trie_cache_size: Maximum prompt-cache trie entries
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
+            default_mllm_draft: Enable the configured assistant drafter unless a
+                request explicitly sets ``mllm_draft`` to false.
         """
         self._model_name = model_name
         self._created_at = time.time()
@@ -238,6 +245,7 @@ class SimpleEngine(BaseEngine):
             "skips": 0,
             "tokens_saved": 0,
         }
+        self._default_mllm_draft = default_mllm_draft
 
         # KV cache size limit
         self._max_kv_size = max_kv_size
@@ -548,9 +556,13 @@ class SimpleEngine(BaseEngine):
         return self._prefix_trie_cache
 
     def _fetch_prefix_trie_cache(
-        self, model: Any, tokens: list[int]
+        self,
+        model: Any,
+        tokens: list[int],
+        *,
+        minimum_tokens_saved: int = 0,
     ) -> tuple[Any | None, list[int] | None, int]:
-        """Fetch a nearest prompt-cache trie entry for a full prompt token list."""
+        """Fetch a trie entry only when it beats the existing cached prefix."""
         prefix_trie = self._ensure_prefix_trie_cache()
         if prefix_trie is None:
             return None, None, 0
@@ -558,6 +570,18 @@ class SimpleEngine(BaseEngine):
         self._prefix_trie_cache_stats["lookups"] += 1
         try:
             with self._prefix_trie_cache_lock:
+                if minimum_tokens_saved > 0:
+                    candidate_tokens_saved = self._peek_prefix_trie_tokens_saved(
+                        prefix_trie,
+                        model,
+                        tokens,
+                    )
+                    if (
+                        candidate_tokens_saved is None
+                        or candidate_tokens_saved <= minimum_tokens_saved
+                    ):
+                        self._prefix_trie_cache_stats["skips"] += 1
+                        return None, None, 0
                 trie_cache, trie_rest = prefix_trie.fetch_nearest_cache(model, tokens)
             if trie_cache is None or trie_rest is None or len(trie_rest) >= len(tokens):
                 self._prefix_trie_cache_stats["misses"] += 1
@@ -572,6 +596,9 @@ class SimpleEngine(BaseEngine):
                 trie_rest = [tokens[-1]]
 
             tokens_saved = len(tokens) - len(trie_rest)
+            if tokens_saved <= minimum_tokens_saved:
+                self._prefix_trie_cache_stats["skips"] += 1
+                return None, None, 0
             self._prefix_trie_cache_stats["hits"] += 1
             self._prefix_trie_cache_stats["tokens_saved"] += tokens_saved
             return trie_cache, list(trie_rest), tokens_saved
@@ -579,6 +606,58 @@ class SimpleEngine(BaseEngine):
             self._prefix_trie_cache_stats["skips"] += 1
             logger.debug("Prefix trie cache lookup skipped after failure (%s)", e)
             return None, None, 0
+
+    @staticmethod
+    def _peek_prefix_trie_tokens_saved(
+        prefix_trie: Any,
+        model: Any,
+        tokens: list[int],
+    ) -> int | None:
+        """Return reusable tokens without copying the matched prompt cache.
+
+        mlx-lm 0.31.3+ exposes no public non-copying lookup. Its LRUPromptCache
+        keeps the search metadata on ``_trie``; feature-detect that stable shape
+        and safely prefer the existing system snapshot if it changes upstream.
+        """
+        trie = getattr(prefix_trie, "_trie", None)
+        search = getattr(trie, "search", None)
+        if not callable(search):
+            return None
+
+        result = search(model, tokens)
+
+        def _entry_is_trimmable(cache_key: list[int]) -> bool | None:
+            get_entry = getattr(trie, "get", None)
+            if not callable(get_entry):
+                return None
+
+            from mlx_lm.models.cache import can_trim_prompt_cache
+
+            entry = get_entry(result.model, cache_key)
+            prompt_cache = getattr(entry, "prompt_cache", None)
+            if prompt_cache is None:
+                return None
+            return can_trim_prompt_cache(prompt_cache)
+
+        exact = getattr(result, "exact", None)
+        if exact is not None:
+            exact_is_trimmable = _entry_is_trimmable(exact)
+            if exact_is_trimmable is None:
+                return None
+            return max(0, len(tokens) - 1) if exact_is_trimmable else 0
+
+        shorter = getattr(result, "shorter", None)
+        shorter_length = len(shorter) if shorter is not None else 0
+        longer = getattr(result, "longer", None)
+        common_prefix = getattr(result, "common_prefix", 0)
+        if longer is not None and common_prefix > shorter_length:
+            longer_is_trimmable = _entry_is_trimmable(longer)
+            if longer_is_trimmable is None:
+                return None
+            if longer_is_trimmable:
+                return min(len(tokens) - 1, common_prefix)
+
+        return shorter_length
 
     def _insert_prefix_trie_cache(
         self, model: Any, cache_key: list[int], prompt_cache: Any
@@ -704,6 +783,7 @@ class SimpleEngine(BaseEngine):
                 draft_model=self._mllm_draft_model_path,
                 draft_kind=self._mllm_draft_kind,
                 draft_block_size=self._mllm_draft_block_size,
+                default_draft_enabled=self._default_mllm_draft,
             )
         else:
             from ..models.llm import MLXLanguageModel
@@ -908,7 +988,11 @@ class SimpleEngine(BaseEngine):
         try:
             from ..text_model_from_vlm import build_text_model
 
-            self._text_model = build_text_model(self._model.model, self._model_name)
+            self._text_model = build_text_model(
+                self._model.model,
+                self._model_name,
+                enable_mtp=self._mtp,
+            )
 
             if self._text_model is None:
                 self._text_tokenizer = None
@@ -926,6 +1010,26 @@ class SimpleEngine(BaseEngine):
                 self._text_tokenizer.eos_token_id = (
                     self._text_tokenizer.convert_tokens_to_ids("<|im_end|>")
                 )
+
+            # Wrap with the full EOS set (tokenizer attrs + config.json +
+            # generation_config.json). Passing the raw HF tokenizer to
+            # mlx_lm.stream_generate makes it wrap with
+            # eos_token_ids={tokenizer.eos_token_id}, dropping turn terminators
+            # declared only in the config EOS list (Gemma 4's <turn|>=106,
+            # <|tool_response>=50) — the model then generates straight through
+            # end-of-turn until max_tokens. The hard-coded Qwen3.5 patch above
+            # is this same bug, fixed per-model. Mirrors MLLMScheduler
+            # stop-token handling on the batched path.
+            from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+            from ..utils.tokenizer import collect_eos_token_ids
+
+            eos_ids = collect_eos_token_ids(self._text_tokenizer)
+            self._text_tokenizer = TokenizerWrapper(
+                self._text_tokenizer,
+                eos_token_ids=eos_ids or None,
+            )
+            logger.info("Text route stop tokens: %s", sorted(eos_ids))
 
             # Probe the derived TextModel's prompt cache for snapshot-safety.
             # Probe args match _stream_generate_text's cache construction so a
@@ -1037,8 +1141,8 @@ class SimpleEngine(BaseEngine):
                     self._generation_abort_hooks[request_id] = on_cancel
                 task = asyncio.create_task(_run_on_generation_worker())
                 try:
-                    return await asyncio.shield(task)
-                except asyncio.CancelledError:
+                    return await shield_task(task)
+                except asyncio.CancelledError as cancelled_error:
                     if on_cancel is not None:
                         try:
                             on_cancel()
@@ -1051,7 +1155,7 @@ class SimpleEngine(BaseEngine):
                         await task
                     except BaseException:
                         pass
-                    raise
+                    raise cancelled_error
                 finally:
                     self._generation_abort_hooks.pop(request_id, None)
                     self._active_requests.pop(request_id, None)
@@ -1122,10 +1226,10 @@ class SimpleEngine(BaseEngine):
 
     async def _track_request_stream(
         self,
-        source_gen: AsyncIterator[GenerationOutput],
+        source_gen: AsyncGenerator[GenerationOutput, None],
         *,
         max_tokens: int = 0,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Yield-through wrapper that records per-request live state and
         final ``prompt_tokens``/``completion_tokens`` counters.
 
@@ -1151,8 +1255,9 @@ class SimpleEngine(BaseEngine):
         consumed inside this method, so there is no value to preserve.
         """
         if _in_tracker.get():
-            async for output in source_gen:
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    yield output
             return
         _in_tracker.set(True)
         request_id = str(uuid.uuid4())
@@ -1177,25 +1282,29 @@ class SimpleEngine(BaseEngine):
         self._active_requests[request_id] = entry
         self._num_running += 1
         try:
-            async for output in source_gen:
-                now = time.time()
-                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-                    last_p = output.prompt_tokens
-                    entry["prompt_tokens"] = last_p
-                if hasattr(output, "completion_tokens") and output.completion_tokens:
-                    if ttft_s is None:
-                        ttft_s = now - start
-                        entry["ttft_s"] = round(ttft_s, 3)
-                        entry["phase"] = "generation"
-                    last_c = output.completion_tokens
-                    entry["completion_tokens"] = last_c
-                entry["elapsed_s"] = round(now - start, 2)
-                if max_tokens > 0:
-                    entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
-                if ttft_s is not None and last_c > 0:
-                    gen_elapsed = max(1e-3, (now - start) - ttft_s)
-                    entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
-                yield output
+            async with aclosing(source_gen):
+                async for output in source_gen:
+                    now = time.time()
+                    if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                        last_p = output.prompt_tokens
+                        entry["prompt_tokens"] = last_p
+                    if (
+                        hasattr(output, "completion_tokens")
+                        and output.completion_tokens
+                    ):
+                        if ttft_s is None:
+                            ttft_s = now - start
+                            entry["ttft_s"] = round(ttft_s, 3)
+                            entry["phase"] = "generation"
+                        last_c = output.completion_tokens
+                        entry["completion_tokens"] = last_c
+                    entry["elapsed_s"] = round(now - start, 2)
+                    if max_tokens > 0:
+                        entry["progress"] = round(min(1.0, last_c / max_tokens), 3)
+                    if ttft_s is not None and last_c > 0:
+                        gen_elapsed = max(1e-3, (now - start) - ttft_s)
+                        entry["tokens_per_second"] = round(last_c / gen_elapsed, 1)
+                    yield output
         finally:
             self._active_requests.pop(request_id, None)
             self._num_running = max(0, self._num_running - 1)
@@ -1215,9 +1324,9 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-generate wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_generate_impl(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -1227,8 +1336,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_generate_impl(
         self,
@@ -1238,7 +1349,7 @@ class SimpleEngine(BaseEngine):
         top_p: float = 0.9,
         stop: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream generation token by token.
 
@@ -1295,7 +1406,7 @@ class SimpleEngine(BaseEngine):
                     use_specprefill = False
 
                 if use_specprefill:
-                    async for output in self._stream_generate_specprefill(
+                    specprefill_stream = self._stream_generate_specprefill(
                         prompt,
                         tokens_list,
                         max_tokens,
@@ -1305,8 +1416,10 @@ class SimpleEngine(BaseEngine):
                         specprefill_keep_pct=specprefill_keep_pct_override,
                         specprefill_backbone_pct=specprefill_backbone_pct_override,
                         **kwargs,
-                    ):
-                        yield output
+                    )
+                    async with aclosing(specprefill_stream):
+                        async for output in specprefill_stream:
+                            yield output
                     return
 
         async with self._acquire_generation_slot(request_id):
@@ -1541,6 +1654,7 @@ class SimpleEngine(BaseEngine):
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                top_p=top_p,
                 tools=template_tools,
                 **kwargs,
             )
@@ -1594,9 +1708,9 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Public stream-chat wrapper with request stats tracking."""
-        async for output in self._track_request_stream(
+        tracked_stream = self._track_request_stream(
             self._stream_chat_impl(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -1608,8 +1722,10 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             ),
             max_tokens=max_tokens,
-        ):
-            yield output
+        )
+        async with aclosing(tracked_stream):
+            async for output in tracked_stream:
+                yield output
 
     async def _stream_chat_impl(
         self,
@@ -1621,7 +1737,7 @@ class SimpleEngine(BaseEngine):
         images: list[str] | None = None,
         videos: list[str] | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """
         Stream chat completion token by token.
 
@@ -1642,7 +1758,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-        mllm_draft_requested = bool(kwargs.pop("mllm_draft", False))
+        mllm_draft_requested = bool(kwargs.pop("mllm_draft", self._default_mllm_draft))
         has_media = has_media_content(messages)
 
         await self._ensure_text_model_for_request(
@@ -1667,23 +1783,25 @@ class SimpleEngine(BaseEngine):
             logger.info("Text-only request → LLM path (MTP=%s)", has_mtp and self._mtp)
             if chat_template_kwargs:
                 kwargs["chat_template_kwargs"] = chat_template_kwargs
-            async for chunk in self._stream_generate_text(
+            text_stream = self._stream_generate_text(
                 messages,
                 max_tokens,
                 temperature,
                 top_p,
                 tools=template_tools,
                 **kwargs,
-            ):
-                yield chunk
+            )
+            async with aclosing(text_stream):
+                async for chunk in text_stream:
+                    yield chunk
             return
 
         def mllm_call_kwargs() -> dict:
             local_kwargs = dict(kwargs)
+            local_kwargs["top_p"] = top_p
             if chat_template_kwargs:
                 local_kwargs["chat_template_kwargs"] = chat_template_kwargs
-            if mllm_draft_requested:
-                local_kwargs["mllm_draft"] = True
+            local_kwargs["mllm_draft"] = mllm_draft_requested
             return local_kwargs
 
         # Build prompt using tokenizer
@@ -1828,6 +1946,7 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
+        safe_messages: list[dict[str, Any]] | None = None
         if hasattr(tokenizer, "apply_chat_template"):
             # Per-request enable_thinking override; default: True unless coder model.
             enable_thinking = kwargs.pop("enable_thinking", None)
@@ -1991,25 +2110,6 @@ class SimpleEngine(BaseEngine):
                 cache_blocking_controls,
             )
 
-        # Normalize messages to plain dicts. The public stream_chat signature
-        # types messages as list[dict], but internal callers (server.py,
-        # tests) sometimes pass Pydantic Message objects directly; those
-        # don't expose a dict-style .get() interface.
-        def _to_msg_dict(m: Any) -> dict[str, Any]:
-            if isinstance(m, dict):
-                return m
-            if hasattr(m, "model_dump"):
-                return m.model_dump()
-            if hasattr(m, "dict"):
-                return m.dict()
-            return {
-                "role": getattr(m, "role", None),
-                "content": getattr(m, "content", ""),
-            }
-
-        messages_for_cache = [_to_msg_dict(m) for m in messages]
-        has_system = any(m.get("role") == "system" for m in messages_for_cache)
-
         if (
             self._prefix_trie_cache_enabled
             and not cache_blocking_controls
@@ -2021,93 +2121,59 @@ class SimpleEngine(BaseEngine):
             full_token_count = len(full_tokens_list)
             prefix_trie_eligible = bool(full_tokens_list)
 
-        if (
-            has_system
-            and not cache_blocking_controls
-            and hasattr(tokenizer, "apply_chat_template")
-        ):
+        system_prefix_text = None
+        if not cache_blocking_controls and hasattr(tokenizer, "apply_chat_template"):
+            system_prefix_text = build_system_prompt_cache_prefix(
+                tokenizer,
+                messages,
+                template_kwargs=template_kwargs,
+                normalized_messages=safe_messages,
+            )
 
-            def _with_user(user_content: str) -> list[dict[str, Any]]:
-                msgs = [dict(m) for m in messages_for_cache]
-                if msgs and msgs[-1].get("role") == "user":
-                    msgs[-1] = {**msgs[-1], "content": user_content}
+        if system_prefix_text is not None:
+            system_hash = hashlib.sha256(system_prefix_text.encode()).hexdigest()[:16]
+
+            add_special = tokenizer.bos_token is None or not prompt.startswith(
+                tokenizer.bos_token
+            )
+            if full_tokens_list is None:
+                full_tokens_list = tokenizer.encode(
+                    prompt, add_special_tokens=add_special
+                )
+            system_tokens_list = tokenizer.encode(
+                system_prefix_text, add_special_tokens=add_special
+            )
+            full_token_count = len(full_tokens_list)
+            system_token_count = len(system_tokens_list)
+
+            if (
+                len(full_tokens_list) > system_token_count
+                and full_tokens_list[:system_token_count] == system_tokens_list
+            ):
+                system_tokens = system_tokens_list
+                suffix_tokens = full_tokens_list[system_token_count:]
+                kv_cache_eligible = True
+                # Read the snapshot reference once. If we promote to HIT,
+                # ``hit_snapshot`` is the exact list the dict lookup returned.
+                candidate = self._system_kv_cache.get(system_hash)
+                if candidate is not None and system_token_count == candidate[1]:
+                    cache_hit = True
+                    hit_snapshot = candidate[0]
+                    logger.info(
+                        "System KV cache HIT (stream_chat): reusing %d "
+                        "tokens, prefilling %d new (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
+                    )
                 else:
-                    msgs = [*msgs, {"role": "user", "content": user_content}]
-                return msgs
-
-            rendered_a: Any = None
-            rendered_b: Any = None
-            try:
-                rendered_a = tokenizer.apply_chat_template(
-                    _with_user("Alpha"), **template_kwargs
-                )
-                rendered_b = tokenizer.apply_chat_template(
-                    _with_user("Bravo"), **template_kwargs
-                )
-            except Exception:
-                pass
-
-            if isinstance(rendered_a, str) and isinstance(rendered_b, str):
-                boundary = 0
-                diverged = False
-                for i in range(min(len(rendered_a), len(rendered_b))):
-                    if rendered_a[i] != rendered_b[i]:
-                        diverged = True
-                        break
-                    boundary = i + 1
-
-                if diverged and boundary >= 16:
-                    system_prefix_text = rendered_a[:boundary]
-                    system_hash = hashlib.sha256(
-                        system_prefix_text.encode()
-                    ).hexdigest()[:16]
-
-                    add_special = tokenizer.bos_token is None or not prompt.startswith(
-                        tokenizer.bos_token
+                    logger.info(
+                        "System KV cache MISS (stream_chat): will "
+                        "prefill %d system + %d suffix tokens (hash=%s)",
+                        system_token_count,
+                        len(suffix_tokens),
+                        system_hash,
                     )
-                    if full_tokens_list is None:
-                        full_tokens_list = tokenizer.encode(
-                            prompt, add_special_tokens=add_special
-                        )
-                    system_tokens_list = tokenizer.encode(
-                        system_prefix_text, add_special_tokens=add_special
-                    )
-                    full_token_count = len(full_tokens_list)
-                    system_token_count = len(system_tokens_list)
-
-                    if (
-                        len(full_tokens_list) > system_token_count
-                        and full_tokens_list[:system_token_count] == system_tokens_list
-                    ):
-                        system_tokens = system_tokens_list
-                        suffix_tokens = full_tokens_list[system_token_count:]
-                        kv_cache_eligible = True
-                        # Read the snapshot reference once. If we promote to
-                        # HIT, ``hit_snapshot`` is the exact list the dict
-                        # lookup just returned. A later concurrent MISS that
-                        # mutates ``self._system_kv_cache`` before our
-                        # serialized worker restores it cannot alias what we
-                        # captured here — dict.get is atomic under the GIL
-                        # and returns a reference to an immutable tuple.
-                        candidate = self._system_kv_cache.get(system_hash)
-                        if candidate is not None and system_token_count == candidate[1]:
-                            cache_hit = True
-                            hit_snapshot = candidate[0]
-                            logger.info(
-                                "System KV cache HIT (stream_chat): reusing %d "
-                                "tokens, prefilling %d new (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
-                        else:
-                            logger.info(
-                                "System KV cache MISS (stream_chat): will "
-                                "prefill %d system + %d suffix tokens (hash=%s)",
-                                system_token_count,
-                                len(suffix_tokens),
-                                system_hash,
-                            )
 
         if kv_cache_eligible or prefix_trie_eligible:
             # Cache-aware path: drive mlx-lm directly with a prompt cache.
@@ -2142,13 +2208,25 @@ class SimpleEngine(BaseEngine):
                 prefix_trie_rest_tokens: list[int] | None = None
                 local_hit_snapshot = hit_snapshot
 
+                # A system snapshot can coexist with a longer conversation-prefix
+                # entry. Preserve the empty-trie fast path, otherwise let them
+                # compete by tokens saved.
+                with self._prefix_trie_cache_lock:
+                    prefix_trie_has_entries = bool(self._prefix_trie_cache)
+
                 # The model, prompt caches, and MLX streams belong to the pinned
                 # generation worker. LRUPromptCache.fetch_nearest_cache deep-copies
                 # cache arrays, so looking up on the event-loop thread would cross
                 # the same ownership boundary that worker pinning protects.
-                if prefix_trie_eligible and not cache_hit:
+                if prefix_trie_eligible and (not cache_hit or prefix_trie_has_entries):
                     trie_cache, trie_rest, trie_tokens_saved = (
-                        self._fetch_prefix_trie_cache(model, cache_key)
+                        self._fetch_prefix_trie_cache(
+                            model,
+                            cache_key,
+                            minimum_tokens_saved=(
+                                system_token_count if cache_hit else 0
+                            ),
+                        )
                     )
                     if trie_cache is not None and trie_rest is not None:
                         prefix_trie_hit = True
@@ -2316,7 +2394,11 @@ class SimpleEngine(BaseEngine):
                         break
             finally:
                 if not producer_task.done():
-                    abort_event.set()
+                    # The terminal chunk can arrive before the worker stores
+                    # the completed prefix. Let normal completion finish;
+                    # only an incomplete stream should abort the producer.
+                    if not finished:
+                        abort_event.set()
                     try:
                         await producer_task
                     except BaseException:
@@ -2326,26 +2408,30 @@ class SimpleEngine(BaseEngine):
                 # Internal fallback to the public stream_generate. The
                 # ``_in_tracker`` context flag prevents double counting
                 # in _track_request_stream.
-                async for output in self.stream_generate(
+                fallback_stream = self.stream_generate(
                     prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     **kwargs,
-                ):
-                    yield output
+                )
+                async with aclosing(fallback_stream):
+                    async for output in fallback_stream:
+                        yield output
             return
 
         # Fallback: no system prefix detected -> original uncached path.
         # Re-entrancy guard in _track_request_stream keeps stats single-counted.
-        async for output in self.stream_generate(
+        fallback_stream = self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             **kwargs,
-        ):
-            yield output
+        )
+        async with aclosing(fallback_stream):
+            async for output in fallback_stream:
+                yield output
 
     async def _stream_generate_specprefill(
         self,
@@ -2358,7 +2444,7 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct: float | None = None,
         specprefill_backbone_pct: float | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """SpecPrefill path for non-MTP models (Nemotron, GPT-OSS, etc).
 
         Scores token importance with the draft model, sparse-prefills the target
@@ -2561,7 +2647,7 @@ class SimpleEngine(BaseEngine):
         top_p: float,
         tools: list | None = None,
         **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    ) -> AsyncGenerator[GenerationOutput, None]:
         """Text-only generation via mlx_lm TextModel.
 
         Used when text-only MLLM routing is active and the request has no media.
@@ -2643,11 +2729,9 @@ class SimpleEngine(BaseEngine):
         prompt_to_send = full_prompt  # Default: send full prompt text
         cache_hit = False
         system_token_count = 0
-        full_token_count = 0
         system_hash = None
         system_tokens = None
         suffix_tokens = None
-        full_tokens_list = None
         cache_blocking_controls = []
         if not self._supports_system_kv_cache:
             cache_blocking_controls.append("non_kv_cache_class")
@@ -2658,6 +2742,18 @@ class SimpleEngine(BaseEngine):
                 "uncached path",
                 cache_blocking_controls,
             )
+
+        # Tokenize the full prompt up front so usage.prompt_tokens is always
+        # reported. Previously this only happened inside the system-KV-cache
+        # branch (which requires a system message AND ChatML markers) or for
+        # specprefill — every other request reported prompt_tokens=0.
+        _add_special = self._text_tokenizer.bos_token is None or not (
+            full_prompt.startswith(self._text_tokenizer.bos_token)
+        )
+        full_tokens_list = self._text_tokenizer.encode(
+            full_prompt, add_special_tokens=_add_special
+        )
+        full_token_count = len(full_tokens_list)
 
         # Extract system messages for caching
         has_system = any(m.get("role") == "system" for m in messages)
@@ -2679,18 +2775,10 @@ class SimpleEngine(BaseEngine):
                     :16
                 ]
 
-                # Tokenize both (matching stream_generate's tokenization logic)
-                tokenizer = self._text_tokenizer
-                add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                    tokenizer.bos_token
-                )
-                full_tokens_list = tokenizer.encode(
-                    full_prompt, add_special_tokens=add_special
-                )
-                full_token_count = len(full_tokens_list)
-
-                system_tokens_list = tokenizer.encode(
-                    system_prefix_text, add_special_tokens=add_special
+                # Tokenize the system prefix (full prompt is tokenized above,
+                # matching stream_generate's tokenization logic)
+                system_tokens_list = self._text_tokenizer.encode(
+                    system_prefix_text, add_special_tokens=_add_special
                 )
                 system_token_count = len(system_tokens_list)
 
@@ -2775,18 +2863,8 @@ class SimpleEngine(BaseEngine):
         else:
             use_specprefill = self._draft_model is not None
 
-        # For specprefill, ensure we have token IDs (not just prompt text)
-        if use_specprefill and suffix_tokens is None and full_tokens_list is None:
-            tokenizer = self._text_tokenizer
-            add_special = tokenizer.bos_token is None or not full_prompt.startswith(
-                tokenizer.bos_token
-            )
-            full_tokens_list = tokenizer.encode(
-                full_prompt, add_special_tokens=add_special
-            )
-            full_token_count = len(full_tokens_list)
-
         # Tokens for specprefill: suffix (if system KV) or full prompt
+        # (full_tokens_list is always populated by the up-front tokenization)
         specprefill_tokens = (
             suffix_tokens if suffix_tokens is not None else full_tokens_list
         )
@@ -3364,6 +3442,17 @@ class SimpleEngine(BaseEngine):
                 "threshold": self._specprefill_threshold,
                 "keep_pct": self._specprefill_keep_pct,
                 "backbone_pct": self._specprefill_backbone_pct,
+            }
+
+        if self._mllm_draft_model_path is not None:
+            stats["mtp"] = {
+                "enabled": True,
+                "implementation": "mlx_vlm_assistant",
+                "draft_model": self._mllm_draft_model_path,
+                "draft_kind": self._mllm_draft_kind,
+                "draft_block_size": self._mllm_draft_block_size,
+                "default_enabled": self._default_mllm_draft,
+                "continuous_batching_supported": True,
             }
 
         # System KV cache stats (LRU over multiple system prefixes)
