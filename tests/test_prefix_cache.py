@@ -601,7 +601,9 @@ class TestMLLMCompletionCacheStore:
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
         request = SimpleNamespace(
-            request_id="saturated", input_ids=mx.array([[1, 2, 3, 4]])
+            request_id="saturated",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
         )
         batch = SimpleNamespace(
             requests=[request],
@@ -633,7 +635,11 @@ class TestMLLMCompletionCacheStore:
         generator._think_suffix_len = 0
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
-        request = SimpleNamespace(request_id="flat", input_ids=mx.array([[1, 2, 3, 4]]))
+        request = SimpleNamespace(
+            request_id="flat",
+            input_ids=mx.array([[1, 2, 3, 4]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[4],
@@ -662,7 +668,11 @@ class TestMLLMCompletionCacheStore:
         generator._think_suffix_len = 0
         generator._prefix_checkpoint_lock = threading.Lock()
         generator._request_prefix_checkpoints = {}
-        request = SimpleNamespace(request_id="plain", input_ids=mx.array([[1, 2, 3]]))
+        request = SimpleNamespace(
+            request_id="plain",
+            input_ids=mx.array([[1, 2, 3]]),
+            is_text_only=True,
+        )
         batch = SimpleNamespace(
             requests=[request],
             num_tokens=[1],
@@ -675,6 +685,17 @@ class TestMLLMCompletionCacheStore:
         _, stored = generator.prefix_cache.store.call_args.args
         assert estimate_kv_cache_memory(stored) > 0
         assert [child.offset for child in stored[0].caches] == [3, 3]
+
+    def test_media_cache_is_never_stored_under_dense_prompt_tokens(self):
+        from vllm_mlx.memory_cache import is_text_only_prefix_cache_request
+
+        request = SimpleNamespace(
+            request_id="media",
+            input_ids=object(),
+            is_text_only=False,
+        )
+
+        assert is_text_only_prefix_cache_request(request) is False
 
     def test_zero_trim_flat_snapshot_does_not_alias_live_cache(self):
         mx = pytest.importorskip("mlx.core")
