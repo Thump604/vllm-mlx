@@ -529,7 +529,7 @@ async def test_stream_emits_sibling_content_and_reasoning_before_terminal_tool_c
         and payload["choices"][0]["delta"].get("content") == "sibling content"
     )
     assert sibling_index < tool_index
-    assert payloads.index(tool_payloads[0]) == sibling_index
+    assert sibling_index < payloads.index(tool_payloads[0])
     emitted_arguments = "".join(
         call.get("function", {}).get("arguments", "") for call in all_calls
     )
