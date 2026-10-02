@@ -1447,6 +1447,9 @@ class MLLMBatchGenerator:
                 cache=cache,
                 **self._language_model_kwargs(request, 0, total),
             )
+            if request.request_id in self._aborted_request_ids:
+                self._aborted_request_ids.discard(request.request_id)
+                raise PrefillAbortedError(request.request_id)
             request.vision_encoded = True
             # Release preprocessed inputs after encoding (issue #442)
             self._release_preprocessed_inputs(request)
