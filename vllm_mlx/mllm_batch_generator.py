@@ -1904,6 +1904,8 @@ class MLLMBatchGenerator:
             sample_logits = logits
             processors = logits_processors_by_request.get(req.request_id)
             if processors:
+                # Processors may mutate their input; preserve reusable prompt logits.
+                sample_logits = logits + 0
                 empty_tokens = mx.array([], dtype=mx.uint32)
                 for processor in processors:
                     sample_logits = processor(empty_tokens, sample_logits)
@@ -2227,6 +2229,7 @@ class MLLMBatchGenerator:
 
                         if (
                             self.prefix_cache is not None
+                            and is_text_only_prefix_cache_request(req)
                             and self._needs_prefill_checkpoint(request_cache)
                             and callable(
                                 getattr(self.prefix_cache, "prepare_store", None)
@@ -3819,6 +3822,8 @@ def install_chunked_prefill_mllm(
 
                 # Apply logits processors for first token
                 if getattr(req, "logits_processors", None):
+                    # Preserve the raw prompt logits stored with the checkpoint.
+                    last_logits = prompt_last_logits + 0
                     empty_tokens = mx.array([], dtype=mx.int32)
                     for processor in req.logits_processors:
                         last_logits = processor(empty_tokens, last_logits)
@@ -3834,8 +3839,8 @@ def install_chunked_prefill_mllm(
                 # request-local processors are applied.
                 if (
                     getattr(batch_gen, "prefix_cache", None) is not None
+                    and is_text_only_prefix_cache_request(req)
                     and batch_gen._needs_prefill_checkpoint(partial["cache"])
-                    and req.input_ids is not None
                 ):
                     full_prompt_entry = batch_gen.prefix_cache.prepare_store(
                         req.input_ids.reshape(-1).tolist(),

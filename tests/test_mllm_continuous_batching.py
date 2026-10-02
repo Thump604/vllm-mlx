@@ -2574,6 +2574,122 @@ class TestPreprocessIdempotent:
             gen._preprocess_request(req)
 
 
+class TestMLLMHybridPrefixCacheIsolation:
+    @pytest.fixture
+    def generator(self, monkeypatch):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchStats
+
+        text_calls = []
+
+        def forward(tokens, cache, marker, scores):
+            cache[0][0] = mx.array([[marker]])
+            values = mx.full((1, 1, tokens.shape[1], 1), float(marker))
+            cache[1].update_and_fetch(values, values + 1)
+            return mx.broadcast_to(mx.array(scores), (1, tokens.shape[1], len(scores)))
+
+        def text_forward(tokens, cache, **kwargs):
+            text_calls.append(tokens.tolist())
+            return forward(tokens, cache, 10, [0.0, 9.0, 8.0])
+
+        def media_forward(tokens, cache, **kwargs):
+            return forward(tokens, cache, 20, [0.0, 0.0, 9.0])
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.max_kv_size = 0
+        gen._stats = MLLMBatchStats()
+        gen._pending_error_responses = []
+        gen._aborted_request_ids = set()
+        gen._prefill_progress = {}
+        gen._prefix_checkpoint_lock = threading.Lock()
+        gen._request_prefix_checkpoints = {}
+        gen.prefill_step_size = 512
+        gen._think_suffix_len = 0
+        gen.language_model = text_forward
+        gen.model = media_forward
+        gen.sampler = lambda scores: mx.argmax(scores, axis=-1)
+        gen.specprefill_enabled = False
+        gen.specprefill_keep_pct = 0.5
+        gen.specprefill_backbone_pct = 0.1
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            gen.model, MemoryCacheConfig(max_memory_mb=1, min_prefix_tokens=1)
+        )
+        # Supply already-tokenized inputs and a tiny model forward while keeping
+        # checkpoint publication, storage, replay, and sampling real.
+        gen._preprocess_request = lambda request: None
+        monkeypatch.setattr(mx, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(
+            "mlx_lm.models.cache.make_prompt_cache",
+            lambda *args, **kwargs: [ArraysCache(1), KVCache()],
+        )
+        return gen, text_calls
+
+    @staticmethod
+    def _request(request_id, processors=None):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id=request_id,
+            prompt="prompt",
+            temperature=0.0,
+            top_p=1.0,
+            logits_processors=processors,
+        )
+        request.input_ids = mx.array([[1, 2, 3, 4]])
+        request.is_text_only = True
+        return request
+
+    @pytest.mark.parametrize("media_field", ["images", "videos", "audio"])
+    def test_media_prefill_does_not_publish_text_prefix(self, generator, media_field):
+        gen, text_calls = generator
+        media_request = self._request("media")
+        setattr(media_request, media_field, ["media payload"])
+        media_request.is_text_only = False
+        media_request.pixel_values = mx.ones((1, 1))
+
+        media_batch = gen._process_prompts([media_request])
+
+        assert media_batch.y.tolist() == [2]
+        assert gen.prefix_cache.get_stats()["entry_count"] == 0
+        assert gen.prefix_cache.fetch_exact_auxiliary([1, 2, 3, 4]) is None
+
+        text_batch = gen._process_prompts([self._request("text")])
+
+        assert text_batch.y.tolist() == [1]
+        assert text_calls == [[[1, 2, 3, 4]]]
+
+    @pytest.mark.parametrize("bias_on_cold_request", [True, False])
+    def test_in_place_processor_does_not_change_replayed_logits(
+        self, generator, bias_on_cold_request
+    ):
+        gen, text_calls = generator
+
+        def mask_preferred_token(tokens, logits):
+            logits[..., 1] = -100.0
+            return logits
+
+        first_processors = [mask_preferred_token] if bias_on_cold_request else None
+        second_processors = None if bias_on_cold_request else [mask_preferred_token]
+        first = gen._process_prompts([self._request("first", first_processors)])
+        second = gen._process_prompts([self._request("second", second_processors)])
+        unbiased = gen._process_prompts([self._request("unbiased")])
+
+        if bias_on_cold_request:
+            assert first.y.tolist() == [2]
+            assert second.y.tolist() == [1]
+        else:
+            assert first.y.tolist() == [1]
+            assert second.y.tolist() == [2]
+        assert unbiased.y.tolist() == [1]
+        assert gen.prefix_cache.fetch_exact_auxiliary([1, 2, 3, 4])[
+            "last_logits"
+        ].tolist() == [[0.0, 9.0, 8.0]]
+        assert text_calls == [[[1, 2, 3, 4]]]
+
+
 class TestChunkedPrefillCacheHandling:
     """Tests for chunked prefill prefix cache handling paths."""
 
@@ -2793,7 +2909,10 @@ class TestChunkedPrefillCacheHandling:
         assert len(abort_responses) == 1
         assert abort_responses[0].request_id == "req-abort"
 
-    def test_interleaved_hybrid_publishes_boundary_checkpoint(self, monkeypatch):
+    @pytest.mark.parametrize("in_place_processor", [False, True])
+    def test_interleaved_hybrid_publishes_boundary_checkpoint(
+        self, monkeypatch, in_place_processor
+    ):
         from mlx_lm.models.cache import ArraysCache, KVCache
 
         from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
@@ -2883,9 +3002,14 @@ class TestChunkedPrefillCacheHandling:
         req.is_text_only = True
         req.temperature = 0.0
         req.top_p = 1.0
-        req.logits_processors = [
-            lambda _tokens, logits: logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
-        ]
+
+        def processor(_tokens, logits):
+            if in_place_processor:
+                logits[:, 1] += 1.0
+                return logits
+            return logits + mx.array([[0.0, 1.0, 0.0, 0.0]])
+
+        req.logits_processors = [processor]
         gen.unprocessed_requests.append(req)
         gen._preprocess_request = lambda _: None
 
