@@ -162,7 +162,12 @@ class QwenToolParser(ToolParser):
             for p_name, p_value in params:
                 # Multiline function calls frame values with one newline on
                 # each side. Preserve all other whitespace as argument data.
-                if p_value.startswith("\n") and p_value.endswith("\n"):
+                # A lone newline cannot serve as both framing delimiters.
+                if (
+                    len(p_value) >= 2
+                    and p_value.startswith("\n")
+                    and p_value.endswith("\n")
+                ):
                     p_value = p_value[1:-1]
                 arguments[p_name.strip()] = _parse_param_value(p_value)
             tool_calls.append(

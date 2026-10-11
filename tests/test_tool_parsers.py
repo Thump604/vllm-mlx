@@ -2073,6 +2073,12 @@ class TestQwenFunctionFormat:
             ("a\nb", "a\nb"),
             ("\nDIRECT_OK\n\n", "DIRECT_OK\n"),
             ("\n  padded  \n", "  padded  "),
+            ("", ""),
+            ("\n", "\n"),
+            ("\n\n", ""),
+            ("\n\n\n", "\n"),
+            ("\nDIRECT_OK", "\nDIRECT_OK"),
+            ("\t padded\t", "\t padded\t"),
         ],
     )
     def test_parameter_preserves_significant_whitespace(
@@ -2121,6 +2127,34 @@ class TestQwenFunctionFormat:
         assert json.loads(calls[0]["function"]["arguments"]) == {
             "content": "DIRECT_OK\n"
         }
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [("\n", "\n"), ("\n\n", ""), ("\n\n\n", "\n"), ("", "")],
+    )
+    @pytest.mark.parametrize("chunk_size", [1, 7])
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_streaming_parameter_preserves_newline_only_value(
+        self, parser, raw_value, expected, chunk_size, wrapped
+    ):
+        """A single newline cannot serve as both framing delimiters (#808)."""
+        output = (
+            f"<function=write><parameter=content>{raw_value}</parameter></function>"
+        )
+        if wrapped:
+            output = f"<tool_call>\n{output}\n</tool_call>"
+
+        text = ""
+        calls = []
+        for offset in range(0, len(output), chunk_size):
+            chunk = output[offset : offset + chunk_size]
+            previous = text
+            text += chunk
+            event = parser.extract_tool_calls_streaming(previous, text, chunk)
+            calls.extend((event or {}).get("tool_calls", []))
+
+        assert len(calls) == 1
+        assert json.loads(calls[0]["function"]["arguments"]) == {"content": expected}
 
 
 class TestQwenMixedFormatAndTruncation:
