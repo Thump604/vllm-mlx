@@ -3379,6 +3379,71 @@ class TestSimpleEngineStop:
         assert engine._loaded is False
 
 
+class TestSimpleEngineImplicitThinking:
+    """The server's injected-<think> probe must see SimpleEngine's prompt (#834)."""
+
+    def _detect(self, rendered):
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("glm-4.7-flash")
+        tokenizer = MagicMock()
+        tokenizer.chat_template = "{{ messages }}"
+        tokenizer.apply_chat_template.return_value = rendered
+        engine._model = SimpleNamespace(tokenizer=tokenizer)
+        engine._loaded = True
+
+        server._implicit_thinking_cache.clear()
+        return server._detect_implicit_thinking(engine, None)
+
+    def test_template_that_opens_think_is_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|><think>") is True
+
+    def test_template_without_think_is_not_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|>") is False
+
+    @pytest.mark.parametrize("enable_thinking", [True, False])
+    def test_tokenized_request_keeps_probe_textual(self, enable_thinking):
+        import vllm_mlx.server as server
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=("hi<assistant>{% if enable_thinking %}<think>{% endif %}"),
+        )
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("glm-4.7-flash")
+        engine._model = SimpleNamespace(tokenizer=tokenizer)
+        engine._loaded = True
+        template_kwargs = {"tokenize": True, "return_dict": False}
+
+        server._implicit_thinking_cache.clear()
+        assert (
+            server._detect_implicit_thinking(
+                engine,
+                {
+                    "chat_template_kwargs": template_kwargs,
+                    "enable_thinking": enable_thinking,
+                },
+            )
+            is enable_thinking
+        )
+        assert template_kwargs == {"tokenize": True, "return_dict": False}
+        prompt, _, _ = engine._render_chat_prompt(
+            [{"role": "user", "content": "hi"}],
+            None,
+            template_kwargs,
+            enable_thinking,
+        )
+        assert prompt == [0]
+
+
 class TestModelIdentityVsLoadPath:
     """The CLI hands engines a repo id (identity) and a resolved snapshot
     (load path). Loading and config.json reads use the snapshot; nothing
