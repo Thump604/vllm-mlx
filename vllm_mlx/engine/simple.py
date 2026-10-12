@@ -1713,9 +1713,12 @@ class SimpleEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         enable_thinking: bool | None = None,
     ) -> str:
-        """Render the text-model prompt that stream_chat sends."""
+        """Render a textual prompt for the server's reasoning probe."""
+        probe_kwargs = dict(chat_template_kwargs or {})
+        # The probe inspects text even when generation consumes token IDs.
+        probe_kwargs.pop("tokenize", None)
         prompt, _, _ = self._render_chat_prompt(
-            messages, tools, chat_template_kwargs or {}, enable_thinking
+            messages, tools, probe_kwargs, enable_thinking
         )
         return prompt
 
