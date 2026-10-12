@@ -9,12 +9,19 @@ with no error, until subprocess.run's timeout fires and the audio is
 silently dropped. Both the ffmpeg flag and the stdin redirect are asserted
 so a refactor cannot quietly reintroduce either half.
 
-Runs without MLX: nothing here needs a model.
+Also pinned here: an auto-extracted soundtrack gets its own template audio
+placeholder, and across messages the audio list follows message order, so
+each audio feature binds to its own message's slot (chat and streaming).
+
+Runs without MLX: nothing here needs a model; mlx-vlm is stubbed.
 """
 
 from __future__ import annotations
 
 import subprocess
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
 from vllm_mlx.models import mllm
@@ -148,3 +155,133 @@ def test_explicit_audio_part_still_renders_independently():
     ]
     parts = _parts(msg, frames={}, audio={})
     assert parts == ["audio", "text"]
+
+
+# --- audio order across messages (review on #807) --------------------------
+#
+# The chat template renders audio placeholders message by message, so the
+# audio list handed to mlx-vlm must follow message order. Explicit audio is
+# collected first and a video soundtrack is added afterwards, so flattening by
+# dict insertion order put a later message's explicit audio in front of an
+# earlier message's soundtrack: each feature bound to the other message's slot.
+
+VIDEO_THEN_AUDIO = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "watch this"},
+            {"type": "video_url", "video_url": {"url": "clip.mov"}},
+        ],
+    },
+    {"role": "assistant", "content": "ok"},
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "now listen"},
+            {"type": "audio_url", "audio_url": {"url": "note.wav"}},
+        ],
+    },
+]
+SOUNDTRACK = "soundtrack-of-clip.mov"
+EXPECTED_BY_MESSAGE = {0: SOUNDTRACK, 2: "note.wav"}
+
+
+def test_audio_inputs_follow_message_order():
+    explicit = {2: ["note.wav"]}
+    extracted = {0: [SOUNDTRACK]}
+    assert mllm._audio_inputs_in_message_order(explicit, extracted) == [
+        SOUNDTRACK,
+        "note.wav",
+    ]
+    # Explicit audio first in the conversation is unaffected.
+    assert mllm._audio_inputs_in_message_order({0: ["a.wav"]}, {3: ["s"]}) == [
+        "a.wav",
+        "s",
+    ]
+
+
+def _slot_owners(chat_messages: list[dict]) -> list[int]:
+    """Message index of every audio placeholder, in rendered order."""
+    owners = []
+    for msg_idx, message in enumerate(chat_messages):
+        content = message.get("content")
+        if isinstance(content, list):
+            owners.extend(
+                msg_idx
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "audio"
+            )
+    return owners
+
+
+@pytest.fixture
+def omni_model(monkeypatch):
+    """An omni model on the frames fallback, with media I/O stubbed out."""
+    model = mllm.MLXMultimodalLM(model_name="local-omni-test")
+    model._loaded = True
+    model.model = object()
+    # chat() tokenizes the prompt for its prefix-cache lookup.
+    model.processor = SimpleNamespace(encode=lambda text: [1])
+    model._cache_manager = None
+    model._video_native = False
+    model._video_native_with_audio = True
+    model._prepare_video = lambda video, **kwargs: ["frame"]
+    model._prepare_audio = lambda inputs: list(inputs)
+
+    monkeypatch.setattr(mllm, "process_video_input", lambda v: v)
+    monkeypatch.setattr(
+        mllm, "extract_audio_from_video", lambda path: f"soundtrack-of-{path}"
+    )
+
+    seen: dict = {}
+
+    def fake_get_chat_template(processor, chat_messages, **kwargs):
+        seen["chat_messages"] = chat_messages
+        return "prompt"
+
+    class Chunk:
+        text = "x"
+        prompt_tokens = 1
+
+    def fake_generate(*args, **kwargs):
+        seen["audio"] = kwargs.get("audio")
+        return SimpleNamespace(text="x", prompt_tokens=1, generation_tokens=1)
+
+    def fake_stream_generate(*args, **kwargs):
+        seen["audio"] = kwargs.get("audio")
+        yield Chunk()
+
+    fake_mlx_vlm = ModuleType("mlx_vlm")
+    fake_mlx_vlm.generate = fake_generate
+    fake_mlx_vlm.stream_generate = fake_stream_generate
+    fake_prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    fake_prompt_utils.get_chat_template = fake_get_chat_template
+    fake_models = ModuleType("mlx_vlm.models")
+    fake_cache = ModuleType("mlx_vlm.models.cache")
+    fake_cache.make_prompt_cache = lambda *args, **kwargs: None
+    fake_models.cache = fake_cache
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_mlx_vlm)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", fake_prompt_utils)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models", fake_models)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
+    return model, seen
+
+
+def _assert_each_slot_gets_its_own_audio(seen: dict) -> None:
+    owners = _slot_owners(seen["chat_messages"])
+    assert owners == [0, 2]
+    assert seen["audio"] == [EXPECTED_BY_MESSAGE[i] for i in owners]
+
+
+def test_chat_binds_soundtrack_and_explicit_audio_to_their_messages(omni_model):
+    model, seen = omni_model
+    model.chat(messages=VIDEO_THEN_AUDIO, max_tokens=4)
+    _assert_each_slot_gets_its_own_audio(seen)
+
+
+def test_stream_chat_binds_soundtrack_and_explicit_audio_to_their_messages(
+    omni_model,
+):
+    model, seen = omni_model
+    list(model.stream_chat(messages=VIDEO_THEN_AUDIO, max_tokens=4))
+    _assert_each_slot_gets_its_own_audio(seen)

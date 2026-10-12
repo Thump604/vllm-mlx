@@ -282,6 +282,29 @@ def _normalize_mllm_tool_calls(tool_calls: list) -> list:
     return normalized[0].get("tool_calls", plain_calls)
 
 
+def _audio_inputs_in_message_order(
+    explicit_audio: dict[int, list[str]],
+    extracted_audio: dict[int, list[str]],
+) -> list[str]:
+    """Flatten audio inputs in the order the chat template renders their slots.
+
+    ``_build_mllm_chat_messages`` emits audio placeholders message by message,
+    so the audio list handed to the processor must follow message order too.
+    Iterating the dicts instead follows insertion order: explicit audio is
+    collected first and a video soundtrack's key is appended later, so an
+    earlier video message's soundtrack would land after a later message's
+    explicit audio and each feature would bind to the other message's slot.
+
+    Within one message the two never coexist: a video's soundtrack is only
+    extracted when that message carries no explicit audio.
+    """
+    ordered: list[str] = []
+    for msg_idx in sorted(explicit_audio.keys() | extracted_audio.keys()):
+        ordered.extend(explicit_audio.get(msg_idx, ()))
+        ordered.extend(extracted_audio.get(msg_idx, ()))
+    return ordered
+
+
 def _build_mllm_chat_messages(
     messages: list[dict],
     *,
@@ -2433,7 +2456,6 @@ class MLXMultimodalLM:
         _msg_video_frame_counts: dict[int, int] = {}
         _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
-        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
@@ -2471,13 +2493,9 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        # Merge auto-extracted audio into the per-message audio map so the
-        # chat-template token-counting loop downstream sees the right count.
-        for msg_idx, extra in _msg_extra_audio.items():
-            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
-
-        for aud_inputs in _msg_audio_inputs.values():
-            all_audio_inputs.extend(aud_inputs)
+        all_audio_inputs = _audio_inputs_in_message_order(
+            _msg_audio_inputs, _msg_extra_audio
+        )
 
         chat_messages = _build_mllm_chat_messages(
             messages,
@@ -2845,7 +2863,6 @@ class MLXMultimodalLM:
         _msg_video_frame_counts: dict[int, int] = {}
         _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
-        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
@@ -2878,11 +2895,9 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        for msg_idx, extra in _msg_extra_audio.items():
-            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
-
-        for aud_inputs in _msg_audio_inputs.values():
-            all_audio_inputs.extend(aud_inputs)
+        all_audio_inputs = _audio_inputs_in_message_order(
+            _msg_audio_inputs, _msg_extra_audio
+        )
 
         chat_messages = _build_mllm_chat_messages(
             messages,
