@@ -775,6 +775,13 @@ def _configure_chunked_prefill(
         )
     )
     if native_api:
+        if prompt_cache_save is not None:
+            logger.warning(
+                "Prompt cache save disabled: prompt-cache-save is "
+                "unavailable on modern mlx-lm (native BatchGenerator has "
+                "no safe extension point for save callbacks). Continuing "
+                "with chunked prefill on native step size."
+            )
         # Native mlx-lm chunking processes at most this many prompt tokens per
         # scheduler turn and returns to generation between turns. Its internal
         # API has no safe extension point for the legacy prompt-cache and
@@ -1578,6 +1585,13 @@ class Scheduler:
         if not need_chunked and prompt_cache_cb is not None:
             if hasattr(bg, "_process_prompts"):
                 _install_prompt_cache_save(bg, prompt_cache_cb)
+            else:
+                logger.warning(
+                    "Prompt cache save disabled: prompt-cache-save is "
+                    "unavailable on modern mlx-lm (BatchGenerator lacks "
+                    "the _process_prompts hook). Continuing without "
+                    "prompt cache save."
+                )
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
@@ -1619,12 +1633,18 @@ class Scheduler:
                 return
 
             prompt_tokens = list(request.prompt_token_ids)
+            from .memory_cache import _is_cache_layer_trimmable, _trim_cache_offset
+
+            if any(not _is_cache_layer_trimmable(lc) for lc in extracted_cache):
+                logger.debug(
+                    "[prompt_cache_save] skip store: non-trimmable "
+                    f"cache layer in stack request={request_id[:12]}"
+                )
+                return
             # Trim cache by 1 so the stored KV has offset = N-1.
             # On exact fetch the scheduler sends the last prompt token
             # for reprocessing (lines 1872-1877).  Without this trim
             # the last token would be placed at position N instead of N-1.
-            from .memory_cache import _trim_cache_offset
-
             trimmed_cache = _trim_cache_offset(extracted_cache, 1)
             _t0 = _time.monotonic()
             # evict_prefixes=False: keep mid-prefill boundary entries so
@@ -1683,6 +1703,15 @@ class Scheduler:
             # Reconstruct cache objects (directly usable by BatchGenerator)
             reconstructed = self._reconstruct_cache_from_states(extracted)
             if not reconstructed:
+                return
+
+            from .memory_cache import _is_cache_layer_trimmable
+
+            if any(not _is_cache_layer_trimmable(lc) for lc in reconstructed):
+                logger.debug(
+                    "[mid_prefill_cache] skip store: non-trimmable "
+                    f"cache layer in stack request={request_id[:12]}"
+                )
                 return
 
             prefix_tokens = list(request.prompt_token_ids[:total_cached])
