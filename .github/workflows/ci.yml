@@ -78,7 +78,10 @@ jobs:
             tests/test_streaming_json_encoder.py \
             tests/test_native_tool_format.py \
             tests/test_memory_cache.py \
+            tests/test_memory_cache_trim_failclosed.py \
             tests/test_prefix_cache.py \
+            tests/test_prefix_cache_trim_failclosed.py \
+            tests/test_scheduler_prompt_save_failclosed.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_media_specprefill.py \
             tests/test_batched_engine_mllm_config.py \
@@ -246,6 +249,7 @@ jobs:
             tests/test_lifecycle_cli.py \
             tests/test_lifecycle_server.py \
             tests/test_outlines_backend_admission.py \
+            tests/test_generation_error_response.py \
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
