@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -36,6 +37,53 @@ from .chat_template_safety import normalize_messages_for_chat_template
 logger = logging.getLogger(__name__)
 
 
+_MLX_CACHE_SUFFIX_MULTIPLIERS = {
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024**2,
+    "gb": 1024**3,
+    "tb": 1024**4,
+}
+
+
+class _NonPositiveLimitError(ValueError):
+    """Non-positive MLX_BUFFER_CACHE_LIMIT value."""
+
+    pass
+
+
+def _parse_mlx_buffer_cache_limit(raw: str) -> int:
+    """Parse MLX_BUFFER_CACHE_LIMIT; bare values integer-only, suffixed may be float."""
+    if not isinstance(raw, str):
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    text = raw.strip()
+    if not text:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*([A-Za-z]*)", text)
+    if match is None:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    number_text, suffix = match.groups()
+    suffix = suffix.lower()
+    if not suffix:
+        try:
+            limit = int(number_text)
+        except ValueError:
+            raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}") from None
+        if limit <= 0:
+            raise _NonPositiveLimitError(f"non-positive MLX_BUFFER_CACHE_LIMIT={raw!r}")
+        return limit
+    if suffix not in _MLX_CACHE_SUFFIX_MULTIPLIERS:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    number = float(number_text)
+    try:
+        limit = int(number * _MLX_CACHE_SUFFIX_MULTIPLIERS[suffix])
+    except OverflowError:
+        raise ValueError(f"invalid MLX_BUFFER_CACHE_LIMIT={raw!r}") from None
+    if limit <= 0:
+        raise _NonPositiveLimitError(f"non-positive MLX_BUFFER_CACHE_LIMIT={raw!r}")
+    return limit
+
+
 def _resolve_metal_buffer_cache_limit(
     max_recommended: int,
     gpu_memory_utilization: float,
@@ -44,20 +92,21 @@ def _resolve_metal_buffer_cache_limit(
     env_limit = os.environ.get("MLX_BUFFER_CACHE_LIMIT")
     if env_limit:
         try:
-            limit = int(env_limit)
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; using device-scaled cap",
-                env_limit,
-            )
-        else:
-            if limit > 0:
-                return limit, "MLX_BUFFER_CACHE_LIMIT"
+            limit = _parse_mlx_buffer_cache_limit(env_limit)
+        except _NonPositiveLimitError:
             logger.warning(
                 "Ignoring non-positive MLX_BUFFER_CACHE_LIMIT=%r; "
                 "using device-scaled cap",
                 env_limit,
             )
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MLX_BUFFER_CACHE_LIMIT=%r; "
+                "using device-scaled cap",
+                env_limit,
+            )
+        else:
+            return limit, "MLX_BUFFER_CACHE_LIMIT"
 
     return int(max_recommended * gpu_memory_utilization), "device-scaled"
 
@@ -133,12 +182,15 @@ class BatchedEngine(BaseEngine):
         specprefill_keep_pct: float = 0.3,
         specprefill_backbone_pct: float = 0.0,
         specprefill_draft_model: str | None = None,
+        model_path: str | None = None,
     ):
         """
         Initialize the batched engine.
 
         Args:
-            model_name: HuggingFace model name or local path
+            model_name: HuggingFace model name or local path. This is the
+                model's identity: name-based defaults (thinking, Qwen3 EOS)
+                key on it.
             trust_remote_code: Whether to trust remote code
             scheduler_config: Optional scheduler configuration
             stream_interval: Tokens to batch before streaming (1=every token)
@@ -152,8 +204,12 @@ class BatchedEngine(BaseEngine):
             specprefill_keep_pct: Fraction of prompt chunks to retain
             specprefill_backbone_pct: Fraction reserved for uniform coverage
             specprefill_draft_model: Small text model used to score prompt tokens
+            model_path: Already-resolved local snapshot to load ``model_name``
+                from. Used only for loading and config.json inspection, never
+                for name heuristics. Defaults to ``model_name``.
         """
         self._model_name = model_name
+        self._model_path = model_path or model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._scheduler_config = scheduler_config
@@ -169,7 +225,7 @@ class BatchedEngine(BaseEngine):
         self._specprefill_backbone_pct = specprefill_backbone_pct
         self._specprefill_draft_model_path = specprefill_draft_model
         self._specprefill_draft_model = None
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(self._model_path)
 
         self._model = None
         self._processor = None  # For MLLM
@@ -316,7 +372,7 @@ class BatchedEngine(BaseEngine):
         if self._model is None or self._processor is None:
             max_kv_size = getattr(self._scheduler_config, "max_kv_size", 0)
             self._mllm_instance = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 max_kv_size=max_kv_size,
                 draft_model=self._mllm_draft_model,
@@ -511,7 +567,7 @@ class BatchedEngine(BaseEngine):
         from mlx_lm.utils import _download
 
         model = self._model
-        model_path = Path(_download(self._model_name))
+        model_path = Path(_download(self._model_path))
         config_path = model_path / "config.json"
         if not config_path.exists():
             logger.warning("[MTP-MLLM] No config.json found, skipping MTP")
@@ -566,8 +622,9 @@ class BatchedEngine(BaseEngine):
             tokenizer_config["eos_token"] = "<|im_end|>"
 
         self._model, self._tokenizer = load_model_with_fallback(
-            self._model_name,
+            self._model_path,
             tokenizer_config=tokenizer_config,
+            model_id=self._model_name,
         )
 
         # Validate MTP support if enabled
@@ -653,6 +710,16 @@ class BatchedEngine(BaseEngine):
         )
 
         await self._engine.engine.start()
+
+    def is_healthy(self) -> bool:
+        """Check whether the underlying scheduler/engine loop is still alive."""
+        if not self._loaded:
+            return True
+        if self._mllm_scheduler is not None and not self._mllm_scheduler.is_healthy():
+            return False
+        if self._engine is not None and not self._engine.engine.is_healthy():
+            return False
+        return True
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -911,6 +978,8 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            mtp_drafts=output.mtp_drafts,
+            mtp_accepted=output.mtp_accepted,
         )
 
     async def stream_generate(
@@ -1012,6 +1081,8 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                mtp_drafts=output.mtp_drafts,
+                mtp_accepted=output.mtp_accepted,
             )
 
     async def chat(

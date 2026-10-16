@@ -78,7 +78,10 @@ jobs:
             tests/test_streaming_json_encoder.py \
             tests/test_native_tool_format.py \
             tests/test_memory_cache.py \
+            tests/test_memory_cache_trim_failclosed.py \
             tests/test_prefix_cache.py \
+            tests/test_prefix_cache_trim_failclosed.py \
+            tests/test_scheduler_prompt_save_failclosed.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_media_specprefill.py \
             tests/test_batched_engine_mllm_config.py \
@@ -88,6 +91,9 @@ jobs:
             tests/test_request.py \
             tests/test_anthropic_models.py \
             tests/test_anthropic_adapter.py \
+            tests/test_anthropic_adapter_images.py \
+            tests/test_mllm_assistant_images.py \
+            tests/test_mllm_message_ordering.py \
             tests/test_anthropic_adapter_canonicalization.py \
             tests/test_dependency_floors.py \
             tests/test_ssd_cache_shutdown.py \
@@ -212,13 +218,16 @@ jobs:
             tests/test_server.py \
             tests/test_metrics.py \
             tests/test_paged_cache.py \
+            tests/test_prefix_cache.py \
             tests/test_prefix_cache_untrimmable.py \
             tests/test_scheduler_max_kv_size.py \
             tests/test_qwen35_mtp_patch.py \
+            tests/test_llm_mtp_per_request_counters.py \
             tests/test_batched_engine_mllm_config.py \
             tests/test_mllm_continuous_batching.py \
             tests/test_mllm_cache.py \
             tests/test_mllm_sampling.py \
+            tests/test_mllm_assistant_images.py \
             tests/test_mllm_steps_executed_stat.py \
             tests/test_metrics.py \
             tests/test_optimizations.py \
@@ -236,11 +245,15 @@ jobs:
             tests/test_mllm_ssd_spill.py \
             tests/test_ssd_cache.py \
             tests/test_ssd_shutdown_wiring.py \
+            tests/test_batch_reshuffle_metadata.py \
             tests/test_lifecycle_cli.py \
             tests/test_lifecycle_server.py \
+            tests/test_outlines_backend_admission.py \
+            tests/test_generation_error_response.py \
             tests/test_normalize_messages.py \
             tests/test_responses_api.py \
             tests/test_thinking_aware_processor.py \
+            tests/test_tool_argument_coercion.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
             tests/test_harmony_render.py \

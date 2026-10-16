@@ -247,7 +247,9 @@ def _build_ordered_mllm_message_content(
             video_frame_count=remaining_video_frames,
         )
 
-    if role == "assistant":
+    # Text-only assistant turns stay strings for template compatibility, but
+    # image turns must retain their placeholders alongside the image payloads.
+    if role == "assistant" and not any(part["type"] == "image" for part in built_parts):
         text = "".join(text_parts)
         return text, bool(text)
 

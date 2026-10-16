@@ -265,6 +265,14 @@ class TestCacheEntry:
         assert entry.cache is cache
         assert entry.memory_bytes == 200
 
+    def test_create_entry_accounts_for_auxiliary_arrays(self):
+        cache = [MockKVCache(100, 100)]
+        entry = _CacheEntry.create(
+            [1, 2, 3], cache, auxiliary={"last_logits": MockArray(64)}
+        )
+
+        assert entry.memory_bytes == 264
+
 
 class TestMemoryAwarePrefixCache:
     """Tests for MemoryAwarePrefixCache."""
@@ -298,6 +306,35 @@ class TestMemoryAwarePrefixCache:
         assert len(cache) == 0
         assert cache.memory_limit_mb == 100.0
 
+    def test_prepare_store_rejects_auxiliary_over_memory_limit(
+        self, small_cache, mock_kv_cache
+    ):
+        entry = small_cache.prepare_store(
+            [1, 2, 3],
+            mock_kv_cache(512 * 1024),
+            auxiliary={"last_logits": MockArray(600 * 1024)},
+        )
+
+        assert entry is None
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
+    def test_commit_rejects_oversized_prepared_entry(self, small_cache):
+        entry = _CacheEntry(
+            tokens=(1, 2, 3),
+            cache=[],
+            memory_bytes=2 * 1024 * 1024,
+            auxiliary=None,
+        )
+
+        assert small_cache.commit_prepared(entry) is False
+        assert len(small_cache) == 0
+        stats = small_cache.get_stats()
+        assert stats["store_rejections"] == 1
+        assert stats["current_memory_mb"] == 0
+
     def test_store_and_fetch_exact_match(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3, 4, 5]
         kv = mock_kv_cache(1000)
@@ -315,6 +352,85 @@ class TestMemoryAwarePrefixCache:
         assert result[0].keys is kv[0].keys
         assert result[0].values is kv[0].values
         assert remaining == []
+
+    def test_prepared_kv_entry_is_not_contaminated_by_live_suffix(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        KVCache = pytest.importorskip("mlx_lm.models.cache").KVCache
+
+        live = KVCache()
+        first_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        first_values = mx.array([[[[11.0], [12.0], [13.0]]]])
+        live.update_and_fetch(first_keys, first_values)
+
+        prepared = small_cache.prepare_store([1, 2, 3], [live])
+        assert prepared is not None
+
+        live.update_and_fetch(
+            mx.array([[[[4.0], [5.0]]]]),
+            mx.array([[[[14.0], [15.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0].offset == 3
+        assert stored[0].keys.shape[2] == 3
+        assert stored[0].keys.tolist() == first_keys.tolist()
+        assert stored[0].values.tolist() == first_values.tolist()
+
+    def test_prepared_hybrid_entry_owns_arrays_and_state_containers(self, small_cache):
+        mx = pytest.importorskip("mlx.core")
+        cache_module = pytest.importorskip("mlx_lm.models.cache")
+
+        live_arrays = cache_module.ArraysCache(size=1)
+        prompt_state = mx.array([[1.0, 2.0, 3.0]])
+        live_arrays[0] = prompt_state
+        live_kv = cache_module.KVCache()
+        prompt_keys = mx.array([[[[1.0], [2.0], [3.0]]]])
+        prompt_values = prompt_keys + 10
+        live_kv.update_and_fetch(prompt_keys, prompt_values)
+
+        prepared = small_cache.prepare_store(
+            [1, 2, 3],
+            [live_arrays, live_kv],
+        )
+        assert prepared is not None
+
+        live_arrays[0] = mx.array([[9.0, 9.0, 9.0]])
+        live_kv.update_and_fetch(
+            mx.array([[[[4.0]]]]),
+            mx.array([[[[14.0]]]]),
+        )
+        assert small_cache.commit_prepared(prepared)
+
+        stored, remaining = small_cache.fetch([1, 2, 3])
+        assert remaining == []
+        assert stored[0] is not live_arrays
+        assert stored[0].state is not live_arrays.state
+        assert stored[0][0] is not prompt_state
+        assert stored[0][0].tolist() == [[1.0, 2.0, 3.0]]
+        assert stored[1] is not live_kv
+        assert stored[1].keys is not live_kv.keys
+        assert stored[1].keys.tolist() == prompt_keys.tolist()
+        assert stored[1].values.tolist() == prompt_values.tolist()
+
+    def test_commit_guard_rejects_before_prefix_eviction(
+        self, small_cache, mock_kv_cache
+    ):
+        base = [1, 2]
+        candidate = [1, 2, 3]
+        assert small_cache.store(base, mock_kv_cache(1000))
+
+        prepared = small_cache.prepare_store(candidate, mock_kv_cache(1000))
+        assert prepared is not None
+        assert not small_cache.commit_prepared(
+            prepared,
+            commit_lock=threading.Lock(),
+            commit_guard=lambda: False,
+        )
+
+        assert tuple(base) in small_cache._entries
+        assert tuple(candidate) not in small_cache._entries
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
         cache = MemoryAwarePrefixCache(
@@ -654,3 +770,397 @@ def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
     ):
         assert cache.load_from_disk(str(tmp_path)) == 0
     assert "version mismatch: disk=3 current=4" in caplog.text
+
+
+def test_load_rejects_same_arch_different_snapshot_or_quant(tmp_path):
+    """Same arch fingerprint but different snapshot/quant must be rejected."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+    # Live provenance differs from what is on disk.
+    cache._model_revision = "bbb"
+    cache._quant_signature = "live-quant"
+
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": cache._model_fingerprint,
+                "model_revision": "aaa",
+                "quant_signature": "disk-quant",
+                "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+            }
+        )
+    )
+    (tmp_path / "entry_0.safetensors").write_bytes(b"")
+    with open(tmp_path / "entry_0_tokens.bin", "wb") as f:
+        _array.array("i", [1, 2, 3]).tofile(f)
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: MagicMock()  # noqa: E731
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 0
+
+
+def test_unknown_hash_divergence_for_non_snapshot_paths():
+    """Different non-snapshot paths yield different provenance hashes."""
+    from vllm_mlx.memory_cache import _provenance_hash, _resolve_model_revision
+
+    rev_a = _resolve_model_revision("some/local/path-a")
+    rev_b = _resolve_model_revision("some/local/path-b")
+    assert rev_a.startswith("unknown-")
+    assert rev_b.startswith("unknown-")
+    assert rev_a != rev_b
+    assert _provenance_hash(rev_a, "", "rt") != _provenance_hash(rev_b, "", "rt")
+
+
+def test_save_load_roundtrip_through_provenance_subdir(tmp_path):
+    """Save writes the provenance subdir and load reads it back."""
+    import sys
+    import types
+
+    model = MagicMock()
+    config = MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    cache = MemoryAwarePrefixCache(model, config)
+    assert cache.store([1, 2, 3], [MockKVCache(500, 500)]) is True
+
+    def _fake_save(path, data, metadata=None):
+        with open(path, "wb") as f:
+            f.write(b"data")
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.save_prompt_cache = _fake_save
+    fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        assert cache.save_to_disk(str(tmp_path)) is True
+        other = MemoryAwarePrefixCache(
+            model, MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+        )
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert other.load_from_disk(str(tmp_path)) == 1
+    assert [1, 2, 3] in other
+
+
+def test_both_dirs_present_prefers_provenance_subdir(tmp_path):
+    """The provenance subdir index wins when both indexes exist."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    model = MagicMock()
+    config = MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    cache = MemoryAwarePrefixCache(model, config)
+    real_dir = tmp_path / cache._provenance_hash
+    real_dir.mkdir(parents=True)
+
+    def _write_index(base, tokens):
+        (base / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": _CACHE_PERSIST_VERSION,
+                    "model_fingerprint": cache._model_fingerprint,
+                    "model_revision": cache._model_revision,
+                    "quant_signature": cache._quant_signature,
+                    "runtime_versions": cache._runtime_versions,
+                    "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+                }
+            )
+        )
+        (base / "entry_0.safetensors").write_bytes(b"")
+        with open(base / "entry_0_tokens.bin", "wb") as f:
+            _array.array("i", tokens).tofile(f)
+
+    _write_index(real_dir, [1, 2, 3])
+    _write_index(tmp_path, [7, 8, 9])
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 1
+    assert [1, 2, 3] in cache
+    assert [7, 8, 9] not in cache
+
+
+def test_empty_quant_signature_matches_empty(tmp_path):
+    """Empty disk quant matches empty live quant and loads."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+    assert cache._quant_signature == ""
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": cache._model_fingerprint,
+                "model_revision": cache._model_revision,
+                "quant_signature": "",
+                "runtime_versions": cache._runtime_versions,
+                "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+            }
+        )
+    )
+    (tmp_path / "entry_0.safetensors").write_bytes(b"")
+    with open(tmp_path / "entry_0_tokens.bin", "wb") as f:
+        _array.array("i", [1, 2, 3]).tofile(f)
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 1
+    assert [1, 2, 3] in cache
+
+
+def test_load_warns_on_revision_mismatch(tmp_path, caplog):
+    """A stale revision is rejected with a revision warning."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+    cache._model_revision = "bbb"
+    cache._quant_signature = "live-quant"
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": cache._model_fingerprint,
+                "model_revision": "aaa",
+                "quant_signature": "live-quant",
+                "runtime_versions": cache._runtime_versions,
+                "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+            }
+        )
+    )
+    (tmp_path / "entry_0.safetensors").write_bytes(b"")
+    with open(tmp_path / "entry_0_tokens.bin", "wb") as f:
+        _array.array("i", [1, 2, 3]).tofile(f)
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: MagicMock()
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 0
+    assert "revision mismatch" in caplog.text
+
+
+def test_load_warns_on_quant_mismatch(tmp_path, caplog):
+    """A stale quant signature is rejected with a quant warning."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+    cache._model_revision = "aaa"
+    cache._quant_signature = "live-quant"
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": cache._model_fingerprint,
+                "model_revision": "aaa",
+                "quant_signature": "disk-quant",
+                "runtime_versions": cache._runtime_versions,
+                "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+            }
+        )
+    )
+    (tmp_path / "entry_0.safetensors").write_bytes(b"")
+    with open(tmp_path / "entry_0_tokens.bin", "wb") as f:
+        _array.array("i", [1, 2, 3]).tofile(f)
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: MagicMock()
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 0
+    assert "quant signature mismatch" in caplog.text
+
+
+def test_runtime_difference_warns_but_still_loads(tmp_path, caplog):
+    """Differing runtime versions warn only and still load."""
+    import array as _array
+    import json
+    import sys
+    import types
+
+    from vllm_mlx.memory_cache import _CACHE_PERSIST_VERSION
+
+    cache = MemoryAwarePrefixCache(
+        MagicMock(), MemoryCacheConfig(max_memory_mb=100, min_prefix_tokens=1)
+    )
+    (tmp_path / "index.json").write_text(
+        json.dumps(
+            {
+                "version": _CACHE_PERSIST_VERSION,
+                "model_fingerprint": cache._model_fingerprint,
+                "model_revision": cache._model_revision,
+                "quant_signature": cache._quant_signature,
+                "runtime_versions": "stale-" + cache._runtime_versions,
+                "entries": [{"index": 0, "num_tokens": 3, "memory_bytes": 100}],
+            }
+        )
+    )
+    (tmp_path / "entry_0.safetensors").write_bytes(b"")
+    with open(tmp_path / "entry_0_tokens.bin", "wb") as f:
+        _array.array("i", [1, 2, 3]).tofile(f)
+
+    fake_mlx = types.ModuleType("mlx_lm")
+    fake_models = types.ModuleType("mlx_lm.models")
+    fake_cache_mod = types.ModuleType("mlx_lm.models.cache")
+    fake_cache_mod.load_prompt_cache = lambda path: [MockKVCache(500, 500)]
+    fake_mlx.models = fake_models
+    fake_models.cache = fake_cache_mod
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlx_lm": fake_mlx,
+            "mlx_lm.models": fake_models,
+            "mlx_lm.models.cache": fake_cache_mod,
+        },
+    ):
+        with patch(
+            "vllm_mlx.memory_cache.estimate_kv_cache_memory",
+            return_value=1024,
+        ):
+            assert cache.load_from_disk(str(tmp_path)) == 1
+    assert "runtime versions differ" in caplog.text
+    assert [1, 2, 3] in cache
+
+
+def test_quant_signature_differs_on_threshold():
+    """Same quant dict with different thresholds gives different output."""
+    from vllm_mlx.memory_cache import _quant_signature_from_config
+
+    quant = {"bits": 4, "group_size": 64}
+    first = {
+        "quantization": quant,
+        "kv_quantize": True,
+        "kv_min_quantize_tokens": 128,
+    }
+    second = {
+        "quantization": quant,
+        "kv_quantize": True,
+        "kv_min_quantize_tokens": 256,
+    }
+    assert _quant_signature_from_config(first) != _quant_signature_from_config(second)
