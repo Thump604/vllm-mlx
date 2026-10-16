@@ -386,7 +386,9 @@ class TestMLLMBatchResponse:
         scheduler.waiting = []
 
         mock_tokenizer = MagicMock()
-        mock_tokenizer.encode.side_effect = RuntimeError("VLM tokenizer contract mismatch")
+        mock_tokenizer.encode.side_effect = RuntimeError(
+            "VLM tokenizer contract mismatch"
+        )
         mock_processor = MagicMock()
         mock_processor.tokenizer = mock_tokenizer
         scheduler.processor = mock_processor
@@ -426,7 +428,10 @@ class TestMLLMBatchResponse:
         generator._prefill_progress = {}
         generator.prefix_cache = None
         generator._maybe_store_prefix_cache = lambda batch, end_idx: None
-        generator._step = lambda *args: (mx.array([10, 20]), [mx.array([0.5]), mx.array([0.5])])
+        generator._step = lambda *args: (
+            mx.array([10, 20]),
+            [mx.array([0.5]), mx.array([0.5])],
+        )
 
         # Request 1: Text-only request (e.g. 20 tokens)
         req_text = MLLMBatchRequest(uid=1, request_id="req-text", prompt="Say OK")
