@@ -7267,7 +7267,10 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    if output_finished and tool_parser and tool_markup_possible:
+                    if output_finished and (
+                        fence_stripper is not None
+                        or (tool_parser and tool_markup_possible)
+                    ):
                         delta_msg = DeltaMessage()
                     else:
                         # Skip this chunk (e.g., <think> token itself)

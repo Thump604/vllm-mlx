@@ -3898,6 +3898,105 @@ class TestStreamChatCompletion:
         assert payloads[1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "response_format",
+        [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                        },
+                        "required": ["name", "age"],
+                    },
+                },
+            },
+        ],
+        ids=["json_object", "json_schema"],
+    )
+    async def test_response_format_stream_keeps_tail_on_empty_final_delta(
+        self, monkeypatch, response_format
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        pieces = ['{"name": "Alice', '", "age"', ": 30}"]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                text = ""
+                for piece in pieces:
+                    text += piece
+                    yield GenerationOutput(
+                        text=text, new_text=piece, finished=False, finish_reason=None
+                    )
+                yield GenerationOutput(
+                    text=text,
+                    new_text="",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=len(pieces) + 1,
+                )
+
+        class ReasoningOnlyParser:
+            def reset_state(self, implicit_mode: bool = False):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if not delta_text:
+                    return None
+                return DeltaMessage(reasoning=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", ReasoningOnlyParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return json")],
+            stream=True,
+            response_format=response_format,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        assert json.loads(content) == {"name": "Alice", "age": 30}
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
     async def test_response_format_stream_rejects_schema_invalid_completion(
         self,
     ):
