@@ -436,7 +436,11 @@ def _stream_mllm_generated_outputs(
     )
     for chunk in _until_stop_sequence(chunks, stop):
         last_chunk = chunk
-        token_count += 1
+        reported = getattr(chunk, "generation_tokens", None)
+        if type(reported) is int:
+            token_count = reported
+        else:
+            token_count += 1
         yield MLLMOutput(
             text=_chunk_text(chunk),
             finish_reason=None,
