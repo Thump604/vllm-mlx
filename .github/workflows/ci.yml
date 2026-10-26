@@ -216,6 +216,10 @@ jobs:
           python -c "import mlx.core as mx; print(f'MLX OK: {mx.default_device()}')"
           python -m pip show mlx mlx-lm
 
+      - name: Run strict JSON schema admission regressions
+        run: |
+          pytest tests/test_invalid_json_schema_admission.py -v --tb=short
+
       - name: Run MLX-dependent tests
         run: |
           pytest \
