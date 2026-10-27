@@ -37,6 +37,19 @@ _TEXT_MODEL_FAMILIES: tuple[tuple[str, str, tuple[str, str]], ...] = (
 # that names neither the model nor the class. Hence the logging either side.
 _DEFAULT_TEXT_MODEL = ("mlx_lm.models.qwen3_5", ("TextModel", "TextModelArgs"))
 
+# Families whose weights the Qwen3.5 hybrid skeleton above is known to fit
+# (Qwen3.5 / 3.6 / 3.8 report qwen3_5 and qwen3_5_moe, with or without _text).
+_DEFAULT_TEXT_MODEL_PREFIXES = ("qwen3_5",)
+
+# Extraction is opt-in per family. Everything else -- Qwen2-VL, Qwen2.5-VL,
+# Qwen3-VL, Qwen4-Exp, ... -- returns no extracted TextModel, which keeps
+# SimpleEngine on the loaded mlx-vlm path for text as well as media instead of
+# serving logits from a mechanically loadable but architecturally different
+# model (Qwen2-VL's dense mrope attention is not Qwen3.5's hybrid layout).
+_EXTRACTABLE_TEXT_MODEL_PREFIXES = _DEFAULT_TEXT_MODEL_PREFIXES + tuple(
+    prefix for prefix, _, _ in _TEXT_MODEL_FAMILIES
+)
+
 
 def _import_text_model_classes(model_type: str):
     """Return ``(Model, ModelArgs)`` for a text config's ``model_type``."""
@@ -92,6 +105,13 @@ def build_text_model(
         config = json.loads((model_path / "config.json").read_text())
         text_config = config.get("text_config", config)
         model_type = text_config.get("model_type") or config.get("model_type", "")
+        if not model_type.startswith(_EXTRACTABLE_TEXT_MODEL_PREFIXES):
+            logger.info(
+                "Keeping model_type=%r on the mlx-vlm text path; no compatible "
+                "mlx-lm TextModel is registered",
+                model_type,
+            )
+            return None
         TextModel, TextModelArgs = _import_text_model_classes(model_type)
         text_model_cls = f"{TextModel.__module__}.{TextModel.__qualname__}"
         logger.debug(
