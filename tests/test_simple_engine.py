@@ -74,25 +74,31 @@ class TestSimpleEngineConcurrency:
         model = MagicMock()
         model.tokenizer = MagicMock()
         model.tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+        model.tokenizer.apply_chat_template = MagicMock(return_value="prompt")
 
         # Track concurrent executions
         model._concurrent_count = 0
         model._max_concurrent = 0
 
-        def chat_side_effect(**kwargs):
+        # chat() aggregates over stream_generate for text models, so the
+        # concurrency tracking lives there.
+        def stream_generate_side_effect(**kwargs):
             model._concurrent_count += 1
             model._max_concurrent = max(model._max_concurrent, model._concurrent_count)
             import time
 
             time.sleep(0.05)
             model._concurrent_count -= 1
-            result = MagicMock()
-            result.text = "test response"
-            result.tokens = [1, 2, 3]
-            result.finish_reason = "stop"
-            return result
+            chunk = MagicMock()
+            chunk.text = "test response"
+            chunk.tokens = [1, 2, 3]
+            chunk.finished = True
+            chunk.finish_reason = "stop"
+            chunk.prompt_tokens = 3
+            chunk.completion_tokens = 3
+            yield chunk
 
-        model.chat = MagicMock(side_effect=chat_side_effect)
+        model.stream_generate = MagicMock(side_effect=stream_generate_side_effect)
         return model
 
     @pytest.mark.anyio
@@ -1469,8 +1475,9 @@ class TestSimpleEngineConcurrency:
         mock_mllm.model = MagicMock()
         mock_mllm.get_tokenizer.return_value = tokenizer
 
-        def build_text_model(*_args, **_kwargs):
+        def build_text_model(*_args, **kwargs):
             captured["build_thread"] = threading.get_ident()
+            captured["enable_mtp"] = kwargs["enable_mtp"]
             return text_model
 
         with (
@@ -1491,13 +1498,82 @@ class TestSimpleEngineConcurrency:
                 )
 
                 assert engine._text_model is text_model
-                assert engine._text_tokenizer is tokenizer
+                # The text route wraps the processor tokenizer with the model's
+                # full EOS set; the wrapper must delegate to the original.
+                from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+                assert isinstance(engine._text_tokenizer, TokenizerWrapper)
+                assert engine._text_tokenizer._tokenizer is tokenizer
+                # Qwen3 <|im_end|> fix feeds the wrapper's stop set.
+                assert 42 in engine._text_tokenizer.eos_token_ids
                 assert captured["build_thread"] == worker_thread
                 assert captured["build_thread"] != event_loop_thread
+                assert captured["enable_mtp"] is False
             finally:
                 await engine.stop()
 
         assert engine._text_model_initialization_attempted is False
+
+    @pytest.mark.anyio
+    async def test_deferred_text_route_still_wraps_the_full_eos_set(self):
+        """A drafter-deferred text route must get the same EOS wrap.
+
+        With an MLLM drafter configured, start() no longer builds the text
+        route -- it is deferred until a request opts out of the drafter path.
+        Both entries go through _initialize_text_model, and the EOS wrap lives
+        there, so the deferred route must stop on the config EOS set exactly
+        like the eager one. Without this, a model whose turn terminator is
+        declared only in config.json free-runs to max_tokens on the deferred
+        path only, which is the hard kind of bug to see.
+        """
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        text_model = MagicMock()
+        text_model.mtp = None
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.return_value = 42
+
+        mock_mllm = MagicMock()
+        mock_mllm.model = MagicMock()
+        mock_mllm.get_tokenizer.return_value = tokenizer
+
+        with (
+            patch(
+                "vllm_mlx.models.mllm.MLXMultimodalLM",
+                return_value=mock_mllm,
+            ),
+            patch(
+                "vllm_mlx.text_model_from_vlm.build_text_model",
+                return_value=text_model,
+            ),
+            patch(
+                "vllm_mlx.utils.tokenizer.collect_eos_token_ids",
+                return_value={1, 50, 106},
+            ),
+        ):
+            engine = SimpleEngine("gemma-4-test", force_mllm=True, mtp=False)
+            engine._mllm_draft_model_path = "some/drafter"
+            try:
+                await engine.start()
+
+                # Deferred: the drafter owns the route until someone opts out.
+                assert engine._text_model is None
+                assert engine._text_model_initialization_attempted is False
+
+                # A drafter request must NOT trigger the build.
+                await engine._ensure_text_model_for_request(mllm_draft_requested=True)
+                assert engine._text_model is None
+
+                # A non-drafter request builds it -- wrapped.
+                await engine._ensure_text_model_for_request(mllm_draft_requested=False)
+                assert engine._text_model is text_model
+                assert isinstance(engine._text_tokenizer, TokenizerWrapper)
+                assert engine._text_tokenizer._tokenizer is tokenizer
+                assert {1, 50, 106} <= set(engine._text_tokenizer.eos_token_ids)
+            finally:
+                await engine.stop()
 
     @pytest.mark.anyio
     async def test_mllm_media_stream_stays_on_owner_thread_with_text_route(self):
@@ -2344,7 +2420,16 @@ class TestSimpleEngineConcurrency:
 
         assert outputs[-1].text == "Hello"
         assert captured_prompts == [tokenizer.apply_chat_template.return_value]
-        tokenizer.encode.assert_not_called()
+        # The manual system-cache path is skipped -- asserted by
+        # fail_if_manual_cache_path_runs above. encode() is no longer a proxy
+        # for that: the full prompt is now tokenized on every request so
+        # usage.prompt_tokens can be reported (it used to be 0 on this route).
+        # What must NOT happen is the second, system-prefix encode.
+        assert tokenizer.encode.call_count == 1
+        assert (
+            tokenizer.encode.call_args.args[0]
+            == tokenizer.apply_chat_template.return_value
+        )
 
     @pytest.mark.anyio
     async def test_stream_generate_text_normal_path_uses_generation_worker(self):
@@ -2700,7 +2785,7 @@ class TestSimpleEngineConcurrency:
         call_count = 0
         call_lock = Lock()
 
-        def chat_side_effect(**kwargs):
+        def stream_generate_side_effect(**kwargs):
             nonlocal call_count
             with call_lock:
                 call_count += 1
@@ -2715,16 +2800,21 @@ class TestSimpleEngineConcurrency:
 
             try:
                 release_workers.wait(timeout=1.0)
-                result = MagicMock()
-                result.text = f"response-{current_call}"
-                result.tokens = [1, 2, 3]
-                result.finish_reason = "stop"
-                return result
+                chunk = MagicMock()
+                chunk.text = f"response-{current_call}"
+                chunk.tokens = [1, 2, 3]
+                chunk.finished = True
+                chunk.finish_reason = "stop"
+                chunk.prompt_tokens = 3
+                chunk.completion_tokens = 3
+                yield chunk
             finally:
                 with call_lock:
                     mock_llm_model._concurrent_count -= 1
 
-        mock_llm_model.chat = MagicMock(side_effect=chat_side_effect)
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
@@ -2755,6 +2845,163 @@ class TestSimpleEngineConcurrency:
 
             assert result2.text == "response-2"
             assert mock_llm_model._max_concurrent == 1
+
+    @pytest.mark.anyio
+    async def test_cancelled_chat_stops_decoding(self, mock_llm_model):
+        """A cancelled non-streaming chat (client disconnect) stops decoding."""
+        import time
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        total = 100
+        produced = 0
+        first_token = threading.Event()
+
+        def chunk(i):
+            out = MagicMock()
+            out.text = "x"
+            out.tokens = [1]
+            out.finished = False
+            out.finish_reason = None
+            out.prompt_tokens = 3
+            out.completion_tokens = i + 1
+            return out
+
+        def stream_generate_side_effect(**kwargs):
+            nonlocal produced
+            for i in range(total):
+                produced += 1
+                first_token.set()
+                time.sleep(0.01)
+                yield chunk(i)
+
+        def blocking_chat_side_effect(**kwargs):
+            for _ in stream_generate_side_effect():
+                pass
+            return MagicMock(text="x", tokens=[1] * total, finish_reason="length")
+
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
+        mock_llm_model.chat = MagicMock(side_effect=blocking_chat_side_effect)
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+
+            task = asyncio.create_task(
+                engine.chat(
+                    messages=[{"role": "user", "content": "hi"}], max_tokens=total
+                )
+            )
+            await asyncio.to_thread(first_token.wait, 1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.3)
+
+            assert produced < total
+
+    @pytest.mark.anyio
+    async def test_chat_returns_generated_token_ids(self, mock_llm_model):
+        """Non-streaming chat keeps the generated token IDs, EOS included."""
+        from vllm_mlx.engine.simple import SimpleEngine
+        from vllm_mlx.models.llm import StreamingOutput
+
+        # Qwen2.5 IDs for "Hello", " World", "." and <|im_end|>; a natural
+        # stop ends the stream without a finish_reason on the last chunk.
+        generated = [(9707, "Hello"), (4337, " World"), (13, "."), (151645, "")]
+
+        def stream_generate_side_effect(**kwargs):
+            for token, text in generated:
+                yield StreamingOutput(text=text, token=token, prompt_tokens=3)
+
+        mock_llm_model.stream_generate = MagicMock(
+            side_effect=stream_generate_side_effect
+        )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "Say hello."}], max_tokens=20
+            )
+
+        assert output.text == "Hello World."
+        assert output.tokens == [9707, 4337, 13, 151645]
+        assert output.completion_tokens == len(output.tokens)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("media_part", "native_video", "chunks", "expected"),
+        [
+            (
+                {"type": "image_url", "image_url": {"url": "image.png"}},
+                False,
+                [
+                    ("Red", None, 1),
+                    (" square", None, 2),
+                    (".", None, 3),
+                    ("", "stop", 3),
+                ],
+                3,
+            ),
+            (
+                {"type": "audio_url", "audio_url": {"url": "audio.wav"}},
+                False,
+                [("Hello", None, 1), (" there", None, 2), ("", "stop", 2)],
+                2,
+            ),
+            (
+                {"type": "video_url", "video_url": {"url": "video.mp4"}},
+                True,
+                [("a cat walks by", "stop", 7)],
+                7,
+            ),
+        ],
+        ids=["image", "audio", "native-video"],
+    )
+    async def test_mllm_media_chat_reports_model_completion_tokens(
+        self, media_part, native_video, chunks, expected
+    ):
+        """Non-streaming media chat keeps the model's completion-token count."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        class FakeMllmModel:
+            _video_native = native_video
+
+            def _collect_video_inputs(self, _messages):
+                return {0: ["video.mp4"]} if native_video else {}
+
+            def stream_chat(self, **_kwargs):
+                for text, finish_reason, completion_tokens in chunks:
+                    yield SimpleNamespace(
+                        text=text,
+                        finish_reason=finish_reason,
+                        prompt_tokens=5,
+                        completion_tokens=completion_tokens,
+                    )
+
+        engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._loaded = True
+        engine._text_model = MagicMock()
+        engine._model = FakeMllmModel()
+
+        output = await engine.chat(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [media_part, {"type": "text", "text": "describe"}],
+                }
+            ],
+            max_tokens=50,
+        )
+
+        assert output.text == "".join(text for text, _, _ in chunks)
+        assert output.completion_tokens == expected
 
     @pytest.mark.anyio
     async def test_specprefill_path_does_not_prelock_serialized_runner(self):
@@ -3090,6 +3337,129 @@ class TestSimpleEngineNaturalStop:
         assert outputs[0].finish_reason == "stop"
 
 
+class TestSimpleEngineStreamClose:
+    @staticmethod
+    def _engine(generate):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._model = MagicMock()
+        engine._model.stream_generate.side_effect = generate
+        engine._model.tokenizer.apply_chat_template.return_value = "prompt"
+        return engine
+
+    @staticmethod
+    async def _close_and_assert_clean(engine, stream, backend_closed, loop_errors):
+        from vllm_mlx.engine.simple import _in_tracker
+
+        first = await anext(stream)
+        await stream.aclose()
+        await asyncio.sleep(0)
+
+        assert not first.finished
+        assert backend_closed()
+        assert not engine._active_requests
+        assert engine._num_running == 0
+        assert not engine._generation_lock.locked()
+        assert not _in_tracker.get()
+        assert not loop_errors
+
+    @pytest.mark.anyio
+    async def test_public_stream_generate_close_cleans_inner_state(self):
+        backend_closed = False
+
+        def generate(**kwargs):
+            nonlocal backend_closed
+            try:
+                yield SimpleNamespace(
+                    text="partial", prompt_tokens=3, finish_reason=None
+                )
+                yield SimpleNamespace(text="ignored", prompt_tokens=3)
+            finally:
+                backend_closed = True
+
+        engine = self._engine(generate)
+
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            stream = engine.stream_generate(prompt="hi", max_tokens=50)
+            await self._close_and_assert_clean(
+                engine, stream, lambda: backend_closed, loop_errors
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    @pytest.mark.anyio
+    async def test_public_stream_chat_close_cleans_nested_generate(self):
+        backend_closed = False
+
+        def generate(**kwargs):
+            nonlocal backend_closed
+            try:
+                yield SimpleNamespace(
+                    text="partial", prompt_tokens=3, finish_reason=None
+                )
+                yield SimpleNamespace(text="ignored", prompt_tokens=3)
+            finally:
+                backend_closed = True
+
+        engine = self._engine(generate)
+        loop_errors = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            stream = engine.stream_chat(
+                messages=[{"role": "user", "content": "hi"}], max_tokens=50
+            )
+            await self._close_and_assert_clean(
+                engine, stream, lambda: backend_closed, loop_errors
+            )
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    @pytest.mark.anyio
+    async def test_mllm_text_route_close_reaches_inner_cleanup(self):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        inner_closed = False
+
+        async def text_stream(*args, **kwargs):
+            nonlocal inner_closed
+            try:
+                yield GenerationOutput(
+                    text="partial",
+                    new_text="partial",
+                    prompt_tokens=3,
+                    completion_tokens=1,
+                    finished=False,
+                )
+                yield GenerationOutput(text="ignored")
+            finally:
+                inner_closed = True
+
+        engine = self._engine(lambda **kwargs: iter(()))
+        engine._is_mllm = True
+        engine._text_model = MagicMock()
+        engine._stream_generate_text = text_stream
+
+        stream = engine.stream_chat(
+            messages=[{"role": "user", "content": "hi"}], max_tokens=50
+        )
+        first = await anext(stream)
+        await stream.aclose()
+
+        assert not first.finished
+        assert inner_closed
+        assert not engine._active_requests
+        assert engine._num_running == 0
+
+
 class TestSimpleEngineClearRuntimeCaches:
     """Operational reset (DELETE /v1/cache) must actually release the
     multi-slot system-prompt KV cache state introduced in the LRU patch —
@@ -3175,3 +3545,232 @@ class TestSimpleEngineStop:
         assert calls["count"] == 1
         assert engine._model is None
         assert engine._loaded is False
+
+
+class TestSimpleEngineTokenizer:
+    """``tokenizer`` must hand out the text tokenizer for MLLM models too.
+
+    Callers (constrained decoding, the thinking budget, Anthropic token
+    counting) call ``encode()`` on it, which multimodal processors lack.
+    """
+
+    def _engine(self, model, *, is_mllm):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine("test-model")
+        engine._model = model
+        engine._loaded = True
+        engine._is_mllm = is_mllm
+        return engine
+
+    def test_mllm_returns_processor_tokenizer(self):
+        tokenizer = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(processor=SimpleNamespace(tokenizer=tokenizer))
+
+        assert self._engine(model, is_mllm=True).tokenizer is tokenizer
+
+    def test_mllm_processor_without_tokenizer_is_returned_as_is(self):
+        processor = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(processor=processor)
+
+        assert self._engine(model, is_mllm=True).tokenizer is processor
+
+    def test_text_model_returns_model_tokenizer(self):
+        tokenizer = SimpleNamespace(encode=lambda text: [1])
+        model = SimpleNamespace(tokenizer=tokenizer)
+
+        assert self._engine(model, is_mllm=False).tokenizer is tokenizer
+
+    def test_not_loaded_returns_none(self):
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        assert SimpleEngine("test-model").tokenizer is None
+
+
+class TestSimpleEngineImplicitThinking:
+    """The server's injected-<think> probe must see SimpleEngine's prompt (#834)."""
+
+    def _detect(self, rendered):
+        import vllm_mlx.server as server
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("glm-4.7-flash")
+        tokenizer = MagicMock()
+        tokenizer.chat_template = "{{ messages }}"
+        tokenizer.apply_chat_template.return_value = rendered
+        engine._model = SimpleNamespace(tokenizer=tokenizer)
+        engine._loaded = True
+
+        server._implicit_thinking_cache.clear()
+        return server._detect_implicit_thinking(engine, None)
+
+    def test_template_that_opens_think_is_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|><think>") is True
+
+    def test_template_without_think_is_not_implicit(self):
+        assert self._detect("[gMASK]<sop><|user|>hi<|assistant|>") is False
+
+    @pytest.mark.parametrize("enable_thinking", [True, False])
+    def test_tokenized_request_keeps_probe_textual(self, enable_thinking):
+        import vllm_mlx.server as server
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=("hi<assistant>{% if enable_thinking %}<think>{% endif %}"),
+        )
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("glm-4.7-flash")
+        engine._model = SimpleNamespace(tokenizer=tokenizer)
+        engine._loaded = True
+        template_kwargs = {"tokenize": True, "return_dict": False}
+
+        server._implicit_thinking_cache.clear()
+        assert (
+            server._detect_implicit_thinking(
+                engine,
+                {
+                    "chat_template_kwargs": template_kwargs,
+                    "enable_thinking": enable_thinking,
+                },
+            )
+            is enable_thinking
+        )
+        assert template_kwargs == {"tokenize": True, "return_dict": False}
+        prompt, _, _ = engine._render_chat_prompt(
+            [{"role": "user", "content": "hi"}],
+            None,
+            template_kwargs,
+            enable_thinking,
+        )
+        assert prompt == [0]
+
+
+class TestModelIdentityVsLoadPath:
+    """The CLI hands engines a repo id (identity) and a resolved snapshot
+    (load path). Loading and config.json reads use the snapshot; nothing
+    about the model's identity may be read off the filesystem path."""
+
+    def test_qwen2_vl_snapshot_keeps_text_on_the_mlx_vlm_model(
+        self, tmp_path, monkeypatch
+    ):
+        """#780 review: a resolved Qwen2-VL snapshot must not enable the
+        generic Qwen3.5 text extractor for text-only chat."""
+        import json
+        import sys
+        import types
+
+        snapshot = tmp_path / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen2_vl",
+                    "hidden_size": 1536,
+                    "num_attention_heads": 12,
+                    "num_key_value_heads": 2,
+                    "vision_config": {"depth": 32},
+                }
+            )
+        )
+
+        built = []
+
+        class TextModelArgs:
+            @classmethod
+            def from_dict(cls, config):
+                built.append(config)
+                return config
+
+        qwen_module = types.ModuleType("mlx_lm.models.qwen3_5")
+        qwen_module.TextModel = MagicMock()
+        qwen_module.TextModelArgs = TextModelArgs
+        monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3_5", qwen_module)
+
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+            model_path=str(snapshot),
+            force_mllm=True,
+        )
+        engine._model = MagicMock()
+        engine._initialize_text_model()
+
+        assert built == []
+        assert engine._text_model is None
+        assert engine._text_tokenizer is None
+
+    def test_compatible_snapshot_is_handed_to_the_extractor(self, tmp_path):
+        """The extractor reads config.json from the snapshot, not the repo id."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        engine = SimpleEngine(
+            "mlx-community/Qwen3.8-27B-8bit",
+            model_path=str(tmp_path),
+            force_mllm=True,
+            mtp=False,
+        )
+        engine._model = MagicMock()
+        with patch(
+            "vllm_mlx.text_model_from_vlm.build_text_model", return_value=None
+        ) as build:
+            engine._initialize_text_model()
+
+        assert build.call_args.args[1] == str(tmp_path)
+        assert engine.model_name == "mlx-community/Qwen3.8-27B-8bit"
+
+    def test_llm_loader_gets_snapshot_and_identity(self):
+        """MLXLanguageModel loads the snapshot but keys name fixes on the id."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        snapshot = "/Users/coder/.cache/huggingface/hub/snapshots/abc123"
+        engine = SimpleEngine("mlx-community/Qwen3-8B-4bit", model_path=snapshot)
+        with patch("vllm_mlx.models.llm.MLXLanguageModel") as llm_cls:
+            engine.prepare_for_start()
+
+        assert llm_cls.call_args.args[0] == snapshot
+        assert llm_cls.call_args.kwargs["model_id"] == "mlx-community/Qwen3-8B-4bit"
+
+
+@pytest.mark.parametrize("use_batching", [False, True])
+def test_lazy_residency_spec_carries_load_path_separately(use_batching):
+    """--lazy-load-model / idle unload rebuild engines from a ModelSpec."""
+    from vllm_mlx.lifecycle import ModelSpec
+    from vllm_mlx.server import _build_engine
+
+    engine = _build_engine(
+        ModelSpec(
+            model_key="default",
+            model_name="mlx-community/Qwen3-8B-4bit",
+            model_path="/Users/coder/snapshots/abc123",
+            use_batching=use_batching,
+        )
+    )
+
+    assert engine.model_name == "mlx-community/Qwen3-8B-4bit"
+    assert engine._model_path == "/Users/coder/snapshots/abc123"
+
+
+def test_mlx_language_model_name_fixes_use_identity_not_path():
+    """A snapshot directory name says nothing about the model family."""
+    from vllm_mlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(
+        "/models/snapshots/abc123", model_id="mlx-community/Qwen3-8B-4bit"
+    )
+    with patch(
+        "vllm_mlx.utils.tokenizer.load_model_with_fallback",
+        return_value=(MagicMock(), MagicMock()),
+    ) as load:
+        model.load()
+
+    assert load.call_args.args[0] == "/models/snapshots/abc123"
+    assert load.call_args.kwargs["tokenizer_config"]["eos_token"] == "<|im_end|>"
+    assert load.call_args.kwargs["model_id"] == "mlx-community/Qwen3-8B-4bit"

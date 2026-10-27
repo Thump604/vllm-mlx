@@ -9,7 +9,6 @@ Handles translation of:
 """
 
 import json
-import re
 import uuid
 
 from .anthropic_models import (
@@ -26,6 +25,45 @@ from .models import (
     Message,
     ToolDefinition,
 )
+from .prompt_canonicalize import canonicalize_system_prompt
+
+
+def _merge_system_messages(messages: list[Message]) -> list[Message]:
+    """Collapse all system messages into one at index 0.
+
+    Claude Code can send a top-level ``system`` field plus additional
+    ``role="system"`` items inside ``messages``. Qwen, Llama, and Gemma
+    templates require at most one leading system message and otherwise raise
+    ``System message must be at the beginning.``
+    """
+
+    def _to_text(value) -> str:
+        if isinstance(value, str):
+            return value
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(exclude_none=True)
+        if isinstance(value, dict):
+            return value.get("text") or ""
+        if isinstance(value, list):
+            return "\n".join(_to_text(item) for item in value)
+        return ""
+
+    if not any(message.role == "system" for message in messages):
+        return messages
+
+    system_texts = [
+        text
+        for text in (
+            _to_text(message.content)
+            for message in messages
+            if message.role == "system"
+        )
+        if text
+    ]
+    non_system = [message for message in messages if message.role != "system"]
+
+    # Preserve an explicit system message even if canonicalization emptied it.
+    return [Message(role="system", content="\n\n".join(system_texts)), *non_system]
 
 
 def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
@@ -64,13 +102,24 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
         # Strip per-request billing/tracking headers injected by some
         # clients (e.g. Claude Code).  These contain a per-request hash
         # that prevents prefix-cache reuse across turn boundaries.
-        system_text = re.sub(r"x-anthropic-billing-header:[^\n]*\n?", "", system_text)
+        #
+        # Use the shared canonicalizer rather than an inline pattern. The
+        # local one was unanchored, so it deleted the header text wherever
+        # it appeared -- including mid-sentence in a user's own prompt --
+        # and this pass runs before canonicalize_system_messages(), which
+        # cannot restore what was already removed.
+        system_text = canonicalize_system_prompt(system_text) or ""
         messages.append(Message(role="system", content=system_text))
 
     # Convert each message
     for msg in request.messages:
         converted = _convert_message(msg)
         messages.extend(converted)
+
+    # Claude Code may inject system-role items after the initial user turn,
+    # notably around agent metadata and compacted conversation continuations.
+    # Normalize them before model chat templates enforce system-at-index-zero.
+    messages = _merge_system_messages(messages)
 
     # Convert tools
     tools = None
@@ -184,10 +233,49 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     text_parts = []
     tool_calls_for_assistant = []
     tool_results = []
+    # Ordered multimodal parts, built in parallel with text_parts. Only used when
+    # the message actually carries media, so the text-only path is byte-identical
+    # to before -- important because that path is the hot one.
+    content_parts: list[dict] = []
+    has_media = False
 
     for block in msg.content:
-        if block.type == "text":
-            text_parts.append(block.text or "")
+        if block.type == "text" and block.text:
+            text_parts.append(block.text)
+            content_parts.append({"type": "text", "text": block.text})
+
+        elif block.type == "image":
+            # Anthropic image block -> OpenAI image_url part.
+            #
+            # Without this branch the block was parsed (AnthropicContentBlock
+            # carries `source`) and then silently DROPPED, so a vision request
+            # returned HTTP 200 with a confident text-only answer -- the model
+            # never saw the picture. vLLM's own Anthropic surface converts
+            # image blocks, so this was also a parity gap.
+            source = block.source or {}
+            src_type = source.get("type")
+            if src_type == "base64":
+                media_type = source.get("media_type") or "image/png"
+                data = source.get("data") or ""
+                if not data:
+                    # A data URI with an empty payload is worse than an error: the
+                    # request would look well-formed and the model would answer
+                    # about nothing.
+                    raise ValueError("image block carries no data")
+                url = f"data:{media_type};base64,{data}"
+            elif src_type == "url":
+                url = source.get("url") or ""
+            else:
+                # Refuse rather than drop: an unknown source type that silently
+                # vanishes is the exact failure this branch exists to end.
+                raise ValueError(
+                    f"unsupported image source type {src_type!r}; "
+                    "expected 'base64' or 'url'"
+                )
+            if not url:
+                raise ValueError("image block carries no data")
+            content_parts.append({"type": "image_url", "image_url": {"url": url}})
+            has_media = True
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -204,6 +292,9 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
             )
 
         elif block.type == "tool_result":
+            # Follow-up (out of scope for the image-block fix): images nested
+            # inside tool_result.content still go through this text-only
+            # extraction and are not converted to image_url parts.
             # Tool result → OpenAI tool message
             result_content = block.content
             if isinstance(result_content, list):
@@ -230,33 +321,47 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
     if msg.role == "assistant":
         combined_text = "\n".join(text_parts) if text_parts else None
         if tool_calls_for_assistant:
+            # An assistant turn can carry an image alongside a tool call; the
+            # media extraction downstream is role-agnostic, so preserve the
+            # full part list rather than flattening to text and dropping it.
             messages.append(
                 Message(
                     role="assistant",
-                    content=combined_text or "",
+                    content=content_parts if has_media else (combined_text or ""),
                     tool_calls=tool_calls_for_assistant,
                 )
             )
+        elif has_media:
+            messages.append(Message(role="assistant", content=content_parts))
         elif combined_text is not None:
             messages.append(Message(role="assistant", content=combined_text))
         else:
             messages.append(Message(role="assistant", content=""))
     elif msg.role == "user":
         # User messages: collect text parts, then add tool results separately
-        if text_parts:
+        if has_media:
+            # Preserve the author's text/image interleaving: for document work the
+            # order of "here is the page" vs "now answer this" changes the task.
+            messages.append(Message(role="user", content=content_parts))
+        elif text_parts:
             combined_text = "\n".join(text_parts)
             messages.append(Message(role="user", content=combined_text))
 
         # Tool results become separate tool messages
         messages.extend(tool_results)
 
-        # If no text and no tool results, add empty user message
-        if not text_parts and not tool_results:
+        # If no text, no media and no tool results, add empty user message.
+        # has_media matters: an image-only message has no text_parts, and without
+        # this guard it emitted the image AND a stray empty user message.
+        if not text_parts and not tool_results and not has_media:
             messages.append(Message(role="user", content=""))
     else:
         # Other roles
-        combined_text = "\n".join(text_parts) if text_parts else ""
-        messages.append(Message(role=msg.role, content=combined_text))
+        if has_media:
+            messages.append(Message(role=msg.role, content=content_parts))
+        else:
+            combined_text = "\n".join(text_parts) if text_parts else ""
+            messages.append(Message(role=msg.role, content=combined_text))
 
     return messages
 

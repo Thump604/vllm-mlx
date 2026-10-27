@@ -1,10 +1,189 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for MLLM assistant-drafter speculative wiring."""
 
+import json
 import sys
 from types import SimpleNamespace
 
 import pytest
+
+
+def _write_drafter_config(tmp_path, config):
+    text = config if isinstance(config, str) else json.dumps(config)
+    (tmp_path / "config.json").write_text(text, encoding="utf-8")
+    return str(tmp_path)
+
+
+def _drafter_module(load_result, validate=lambda *args: None):
+    return SimpleNamespace(
+        load_drafter=lambda *args, **kwargs: load_result,
+        validate_drafter_compatibility=validate,
+    )
+
+
+def _install_fake_mlx_vlm(monkeypatch, drafter_module):
+    target = SimpleNamespace(config=SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm", SimpleNamespace(load=lambda path: (target, object()))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.utils",
+        SimpleNamespace(load_config=lambda path: {"model_type": "qwen4_exp"}),
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", drafter_module)
+    return target
+
+
+def test_registered_mtp_drafter_resolves_repo_id_without_network(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    captured = {}
+
+    def resolve(repo_id):
+        captured["repo_id"] = repo_id
+        return tmp_path
+
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.utils", SimpleNamespace(get_model_path=resolve)
+    )
+    drafter = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        _drafter_module((drafter, "mtp")),
+    )
+
+    assert load_mtp_drafter("owner/qwen4-exp-mtp") is drafter
+    assert captured["repo_id"] == "owner/qwen4-exp-mtp"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "gemma4_assistant"},
+        {"model_type": "GEMMA4_UNIFIED_ASSISTANT"},
+        {"model_type": "gemma4", "text_config": {"model_type": "gemma4_assistant"}},
+    ],
+)
+def test_mtp_drafter_preserves_supported_gemma_loader_shapes(
+    monkeypatch, tmp_path, config
+):
+    from vllm_mlx.models import mllm
+
+    path = _write_drafter_config(tmp_path, config)
+    expected = object()
+    monkeypatch.setattr(mllm, "load_gemma4_assistant_drafter", lambda path: expected)
+
+    assert mllm.load_mtp_drafter(path) is expected
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (None, "must be a JSON object"),
+        ([], "must be a JSON object"),
+        ({}, "has no valid model_type"),
+        ("{not-json", "Invalid MTP drafter config JSON"),
+        (
+            {
+                "model_type": "qwen4_exp_mtp",
+                "text_config": {"model_type": "gemma4_assistant"},
+            },
+            "conflicting model types",
+        ),
+    ],
+)
+def test_mtp_drafter_rejects_invalid_config(tmp_path, config, message):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    path = _write_drafter_config(tmp_path, config)
+    with pytest.raises(ValueError, match=message):
+        load_mtp_drafter(path)
+
+
+@pytest.mark.parametrize("source", ["text_config", "speculators_model_type"])
+def test_mtp_drafter_prefers_nested_drafter_model_type(tmp_path, source):
+    from vllm_mlx.models.mllm import _read_mtp_drafter_model_type
+
+    config = {"model_type": "qwen4_exp"}
+    config[source] = (
+        {"model_type": "qwen4_exp_mtp"} if source == "text_config" else "qwen4_exp_mtp"
+    )
+    _write_drafter_config(tmp_path, config)
+
+    assert _read_mtp_drafter_model_type(tmp_path / "config.json") == "qwen4_exp_mtp"
+
+
+@pytest.mark.parametrize(
+    ("loaded", "message"),
+    [
+        (None, "must return"),
+        ((None, "mtp"), "returned no model"),
+        ((object(), "dflash"), "unsupported kind"),
+        ((object(), "mtp", "extra"), "must return"),
+    ],
+)
+def test_mtp_drafter_rejects_invalid_loader_return(
+    monkeypatch, tmp_path, loaded, message
+):
+    from vllm_mlx.models.mllm import load_mtp_drafter
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.speculative.drafters", _drafter_module(loaded)
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_mtp_drafter(path)
+
+
+def test_mllm_load_binds_registered_drafter_and_validates_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    drafter = SimpleNamespace()
+    captured = {}
+
+    def validate(target_model, draft_model, draft_kind):
+        captured.update(target=target_model, draft=draft_model, kind=draft_kind)
+
+    target = _install_fake_mlx_vlm(
+        monkeypatch, _drafter_module((drafter, "mtp"), validate)
+    )
+    model = MLXMultimodalLM("target", draft_model=path, draft_kind="mtp")
+    model.load()
+
+    assert model._draft_model is drafter
+    assert captured == {"target": target, "draft": drafter, "kind": "mtp"}
+
+
+def test_mllm_load_preserves_registered_drafter_error(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MLXMultimodalLM, MTPDrafterLoadError
+
+    path = _write_drafter_config(tmp_path, {"model_type": "qwen4_exp_mtp"})
+    _install_fake_mlx_vlm(monkeypatch, SimpleNamespace())
+    model = MLXMultimodalLM("target", draft_model=path, draft_kind="mtp")
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        model.load()
+
+
+def test_registered_mtp_drafter_requires_validator_for_target(monkeypatch, tmp_path):
+    from vllm_mlx.models.mllm import MTPDrafterLoadError, load_mtp_drafter
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp_mtp"}), encoding="utf-8"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.speculative.drafters",
+        SimpleNamespace(load_drafter=lambda *args, **kwargs: (object(), "mtp")),
+    )
+
+    with pytest.raises(MTPDrafterLoadError, match="registered 'qwen4_exp_mtp'"):
+        load_mtp_drafter(str(tmp_path), target_model=object())
 
 
 def test_mllm_chat_forwards_configured_assistant_drafter(monkeypatch):
@@ -223,6 +402,68 @@ def test_simple_engine_text_route_stays_default_when_mllm_drafter_configured():
     )
 
 
+def test_simple_engine_defaults_configured_drafter_on_but_allows_opt_out():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=4,
+        default_mllm_draft=True,
+    )
+
+    assert engine._default_mllm_draft is True
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=True) is False
+    )
+    assert (
+        engine._should_route_text_through_text_model(mllm_draft_requested=False) is True
+    )
+
+
+def test_mllm_drafter_defaults_on_and_request_can_opt_out():
+    from vllm_mlx.models.mllm import MLXMultimodalLM
+
+    model = MLXMultimodalLM(
+        "target",
+        draft_model="assistant",
+        draft_kind="mtp",
+        default_draft_enabled=True,
+    )
+    model._draft_model = SimpleNamespace(accept_lens=[])
+
+    assert model._draft_generation_kwargs() == {
+        "draft_model": model._draft_model,
+        "draft_kind": "mtp",
+    }
+    assert model._draft_generation_kwargs({"mllm_draft": False}) == {}
+
+
+def test_simple_engine_reports_configured_mllm_drafter_status():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        mllm_draft_block_size=4,
+        default_mllm_draft=True,
+    )
+
+    assert engine.get_stats()["mtp"] == {
+        "enabled": True,
+        "implementation": "mlx_vlm_assistant",
+        "draft_model": "assistant",
+        "draft_kind": "mtp",
+        "draft_block_size": 4,
+        "default_enabled": True,
+        "continuous_batching_supported": True,
+    }
+
+
 def test_chat_request_passes_mllm_draft_opt_in():
     from vllm_mlx.server import (
         ChatCompletionRequest,
@@ -243,6 +484,18 @@ def test_chat_request_passes_mllm_draft_opt_in():
     prepared = _prepare_chat_completion_invocation(Engine(), request, 16)
 
     assert prepared.chat_kwargs["mllm_draft"] is True
+
+
+def test_completion_request_preserves_mllm_draft_opt_out():
+    from vllm_mlx.api.models import CompletionRequest
+
+    request = CompletionRequest(
+        model="gemma4",
+        prompt="hello",
+        mllm_draft=False,
+    )
+
+    assert request.mllm_draft is False
 
 
 @pytest.mark.anyio
@@ -287,3 +540,56 @@ async def test_simple_engine_forwards_mllm_draft_opt_in_to_mllm_path():
     assert captured["kwargs"]["mllm_draft"] is True
     assert outputs[-1].mtp_drafts == 2
     assert outputs[-1].mtp_accepted == 1
+
+
+@pytest.mark.anyio
+async def test_simple_engine_forwards_mllm_draft_opt_out_to_media_path():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    captured = {}
+
+    class FakeMLLM:
+        def stream_chat(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            yield SimpleNamespace(
+                text="ok",
+                finish_reason="stop",
+                prompt_tokens=3,
+                mtp_drafts=0,
+                mtp_accepted=0,
+            )
+
+    engine = SimpleEngine(
+        "gemma4",
+        force_mllm=True,
+        mllm_draft_model="assistant",
+        mllm_draft_kind="mtp",
+        default_mllm_draft=True,
+    )
+    engine._loaded = True
+    engine._text_model = object()
+    engine._model = FakeMLLM()
+
+    outputs = [
+        output
+        async for output in engine.stream_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=8,
+            temperature=0.0,
+            mllm_draft=False,
+        )
+    ]
+
+    assert captured["kwargs"]["mllm_draft"] is False
+    assert outputs[-1].text == "ok"

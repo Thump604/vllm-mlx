@@ -132,6 +132,13 @@ class LLGuidanceJSONSchemaLogitsProcessor:
                 f"failed to compile strict JSON Schema grammar: {exc}"
             ) from exc
 
+        # llguidance can return an invalid matcher without raising.
+        if self._matcher.is_error():
+            detail = self._matcher.get_error() or self._matcher.stop_reason()
+            raise ConstrainedDecodingError(
+                f"failed to compile strict JSON Schema grammar: {detail}"
+            )
+
         self._prompt_len: int | None = None
         self._consumed_suffix: list[int] = []
         self._terminal = False

@@ -15,3 +15,4 @@ include tests/test_metal_context_native.py
 include tests/test_metal_context_page_runtime.py
 include docs/metal-context-page-runtime.md
 include vllm_mlx/metal_context_runtime.py
+include tests/test_metal_context_shader_contract.py
