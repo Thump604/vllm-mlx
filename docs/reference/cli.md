@@ -33,7 +33,7 @@ vllm-mlx serve --models-config <yaml> [options]
 | `--timeout` | Request timeout in seconds | 300 |
 | `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
-| `--mllm-draft-model` | Configured mlx-vlm assistant/draft model path. Requires `--mllm`. | None |
+| `--mllm-draft-model` | Local path or Hugging Face repo ID for an mlx-vlm assistant/draft model. Requires `--mllm`. | None |
 | `--mllm-draft-kind` | Assistant drafter kind. Use `mtp` for continuous batching. | None |
 | `--mllm-draft-block-size` | Speculative block size passed to mlx-vlm. | None |
 | `--default-mllm-draft` | Enable the configured assistant by default. Requests can override with `mllm_draft`. | False |
@@ -210,6 +210,8 @@ TTFT, TPOT, throughput, cache deltas, and Metal memory. Workload mode adds
 per-case quality checks, repeated samples for variance, and comparison-only
 product policy timeouts. Workload cases can embed `messages` directly or point
 `request_path` at an existing OpenAI-compatible request JSON.
+Capacity-envelope mode produces a versioned concurrency/SLO evidence artifact;
+see [Capacity-envelope benchmarking](../guides/capacity-envelope.md).
 
 ### Usage
 
@@ -225,6 +227,7 @@ vllm-mlx bench-serve --url http://localhost:8000 [options]
 | `--model` | API model id | Auto-detect |
 | `--prompts` | Comma-separated prompt sets or files for sweep mode | `short,medium,long` |
 | `--workload` | Declarative workload JSON for contract mode | None |
+| `--capacity-envelope` | Run the versioned capacity-envelope JSON benchmark | False |
 | `--concurrency` | Comma-separated concurrency levels for sweep mode | `1,4` |
 | `--max-tokens` | Max tokens for sweep mode | `256` |
 | `--repetitions` | Repetitions per sweep configuration or workload case | `3` |

@@ -70,7 +70,7 @@ class QwenToolParser(ToolParser):
     FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
 
     # Pattern for parameter extraction: <parameter=key>value</parameter>
-    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+    PARAM_PATTERN = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 
     # Pattern for empty <tool_call> wrappers left after function extraction
     EMPTY_TOOL_CALL = re.compile(r"<tool_call>\s*</tool_call>", re.DOTALL)
@@ -160,7 +160,16 @@ class QwenToolParser(ToolParser):
             params = self.PARAM_PATTERN.findall(params_block)
             arguments = {}
             for p_name, p_value in params:
-                arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                # Multiline function calls frame values with one newline on
+                # each side. Preserve all other whitespace as argument data.
+                # A lone newline cannot serve as both framing delimiters.
+                if (
+                    len(p_value) >= 2
+                    and p_value.startswith("\n")
+                    and p_value.endswith("\n")
+                ):
+                    p_value = p_value[1:-1]
+                arguments[p_name.strip()] = _parse_param_value(p_value)
             tool_calls.append(
                 {
                     "id": generate_tool_id(),
@@ -333,10 +342,17 @@ class QwenToolParser(ToolParser):
             # Tool call complete, parse the whole thing
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
+                # Trailing whitespace and the final engine delta still contain
+                # every completed call. Emit only newly completed invocations.
+                first_new = self.current_tool_id + 1
+                new_calls = result.tool_calls[first_new:]
+                if not new_calls:
+                    return None
+                self.current_tool_id = len(result.tool_calls) - 1
                 return {
                     "tool_calls": [
                         {
-                            "index": i,
+                            "index": first_new + i,
                             "id": tc["id"],
                             "type": "function",
                             "function": {
@@ -344,7 +360,7 @@ class QwenToolParser(ToolParser):
                                 "arguments": tc["arguments"],
                             },
                         }
-                        for i, tc in enumerate(result.tool_calls)
+                        for i, tc in enumerate(new_calls)
                     ]
                 }
 

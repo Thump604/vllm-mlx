@@ -240,8 +240,12 @@ def serve_command(args):
     )
     print("=" * 60)
 
-    # Pre-download model with retry/timeout
-    from .api.utils import is_mllm_model
+    # Pre-download model with retry/timeout, and resolve the MLLM/LLM
+    # routing decision from that same resolved snapshot's config.json
+    # (rather than filename heuristics) before engine construction. This
+    # reuses the download's own resolution, so a bare HF repo id gets an
+    # authoritative check with no second network lookup.
+    from .api.utils import MllmRouteUndetermined, is_mllm_model, resolve_mllm_route
     from .utils.download import DownloadConfig, ensure_model_downloaded
 
     download_config = DownloadConfig(
@@ -249,11 +253,30 @@ def serve_command(args):
         max_retries=args.download_retries,
         offline=getattr(args, "offline", False),
     )
+    resolved_model_path = None
+    mllm_route = None
     if model_arg:
-        ensure_model_downloaded(
+        resolved = ensure_model_downloaded(
             model_arg,
             config=download_config,
+            # This guess only selects which files to fetch; the actual
+            # MLLM/LLM routing decision is made below from the resolved
+            # snapshot's config.json.
             is_mllm=is_mllm_model(model_arg),
+        )
+        resolved_model_path = str(resolved) if resolved is not None else None
+        try:
+            mllm_route = resolve_mllm_route(
+                model_arg,
+                resolved_model_path,
+                force_mllm=getattr(args, "mllm", False),
+            )
+        except MllmRouteUndetermined as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        logger.info(
+            f"Model route: {'MLLM' if mllm_route.is_mllm else 'LLM'} "
+            f"(source={mllm_route.source})"
         )
         if args.lazy_load_model:
             print(f"Registering model for lazy load: {model_arg}")
@@ -419,15 +442,22 @@ def serve_command(args):
             memory_budget_gb=memory_budget_gb,
         )
     else:
-        # Load model with unified server
+        # Load model with unified server. The repo id stays the model's
+        # identity (served name, thinking/Qwen3/Nemotron name defaults); the
+        # already-resolved snapshot is passed separately as the load path so
+        # loaders don't re-resolve it. force_mllm carries the routing
+        # decision made above so it can't disagree with a second check.
         load_model(
             model_arg,
+            model_path=resolved_model_path,
             use_batching=args.continuous_batching,
             scheduler_config=scheduler_config,
             stream_interval=args.stream_interval if args.continuous_batching else 1,
             max_tokens=args.max_tokens,
             max_request_tokens=max_request_tokens,
-            force_mllm=getattr(args, "mllm", False),
+            force_mllm=(
+                mllm_route.is_mllm if mllm_route else getattr(args, "mllm", False)
+            ),
             gpu_memory_utilization=args.gpu_memory_utilization,
             served_model_name=args.served_model_name,
             trust_remote_code=trust_remote_code,
@@ -952,7 +982,68 @@ def bench_serve_command(args):
     """Run serving benchmark."""
     import asyncio
 
-    from .bench_serve import run_bench_serve, run_bench_serve_workload
+    from .bench_serve import (
+        CapacityConfig,
+        CapacityThresholds,
+        run_bench_serve,
+        run_bench_serve_workload,
+        run_capacity_envelope,
+    )
+
+    if args.capacity_envelope:
+
+        def _positive_csv(value: str, option: str) -> tuple[int, ...]:
+            try:
+                parsed = tuple(
+                    int(item.strip()) for item in value.split(",") if item.strip()
+                )
+            except ValueError as exc:
+                raise ValueError(f"{option} must be comma-separated integers") from exc
+            if not parsed or any(item < 1 for item in parsed):
+                raise ValueError(f"{option} must contain positive integers")
+            return parsed
+
+        cache_modes = tuple(
+            item.strip().lower()
+            for item in args.capacity_cache_modes.split(",")
+            if item.strip()
+        )
+        config = CapacityConfig(
+            concurrencies=_positive_csv(
+                args.capacity_concurrency, "--capacity-concurrency"
+            ),
+            prompt_tokens=_positive_csv(
+                args.capacity_prompt_tokens, "--capacity-prompt-tokens"
+            ),
+            output_tokens=_positive_csv(
+                args.capacity_output_tokens, "--capacity-output-tokens"
+            ),
+            cache_modes=cache_modes,
+            repetitions=args.capacity_repetitions,
+            warmup=args.capacity_warmup,
+            request_timeout_s=(
+                None if args.request_timeout_s <= 0 else args.request_timeout_s
+            ),
+            thresholds=CapacityThresholds(
+                max_p95_ttft_ms=args.capacity_max_p95_ttft_ms,
+                max_p95_chunk_gap_ms=args.capacity_max_p95_chunk_gap_ms,
+                max_p95_e2e_ms=args.capacity_max_p95_e2e_ms,
+                max_failure_rate=args.capacity_max_failure_rate,
+                max_ooms=args.capacity_max_ooms,
+                max_timeouts=args.capacity_max_timeouts,
+            ),
+            extra_body={"temperature": 0.0},
+        )
+        asyncio.run(
+            run_capacity_envelope(
+                url=args.url,
+                model=args.model,
+                config=config,
+                output_path=args.output,
+                baseline_url=args.capacity_baseline_url,
+            )
+        )
+        return
 
     if args.workload:
         sweep_only_warnings = []
@@ -1301,7 +1392,8 @@ Examples:
         default=False,
         help="Enable SpecPrefill: use a small draft model to score token importance, "
         "then sparse-prefill only the important tokens on the target model. "
-        "Reduces TTFT on long prompts. Requires --specprefill-draft-model.",
+        "Reduces TTFT on long prompts. Supported Qwen media routes preserve "
+        "visual embeddings and MRoPE state. Requires --specprefill-draft-model.",
     )
     serve_parser.add_argument(
         "--specprefill-threshold",
@@ -1357,7 +1449,8 @@ Examples:
         "--mllm-draft-model",
         type=str,
         default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model. "
+        help="Local path or Hugging Face repo ID for an mlx-vlm MLLM "
+        "draft/assistant model. "
         "For Gemma 4 assistant drafters, use with --mllm-draft-kind mtp.",
     )
     serve_parser.add_argument(
@@ -2050,6 +2143,93 @@ Examples:
             "runs contract-style cases with per-case quality checks and "
             "comparison-only policy timeouts instead of the prompt sweep."
         ),
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-envelope",
+        action="store_true",
+        help=(
+            "Run the versioned capacity-envelope sweep. This is an HTTP-only "
+            "mode and writes a JSON artifact; legacy prompt/workload modes "
+            "remain unchanged."
+        ),
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-concurrency",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Capacity concurrency levels (default: 1,2,4,8,16,32)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-prompt-tokens",
+        type=str,
+        default="256,2048,8192,32768",
+        help="Requested prompt sizes (default: 256,2048,8192,32768)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-output-tokens",
+        type=str,
+        default="128,512",
+        help="Requested output limits (default: 128,512)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-cache-modes",
+        type=str,
+        default="cold,warm,prefix-hit,prefix-miss",
+        help="Cache-state cases (default: cold,warm,prefix-hit,prefix-miss)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-repetitions",
+        type=int,
+        default=3,
+        help="Measured repetitions per capacity cell (default: 3)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-warmup",
+        type=int,
+        default=1,
+        help="Warmup requests before measured capacity batches (default: 1)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-baseline-url",
+        type=str,
+        default=None,
+        help="Optional HTTP baseline URL for greedy output parity checks",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-ttft-ms",
+        type=float,
+        default=None,
+        help="Optional p95 TTFT SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-chunk-gap-ms",
+        type=float,
+        default=None,
+        help="Optional p95 content-chunk-gap SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-p95-e2e-ms",
+        type=float,
+        default=None,
+        help="Optional p95 end-to-end latency SLO for sustainable capacity",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-failure-rate",
+        type=float,
+        default=0.0,
+        help="Maximum allowed request failure rate (default: 0)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-ooms",
+        type=int,
+        default=0,
+        help="Maximum allowed OOM-classified failures (default: 0)",
+    )
+    bench_serve_parser.add_argument(
+        "--capacity-max-timeouts",
+        type=int,
+        default=0,
+        help="Maximum allowed timeout failures (default: 0)",
     )
     bench_serve_parser.add_argument(
         "--prompts",
