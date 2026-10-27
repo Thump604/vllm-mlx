@@ -23,6 +23,7 @@ import mlx.core as mx
 
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
+from .engine.base import run_blocking_startup_work, suspend_cancellation
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
 from .mlx_streams import bind_generation_streams
@@ -181,15 +182,37 @@ class EngineCore:
             self._task = None
             # Safety nets for a loop that never started or whose cleanup
             # raised. Both operations are idempotent.
-            try:
-                self.scheduler._close_batch_generator()
-            finally:
-                await asyncio.to_thread(self.scheduler.close_ssd_tier)
+            with suspend_cancellation():
+                try:
+                    worker = getattr(self, "_external_generation_worker", None)
+                    if worker is None:
+                        self.scheduler._close_batch_generator()
+                    else:
+                        await run_blocking_startup_work(
+                            self.scheduler._close_batch_generator,
+                            executor=worker,
+                        )
+                finally:
+                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
         """Check if engine is running."""
         return self._running
+
+    def is_healthy(self) -> bool:
+        """True unless the engine loop task exited without stop() being called.
+
+        The loop itself only breaks out on cancellation (stop()) since its
+        inner per-step try/except swallows ordinary exceptions and keeps
+        looping, so a done-but-not-stopped task means something fatal
+        escaped the loop's own cleanup (e.g. the finally block) rather than
+        a clean shutdown.
+        """
+        if not self._running:
+            return True
+        task = self._task
+        return task is None or not task.done()
 
     async def _engine_loop(self) -> None:
         """Main engine loop.
@@ -306,8 +329,11 @@ class EngineCore:
                                     worker, _step_on_worker
                                 )
                             except Exception as e:
+                                # Only an internally created worker may be
+                                # abandoned. A supplied worker owns the model.
                                 if (
                                     _is_stream_thread_error(e)
+                                    and owns_worker
                                     and not stream_thread_fallback_used
                                 ):
                                     await loop.run_in_executor(
@@ -458,8 +484,27 @@ class EngineCore:
         )
         self._finished_events[request_id] = asyncio.Event()
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        # Prefix-cache lookup can reconstruct, trim, or dequantize MLX arrays.
+        # Keep that work on the same thread that owns the text model. Standalone
+        # EngineCore callers without a supplied worker retain inline admission.
+        worker = getattr(self, "_external_generation_worker", None)
+        try:
+            if worker is None:
+                self.scheduler.add_request(request)
+            else:
+                await run_blocking_startup_work(
+                    lambda: self.scheduler.add_request(request), executor=worker
+                )
+        except asyncio.CancelledError:
+            self.scheduler.abort_request(request_id)
+            self._cleanup_request_tracking(request_id)
+            _set_request_event(getattr(self, "_request_event", None))
+            raise
+        except BaseException:
+            self.scheduler.abort_request(request_id)
+            self._cleanup_request_tracking(request_id)
+            _set_request_event(getattr(self, "_request_event", None))
+            raise
         _set_request_event(getattr(self, "_request_event", None))
 
         return request_id
@@ -467,16 +512,21 @@ class EngineCore:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
         result = self.scheduler.abort_request(request_id)
-        self._cleanup_request(request_id)
+        self._cleanup_request_tracking(request_id)
+        _set_request_event(getattr(self, "_request_event", None))
         return result
 
-    def _cleanup_request(self, request_id: str) -> None:
-        """Clean up request tracking."""
+    def _cleanup_request_tracking(self, request_id: str) -> None:
+        """Drop async output state without racing scheduler-owned cleanup."""
         collector = self._output_collectors.pop(request_id, None)
         if collector:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+
+    def _cleanup_request(self, request_id: str) -> None:
+        """Clean up request tracking after scheduler processing is complete."""
+        self._cleanup_request_tracking(request_id)
         self.scheduler.remove_finished_request(request_id)
 
     async def stream_outputs(
@@ -864,6 +914,10 @@ class AsyncEngineCore:
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
+
+    def is_healthy(self) -> bool:
+        """Check whether the wrapped engine's loop task is still alive."""
+        return self.engine.is_healthy()
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk."""

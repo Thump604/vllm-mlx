@@ -414,6 +414,116 @@ class TestAnthropicRequest:
             )
 
 
+class TestWhisperTranscriptionEndpoint:
+    """Exercise processor recovery through the real HTTP route and STT engine."""
+
+    @pytest.mark.parametrize(
+        "fail_first_download",
+        [False, True],
+        ids=["missing-processor", "download-retry"],
+    )
+    def test_transcription_recovers_processor(self, monkeypatch, fail_first_download):
+        import io
+        import wave
+        from pathlib import Path
+        from types import ModuleType
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.audio.stt import STTEngine
+        from vllm_mlx.metrics import MetricsCollector
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 20000)
+        audio_bytes = wav_buffer.getvalue()
+        processor = object()
+        models = []
+        processor_calls = []
+        generated_paths = []
+
+        def load_model(model_name):
+            assert model_name == "mlx-community/whisper-small-mlx"
+            model = SimpleNamespace(_processor=None)
+
+            def generate(audio_path, *, verbose, language, task):
+                assert model._processor is processor
+                assert verbose is False
+                assert language == "en"
+                assert task == "transcribe"
+                assert Path(audio_path).read_bytes() == audio_bytes
+                generated_paths.append(Path(audio_path))
+                return SimpleNamespace(
+                    text=" hello ",
+                    language="en",
+                    segments=[{"start": 0.0, "end": 1.25, "text": "hello"}],
+                )
+
+            model.generate = generate
+            models.append(model)
+            return model
+
+        def load_processor(processor_repo):
+            processor_calls.append(processor_repo)
+            if fail_first_download and len(processor_calls) == 1:
+                raise OSError("processor download failed")
+            return processor
+
+        utils_module = ModuleType("mlx_audio.stt.utils")
+        utils_module.load_model = load_model
+        stt_module = ModuleType("mlx_audio.stt")
+        stt_module.utils = utils_module
+        mlx_audio_module = ModuleType("mlx_audio")
+        mlx_audio_module.stt = stt_module
+        monkeypatch.setitem(sys.modules, "mlx_audio", mlx_audio_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", stt_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils_module)
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained", load_processor
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_api_key", "test-api-key")
+        monkeypatch.setattr(srv, "_metrics", MetricsCollector())
+
+        client = TestClient(srv.app, headers={"Authorization": "Bearer test-api-key"})
+        try:
+            if fail_first_download:
+                failed = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert failed.status_code == 500
+                assert failed.json() == {"detail": "Transcription failed"}
+                assert srv._stt_engine.model is None
+                assert srv._stt_engine._loaded is False
+                assert generated_paths == []
+
+            for _ in range(2):
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "text": "hello",
+                    "language": "en",
+                    "duration": 1.25,
+                }
+        finally:
+            client.close()
+
+        assert isinstance(srv._stt_engine, STTEngine)
+        assert len(models) == (2 if fail_first_download else 1)
+        assert srv._stt_engine.model is models[-1]
+        assert processor_calls == ["openai/whisper-small"] * len(models)
+        assert len(generated_paths) == 2
+        assert all(not path.exists() for path in generated_paths)
+
+
 class TestMCPExecuteEndpoint:
     """Test MCP execute endpoint sandbox routing."""
 
@@ -2029,6 +2139,185 @@ class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("suppress_final", [False, True])
+    async def test_final_delta_attaches_metadata_to_terminal_choice(
+        self, monkeypatch, suppress_final
+    ):
+        """Direct and parser-suppressed finals keep a compatible shape."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class SuppressingReasoningParser:
+            def __init__(self, tokenizer=None):
+                pass
+
+            def reset_state(self, implicit_mode: bool = False):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return None
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="" if suppress_final else "ok",
+                    new_text="</think>" if suppress_final else "ok",
+                    finished=True,
+                    finish_reason="stop",
+                    specprefill_outcome=SimpleNamespace(
+                        requested=True,
+                        engaged=False,
+                        reason="unsupported_media_type",
+                        route="mllm_media",
+                        model_module="mlx_vlm.models.qwen3_vl.qwen3_vl",
+                        language_module="mlx_vlm.models.qwen3_vl.language",
+                        model_type="qwen3_vl",
+                        original_tokens=9000,
+                        selected_tokens=0,
+                    ),
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(
+            server,
+            "_reasoning_parser_name",
+            "suppressing" if suppress_final else None,
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server, "get_reasoning_parser", lambda name: SuppressingReasoningParser
+        )
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert request.stream_options is None
+        assert all(payload["choices"] for payload in payloads)
+        metadata_payloads = [
+            payload
+            for payload in payloads
+            if payload.get("generation_metadata") is not None
+        ]
+        assert len(metadata_payloads) == 1
+
+        metadata_payload = metadata_payloads[0]
+        assert metadata_payload["choices"][0]["finish_reason"] == "stop"
+        assert metadata_payload["generation_metadata"]["specprefill_requested"] is True
+        assert metadata_payload["generation_metadata"]["specprefill_engaged"] is False
+        assert (
+            metadata_payload["generation_metadata"]["specprefill_reason"]
+            == "unsupported_media_type"
+        )
+
+    @pytest.mark.anyio
+    async def test_usage_chunk_preserves_thinking_processor_through_builder(
+        self, monkeypatch
+    ):
+        """Opted-in usage metadata preserves the live thinking processor state."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            _build_chat_streaming_response,
+            ChatCompletionRequest,
+            Message,
+        )
+        import vllm_mlx.server as server
+
+        thinking_processor = SimpleNamespace(
+            _no_final_content_token_limit=7,
+            watchdog_was_enforced=True,
+        )
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                assert "thinking_processor" not in kwargs
+                assert kwargs["logits_processors"] == [thinking_processor]
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        async def passthrough_disconnect_guard(generator, *_args, **_kwargs):
+            async for chunk in generator:
+                yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", None)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(server, "_disconnect_guard", passthrough_disconnect_guard)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        response, release_on_exit = await _build_chat_streaming_response(
+            FakeEngine(),
+            request.messages,
+            request,
+            SimpleNamespace(),
+            None,
+            {"logits_processors": [thinking_processor]},
+            None,
+            None,
+            thinking_processor=thinking_processor,
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert release_on_exit is False
+        usage_payloads = [payload for payload in payloads if payload["choices"] == []]
+        assert len(usage_payloads) == 1
+        usage_payload = usage_payloads[0]
+        assert usage_payload["usage"] == {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }
+        metadata = usage_payload["generation_metadata"]
+        assert metadata["no_final_content_watchdog_tokens"] == 7
+        assert metadata["no_final_content_watchdog_enforced"] is True
+
+    @pytest.mark.anyio
     async def test_interleaved_streams_keep_reasoning_parser_state_isolated(
         self, monkeypatch
     ):
@@ -3607,6 +3896,105 @@ class TestStreamChatCompletion:
         assert json.loads(delta["content"]) == {"ok": True}
         assert "reasoning_content" not in delta
         assert payloads[1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "response_format",
+        [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                        },
+                        "required": ["name", "age"],
+                    },
+                },
+            },
+        ],
+        ids=["json_object", "json_schema"],
+    )
+    async def test_response_format_stream_keeps_tail_on_empty_final_delta(
+        self, monkeypatch, response_format
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        pieces = ['{"name": "Alice', '", "age"', ": 30}"]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                text = ""
+                for piece in pieces:
+                    text += piece
+                    yield GenerationOutput(
+                        text=text, new_text=piece, finished=False, finish_reason=None
+                    )
+                yield GenerationOutput(
+                    text=text,
+                    new_text="",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=len(pieces) + 1,
+                )
+
+        class ReasoningOnlyParser:
+            def reset_state(self, implicit_mode: bool = False):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if not delta_text:
+                    return None
+                return DeltaMessage(reasoning=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", ReasoningOnlyParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return json")],
+            stream=True,
+            response_format=response_format,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        assert json.loads(content) == {"name": "Alice", "age": 30}
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
     async def test_response_format_stream_rejects_schema_invalid_completion(
@@ -5632,3 +6020,109 @@ class TestDetectImplicitThinking:
         assert engine.calls == 2, "unidentifiable template must not be cached"
         assert server._implicit_thinking_cache == {}
         server._implicit_thinking_cache.clear()
+
+
+class TestAnthropicImageClientErrors:
+    """Invalid image blocks must produce deliberate 400s, not unhandled 500s.
+
+    The adapter raises ValueError for empty/unknown image sources; the route
+    must translate that before engine acquisition, in both modes.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def _setup(self, monkeypatch):
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+
+    def _payload(self, source, stream=False):
+        return {
+            "model": "test-model",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": source}],
+                }
+            ],
+        }
+
+    def test_empty_image_data_is_400_non_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "base64", "media_type": "image/png", "data": ""}
+        response = client.post("/v1/messages", json=self._payload(source))
+        assert response.status_code == 400
+        assert "image" in response.json()["detail"]
+
+    def test_unknown_image_source_is_400_non_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "carrier-pigeon", "data": "abc"}
+        response = client.post("/v1/messages", json=self._payload(source))
+        assert response.status_code == 400
+        assert "carrier-pigeon" in response.json()["detail"]
+
+    def test_empty_image_data_is_400_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "base64", "media_type": "image/png", "data": ""}
+        response = client.post("/v1/messages", json=self._payload(source, stream=True))
+        assert response.status_code == 400
+        assert "image" in response.json()["detail"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_blocked_image_url_releases_registry_lease(
+        self, client, monkeypatch, stream
+    ):
+        """URL rejection after acquisition must release all request ownership."""
+        import vllm_mlx.server as server
+        from vllm_mlx.model_registry import ModelLease
+
+        self._setup(monkeypatch)
+        engine = SimpleNamespace(is_mllm=True)
+        leases = []
+        manager = SimpleNamespace(
+            active_requests=0,
+            registered_model_names=["test-model"],
+            has_model=lambda name: name == "test-model",
+        )
+
+        async def acquire(model_name):
+            manager.active_requests += 1
+
+            async def release():
+                manager.active_requests -= 1
+
+            lease = ModelLease(manager, model_name, engine, release)
+            leases.append(lease)
+            return lease
+
+        manager.acquire = acquire
+        monkeypatch.setattr(server, "_model_manager", manager)
+        monkeypatch.setattr(server, "_active_request_contexts", {})
+        source = {"type": "url", "url": "http://127.0.0.1/image.png"}
+
+        for _ in range(2):
+            response = client.post(
+                "/v1/messages", json=self._payload(source, stream=stream)
+            )
+            assert response.status_code == 400
+            assert manager.active_requests == 0
+            assert leases[-1].manager is None
+            assert server._active_request_contexts == {}
+
+        assert len(leases) == 2

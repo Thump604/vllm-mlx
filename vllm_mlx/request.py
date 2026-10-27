@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
+    from .mllm_specprefill import SpecPrefillOutcome
     from .paged_cache import BlockTable
 
 
@@ -143,6 +144,13 @@ class Request:
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )
 
+    # MTP (multi-token prediction) per-request counters, mirroring
+    # MLLMRequest.mtp_drafts/mtp_accepted (mllm_scheduler.py). Attributed by
+    # UID in Scheduler._process_batch_responses from the deltas
+    # _install_mtp's closures accumulate per step (see scheduler.py).
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""
@@ -217,6 +225,8 @@ class RequestOutput:
     # MTP speculative decoding counters. Zero means no MTP attempt occurred.
     mtp_drafts: int = 0
     mtp_accepted: int = 0
+    # Request-level sparse-prefill decision and diagnostics.
+    specprefill_outcome: Optional["SpecPrefillOutcome"] = None
 
     @property
     def usage(self) -> Dict[str, int]:
