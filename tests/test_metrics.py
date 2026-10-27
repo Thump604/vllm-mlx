@@ -1,8 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Prometheus server metrics."""
+"""Tests for Prometheus server metrics.
 
+Runs against a real FastAPI TestClient built from vllm_mlx.server, which
+pulls in the full server dependency chain (uvicorn, fastapi, prometheus-client,
+mlx.core). Kept Apple-Silicon-only rather than mlx-stubbed: unlike
+test_mllm_steps_executed_stat.py's mlx.core-only need, this file's import
+chain also needs uvicorn/prometheus-client, neither of which the Linux
+test-matrix job installs (see PR #749's review -- an earlier version of
+this file ran here via tests/_mlx_stub.py and errored at fixture setup
+with ModuleNotFoundError: No module named 'uvicorn'). The one assertion
+that specifically needed Linux coverage (get_stats()["steps_executed"]
+reaching the vllm_mlx_engine_steps_executed gauge) now has a dependency-light
+equivalent in test_mllm_steps_executed_stat.py's
+TestMetricsEngineStepsExecutedGauge, which calls MetricsCollector directly
+and needs neither uvicorn nor a real prometheus_client registry. This file
+still runs in the Apple job for full HTTP-layer integration coverage.
+"""
+
+import asyncio
 import platform
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -153,6 +171,70 @@ class TestMetricsEndpoint:
 
         assert response.status_code == 404
 
+    def test_metrics_endpoint_reports_dead_gauges_without_engine_or_manager(
+        self, metrics_client
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+        assert server._engine is None
+        assert server._model_manager is None
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 0.0" in response.text
+        assert "vllm_mlx_scheduler_waiting_requests 0.0" in response.text
+
+    def test_metrics_endpoint_scrapes_registry_mode_engine(
+        self, metrics_client, monkeypatch
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+
+        class FakeModelManager:
+            def __init__(self, engine):
+                self._engine = engine
+
+            def get_metrics_engine(self):
+                return self._engine
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(server, "_model_manager", FakeModelManager(FakeEngine()))
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 1.0" in response.text
+        assert "vllm_mlx_scheduler_waiting_requests 2.0" in response.text
+        assert (
+            'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
+        )
+
+    def test_metrics_endpoint_registry_mode_dead_gauges_when_idle(
+        self, metrics_client, monkeypatch
+    ):
+        client, server, collector = metrics_client
+
+        collector.configure(enabled=True)
+
+        class FakeModelManager:
+            def get_metrics_engine(self):
+                return None
+
+            async def shutdown(self):
+                return None
+
+        monkeypatch.setattr(server, "_model_manager", FakeModelManager())
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "vllm_mlx_model_loaded 0.0" in response.text
+
     def test_metrics_endpoint_scrapes_runtime_stats(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client
 
@@ -170,6 +252,10 @@ class TestMetricsEndpoint:
         assert (
             'vllm_mlx_cache_type{cache_type="memory_aware_cache"} 1.0' in response.text
         )
+        # get_stats()["steps_executed"] must reach the gauge -- the
+        # duck-typed read side of #746 (the producer side, MLLMScheduler /
+        # BatchedEngine, is covered by test_mllm_steps_executed_stat.py).
+        assert "vllm_mlx_engine_steps_executed 7.0" in response.text
 
     def test_metrics_collapse_unmatched_paths(self, metrics_client, monkeypatch):
         client, server, collector = metrics_client
@@ -259,4 +345,214 @@ class TestMetricsEndpoint:
         assert (
             'vllm_mlx_completion_tokens_total{endpoint="chat_completions",stream="true"} 2.0'
             in scrape.text
+        )
+
+
+class TestMetricsMiddlewareStreamingTiming:
+    """Regression coverage for `_metrics_middleware`'s in-flight gauge timing.
+
+    `call_next()` (Starlette's BaseHTTPMiddleware) resolves as soon as the
+    ASGI response has *started* -- for a StreamingResponse this is long
+    before the body finishes sending. These tests exercise
+    `_metrics_middleware` directly, with a fake `call_next` returning a
+    controllable fake streaming response, instead of driving a real
+    FastAPI/TestClient/uvicorn round trip -- this makes the exact moment the
+    gauge changes deterministic and independent of any real inference or
+    real async I/O, per `TestDisconnectGuard`'s established pattern for this
+    file.
+    """
+
+    PATH = "/v1/chat/completions"
+
+    def _make_collector_and_request(self, monkeypatch):
+        import vllm_mlx.server as server
+        from vllm_mlx.metrics import MetricsCollector
+
+        collector = MetricsCollector()
+        collector.configure(enabled=True)
+        monkeypatch.setattr(server, "_metrics", collector)
+        monkeypatch.setattr(
+            server, "_metrics_path_for_request", lambda request: self.PATH
+        )
+        request = SimpleNamespace(method="POST")
+        return server, collector, request
+
+    @staticmethod
+    def _inflight_value(collector, path):
+        payload, _ = collector.render_metrics(engine=None, mcp_manager=None)
+        needle = f'vllm_mlx_http_requests_in_flight{{method="POST",path="{path}"}}'
+        for line in payload.decode().splitlines():
+            if line.startswith(needle):
+                return float(line.split()[-1])
+        return None
+
+    @staticmethod
+    def _total_count(collector, path, status_code):
+        payload, _ = collector.render_metrics(engine=None, mcp_manager=None)
+        needle = (
+            f'vllm_mlx_http_requests_total{{method="POST",path="{path}",'
+            f'status_code="{status_code}"}}'
+        )
+        for line in payload.decode().splitlines():
+            if line.startswith(needle):
+                return float(line.split()[-1])
+        return 0.0
+
+    @pytest.mark.anyio
+    async def test_streaming_body_holds_gauge_until_exhausted(self, monkeypatch):
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+        resume = asyncio.Event()
+
+        async def slow_body():
+            yield b"data: role-preamble\n\n"
+            await resume.wait()
+            yield b"data: [DONE]\n\n"
+
+        async def call_next(_request):
+            return SimpleNamespace(body_iterator=slow_body(), status_code=200)
+
+        # Prometheus only emits a line for a labeled gauge once it has been
+        # touched at least once -- untouched, it's absent, not 0.0.
+        assert self._inflight_value(collector, self.PATH) is None
+
+        response = await server._metrics_middleware(request, call_next)
+        # call_next() has already resolved here -- this is exactly the
+        # moment the OLD code decremented the gauge, before any real
+        # generation has happened.
+        assert self._inflight_value(collector, self.PATH) == 1.0
+
+        body_iter = response.body_iterator.__aiter__()
+        first_chunk = await body_iter.__anext__()
+        assert first_chunk == b"data: role-preamble\n\n"
+        assert self._inflight_value(collector, self.PATH) == 1.0, (
+            "must still be in flight after only the content-free preamble "
+            "chunk has been sent -- this is the exact case the old gauge "
+            "got wrong"
+        )
+
+        resume.set()
+        remaining = [chunk async for chunk in body_iter]
+
+        assert remaining == [b"data: [DONE]\n\n"]
+        assert (
+            self._inflight_value(collector, self.PATH) == 0.0
+        ), "must be decremented once the body is actually exhausted"
+
+    @pytest.mark.anyio
+    async def test_error_mid_stream_decrements_exactly_once(self, monkeypatch):
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+
+        async def erroring_body():
+            yield b"data: role-preamble\n\n"
+            raise RuntimeError("boom")
+
+        async def call_next(_request):
+            return SimpleNamespace(body_iterator=erroring_body(), status_code=200)
+
+        response = await server._metrics_middleware(request, call_next)
+        assert self._inflight_value(collector, self.PATH) == 1.0
+
+        received = []
+        with pytest.raises(RuntimeError, match="boom"):
+            async for chunk in response.body_iterator:
+                received.append(chunk)
+
+        assert received == [b"data: role-preamble\n\n"]
+        assert (
+            self._inflight_value(collector, self.PATH) == 0.0
+        ), "a mid-stream error must not leak the gauge stuck at 1"
+
+        # The generator is already closed by the propagated exception,
+        # closing it again (e.g. GC, or a caller's own cleanup) must not
+        # double-decrement past zero.
+        await response.body_iterator.aclose()
+        assert self._inflight_value(collector, self.PATH) == 0.0
+
+    @pytest.mark.anyio
+    async def test_call_next_raising_before_any_response_finishes_once(
+        self, monkeypatch
+    ):
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+
+        async def call_next(_request):
+            raise RuntimeError("engine acquisition failed")
+
+        with pytest.raises(RuntimeError, match="engine acquisition failed"):
+            await server._metrics_middleware(request, call_next)
+
+        assert self._inflight_value(collector, self.PATH) == 0.0
+        assert self._total_count(collector, self.PATH, 500) == 1.0
+
+    @pytest.mark.anyio
+    async def test_non_streaming_single_chunk_body_still_settles_immediately(
+        self, monkeypatch
+    ):
+        """Non-streaming responses are unaffected: their entire body is
+        already produced before `call_next()` returns, so the returned
+        body_iterator yields once and is done -- net timing is unchanged
+        from before this fix."""
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+
+        async def single_chunk_body():
+            yield b'{"id": "cmpl-1", "object": "chat.completion"}'
+
+        async def call_next(_request):
+            return SimpleNamespace(body_iterator=single_chunk_body(), status_code=200)
+
+        response = await server._metrics_middleware(request, call_next)
+        assert self._inflight_value(collector, self.PATH) == 1.0
+
+        received = [chunk async for chunk in response.body_iterator]
+
+        assert received == [b'{"id": "cmpl-1", "object": "chat.completion"}']
+        assert self._inflight_value(collector, self.PATH) == 0.0
+
+    @pytest.mark.anyio
+    async def test_send_failure_mid_stream_settles_at_request_exit(self, monkeypatch):
+        """Reproduces the PR #782 review finding (Thump604): on the real
+        Starlette `_StreamingResponse.__call__` path, `send()` raising
+        mid-stream (e.g. a genuine client disconnect) abandons
+        `body_iterator` without ever closing it -- `async for`/`await` do
+        not call `aclose()` on early termination via a propagated
+        exception. `body_iterator`-only wrapping settles metrics only
+        whenever that abandoned generator happens to be garbage-collected,
+        not at request exit. This must settle synchronously instead, the
+        moment the response's ASGI call raises."""
+        server, collector, request = self._make_collector_and_request(monkeypatch)
+
+        class FakeASGIStreamingResponse:
+            """Minimal stand-in for Starlette's `_StreamingResponse`:
+            `__call__` mirrors its body-iteration loop exactly (no
+            try/finally of its own around it), so a `send()` failure
+            propagates straight out, leaving `body_iterator` suspended
+            mid-yield -- exactly like the real object this stands in for."""
+
+            def __init__(self, body_iterator, status_code=200):
+                self.body_iterator = body_iterator
+                self.status_code = status_code
+
+            async def __call__(self, scope, receive, send):
+                async for chunk in self.body_iterator:
+                    await send({"type": "http.response.body", "body": chunk})
+
+        async def slow_body():
+            yield b"first chunk"
+            yield b"second chunk"  # never reached -- send() dies on the first
+
+        async def call_next(_request):
+            return FakeASGIStreamingResponse(slow_body(), status_code=200)
+
+        response = await server._metrics_middleware(request, call_next)
+        assert self._inflight_value(collector, self.PATH) == 1.0
+
+        async def dying_send(_message):
+            raise OSError("Broken pipe")
+
+        with pytest.raises(OSError, match="Broken pipe"):
+            await response(None, None, dying_send)
+
+        assert self._inflight_value(collector, self.PATH) == 0.0, (
+            "a send() failure mid-stream (a real client disconnect) must "
+            "settle metrics at request exit, not only whenever the "
+            "abandoned generator happens to be garbage-collected"
         )

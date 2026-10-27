@@ -76,6 +76,11 @@ def _install_mlx_stubs() -> None:
 _install_mlx_stubs()
 
 
+def _thread_label(thread: threading.Thread | None) -> str:
+    """Readable identity for failure messages; None means never bound."""
+    return "—" if thread is None else f"{thread.name}/{thread.ident}"
+
+
 class _Chunk:
     def __init__(self, text: str, finish_reason: str | None = None) -> None:
         self.text = text
@@ -93,19 +98,24 @@ class _ThreadRecordingModel:
         *,
         chunks: int = 3,
         chunk_gate: threading.Event | None = None,
+        thread_instances: set[threading.Thread] | None = None,
     ) -> None:
         self._threads = threads
         self._chunks = chunks
         self._chunk_gate = chunk_gate
+        self._thread_instances = thread_instances
         self.closed = threading.Event()
         self.tokenizer = types.SimpleNamespace(encode=lambda s: [0] * len(s.split()))
         self.model = object()
 
     def _record(self, key: str) -> None:
-        # Name plus ident: a fresh ThreadPoolExecutor restarts its numbering, so
-        # two different threads both answer to "simple-generate_0".
+        # Keep the readable name/ident diagnostics, but retain Thread objects
+        # when a test must distinguish workers: executors restart their thread
+        # numbering and the OS may recycle an ident after the old thread exits.
         current = threading.current_thread()
         self._threads.setdefault(key, []).append(f"{current.name}/{current.ident}")
+        if self._thread_instances is not None:
+            self._thread_instances.add(current)
 
     def load(self) -> None:
         self._record("load")
@@ -254,6 +264,63 @@ def test_stream_done_sentinel_is_distinct(engine_module):
     assert sentinel is not None
     assert next(iter([]), sentinel) is sentinel
     assert next(iter([_Chunk("x")]), sentinel) is not sentinel
+
+
+@pytest.mark.parametrize("route", ["chat", "stream_chat", "native_video"])
+@pytest.mark.parametrize("top_p", [None, 0.37, 1.0])
+def test_mllm_chat_sampling_reaches_generation_worker(
+    engine_module, monkeypatch, route, top_p
+):
+    """Both worker dispatch paths must retain the request's nucleus sampling."""
+    from vllm_mlx.models.mllm import MLLMOutput
+
+    class SamplingModel:
+        _video_native = route == "native_video"
+
+        def _collect_video_inputs(self, messages):
+            return ["test-video"] if self._video_native else []
+
+        def chat(self, *, temperature=0.0, top_p=1.0, top_k=0, **kwargs):
+            return MLLMOutput(
+                text=f"{temperature}:{top_p}:{top_k}",
+                prompt_tokens=3,
+                completion_tokens=1,
+                finish_reason="stop",
+            )
+
+        def stream_chat(self, **kwargs):
+            yield self.chat(**kwargs)
+
+    engine = engine_module.SimpleEngine("test-model", force_mllm=True)
+    engine._loaded = True
+    engine._model = SamplingModel()
+    engine._text_model_initialization_attempted = True
+    monkeypatch.setattr(engine, "_bind_generation_streams_once", lambda: None)
+    media_type = "video_url" if route == "native_video" else "image_url"
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": media_type, media_type: {"url": "test-media"}}],
+        }
+    ]
+
+    async def scenario():
+        kwargs = {"temperature": 0.8, "top_k": 17}
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if route == "chat":
+            return await engine.chat(messages, **kwargs)
+        chunks = [chunk async for chunk in engine.stream_chat(messages, **kwargs)]
+        return chunks[-1]
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        if engine._generation_executor is not None:
+            engine._generation_executor.shutdown(wait=True)
+
+    expected_top_p = 0.9 if top_p is None else top_p
+    assert result.text == f"0.8:{expected_top_p}:17"
 
 
 def test_stop_does_not_block_the_event_loop(engine_module):
@@ -450,8 +517,14 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
     thread has to join the old one before it loads anything.
     """
     threads: dict[str, list[str]] = {}
+    thread_instances: set[threading.Thread] = set()
     gate = threading.Event()
-    slow = _ThreadRecordingModel(threads, chunks=64, chunk_gate=gate)
+    slow = _ThreadRecordingModel(
+        threads,
+        chunks=64,
+        chunk_gate=gate,
+        thread_instances=thread_instances,
+    )
     engine = _make_engine(engine_module, slow)
 
     async def scenario() -> None:
@@ -473,7 +546,7 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
         # Restart: a new worker, whose first job is to wait the old one out.
         engine._stopping = False
         engine._loaded = True
-        fresh = _ThreadRecordingModel(threads)
+        fresh = _ThreadRecordingModel(threads, thread_instances=thread_instances)
         engine._model = fresh
         worker = engine._generation_worker()
         assert worker is not detached, "stop() must not hand back the dead worker"
@@ -489,7 +562,7 @@ def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
     asyncio.run(scenario())
 
     names = sorted(set(threads["stream_generate"]))
-    assert len(names) == 2, f"restart must not reuse the old thread, saw {names}"
+    assert len(thread_instances) == 2, f"restart must use a fresh thread, saw {names}"
     assert not any(t.startswith("MainThread") for t in names)
 
 
@@ -505,15 +578,21 @@ def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkey
     is faked so the check runs on machines without MLX, matching the rest of
     this module.
     """
-    owner_of: dict[int, int] = {}
-    cross_thread: list[tuple[int, int | None, int]] = []
+    # Keyed by Thread object, not ident: this test retires a worker and starts
+    # another, which is exactly the window in which the OS may hand the new
+    # thread the dead one's ident. Comparing idents would then read a
+    # cross-thread bind as same-thread and silently stop catching the
+    # regression. Same reason as 36deafe1 for the neighbouring test.
+    owner_of: dict[int, threading.Thread] = {}
+    cross_thread: list[tuple[int, str, str]] = []
     issued = [0]
 
     def fake_bind(stream=None):
-        me = threading.get_ident()
+        me = threading.current_thread()
         if stream is not None:
-            if owner_of.get(stream) != me:
-                cross_thread.append((stream, owner_of.get(stream), me))
+            owner = owner_of.get(stream)
+            if owner is not me:
+                cross_thread.append((stream, _thread_label(owner), _thread_label(me)))
             return stream
         issued[0] += 1
         owner_of[issued[0]] = me
@@ -559,5 +638,124 @@ def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkey
 
     assert not cross_thread, (
         "a thread bound a stream created by another thread: "
-        f"{cross_thread} (stream, owner_ident, binder_ident)"
+        f"{cross_thread} (stream, owner, binder)"
     )
+
+
+@pytest.fixture()
+def cache_chat_engine(engine_module, monkeypatch):
+    """Exercise the real cache producer/consumer with an in-memory cache sink."""
+
+    class PromptTrie:
+        nbytes = 0
+
+        def __init__(self):
+            self.entries = []
+
+        def __len__(self):
+            return len(self.entries)
+
+        def fetch_nearest_cache(self, model, tokens):
+            return None, tokens
+
+        def insert_cache(self, model, tokens, cache):
+            self.entries.append((model, list(tokens), cache))
+
+    lm = types.ModuleType("mlx_lm")
+    lm.__path__ = []
+    cache_module = types.ModuleType("mlx_lm.models.cache")
+    cache_module.make_prompt_cache = lambda model: [object()]
+    sample_module = types.ModuleType("mlx_lm.sample_utils")
+    sample_module.make_sampler = lambda **kwargs: None
+    monkeypatch.setitem(sys.modules, "mlx_lm", lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_module)
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", sample_module)
+
+    engine = engine_module.SimpleEngine("test-model", prefix_trie_cache=True)
+    engine._loaded = True
+    engine._supports_system_kv_cache = True
+    engine._model = types.SimpleNamespace(
+        model=object(),
+        tokenizer=types.SimpleNamespace(
+            encode=lambda text, **kwargs: [ord(char) for char in text],
+            bos_token=None,
+        ),
+    )
+    trie = PromptTrie()
+    engine._prefix_trie_cache = trie
+    yield engine, lm, trie
+    if engine._generation_executor is not None:
+        engine._generation_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize(
+    "finish_reason,max_tokens", [("stop", 4), (None, 1)], ids=["eos", "token-limit"]
+)
+def test_completed_cached_stream_finishes_cache_insert(
+    cache_chat_engine, finish_reason, max_tokens
+):
+    engine, lm, trie = cache_chat_engine
+    release_worker = threading.Event()
+
+    def generate(*args, **kwargs):
+        yield types.SimpleNamespace(
+            text="X", token=ord("X"), finish_reason=finish_reason
+        )
+        assert release_worker.wait(timeout=5), "consumer never released the worker"
+
+    lm.stream_generate = generate
+
+    async def scenario():
+        chunks = []
+        async for chunk in engine.stream_chat(
+            [{"role": "user", "content": "hello"}], max_tokens=max_tokens
+        ):
+            chunks.append(chunk)
+            # The worker resumes only after the consumer enters stream cleanup
+            # and awaits the producer. No scheduling-speed assumption is needed.
+            asyncio.get_running_loop().call_soon(release_worker.set)
+        return chunks
+
+    try:
+        chunks = asyncio.run(scenario())
+    finally:
+        release_worker.set()
+
+    assert len(chunks) == 1
+    assert chunks[0].finished
+    assert len(trie.entries) == 1
+    assert trie.entries[0][1][-1] == ord("X")
+    assert engine.get_stats()["prefix_trie_cache"]["inserts"] == 1
+
+
+def test_closing_incomplete_cached_stream_does_not_insert(cache_chat_engine):
+    engine, lm, trie = cache_chat_engine
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    def generate(*args, **kwargs):
+        try:
+            yield types.SimpleNamespace(text="X", token=ord("X"), finish_reason=None)
+            assert release_worker.wait(timeout=5), "consumer never released the worker"
+        finally:
+            worker_finished.set()
+
+    lm.stream_generate = generate
+
+    async def scenario():
+        stream = engine.stream_chat(
+            [{"role": "user", "content": "hello"}], max_tokens=4
+        )
+        first = await anext(stream)
+        assert not first.finished
+        asyncio.get_running_loop().call_soon(release_worker.set)
+        await stream.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_worker.set()
+
+    assert worker_finished.is_set()
+    assert trie.entries == []
+    assert engine.get_stats()["prefix_trie_cache"]["inserts"] == 0

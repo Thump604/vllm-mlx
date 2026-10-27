@@ -414,6 +414,116 @@ class TestAnthropicRequest:
             )
 
 
+class TestWhisperTranscriptionEndpoint:
+    """Exercise processor recovery through the real HTTP route and STT engine."""
+
+    @pytest.mark.parametrize(
+        "fail_first_download",
+        [False, True],
+        ids=["missing-processor", "download-retry"],
+    )
+    def test_transcription_recovers_processor(self, monkeypatch, fail_first_download):
+        import io
+        import wave
+        from pathlib import Path
+        from types import ModuleType
+
+        import vllm_mlx.server as srv
+        from vllm_mlx.audio.stt import STTEngine
+        from vllm_mlx.metrics import MetricsCollector
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(b"\x00\x00" * 20000)
+        audio_bytes = wav_buffer.getvalue()
+        processor = object()
+        models = []
+        processor_calls = []
+        generated_paths = []
+
+        def load_model(model_name):
+            assert model_name == "mlx-community/whisper-small-mlx"
+            model = SimpleNamespace(_processor=None)
+
+            def generate(audio_path, *, verbose, language, task):
+                assert model._processor is processor
+                assert verbose is False
+                assert language == "en"
+                assert task == "transcribe"
+                assert Path(audio_path).read_bytes() == audio_bytes
+                generated_paths.append(Path(audio_path))
+                return SimpleNamespace(
+                    text=" hello ",
+                    language="en",
+                    segments=[{"start": 0.0, "end": 1.25, "text": "hello"}],
+                )
+
+            model.generate = generate
+            models.append(model)
+            return model
+
+        def load_processor(processor_repo):
+            processor_calls.append(processor_repo)
+            if fail_first_download and len(processor_calls) == 1:
+                raise OSError("processor download failed")
+            return processor
+
+        utils_module = ModuleType("mlx_audio.stt.utils")
+        utils_module.load_model = load_model
+        stt_module = ModuleType("mlx_audio.stt")
+        stt_module.utils = utils_module
+        mlx_audio_module = ModuleType("mlx_audio")
+        mlx_audio_module.stt = stt_module
+        monkeypatch.setitem(sys.modules, "mlx_audio", mlx_audio_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", stt_module)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", utils_module)
+        monkeypatch.setattr(
+            "transformers.WhisperProcessor.from_pretrained", load_processor
+        )
+        monkeypatch.setattr(srv, "_stt_engine", None)
+        monkeypatch.setattr(srv, "_api_key", "test-api-key")
+        monkeypatch.setattr(srv, "_metrics", MetricsCollector())
+
+        client = TestClient(srv.app, headers={"Authorization": "Bearer test-api-key"})
+        try:
+            if fail_first_download:
+                failed = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert failed.status_code == 500
+                assert failed.json() == {"detail": "Transcription failed"}
+                assert srv._stt_engine.model is None
+                assert srv._stt_engine._loaded is False
+                assert generated_paths == []
+
+            for _ in range(2):
+                response = client.post(
+                    "/v1/audio/transcriptions",
+                    params={"model": "whisper-small", "language": "en"},
+                    files={"file": ("speech.wav", audio_bytes, "audio/wav")},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "text": "hello",
+                    "language": "en",
+                    "duration": 1.25,
+                }
+        finally:
+            client.close()
+
+        assert isinstance(srv._stt_engine, STTEngine)
+        assert len(models) == (2 if fail_first_download else 1)
+        assert srv._stt_engine.model is models[-1]
+        assert processor_calls == ["openai/whisper-small"] * len(models)
+        assert len(generated_paths) == 2
+        assert all(not path.exists() for path in generated_paths)
+
+
 class TestMCPExecuteEndpoint:
     """Test MCP execute endpoint sandbox routing."""
 
@@ -2029,6 +2139,185 @@ class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("suppress_final", [False, True])
+    async def test_final_delta_attaches_metadata_to_terminal_choice(
+        self, monkeypatch, suppress_final
+    ):
+        """Direct and parser-suppressed finals keep a compatible shape."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class SuppressingReasoningParser:
+            def __init__(self, tokenizer=None):
+                pass
+
+            def reset_state(self, implicit_mode: bool = False):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                return None
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="" if suppress_final else "ok",
+                    new_text="</think>" if suppress_final else "ok",
+                    finished=True,
+                    finish_reason="stop",
+                    specprefill_outcome=SimpleNamespace(
+                        requested=True,
+                        engaged=False,
+                        reason="unsupported_media_type",
+                        route="mllm_media",
+                        model_module="mlx_vlm.models.qwen3_vl.qwen3_vl",
+                        language_module="mlx_vlm.models.qwen3_vl.language",
+                        model_type="qwen3_vl",
+                        original_tokens=9000,
+                        selected_tokens=0,
+                    ),
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(
+            server,
+            "_reasoning_parser_name",
+            "suppressing" if suppress_final else None,
+        )
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            server, "get_reasoning_parser", lambda name: SuppressingReasoningParser
+        )
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert request.stream_options is None
+        assert all(payload["choices"] for payload in payloads)
+        metadata_payloads = [
+            payload
+            for payload in payloads
+            if payload.get("generation_metadata") is not None
+        ]
+        assert len(metadata_payloads) == 1
+
+        metadata_payload = metadata_payloads[0]
+        assert metadata_payload["choices"][0]["finish_reason"] == "stop"
+        assert metadata_payload["generation_metadata"]["specprefill_requested"] is True
+        assert metadata_payload["generation_metadata"]["specprefill_engaged"] is False
+        assert (
+            metadata_payload["generation_metadata"]["specprefill_reason"]
+            == "unsupported_media_type"
+        )
+
+    @pytest.mark.anyio
+    async def test_usage_chunk_preserves_thinking_processor_through_builder(
+        self, monkeypatch
+    ):
+        """Opted-in usage metadata preserves the live thinking processor state."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            _build_chat_streaming_response,
+            ChatCompletionRequest,
+            Message,
+        )
+        import vllm_mlx.server as server
+
+        thinking_processor = SimpleNamespace(
+            _no_final_content_token_limit=7,
+            watchdog_was_enforced=True,
+        )
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                assert "thinking_processor" not in kwargs
+                assert kwargs["logits_processors"] == [thinking_processor]
+                yield GenerationOutput(
+                    text="ok",
+                    new_text="ok",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                )
+
+        async def passthrough_disconnect_guard(generator, *_args, **_kwargs):
+            async for chunk in generator:
+                yield chunk
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", None)
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+        monkeypatch.setattr(server, "_disconnect_guard", passthrough_disconnect_guard)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        response, release_on_exit = await _build_chat_streaming_response(
+            FakeEngine(),
+            request.messages,
+            request,
+            SimpleNamespace(),
+            None,
+            {"logits_processors": [thinking_processor]},
+            None,
+            None,
+            thinking_processor=thinking_processor,
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        assert release_on_exit is False
+        usage_payloads = [payload for payload in payloads if payload["choices"] == []]
+        assert len(usage_payloads) == 1
+        usage_payload = usage_payloads[0]
+        assert usage_payload["usage"] == {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }
+        metadata = usage_payload["generation_metadata"]
+        assert metadata["no_final_content_watchdog_tokens"] == 7
+        assert metadata["no_final_content_watchdog_enforced"] is True
+
+    @pytest.mark.anyio
     async def test_interleaved_streams_keep_reasoning_parser_state_isolated(
         self, monkeypatch
     ):
@@ -2046,7 +2335,7 @@ class TestStreamChatCompletion:
             def __init__(self, tokenizer=None):
                 self.in_think = False
 
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self.in_think = False
 
             def extract_reasoning_streaming(
@@ -2238,6 +2527,223 @@ class TestStreamChatCompletion:
             "completion_tokens": 7,
             "total_tokens": 12,
         }
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("parser_name", ["deepseek_v4", "auto"])
+    async def test_deepseek_v4_split_marker_never_leaks(self, monkeypatch, parser_name):
+        """The request-local DSML parser must see text before the split marker."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        d = "｜DSML｜"
+        deltas = [
+            "Checking.\n\n",
+            "<",
+            d,
+            "tool_calls>\n",
+            f'<{d}invoke name="get_weather">\n',
+            f'<{d}parameter name="city" string="true">Prague</{d}parameter>\n',
+            f"</{d}invoke>\n",
+            f"</{d}tool_calls>",
+        ]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                for index, delta in enumerate(deltas):
+                    finished = index == len(deltas) - 1
+                    yield GenerationOutput(
+                        text="",
+                        new_text=delta,
+                        finished=finished,
+                        finish_reason="stop" if finished else None,
+                    )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", parser_name)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            payload["choices"][0]["delta"].get("content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+        tool_payloads = [
+            payload
+            for payload in payloads
+            if payload["choices"] and payload["choices"][0]["delta"].get("tool_calls")
+        ]
+
+        assert content.strip() == "Checking."
+        assert d not in content
+        assert len(tool_payloads) == 1
+        assert (
+            tool_payloads[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+            == "get_weather"
+        )
+
+    @pytest.mark.anyio
+    async def test_deepseek_v4_truncated_dsml_is_visible_at_eos(self, monkeypatch):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        d = "｜DSML｜"
+        truncated = f'Before <{d}tool_calls>\n<{d}invoke name="f'
+        model_output = "thinking</think>" + truncated
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="",
+                    new_text=model_output,
+                    finished=False,
+                )
+                yield GenerationOutput(
+                    text="",
+                    new_text="",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "deepseek_v4")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(server, "_tool_call_parser", "deepseek_v4")
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            payload["choices"][0]["delta"].get("content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+
+        assert content == truncated
+        assert payloads[-1]["choices"][0]["finish_reason"] == "length"
+
+    @pytest.mark.anyio
+    async def test_deepseek_v4_reasoning_flushes_final_lt_and_terminal(
+        self, monkeypatch
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(text="", new_text="2 ", finished=False)
+                yield GenerationOutput(
+                    text="",
+                    new_text="<",
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "deepseek_v4")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        reasoning = "".join(
+            payload["choices"][0]["delta"].get("reasoning_content") or ""
+            for payload in payloads
+            if payload["choices"]
+        )
+
+        assert reasoning == "2 <"
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
     async def test_stream_without_parser_flags_keeps_plain_text(self, monkeypatch):
@@ -2657,7 +3163,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self._in_reasoning = False
 
             def extract_reasoning_streaming(
@@ -2894,7 +3400,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3058,7 +3564,7 @@ class TestStreamChatCompletion:
                 )
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3137,7 +3643,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3252,7 +3758,7 @@ class TestStreamChatCompletion:
                     yield chunk
 
         class FakeReasoningParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 self._in_reasoning = False
 
             def extract_reasoning_streaming(
@@ -3342,7 +3848,7 @@ class TestStreamChatCompletion:
                 )
 
         class ReasoningOnlyParser:
-            def reset_state(self):
+            def reset_state(self, implicit_mode: bool = False):
                 pass
 
             def extract_reasoning_streaming(
@@ -3390,6 +3896,105 @@ class TestStreamChatCompletion:
         assert json.loads(delta["content"]) == {"ok": True}
         assert "reasoning_content" not in delta
         assert payloads[1]["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "response_format",
+        [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                        },
+                        "required": ["name", "age"],
+                    },
+                },
+            },
+        ],
+        ids=["json_object", "json_schema"],
+    )
+    async def test_response_format_stream_keeps_tail_on_empty_final_delta(
+        self, monkeypatch, response_format
+    ):
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.reasoning import DeltaMessage
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        pieces = ['{"name": "Alice', '", "age"', ": 30}"]
+
+        class FakeEngine:
+            model_name = "fake-engine"
+
+            async def stream_chat(self, messages, **kwargs):
+                text = ""
+                for piece in pieces:
+                    text += piece
+                    yield GenerationOutput(
+                        text=text, new_text=piece, finished=False, finish_reason=None
+                    )
+                yield GenerationOutput(
+                    text=text,
+                    new_text="",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=4,
+                    completion_tokens=len(pieces) + 1,
+                )
+
+        class ReasoningOnlyParser:
+            def reset_state(self, implicit_mode: bool = False):
+                pass
+
+            def extract_reasoning_streaming(
+                self, previous_text, current_text, delta_text
+            ):
+                if not delta_text:
+                    return None
+                return DeltaMessage(reasoning=delta_text)
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser", ReasoningOnlyParser())
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="return json")],
+            stream=True,
+            response_format=response_format,
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        assert json.loads(content) == {"name": "Alice", "age": 30}
+        assert payloads[-1]["choices"][0]["finish_reason"] == "stop"
 
     @pytest.mark.anyio
     async def test_response_format_stream_rejects_schema_invalid_completion(
@@ -3620,6 +4225,73 @@ class TestStreamChatCompletion:
         ]
         assert not errors, f"Unexpected streaming wrapper errors: {errors}"
         assert any("data: [DONE]" in chunk for chunk in chunks)
+
+    @pytest.mark.anyio
+    async def test_reasoning_stream_flushes_partial_marker_before_finish(
+        self, monkeypatch
+    ):
+        """A final partial reasoning marker must not be dropped."""
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.server import (
+            ChatCompletionRequest,
+            Message,
+            stream_chat_completion,
+        )
+        import vllm_mlx.server as server
+
+        class FakeEngine:
+            model_name = "fake-engine"
+            tokenizer = None
+
+            async def stream_chat(self, messages, **kwargs):
+                yield GenerationOutput(
+                    text="thinking</thi",
+                    new_text="thinking</thi",
+                    finished=True,
+                    finish_reason="stop",
+                    prompt_tokens=3,
+                    completion_tokens=2,
+                )
+
+        monkeypatch.setattr(server, "_model_name", "served-model")
+        monkeypatch.setattr(server, "_reasoning_parser_name", "qwen3")
+        monkeypatch.setattr(server, "_reasoning_parser", None)
+        monkeypatch.setattr(server, "_enable_auto_tool_choice", False)
+        monkeypatch.setattr(server, "_tool_call_parser", None)
+        monkeypatch.setattr(server, "_tool_parser_instance", None)
+
+        request = ChatCompletionRequest(
+            model="served-model",
+            messages=[Message(role="user", content="hi")],
+            stream=True,
+        )
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                FakeEngine(), request.messages, request
+            )
+        ]
+        payloads = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if chunk != "data: [DONE]\n\n"
+        ]
+
+        reasoning = "".join(
+            choice["delta"].get("reasoning_content", "")
+            for payload in payloads
+            for choice in payload["choices"]
+        )
+        finish_reasons = [
+            choice["finish_reason"]
+            for payload in payloads
+            for choice in payload["choices"]
+            if choice["finish_reason"] is not None
+        ]
+
+        assert reasoning == "thinking</thi"
+        assert finish_reasons == ["stop"]
+        assert chunks[-1] == "data: [DONE]\n\n"
 
 
 class TestReasoningAndToolCallsNonStreaming:
@@ -4745,11 +5417,9 @@ class TestServerIntegration:
         """Test /v1/chat/completions endpoint."""
         import requests
 
-        payload = {
-            "model": "default",
-            "messages": [{"role": "user", "content": "Say hello"}],
-            "max_tokens": 10,
-        }
+        from tests.server_integration_helpers import get_chat_completion_payload
+
+        payload = get_chat_completion_payload(requests, server_url)
 
         response = requests.post(
             f"{server_url}/v1/chat/completions",
@@ -4987,3 +5657,472 @@ def pytest_addoption(parser):
         default="http://localhost:8000",
         help="URL of the vllm-mlx server for integration tests",
     )
+
+
+class TestDetectImplicitThinking:
+    """The probe that tells the streaming parser a <think> was injected."""
+
+    class _Tokenizer:
+        """Stands in for the HF tokenizer the probe reads its template from.
+
+        Real engines always expose one (verified on GLM-5.3: a 10.6KB
+        ``chat_template`` string on both tokenizer and processor), so the
+        default harness must too -- otherwise every test here would silently
+        exercise the uncacheable path. See ``_NoTemplateEngine`` for that case.
+        """
+
+        def __init__(self, chat_template="{{ messages }}<|assistant|><think>"):
+            self.chat_template = chat_template
+
+    class _Engine:
+        model_name = "glm-5.3-flash"
+
+        def __init__(self, rendered, chat_template=None):
+            self._rendered = rendered
+            self.calls = 0
+            self.seen_kwargs = []
+            self.tokenizer = TestDetectImplicitThinking._Tokenizer(
+                *([chat_template] if chat_template is not None else [])
+            )
+
+        def _apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            self.seen_kwargs.append(kwargs)
+            if callable(self._rendered):
+                return self._rendered(kwargs)
+            return self._rendered
+
+    def _detect(self, engine, chat_kwargs=None):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        return server._detect_implicit_thinking(engine, chat_kwargs)
+
+    def test_trailing_think_tag_is_implicit(self):
+        assert self._detect(self._Engine("<|user|>hi<|assistant|>\n<think>")) is True
+
+    def test_trailing_whitespace_after_tag_still_counts(self):
+        assert self._detect(self._Engine("<|assistant|>\n<think>\n  ")) is True
+
+    def test_template_without_injected_tag_is_not_implicit(self):
+        assert self._detect(self._Engine("<|user|>hi<|assistant|>\n")) is False
+
+    def test_think_elsewhere_in_prompt_does_not_count(self):
+        """Only a TRAILING <think> means generation starts inside the block."""
+        engine = self._Engine("<|user|>what is <think> for?<|assistant|>\n")
+        assert self._detect(engine) is False
+
+    def test_result_is_cached_per_model(self):
+        import vllm_mlx.server as server
+
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert engine.calls == 1, "template should be rendered once, not per request"
+
+    def test_render_failure_is_not_cached_and_defaults_false(self):
+        import vllm_mlx.server as server
+
+        class Boom:
+            model_name = "boom"
+
+            def _apply_chat_template(self, messages, **kwargs):
+                raise RuntimeError("no template")
+
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(Boom(), None) is False
+        assert server._implicit_thinking_cache == {}
+
+    def test_engine_without_template_hook_defaults_false(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        assert server._detect_implicit_thinking(object(), None) is False
+
+    def test_cache_is_bounded_against_client_supplied_template_kwargs(
+        self, monkeypatch
+    ):
+        """chat_template_kwargs is request-controlled, so the key space is too."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_IMPLICIT_THINKING_CACHE_MAX_SIZE", 8)
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        for n in range(50):
+            assert (
+                server._detect_implicit_thinking(
+                    engine, {"chat_template_kwargs": {"junk": n}}
+                )
+                is True
+            )
+        assert len(server._implicit_thinking_cache) == 8
+        server._implicit_thinking_cache.clear()
+
+    def test_probe_renders_with_the_resolved_enable_thinking(self):
+        """The probe must see the same flag the real prompt render will get."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"enable_thinking": False})
+        assert engine.seen_kwargs[-1].get("enable_thinking") is False
+        server._implicit_thinking_cache.clear()
+
+    def test_enable_thinking_omitted_when_request_does_not_set_it(self):
+        """Absent means 'let the engine default decide', not False."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {})
+        assert "enable_thinking" not in engine.seen_kwargs[-1]
+        server._implicit_thinking_cache.clear()
+
+    def test_enable_thinking_is_part_of_the_cache_key(self):
+        """A template that honours the flag must not reuse the other verdict.
+
+        _apply_forced_tool_choice sets chat_kwargs["enable_thinking"] = False
+        without touching chat_template_kwargs, so keying on the latter alone
+        would serve a forced-tool request the thinking-enabled verdict.
+        """
+        import vllm_mlx.server as server
+
+        def render(kwargs):
+            if kwargs.get("enable_thinking") is False:
+                return "<|assistant|>\n"
+            return "<|assistant|>\n<think>"
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine(render)
+        assert server._detect_implicit_thinking(engine, None) is True
+        forced = {"enable_thinking": False}
+        assert server._detect_implicit_thinking(engine, forced) is False
+        assert engine.calls == 2, "the two flags must not share a cache entry"
+        assert server._detect_implicit_thinking(engine, forced) is False
+        assert engine.calls == 2, "each flag is still cached"
+        server._implicit_thinking_cache.clear()
+
+    def test_template_ignoring_the_flag_stays_implicit(self):
+        """GLM-5.3 opens <think> unconditionally, so forced tools stay implicit.
+
+        Its chat template has no enable_thinking variable at all, so disabling
+        thinking must NOT flip the verdict -- the prompt still starts inside
+        the reasoning block and the parser still has to route accordingly.
+        """
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, {"enable_thinking": False})
+        server._implicit_thinking_cache.clear()
+
+    # --- tools ------------------------------------------------------------
+    #
+    # The probe used to render without `tools` while the real prompt render
+    # gets them from chat_kwargs["tools"], and the cache key ignored them --
+    # so a template whose <think> injection is tool-conditional could cache
+    # the no-tool verdict and serve it to a tool request.
+
+    _TOOL_A = {
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {"type": "object"}},
+    }
+    _TOOL_B = {
+        "type": "function",
+        "function": {"name": "send_email", "parameters": {"type": "object"}},
+    }
+
+    def test_probe_forwards_tools_to_the_template(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        assert engine.seen_kwargs[-1].get("tools") == [self._TOOL_A]
+        server._implicit_thinking_cache.clear()
+
+    def test_no_tools_leaves_the_kwarg_out(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {})
+        assert "tools" not in engine.seen_kwargs[-1]
+        server._implicit_thinking_cache.clear()
+
+    def test_tool_conditional_template_is_not_served_the_no_tool_verdict(self):
+        """The reviewer's scenario: <think> only opens when tools are absent."""
+        import vllm_mlx.server as server
+
+        def render(kwargs):
+            if kwargs.get("tools"):
+                return "<|assistant|>\n"
+            return "<|assistant|>\n<think>"
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine(render)
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]}) is (
+            False
+        )
+        assert engine.calls == 2, "tools must not share the no-tool cache entry"
+        server._implicit_thinking_cache.clear()
+
+    def test_verdict_is_cached_per_tool_set(self):
+        """Same tool names reuse the entry; a different set re-probes."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_A]})
+        assert engine.calls == 1, "identical tool sets must hit the cache"
+        server._detect_implicit_thinking(engine, {"tools": [self._TOOL_B]})
+        assert engine.calls == 2, "a different tool set must re-probe"
+        server._implicit_thinking_cache.clear()
+
+    def test_tool_order_does_not_split_the_cache_entry(self):
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        server._detect_implicit_thinking(
+            engine, {"tools": [self._TOOL_A, self._TOOL_B]}
+        )
+        server._detect_implicit_thinking(
+            engine, {"tools": [self._TOOL_B, self._TOOL_A]}
+        )
+        assert engine.calls == 1
+        server._implicit_thinking_cache.clear()
+
+    def test_forced_tool_choice_context_stays_implicit_on_glm53(self):
+        """Forced tool choice: tools filtered to one AND enable_thinking=False.
+
+        GLM-5.3 opens <think> regardless, so the verdict must stay True --
+        this is the exact combination _apply_forced_tool_choice produces.
+        """
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        forced = {"tools": [self._TOOL_A], "enable_thinking": False}
+        assert server._detect_implicit_thinking(engine, forced) is True
+        assert engine.seen_kwargs[-1].get("tools") == [self._TOOL_A]
+        assert engine.seen_kwargs[-1].get("enable_thinking") is False
+        server._implicit_thinking_cache.clear()
+
+    def test_cache_bound_holds_as_tool_sets_vary(self, monkeypatch):
+        """tools are request-controlled too, so they must not evade the bound."""
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_IMPLICIT_THINKING_CACHE_MAX_SIZE", 8)
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        for n in range(50):
+            tool = {"type": "function", "function": {"name": f"tool_{n}"}}
+            assert server._detect_implicit_thinking(engine, {"tools": [tool]}) is True
+        assert len(server._implicit_thinking_cache) == 8
+        server._implicit_thinking_cache.clear()
+
+    def test_malformed_tool_entries_do_not_break_the_probe(self):
+        """tools come from a client-shaped list; a stray non-dict must not 500."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, {"tools": ["nonsense", None]})
+        server._implicit_thinking_cache.clear()
+
+    # --- template identity --------------------------------------------------
+    #
+    # model_name is only a proxy for the template. Two engines can share a
+    # name and render differently (a local override, a re-pull, a swapped
+    # tokenizer), and the cached verdict would follow the name, not the
+    # template that actually produced it.
+
+    class _NoTemplateEngine:
+        """An engine whose template can't be identified (no tokenizer)."""
+
+        model_name = "opaque"
+
+        def __init__(self, rendered):
+            self._rendered = rendered
+            self.calls = 0
+
+        def _apply_chat_template(self, messages, **kwargs):
+            self.calls += 1
+            return self._rendered
+
+    def test_changed_template_cannot_reuse_the_previous_verdict(self):
+        """The reviewer's regression: same engine, template swapped underneath."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>", chat_template="TEMPLATE A")
+        assert server._detect_implicit_thinking(engine, None) is True
+
+        # Swap in a template that does NOT open <think>.
+        engine.tokenizer.chat_template = "TEMPLATE B"
+        engine._rendered = "<|assistant|>\n"
+        assert server._detect_implicit_thinking(engine, None) is False
+        assert engine.calls == 2, "changed template must force a re-probe"
+        server._implicit_thinking_cache.clear()
+
+    def test_same_model_name_different_templates_do_not_collide(self):
+        """Two engines, one model_name, different templates -> two verdicts."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        implicit = self._Engine("<|assistant|>\n<think>", chat_template="A")
+        explicit = self._Engine("<|assistant|>\n", chat_template="B")
+        assert implicit.model_name == explicit.model_name
+        assert server._detect_implicit_thinking(implicit, None) is True
+        assert server._detect_implicit_thinking(explicit, None) is False
+        assert explicit.calls == 1, "second engine must probe, not reuse"
+        server._implicit_thinking_cache.clear()
+
+    def test_identical_template_still_shares_one_entry(self):
+        """The signature must not defeat caching for the common case."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        first = self._Engine("<|assistant|>\n<think>", chat_template="SAME")
+        second = self._Engine("<|assistant|>\n<think>", chat_template="SAME")
+        assert server._detect_implicit_thinking(first, None) is True
+        assert server._detect_implicit_thinking(second, None) is True
+        assert second.calls == 0, "identical template should hit the cache"
+        server._implicit_thinking_cache.clear()
+
+    def test_processor_template_is_part_of_the_identity(self):
+        """MLLM engines render via the processor, so its template counts too."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._Engine("<|assistant|>\n<think>", chat_template="SHARED")
+        engine._processor = self._Tokenizer("PROCESSOR A")
+        assert server._detect_implicit_thinking(engine, None) is True
+
+        engine._processor.chat_template = "PROCESSOR B"
+        engine._rendered = "<|assistant|>\n"
+        assert server._detect_implicit_thinking(engine, None) is False
+        assert engine.calls == 2
+        server._implicit_thinking_cache.clear()
+
+    def test_unidentifiable_template_is_probed_every_time(self):
+        """No signature means no way to invalidate -- so cache nothing."""
+        import vllm_mlx.server as server
+
+        server._implicit_thinking_cache.clear()
+        engine = self._NoTemplateEngine("<|assistant|>\n<think>")
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert server._detect_implicit_thinking(engine, None) is True
+        assert engine.calls == 2, "unidentifiable template must not be cached"
+        assert server._implicit_thinking_cache == {}
+        server._implicit_thinking_cache.clear()
+
+
+class TestAnthropicImageClientErrors:
+    """Invalid image blocks must produce deliberate 400s, not unhandled 500s.
+
+    The adapter raises ValueError for empty/unknown image sources; the route
+    must translate that before engine acquisition, in both modes.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from vllm_mlx.server import app
+
+        return TestClient(app)
+
+    def _setup(self, monkeypatch):
+        import vllm_mlx.server as server
+
+        monkeypatch.setattr(server, "_model_name", "test-model")
+        monkeypatch.setattr(server, "_default_timeout", 30.0)
+        monkeypatch.setattr(server, "_default_max_tokens", 128)
+        monkeypatch.setattr(server, "_api_key", None)
+        monkeypatch.setattr(
+            server,
+            "_rate_limiter",
+            server.RateLimiter(requests_per_minute=60, enabled=False),
+        )
+
+    def _payload(self, source, stream=False):
+        return {
+            "model": "test-model",
+            "max_tokens": 16,
+            "stream": stream,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": source}],
+                }
+            ],
+        }
+
+    def test_empty_image_data_is_400_non_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "base64", "media_type": "image/png", "data": ""}
+        response = client.post("/v1/messages", json=self._payload(source))
+        assert response.status_code == 400
+        assert "image" in response.json()["detail"]
+
+    def test_unknown_image_source_is_400_non_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "carrier-pigeon", "data": "abc"}
+        response = client.post("/v1/messages", json=self._payload(source))
+        assert response.status_code == 400
+        assert "carrier-pigeon" in response.json()["detail"]
+
+    def test_empty_image_data_is_400_streaming(self, client, monkeypatch):
+        self._setup(monkeypatch)
+        source = {"type": "base64", "media_type": "image/png", "data": ""}
+        response = client.post("/v1/messages", json=self._payload(source, stream=True))
+        assert response.status_code == 400
+        assert "image" in response.json()["detail"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_blocked_image_url_releases_registry_lease(
+        self, client, monkeypatch, stream
+    ):
+        """URL rejection after acquisition must release all request ownership."""
+        import vllm_mlx.server as server
+        from vllm_mlx.model_registry import ModelLease
+
+        self._setup(monkeypatch)
+        engine = SimpleNamespace(is_mllm=True)
+        leases = []
+        manager = SimpleNamespace(
+            active_requests=0,
+            registered_model_names=["test-model"],
+            has_model=lambda name: name == "test-model",
+        )
+
+        async def acquire(model_name):
+            manager.active_requests += 1
+
+            async def release():
+                manager.active_requests -= 1
+
+            lease = ModelLease(manager, model_name, engine, release)
+            leases.append(lease)
+            return lease
+
+        manager.acquire = acquire
+        monkeypatch.setattr(server, "_model_manager", manager)
+        monkeypatch.setattr(server, "_active_request_contexts", {})
+        source = {"type": "url", "url": "http://127.0.0.1/image.png"}
+
+        for _ in range(2):
+            response = client.post(
+                "/v1/messages", json=self._payload(source, stream=stream)
+            )
+            assert response.status_code == 400
+            assert manager.active_requests == 0
+            assert leases[-1].manager is None
+            assert server._active_request_contexts == {}
+
+        assert len(leases) == 2
