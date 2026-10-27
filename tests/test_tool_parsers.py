@@ -2,6 +2,7 @@
 """Comprehensive tests for tool call parsers."""
 
 import json
+import re
 
 import pytest
 
@@ -998,6 +999,80 @@ class TestAutoToolParser:
         assert result.tool_calls[0]["name"] == "read"
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["file_path"] == "/tmp/test.py"
+
+    def test_detects_glm47_with_args(self, parser):
+        """GLM-4.7's native <tool_call>name\\n<arg_key> format (captured from
+        a real GLM-4.7-Flash response) must be recognized via delegation to
+        Glm47ToolParser."""
+        text = (
+            "I'll run the `ls` command in the current directory and count "
+            "the files for you.\n<tool_call>Bash\n<arg_key>command</arg_key>"
+            "<arg_value>ls</arg_value>\n</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Bash"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["command"] == "ls"
+
+    def test_detects_glm47_zero_args(self, parser):
+        """GLM-4.7 no-arg native form: <tool_call>name</tool_call>."""
+        text = "<tool_call>get_current_time</tool_call>"
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert result.tool_calls[0]["name"] == "get_current_time"
+
+    def test_qwen_xml_blob_not_misrouted_to_glm47(self, parser):
+        """Regression: Qwen/Hermes's JSON-blob
+        <tool_call>{...}</tool_call> format must NOT be swallowed by the
+        GLM detour — it opens with '{', not a bare identifier, so the GLM
+        native-pattern gate must not match it, and it must still resolve
+        via the existing Qwen/Hermes XML pattern."""
+        text = '<tool_call>\n{"name": "Bash", "arguments": {"command": "ls"}}\n</tool_call>'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Bash"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["command"] == "ls"
+
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_qwen_argument_glm_markup_is_not_a_tool_call(self, parser, streaming):
+        """Native markup inside a JSON argument must remain literal text."""
+        arguments = {
+            "path": "example.txt",
+            "content": "<tool_call>Bash</tool_call>",
+        }
+        text = (
+            "<tool_call>"
+            + json.dumps({"name": "write_file", "arguments": arguments})
+            + "</tool_call>"
+        )
+        request = {
+            "tools": [
+                {"type": "function", "function": {"name": name}}
+                for name in ("write_file", "Bash")
+            ]
+        }
+
+        if streaming:
+            result = parser.extract_tool_calls_streaming(
+                "", text, text, request=request
+            )
+            assert result is not None
+            calls = [call["function"] for call in result["tool_calls"]]
+        else:
+            result = parser.extract_tool_calls(text, request)
+            assert result.tools_called
+            calls = result.tool_calls
+
+        assert len(calls) == 1
+        assert calls[0]["name"] == "write_file"
+        assert json.loads(calls[0]["arguments"]) == arguments
 
     def test_detects_llama(self, parser):
         """Test auto detection of Llama format."""
@@ -2065,6 +2140,97 @@ class TestQwenFunctionFormat:
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("DIRECT_OK\n", "DIRECT_OK\n"),
+            ("  padded  ", "  padded  "),
+            ("a\nb", "a\nb"),
+            ("\nDIRECT_OK\n\n", "DIRECT_OK\n"),
+            ("\n  padded  \n", "  padded  "),
+            ("", ""),
+            ("\n", "\n"),
+            ("\n\n", ""),
+            ("\n\n\n", "\n"),
+            ("\nDIRECT_OK", "\nDIRECT_OK"),
+            ("\t padded\t", "\t padded\t"),
+        ],
+    )
+    def test_parameter_preserves_significant_whitespace(
+        self, parser, raw_value, expected
+    ):
+        """Function-style argument bytes survive except paired framing newlines (#808)."""
+        output = (
+            f"<function=write><parameter=content>{raw_value}</parameter></function>"
+        )
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"content": expected}
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [("\n42\n", 42), ("\ntrue\n", True), ("\nnull\n", None)],
+    )
+    def test_parameter_keeps_json_literals(self, parser, raw_value, expected):
+        """Removing framing newlines retains scalar JSON argument types."""
+        output = f"<function=write><parameter=value>{raw_value}</parameter></function>"
+
+        result = parser.extract_tool_calls(output)
+
+        assert result.tools_called
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"value": expected}
+
+    def test_streaming_parameter_preserves_trailing_newline(self, parser):
+        """Chunking a function call must not discard the final value newline."""
+        chunks = [
+            "<function=write>",
+            "<parameter=content>DIRECT_OK",
+            "\n</parameter>",
+            "</function>",
+        ]
+        text = ""
+        calls = []
+        for chunk in chunks:
+            previous = text
+            text += chunk
+            event = parser.extract_tool_calls_streaming(previous, text, chunk)
+            calls.extend((event or {}).get("tool_calls", []))
+
+        assert len(calls) == 1
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "content": "DIRECT_OK\n"
+        }
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [("\n", "\n"), ("\n\n", ""), ("\n\n\n", "\n"), ("", "")],
+    )
+    @pytest.mark.parametrize("chunk_size", [1, 7])
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_streaming_parameter_preserves_newline_only_value(
+        self, parser, raw_value, expected, chunk_size, wrapped
+    ):
+        """A single newline cannot serve as both framing delimiters (#808)."""
+        output = (
+            f"<function=write><parameter=content>{raw_value}</parameter></function>"
+        )
+        if wrapped:
+            output = f"<tool_call>\n{output}\n</tool_call>"
+
+        text = ""
+        calls = []
+        for offset in range(0, len(output), chunk_size):
+            chunk = output[offset : offset + chunk_size]
+            previous = text
+            text += chunk
+            event = parser.extract_tool_calls_streaming(previous, text, chunk)
+            calls.extend((event or {}).get("tool_calls", []))
+
+        assert len(calls) == 1
+        assert json.loads(calls[0]["function"]["arguments"]) == {"content": expected}
+
 
 class TestQwenMixedFormatAndTruncation:
     """Regression tests for multi-format extraction and truncated output.
@@ -2423,3 +2589,88 @@ class TestGLM47ToolParser:
                 assert args == {}
 
         assert tool_calls_found, "Zero-argument tool call should have been detected"
+
+
+class TestStreamingTwoToolCalls:
+    """Two tool calls in one streamed response come out as two calls (#833)."""
+
+    CALLS = [("get_weather", "city", "Paris"), ("Bash", "command", "ls")]
+
+    # (prefix, per-call template, suffix); the template gets name, key, value, index.
+    FORMATS = {
+        "auto": (
+            AutoToolParser,
+            "",
+            '<tool_call>{{"name": "{0}", "arguments": {{"{1}": "{2}"}}}}</tool_call>',
+            "",
+        ),
+        "hermes": (
+            HermesToolParser,
+            "",
+            '<tool_call>{{"name": "{0}", "arguments": {{"{1}": "{2}"}}}}</tool_call>',
+            "",
+        ),
+        "glm47": (
+            Glm47ToolParser,
+            "",
+            "<tool_call>{0}\n<arg_key>{1}</arg_key><arg_value>{2}</arg_value>\n</tool_call>",
+            "",
+        ),
+        "nemotron": (
+            NemotronToolParser,
+            "",
+            "<tool_call><function={0}><parameter={1}>{2}</parameter></function></tool_call>",
+            "",
+        ),
+        "functionary": (
+            FunctionaryToolParser,
+            "",
+            '<function={0}>{{"{1}": "{2}"}}</function>',
+            "",
+        ),
+        "kimi": (
+            KimiToolParser,
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.{0}:{3}<|tool_call_argument_begin|>"
+            '{{"{1}": "{2}"}}<|tool_call_end|>',
+            "<|tool_calls_section_end|>",
+        ),
+        "deepseek": (
+            DeepSeekToolParser,
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{0}\n```json\n"
+            '{{"{1}": "{2}"}}\n```<｜tool▁call▁end｜>',
+            "<｜tool▁calls▁end｜>",
+        ),
+    }
+
+    @pytest.mark.parametrize("name", list(FORMATS))
+    def test_each_call_streamed_once(self, name):
+        parser_cls, prefix, template, suffix = self.FORMATS[name]
+        parser = parser_cls()
+        text = (
+            prefix
+            + "".join(template.format(*call, i) for i, call in enumerate(self.CALLS))
+            + suffix
+        )
+
+        # Tags are special tokens, so each arrives as one whole delta.
+        streamed = []
+        accumulated = ""
+        for delta in filter(None, re.split(r"(<[^>]*>)", text)):
+            prev = accumulated
+            accumulated += delta
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=delta,
+            )
+            if r is not None:
+                streamed.extend(r.get("tool_calls") or [])
+
+        assert [tc["index"] for tc in streamed] == [0, 1]
+        assert [tc["function"]["name"] for tc in streamed] == ["get_weather", "Bash"]
+        assert [json.loads(tc["function"]["arguments"]) for tc in streamed] == [
+            {"city": "Paris"},
+            {"command": "ls"},
+        ]

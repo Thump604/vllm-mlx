@@ -551,10 +551,19 @@ bool validate_inputs(
 
   const auto* table_data = static_cast<const int32_t*>(table.buf);
   const auto* length_data = static_cast<const int32_t*>(lengths.buf);
+  const long double max_value = static_cast<long double>(max_abs_bf16(v));
   for (Py_ssize_t request = 0; request < batch; ++request) {
     const int32_t length = length_data[request];
     if (length < 0 || static_cast<uint64_t>(length) > max_sequence) {
       *error = "sequence_lengths must be in [0, max_blocks * block_size]";
+      return false;
+    }
+    // The shader divides the weighted value sum only after accumulation.
+    // Bound the unnormalized sum too, even when its final mean is finite.
+    if (max_value * static_cast<long double>(length) > kFloat32SafeMagnitude) {
+      *error =
+          "finite BF16 magnitudes may overflow float32 value accumulation; "
+          "reduce value magnitudes or sequence length";
       return false;
     }
     const Py_ssize_t needed_blocks =

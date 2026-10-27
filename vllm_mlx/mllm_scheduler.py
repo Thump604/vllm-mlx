@@ -484,8 +484,10 @@ class MLLMScheduler:
         )
         try:
             request.num_prompt_tokens = len(tokenizer.encode(prompt))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                f"Could not pre-estimate prompt tokens for request {request_id}: {e}"
+            )
 
         self.requests[request_id] = request
         self.waiting.append(request)
@@ -697,6 +699,13 @@ class MLLMScheduler:
                 logger.warning(f"Request {request_id} failed during preprocessing")
                 outputs.append(output)
                 continue
+
+            # Update authoritative prompt token count from batch generator prefill
+            if response.prompt_tokens is not None and response.prompt_tokens > 0:
+                diff = response.prompt_tokens - request.num_prompt_tokens
+                if diff != 0:
+                    self.total_prompt_tokens += diff
+                    request.num_prompt_tokens = response.prompt_tokens
 
             # Append token to request
             request.output_tokens.append(response.token)
@@ -939,10 +948,17 @@ class MLLMScheduler:
     async def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
-        if self._processing_task:
-            self._processing_task.cancel()
+        task = self._processing_task
+        if task:
+            self._processing_task = None
+            task.cancel()
             try:
-                await self._processing_task
+                # Wait without re-raising the loop's CancelledError here:
+                # asyncio keeps a raised exception alive past this step, and
+                # its traceback would pin this frame and _process_loop's (and
+                # through them the batch generator and the model) until after
+                # BatchedEngine.stop() has tried to free them.
+                await asyncio.wait([task])
             except asyncio.CancelledError:
                 pass
 
@@ -962,6 +978,18 @@ class MLLMScheduler:
             logger.info("SSD cache tier closed")
 
         logger.info("MLLM Scheduler stopped")
+
+    def is_healthy(self) -> bool:
+        """True unless the processing task exited without stop() being called.
+
+        Mirrors EngineCore.is_healthy(): the loop's inner try/except
+        swallows ordinary per-step exceptions and keeps running, so a
+        done-but-not-stopped task means something fatal escaped the loop.
+        """
+        if not self._running:
+            return True
+        task = self._processing_task
+        return task is None or not task.done()
 
     async def _process_loop(self) -> None:
         """Main async processing loop.

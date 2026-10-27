@@ -24,11 +24,16 @@ seq_lens    [batch]
 ```
 
 The host validates shapes, native-endian PEP-3118 formats, page bounds for
-every live token, finite BF16 data, conservative float32 dot/score bounds, and
+every live token, finite BF16 data, conservative float32 dot/score/value-sum bounds, and
 the supported geometry before allocating any Metal buffer.  Unused page table
 entries may be `-1`; live entries may not be.  The shader repeats the
 page-bound guard so a malformed low-level dispatch cannot read outside the
 page buffer, while the host remains responsible for surfacing the error.
+The value-sum bound rejects a request when the largest absolute value in the
+supplied value buffer times the request's live sequence length exceeds half
+the float32 maximum. This is deliberately conservative: unused large values
+can also cause rejection. It prevents intermediate overflow even if the final
+normalized average would be finite; it is not a normalized-accumulation kernel.
 
 ## Known execution limitation
 

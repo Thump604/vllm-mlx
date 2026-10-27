@@ -189,14 +189,15 @@ def _append_ordered_mllm_content_part(
     text_parts: list[str],
     all_image_urls: list[str],
     video_frame_count: int,
-) -> int:
+    video_audio_count: int = 0,
+) -> tuple[int, int]:
     item = _normalize_content_part(raw_item)
     if isinstance(item, str):
         _append_text_content_part(built_parts, text_parts, item)
-        return video_frame_count
+        return video_frame_count, video_audio_count
 
     if not isinstance(item, dict):
-        return video_frame_count
+        return video_frame_count, video_audio_count
 
     item_type = item.get("type", "")
     if item_type in {"text", "input_text"}:
@@ -216,8 +217,14 @@ def _append_ordered_mllm_content_part(
         # Native video models bypass this helper. For fallback frame extraction,
         # preserve the video position by inserting that message's frames here.
         built_parts.extend({"type": "image"} for _ in range(video_frame_count))
-        return 0
-    return video_frame_count
+        # Omni models auto-extract the clip's soundtrack. The file already
+        # reaches generate(audio=...) and the encoder, but the chat template
+        # only renders an audio placeholder for an audio content PART - and
+        # without one the model has N audio features and zero slots to put
+        # them in ("Sound token count (0) does not match feature count").
+        built_parts.extend({"type": "audio"} for _ in range(video_audio_count))
+        return 0, 0
+    return video_frame_count, video_audio_count
 
 
 def _build_ordered_mllm_message_content(
@@ -226,6 +233,7 @@ def _build_ordered_mllm_message_content(
     role: str,
     all_image_urls: list[str],
     video_frame_count: int = 0,
+    video_audio_count: int = 0,
 ) -> tuple[object, bool]:
     """Build template content while preserving OpenAI media/text part order."""
     if isinstance(content, str):
@@ -237,17 +245,23 @@ def _build_ordered_mllm_message_content(
     built_parts: list[dict[str, str]] = []
     text_parts: list[str] = []
     remaining_video_frames = video_frame_count
+    remaining_video_audio = video_audio_count
 
     for raw_item in content:
-        remaining_video_frames = _append_ordered_mllm_content_part(
-            raw_item,
-            built_parts=built_parts,
-            text_parts=text_parts,
-            all_image_urls=all_image_urls,
-            video_frame_count=remaining_video_frames,
+        remaining_video_frames, remaining_video_audio = (
+            _append_ordered_mllm_content_part(
+                raw_item,
+                built_parts=built_parts,
+                text_parts=text_parts,
+                all_image_urls=all_image_urls,
+                video_frame_count=remaining_video_frames,
+                video_audio_count=remaining_video_audio,
+            )
         )
 
-    if role == "assistant":
+    # Text-only assistant turns stay strings for template compatibility, but
+    # image turns must retain their placeholders alongside the image payloads.
+    if role == "assistant" and not any(part["type"] == "image" for part in built_parts):
         text = "".join(text_parts)
         return text, bool(text)
 
@@ -268,11 +282,35 @@ def _normalize_mllm_tool_calls(tool_calls: list) -> list:
     return normalized[0].get("tool_calls", plain_calls)
 
 
+def _audio_inputs_in_message_order(
+    explicit_audio: dict[int, list[str]],
+    extracted_audio: dict[int, list[str]],
+) -> list[str]:
+    """Flatten audio inputs in the order the chat template renders their slots.
+
+    ``_build_mllm_chat_messages`` emits audio placeholders message by message,
+    so the audio list handed to the processor must follow message order too.
+    Iterating the dicts instead follows insertion order: explicit audio is
+    collected first and a video soundtrack's key is appended later, so an
+    earlier video message's soundtrack would land after a later message's
+    explicit audio and each feature would bind to the other message's slot.
+
+    Within one message the two never coexist: a video's soundtrack is only
+    extracted when that message carries no explicit audio.
+    """
+    ordered: list[str] = []
+    for msg_idx in sorted(explicit_audio.keys() | extracted_audio.keys()):
+        ordered.extend(explicit_audio.get(msg_idx, ()))
+        ordered.extend(extracted_audio.get(msg_idx, ()))
+    return ordered
+
+
 def _build_mllm_chat_messages(
     messages: list[dict],
     *,
     all_image_urls: list[str],
     video_frame_counts: dict[int, int],
+    video_audio_counts: dict[int, int] | None = None,
 ) -> list[dict]:
     """Build chat-template messages without reordering multimodal content parts."""
     chat_messages: list[dict] = []
@@ -286,6 +324,7 @@ def _build_mllm_chat_messages(
             role=role,
             all_image_urls=all_image_urls,
             video_frame_count=video_frame_counts.get(msg_idx, 0),
+            video_audio_count=(video_audio_counts or {}).get(msg_idx, 0),
         )
         chat_message = {"role": role, "content": content}
 
@@ -397,7 +436,11 @@ def _stream_mllm_generated_outputs(
     )
     for chunk in _until_stop_sequence(chunks, stop):
         last_chunk = chunk
-        token_count += 1
+        reported = getattr(chunk, "generation_tokens", None)
+        if type(reported) is int:
+            token_count = reported
+        else:
+            token_count += 1
         yield MLLMOutput(
             text=_chunk_text(chunk),
             finish_reason=None,
@@ -412,6 +455,62 @@ def _stream_mllm_generated_outputs(
         completion_tokens=token_count,
         **draft_metrics(),
     )
+
+
+def load_assistant_drafter(model_path: str):
+    """Load an mlx-vlm assistant/MTP drafter for speculative decoding.
+
+    Dispatches by the drafter checkpoint's own ``config.json`` ``model_type``
+    (via ``mlx_vlm.utils.load_model``, the same generic loader mlx-vlm uses
+    for its own regular models) instead of assuming a single fixed
+    architecture. This covers the MTP drafter families mlx-vlm ships under
+    ``mlx_vlm.speculative.drafters`` (``gemma4_assistant``, ``qwen3_5_mtp``,
+    ``deepseek_v4_mtp``, ...) with one code path. Other speculative modes such
+    as Eagle3 and DFlash require generation paths vllm-mlx does not expose yet.
+
+    Deliberately uses ``load_model`` rather than ``mlx_vlm.utils.load``:
+    standalone assistant/MTP drafters are small predictor heads, not
+    full checkpoints, and typically don't ship their own tokenizer/processor
+    files (they reuse the target model's) — ``load`` would additionally try
+    to load a processor and fail or misbehave for such a checkpoint.
+    """
+    path = Path(model_path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
+    if not sorted(path.glob("*.safetensors")):
+        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
+
+    try:
+        from mlx_vlm.speculative.drafters import resolve_drafter_kind
+        from mlx_vlm.utils import load_model
+    except ImportError as exc:
+        raise ImportError(
+            "Assistant/MTP drafter support requires mlx-vlm to be installed."
+        ) from exc
+
+    try:
+        mlx_vlm_version = version("mlx-vlm")
+    except PackageNotFoundError:
+        mlx_vlm_version = "unknown"
+
+    model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
+    resolved_kind = resolve_drafter_kind(path)
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Assistant drafter model_type={model_type!r} requires draft kind "
+            f"{resolved_kind!r}; vllm-mlx currently supports only 'mtp'."
+        )
+    logger.info(
+        "Loading %s assistant drafter from %s using mlx-vlm %s",
+        model_type or "unknown-architecture",
+        model_path,
+        mlx_vlm_version,
+    )
+
+    model = load_model(path)
+    model.eval()
+    return model
 
 
 def load_gemma4_assistant_drafter(model_path: str):
@@ -455,6 +554,128 @@ def load_gemma4_assistant_drafter(model_path: str):
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())
     model.eval()
+    return model
+
+
+class MTPDrafterLoadError(RuntimeError):
+    """Raised when a registered MTP drafter architecture is unavailable."""
+
+
+_GEMMA4_ASSISTANT_MODEL_TYPES = {
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+}
+
+
+def _read_mtp_drafter_model_type(config_path: Path) -> str:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid MTP drafter config JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"MTP drafter config must be a JSON object: {config_path}")
+
+    candidates = [config.get("model_type"), config.get("speculators_model_type")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.append(text_config.get("model_type"))
+
+    model_types = [
+        value.strip().casefold()
+        for value in candidates
+        if isinstance(value, str) and value.strip()
+    ]
+    drafter_types = {
+        model_type
+        for model_type in model_types
+        if model_type.endswith("_mtp") or model_type in _GEMMA4_ASSISTANT_MODEL_TYPES
+    }
+    if len(drafter_types) > 1:
+        raise ValueError(
+            f"MTP drafter config has conflicting model types: {config_path}"
+        )
+    if drafter_types:
+        return drafter_types.pop()
+    if model_types:
+        return model_types[0]
+    raise ValueError(f"MTP drafter config has no valid model_type: {config_path}")
+
+
+def _resolve_mtp_drafter_path(path_or_repo: str) -> Path:
+    path = Path(path_or_repo)
+    if path.exists():
+        return path
+    try:
+        from mlx_vlm.utils import get_model_path
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "Resolving an MTP drafter repository requires mlx-vlm"
+        ) from exc
+    return Path(get_model_path(path_or_repo))
+
+
+def load_mtp_drafter(model_path: str, target_model=None):
+    """Load a local or Hugging Face MTP drafter without assuming Gemma layout."""
+    resolved_path = _resolve_mtp_drafter_path(model_path)
+    config_path = resolved_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"MTP drafter config not found: {config_path}")
+    model_type = _read_mtp_drafter_model_type(config_path)
+    if model_type in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        model = load_gemma4_assistant_drafter(str(resolved_path))
+        if target_model is not None:
+            try:
+                from mlx_vlm.speculative.drafters import (
+                    validate_drafter_compatibility,
+                )
+            except ImportError:
+                # Preserve compatibility with mlx-vlm releases that predate
+                # the shared validator; this is the existing Gemma loader.
+                pass
+            else:
+                validate_drafter_compatibility(target_model, model, "mtp")
+        return model
+
+    try:
+        from mlx_vlm.speculative.drafters import load_drafter
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+
+    logger.info(
+        "Loading registered MTP drafter model_type=%s from %s",
+        model_type,
+        resolved_path,
+    )
+    try:
+        loaded = load_drafter(str(resolved_path), kind="mtp", lazy=False)
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise ValueError("mlx-vlm load_drafter() must return (model, resolved_kind)")
+    model, resolved_kind = loaded
+    if model is None:
+        raise ValueError("mlx-vlm load_drafter() returned no model")
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
+        )
+    if target_model is not None:
+        try:
+            from mlx_vlm.speculative.drafters import (
+                validate_drafter_compatibility,
+            )
+        except ImportError as exc:
+            raise MTPDrafterLoadError(
+                "This MTP drafter requires an mlx-vlm build with the registered "
+                f"{model_type!r} architecture."
+            ) from exc
+        validate_drafter_compatibility(target_model, model, resolved_kind)
     return model
 
 
@@ -1005,6 +1226,7 @@ def _video_has_audio_track(video_path: str) -> bool:
                 "csv=p=0",
                 video_path,
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=30,
             text=True,
@@ -1052,6 +1274,12 @@ def extract_audio_from_video(video_path: str) -> str | None:
         r = subprocess.run(
             [
                 "ffmpeg",
+                # ffmpeg polls stdin for interactive keys. Under a job-control
+                # launcher the server sits in a background process group, and
+                # a background read of the terminal raises SIGTTIN against the
+                # WHOLE group - server included - freezing every request with
+                # 0% CPU until the 600s timeout silently drops the audio.
+                "-nostdin",
                 "-y",
                 "-i",
                 video_path,
@@ -1064,6 +1292,7 @@ def extract_audio_from_video(video_path: str) -> str | None:
                 "pcm_s16le",
                 out_path,
             ],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=600,
@@ -1405,7 +1634,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_mtp_drafter(self.draft_model_path, target_model=self.model)
 
         from mlx_vlm.utils import load
 
@@ -2231,7 +2460,6 @@ class MLXMultimodalLM:
         _msg_video_frame_counts: dict[int, int] = {}
         _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
-        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
@@ -2269,18 +2497,15 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        # Merge auto-extracted audio into the per-message audio map so the
-        # chat-template token-counting loop downstream sees the right count.
-        for msg_idx, extra in _msg_extra_audio.items():
-            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
-
-        for aud_inputs in _msg_audio_inputs.values():
-            all_audio_inputs.extend(aud_inputs)
+        all_audio_inputs = _audio_inputs_in_message_order(
+            _msg_audio_inputs, _msg_extra_audio
+        )
 
         chat_messages = _build_mllm_chat_messages(
             messages,
             all_image_urls=all_image_urls,
             video_frame_counts=_msg_video_frame_counts,
+            video_audio_counts={k: len(v) for k, v in _msg_extra_audio.items()},
         )
 
         # Process images
@@ -2642,7 +2867,6 @@ class MLXMultimodalLM:
         _msg_video_frame_counts: dict[int, int] = {}
         _msg_extra_audio: dict[int, list[str]] = {}
         all_video_frames: list[str] = []
-        all_audio_inputs: list[str] = []
         for msg_idx, vid_inputs in _msg_video_inputs.items():
             total_frames = 0
             has_explicit_audio = bool(_msg_audio_inputs.get(msg_idx))
@@ -2675,16 +2899,15 @@ class MLXMultimodalLM:
                 logger.info(f"Added {len(frames)} frames from video: {vid_input}")
             _msg_video_frame_counts[msg_idx] = total_frames
 
-        for msg_idx, extra in _msg_extra_audio.items():
-            _msg_audio_inputs.setdefault(msg_idx, []).extend(extra)
-
-        for aud_inputs in _msg_audio_inputs.values():
-            all_audio_inputs.extend(aud_inputs)
+        all_audio_inputs = _audio_inputs_in_message_order(
+            _msg_audio_inputs, _msg_extra_audio
+        )
 
         chat_messages = _build_mllm_chat_messages(
             messages,
             all_image_urls=all_image_urls,
             video_frame_counts=_msg_video_frame_counts,
+            video_audio_counts={k: len(v) for k, v in _msg_extra_audio.items()},
         )
 
         all_images = []

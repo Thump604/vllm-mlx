@@ -42,7 +42,18 @@ def test_unavailable_native_dispatch_fails_precisely():
         pytest.skip("native extension is available; dispatch is covered on Apple CI")
 
     with pytest.raises(RuntimeError, match="metal-context backend unavailable"):
-        _metal_context.paged_decode(None)
+        query = np.zeros((1, 1, 128), dtype=np.uint16)
+        pages = np.zeros((1, 1, 16, 128), dtype=np.uint16)
+        _metal_context.paged_decode(
+            query,
+            pages,
+            pages,
+            np.array([[0]], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            1,
+            16,
+            1.0,
+        )
 
 
 def test_native_paged_decode_matches_numpy_oracle():
@@ -173,8 +184,8 @@ def test_native_rejects_non_native_formats_and_nonfinite_bf16():
     from vllm_mlx import _metal_context
 
     capabilities = _metal_context.capabilities()
-    if not capabilities["available"]:
-        pytest.skip("strict native Metal build is unavailable")
+    if not capabilities["compiled"]:
+        pytest.skip("native host validator is not compiled")
 
     rng = np.random.default_rng(41)
     query = (
@@ -216,8 +227,8 @@ def test_native_rejects_finite_bf16_dot_and_score_overflow():
 
     from vllm_mlx import _metal_context
 
-    if not _metal_context.capabilities()["available"]:
-        pytest.skip("strict native Metal build is unavailable")
+    if not _metal_context.capabilities()["compiled"]:
+        pytest.skip("native host validator is not compiled")
 
     key = np.zeros((1, 1, 16, 128), dtype=np.uint16)
     value = np.zeros_like(key)
@@ -254,6 +265,28 @@ def test_native_rejects_finite_bf16_dot_and_score_overflow():
             num_kv_heads=1,
             block_size=16,
             scale=4.0,
+        )
+
+
+@pytest.mark.parametrize("bits", [0x7F7F, 0xFF7F])
+def test_native_rejects_finite_bf16_value_sum_overflow(bits):
+    from vllm_mlx import _metal_context
+
+    if not _metal_context.capabilities()["compiled"]:
+        pytest.skip("native host validator is not compiled")
+    query = np.zeros((1, 1, 128), dtype=np.uint16)
+    keys = np.zeros((1, 1, 16, 128), dtype=np.uint16)
+    values = np.full_like(keys, bits)
+    with pytest.raises(ValueError, match="value accumulation"):
+        _metal_context.paged_decode(
+            query,
+            keys,
+            values,
+            np.array([[0]], dtype=np.int32),
+            np.array([2], dtype=np.int32),
+            1,
+            16,
+            1.0,
         )
 
 

@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 
 import uvicorn
@@ -495,6 +495,81 @@ def _raise_remote_media_http_error(exc: UnsafeRemoteURLError) -> None:
     raise HTTPException(status_code=400, detail=exc.public_message) from exc
 
 
+_OUTLINES_BACKEND_UNAVAILABLE_DETAIL = (
+    "response_format backend 'outlines' is unavailable"
+)
+
+
+def _is_outlines_backend_selector(value: object) -> bool:
+    """Return whether a backend selector explicitly names Outlines."""
+    return isinstance(value, str) and value.strip().casefold() == "outlines"
+
+
+def _response_format_uses_outlines_backend(response_format: object | None) -> bool:
+    """Inspect only response-format backend selector fields."""
+    if isinstance(response_format, dict):
+        return _is_outlines_backend_selector(
+            response_format.get("type")
+        ) or _is_outlines_backend_selector(response_format.get("backend"))
+
+    return _is_outlines_backend_selector(
+        getattr(response_format, "type", None)
+    ) or _is_outlines_backend_selector(getattr(response_format, "backend", None))
+
+
+def _request_uses_outlines_backend(payload: object) -> bool:
+    """Inspect approved OpenAI/vLLM backend selector paths only.
+
+    The request model intentionally permits vendor extensions.  This detector
+    therefore operates on the raw JSON payload so an explicit selector is not
+    lost to Pydantic's default extra-field handling, without forbidding or
+    recursively searching unrelated request/schema fields.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    if _is_outlines_backend_selector(payload.get("guided_decoding_backend")):
+        return True
+
+    for namespace in ("guided_decoding", "structured_outputs"):
+        options = payload.get(namespace)
+        if not isinstance(options, dict):
+            continue
+        if _is_outlines_backend_selector(options.get("backend")):
+            return True
+        if _is_outlines_backend_selector(options.get("guided_decoding_backend")):
+            return True
+
+    return _response_format_uses_outlines_backend(payload.get("response_format"))
+
+
+def _raise_if_outlines_backend_requested(payload: object) -> None:
+    """Fail closed for an explicit Outlines request without advertising it."""
+    if _request_uses_outlines_backend(payload):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+
+
+def _raise_if_outlines_response_format_requested(
+    response_format: object | None,
+) -> None:
+    """Fail closed for an internal response-format object or dict."""
+    if _response_format_uses_outlines_backend(response_format):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+
+
+async def _preflight_response_format_backend(raw_request: Request | None) -> None:
+    """Reject unsupported backend selectors before acquiring a model."""
+    if raw_request is None:
+        return
+    _raise_if_outlines_backend_requested(await raw_request.json())
+
+
 def _prepare_json_logits_processor(
     engine: BaseEngine,
     messages: list[dict],
@@ -506,6 +581,7 @@ def _prepare_json_logits_processor(
     thinking_model: bool = False,
 ) -> tuple[list[dict], object | None]:
     """Inject response_format instruction and build constrained decoding processor."""
+    _raise_if_outlines_response_format_requested(response_format)
     json_logits_processor = None
     if not response_format:
         return messages, json_logits_processor
@@ -1125,6 +1201,71 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     raise HTTPException(status_code=500, detail=detail)
 
 
+class GenerationError(HTTPException):
+    """The engine finished a request with ``finish_reason="error"``.
+
+    The schedulers report a request that failed inside the engine (for example
+    a Metal out-of-memory error during prefill) as a finished output with
+    ``finish_reason="error"`` and no tokens. That value is internal: it is not
+    an OpenAI finish reason, and clients read a stream ending with it as a
+    successful, empty completion. Raising this turns it into HTTP 500 for
+    non-streaming requests and an SSE error event for streaming ones, the same
+    way vLLM handles its ``GenerationError``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=500, detail="Internal server error during generation"
+        )
+
+
+def _raise_if_generation_error(output) -> None:
+    """Raise :class:`GenerationError` if the engine reported a failed request."""
+    if output is not None and getattr(output, "finish_reason", None) == "error":
+        logger.error("Request failed with an internal error during generation")
+        raise GenerationError()
+
+
+def _stream_error_payload(exc: Exception) -> dict:
+    """Status and message to expose for an exception raised mid-stream.
+
+    ``HTTPException`` details are written for clients; anything else may carry
+    internal state, so it is reported generically (the server log has it).
+    """
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+        return {"code": exc.status_code, "message": exc.detail}
+    return {"code": 500, "message": "Internal server error"}
+
+
+def _openai_sse_error_frame(exc: Exception) -> str:
+    """OpenAI-style SSE error event (``data: {"error": {...}}``).
+
+    Not part of the chunk schema, but it is what vLLM and llama.cpp send and
+    what the OpenAI Python SDK raises ``APIError`` on.
+    """
+    payload = _stream_error_payload(exc)
+    error = {
+        "message": payload["message"],
+        "type": (
+            "InternalServerError" if payload["code"] >= 500 else "BadRequestError"
+        ),
+        "param": None,
+        "code": payload["code"],
+    }
+    return f"data: {json.dumps({'error': error})}\n\n"
+
+
+def _anthropic_sse_error_frame(exc: Exception) -> str:
+    """Anthropic Messages streaming ``error`` event."""
+    payload = _stream_error_payload(exc)
+    error_type = "api_error" if payload["code"] >= 500 else "invalid_request_error"
+    data = {
+        "type": "error",
+        "error": {"type": error_type, "message": payload["message"]},
+    }
+    return f"event: error\ndata: {json.dumps(data)}\n\n"
+
+
 def _raise_engine_busy(exc: EngineBusy) -> None:
     """Translate serialized-engine admission failures into retryable HTTP 503."""
     raise HTTPException(
@@ -1566,6 +1707,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
             specprefill_keep_pct=spec.specprefill_keep_pct,
             specprefill_backbone_pct=spec.specprefill_backbone_pct,
             specprefill_draft_model=spec.specprefill_draft_model,
+            model_path=spec.model_path,
         )
 
     from .engine.simple import SimpleEngine
@@ -1588,6 +1730,7 @@ def _build_engine(spec: ModelSpec) -> BaseEngine:
         prefix_trie_cache=spec.prefix_trie_cache,
         prefix_trie_cache_size=spec.prefix_trie_cache_size,
         prefix_trie_cache_memory_mb=spec.prefix_trie_cache_memory_mb,
+        model_path=spec.model_path,
     )
 
 
@@ -1907,6 +2050,51 @@ def _metrics_path_for_request(request: Request) -> str:
     return "__unmatched__"
 
 
+class _MetricsFinishOnCallExit:
+    """Thin ASGI-callable wrapper around a response, so `on_call_end()` runs
+    once the response's own ASGI call returns OR raises, by any path.
+
+    This exists alongside `_metrics_middleware`'s `body_iterator` wrapping,
+    not instead of it -- the two cover different failure modes:
+
+    - `body_iterator` wrapping (in `_metrics_middleware` below) finishes
+      metrics when the body generator itself is exhausted, raises, or is
+      explicitly closed.
+    - This wrapper additionally covers a `send()` failure -- e.g. a genuine
+      client disconnect -- raised by the ASGI server *while consuming* that
+      body_iterator. Starlette's `_StreamingResponse.__call__` does
+      `async for chunk in self.body_iterator: await send(...)` with no
+      `try/finally` of its own, so when `send()` raises, the exception
+      propagates straight out and the generator is simply abandoned,
+      still suspended at its current `yield` -- neither `async for` nor a
+      propagating exception calls `aclose()` on it. Left alone, that
+      generator's own `finally` only runs whenever it happens to be
+      garbage-collected, which settles the metrics late and
+      unpredictably (confirmed: PR #782 review, Thump604, against a real
+      Starlette `_StreamingResponse.__call__`). Wrapping the *call* instead
+      of only the iterator settles metrics synchronously, exactly when the
+      request ends, regardless of which side (generator or `send()`) is
+      what actually fails.
+
+    `on_call_end` is idempotent (see `_metrics_middleware`), so whichever of
+    the two paths fires first wins and the other is a no-op.
+    """
+
+    def __init__(self, response, on_call_end):
+        self._response = response
+        self._on_call_end = on_call_end
+        self.status_code = response.status_code
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            self._on_call_end()
+
+
 @app.middleware("http")
 async def _metrics_middleware(request: Request, call_next):
     """Capture generic HTTP request metrics when enabled."""
@@ -1920,24 +2108,59 @@ async def _metrics_middleware(request: Request, call_next):
 
     start_time = time.perf_counter()
     _metrics.observe_http_start(method=method, path=path)
-    try:
-        response = await call_next(request)
-    except Exception:
+
+    finished = False
+
+    def finish(status_code: int) -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
         _metrics.observe_http_finish(
             method=method,
             path=path,
-            status_code=500,
+            status_code=status_code,
             duration=time.perf_counter() - start_time,
         )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        finish(500)
         raise
 
-    _metrics.observe_http_finish(
-        method=method,
-        path=path,
-        status_code=response.status_code,
-        duration=time.perf_counter() - start_time,
-    )
-    return response
+    # `call_next()` resolves as soon as the ASGI response has STARTED
+    # (headers + earliest body availability), not when a streaming body
+    # finishes sending -- Starlette's BaseHTTPMiddleware.call_next() always
+    # hands back a `_StreamingResponse` wrapping `body_iterator`, a lazy
+    # generator the ASGI server pulls from *after* this middleware returns
+    # (see starlette/middleware/base.py). Finishing metrics right here would
+    # decrement the in-flight gauge (and record request duration) within
+    # milliseconds of request start for any streaming endpoint -- long
+    # before real generation happens, let alone finishes. Defer the finish
+    # call until the response is actually done, instead. `body_iterator` is
+    # a private Starlette attribute (same caveat as `_find_uvicorn_cycle`
+    # above); if a future Starlette drops it, fall back to the old
+    # immediate-finish timing rather than raising.
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        finish(response.status_code)
+        return response
+
+    async def tracked_body():
+        try:
+            async for chunk in body_iterator:
+                yield chunk
+        finally:
+            finish(response.status_code)
+
+    response.body_iterator = tracked_body()
+
+    # See `_MetricsFinishOnCallExit`: `tracked_body()` alone settles metrics
+    # on normal exhaustion or a generator-raised error, but not when the
+    # ASGI server's own `send()` fails mid-stream and abandons the iterator
+    # without closing it. Wrapping the call itself closes that gap.
+    return _MetricsFinishOnCallExit(response, lambda: finish(response.status_code))
 
 
 class RateLimiter:
@@ -2033,13 +2256,7 @@ def get_engine() -> BaseEngine:
 def _coerce_tool_arguments(
     arguments_json: str, tool_name: str, tools: list[dict] | None
 ) -> str:
-    """
-    Coerce tool call arguments to match the tool schema.
-
-    If a schema field expects "string" but the model produced an object/array,
-    JSON-stringify the value. This fixes a common LLM failure mode where models
-    output raw JSON objects instead of JSON strings for file content, etc.
-    """
+    """Losslessly recover tool argument types from the request schema."""
     if not tools:
         return arguments_json
 
@@ -2065,16 +2282,130 @@ def _coerce_tool_arguments(
     changed = False
 
     for key, value in arguments.items():
-        if key in properties:
-            expected_type = properties[key].get("type")
-            if expected_type == "string" and isinstance(value, (dict, list)):
-                arguments[key] = json.dumps(value, ensure_ascii=False, indent=2)
-                changed = True
+        property_schema = properties.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        normalized = _coerce_tool_argument_value(value, property_schema.get("type"))
+        if normalized != value or type(normalized) is not type(value):
+            arguments[key] = normalized
+            changed = True
 
     if changed:
-        return json.dumps(arguments, ensure_ascii=False)
+        try:
+            return json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        except ValueError:
+            # Do not replace non-JSON numbers or alter an invalid source payload.
+            return arguments_json
 
     return arguments_json
+
+
+def _coerce_tool_argument_value(value: object, declared_type: object) -> object:
+    if isinstance(declared_type, str):
+        expected_types = (declared_type,)
+    elif isinstance(declared_type, list):
+        expected_types = tuple(item for item in declared_type if isinstance(item, str))
+    else:
+        return value
+
+    if any(_tool_argument_matches_type(value, kind) for kind in expected_types):
+        return value
+
+    if "string" in expected_types and isinstance(value, (dict, list)):
+        try:
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        except ValueError:
+            return value
+
+    if not isinstance(value, str):
+        return value
+
+    for kind in expected_types:
+        normalized = _decode_tool_argument_string(value, kind)
+        if _tool_argument_matches_type(normalized, kind):
+            return normalized
+    return value
+
+
+def _decode_tool_argument_string(value: str, expected_type: str) -> object:
+    if expected_type not in {"array", "object", "integer", "number", "boolean", "null"}:
+        return value
+    try:
+        decoded = json.loads(value)
+        # Check nested values too: Python accepts NaN/Infinity and overflow
+        # during loads, but these must not become newly emitted JSON numbers.
+        json.dumps(decoded, allow_nan=False)
+    except (ValueError, TypeError):
+        return value
+    return decoded
+
+
+def _tool_argument_matches_type(value: object, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "null":
+        return value is None
+    return False
+
+
+def _merge_streaming_tool_call_fragments(
+    calls: dict[int, dict], fragments: list[dict]
+) -> list[dict]:
+    """Buffer arguments, returning newly established call identity once."""
+    identities = []
+    for fragment in fragments:
+        index = int(fragment.get("index", 0))
+        call = calls.setdefault(
+            index,
+            {
+                "index": index,
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        identity = {"index": index}
+        if fragment.get("id") and not call["id"]:
+            call["id"] = fragment["id"]
+            identity["id"] = call["id"]
+            identity["type"] = fragment.get("type") or "function"
+        if fragment.get("type"):
+            call["type"] = fragment["type"]
+        function = fragment.get("function") or {}
+        if function.get("name") and not call["function"]["name"]:
+            call["function"]["name"] = function["name"]
+            identity["function"] = {"name": function["name"]}
+        call["function"]["arguments"] += function.get("arguments") or ""
+        if len(identity) > 1:
+            identities.append(identity)
+    return identities
+
+
+def _finalize_streaming_tool_calls(
+    calls: dict[int, dict], tools: list[dict] | None
+) -> list[dict]:
+    """Emit complete arguments only; call identities have already streamed."""
+    finalized = []
+    for index in sorted(calls):
+        call = calls[index]
+        function = call["function"]
+        arguments = _coerce_tool_arguments(
+            function["arguments"], function["name"], tools
+        )
+        finalized.append({"index": index, "function": {"arguments": arguments}})
+    return finalized
 
 
 def _validate_model_name(request_model: str) -> None:
@@ -2721,6 +3052,7 @@ async def _run_responses_request(
     )
     if output is None:
         return None, []
+    _raise_if_generation_error(output)
 
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
     reasoning_text = None
@@ -3726,12 +4058,14 @@ def load_model(
     auto_unload_idle_seconds: float = 0.0,
     lazy_load_model: bool = False,
     default_mllm_draft: bool = False,
+    model_path: str | None = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
 
     Args:
-        model_name: HuggingFace model name or local path
+        model_name: HuggingFace model name or local path; the model's identity
+            for name-based defaults and the default served name
         use_batching: Use continuous batching (BatchedEngine) vs simple mode (SimpleEngine)
         scheduler_config: Scheduler config for batched mode
         stream_interval: Tokens to batch before streaming (batched mode only)
@@ -3760,6 +4094,9 @@ def load_model(
             startup.
         default_mllm_draft: Enable a configured assistant drafter unless a
             request explicitly opts out.
+        model_path: Already-resolved local snapshot to load ``model_name``
+            from (e.g. from ``ensure_model_downloaded()``). Loading only;
+            identity stays ``model_name``.
     """
     global _engine, _model_manager, _model_name, _model_path, _default_max_tokens
     global _max_request_tokens, _tool_parser_instance, _warm_prompts_path
@@ -3855,6 +4192,7 @@ def load_model(
             prefix_trie_cache=prefix_trie_cache,
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
+            model_path=model_path,
         )
         _residency_manager = ResidencyManager(
             _engine_factory,
@@ -3892,6 +4230,7 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_backbone_pct=specprefill_backbone_pct,
             specprefill_draft_model=specprefill_draft_model,
+            model_path=model_path,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -3924,6 +4263,7 @@ def load_model(
             prefix_trie_cache_size=prefix_trie_cache_size,
             prefix_trie_cache_memory_mb=prefix_trie_cache_memory_mb,
             default_mllm_draft=default_mllm_draft,
+            model_path=model_path,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
@@ -4863,13 +5203,16 @@ async def list_voices(model: str = "kokoro"):
 async def _ensure_sse_terminal(
     generator: AsyncIterator[str],
     terminal_frame: str,
+    error_frame: Callable[[Exception], str] = _openai_sse_error_frame,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
 
     If the inner generator already yields the terminal frame on its happy path,
     the wrapper detects it and avoids double-emission.  If the generator raises
-    before reaching the terminal, the wrapper emits it in the ``finally`` block.
+    before reaching the terminal, the wrapper first emits ``error_frame(exc)``
+    so the client can tell the failure from a normal end of stream (the HTTP
+    status is already 200 by then), then the terminal frame in ``finally``.
     """
     emitted = False
     try:
@@ -4879,6 +5222,8 @@ async def _ensure_sse_terminal(
             yield chunk
     except Exception as e:
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
+        if not emitted:
+            yield error_frame(e)
     finally:
         if not emitted:
             yield terminal_frame
@@ -5517,6 +5862,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                         timeout=_remaining_request_timeout(total_timeout, deadline),
                         timeout_detail_seconds=total_timeout,
                     )
+                _raise_if_generation_error(output)
             except HTTPException as exc:
                 tracker.finish(result=_metrics_result_from_status(exc.status_code))
                 raise
@@ -5616,6 +5962,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     """
     _validate_model_name(request.model)
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
+    _raise_if_outlines_response_format_requested(request.response_format)
+    await _preflight_response_format_backend(raw_request)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
     total_timeout, deadline = _start_request_budget(request.timeout)
 
@@ -5690,6 +6038,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
             )
+            _raise_if_generation_error(output)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -5850,6 +6199,12 @@ def _get_engine_tokenizer(engine) -> object | None:
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
+    if _is_outlines_backend_selector(request.text.format.type):
+        raise HTTPException(
+            status_code=422,
+            detail=_OUTLINES_BACKEND_UNAVAILABLE_DETAIL,
+        )
+    await _preflight_response_format_backend(raw_request)
     try:
         if request.stream:
             chat_request = _responses_request_to_chat_request(request)
@@ -6064,8 +6419,14 @@ async def create_anthropic_message(
         _sanitize_log_text(last_user_preview, limit=300),
     )
 
-    # Convert Anthropic request -> OpenAI request
-    openai_request = anthropic_to_openai(anthropic_request)
+    # Convert Anthropic request -> OpenAI request. Conversion errors are
+    # client-input errors (e.g. an image block with an empty payload or an
+    # unknown source type) and must surface as 400s before any engine is
+    # acquired, never as unhandled 500s.
+    try:
+        openai_request = anthropic_to_openai(anthropic_request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     total_timeout, deadline = _start_request_budget(None)
     engine = await _acquire_default_engine_for_request(
         request,
@@ -6076,13 +6437,15 @@ async def create_anthropic_message(
     if engine is None:
         return Response(status_code=499)
     release_on_exit = True
-    prepared = _prepare_anthropic_endpoint_invocation(
-        engine,
-        openai_request,
-        effective_max_tokens,
-    )
 
     try:
+        # Preparation can reject media URLs after acquisition, so it must
+        # share the same lease cleanup as generation failures.
+        prepared = _prepare_anthropic_endpoint_invocation(
+            engine,
+            openai_request,
+            effective_max_tokens,
+        )
         if anthropic_request.stream:
             anthropic_terminal = (
                 f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -6098,6 +6461,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
+                        _anthropic_sse_error_frame,
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
@@ -6120,6 +6484,7 @@ async def create_anthropic_message(
                 timeout=_remaining_request_timeout(total_timeout, deadline),
                 timeout_detail_seconds=total_timeout,
             )
+            _raise_if_generation_error(output)
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
             raise
@@ -6465,6 +6830,7 @@ async def _stream_anthropic_messages(
 
     try:
         async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text or ""
@@ -6538,6 +6904,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6610,6 +6977,7 @@ async def _stream_anthropic_messages(
                             tool_result = _finalize_streaming_tool_result(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
+
                         if tool_result is None:
                             # Inside tool markup, so suppress this delta.
                             continue
@@ -6750,6 +7118,7 @@ async def stream_completion(
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             prompt_tokens = (
@@ -6780,6 +7149,9 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+        # Only on success: on failure _ensure_sse_terminal emits the error
+        # event first and then [DONE] (clients stop reading at [DONE]).
+        yield "data: [DONE]\n\n"
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -6790,7 +7162,6 @@ async def stream_completion(
         result = "error"
         raise
     finally:
-        yield "data: [DONE]\n\n"
         if metrics_tracker is not None:
             metrics_tracker.finish(
                 result=result,
@@ -6882,6 +7253,8 @@ async def stream_chat_completion(
     tool_calls_detected = False
     tool_parser = _get_streaming_tool_parser(request, engine)
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    buffer_typed_tool_calls = request.tool_argument_recovery == "buffered"
+    buffered_tool_calls: dict[int, dict] = {}
     # Whether any emitted chunk carried a terminal finish_reason. The engine's
     # finished=True output can be swallowed by a parser `continue` below (e.g.
     # a bare end-of-turn token arriving after a completed tool call); without
@@ -6891,6 +7264,7 @@ async def stream_chat_completion(
     try:
         # Stream content
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            _raise_if_generation_error(output)
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text or ""
@@ -6935,7 +7309,10 @@ async def stream_chat_completion(
                 )
 
                 if delta_msg is None:
-                    if output_finished and tool_parser and tool_markup_possible:
+                    if output_finished and (
+                        fence_stripper is not None
+                        or (tool_parser and tool_markup_possible)
+                    ):
                         delta_msg = DeltaMessage()
                     else:
                         # Skip this chunk (e.g., <think> token itself)
@@ -6997,6 +7374,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress content output
                             if reasoning:
@@ -7033,21 +7418,29 @@ async def stream_chat_completion(
 
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
-                                for tc in tool_result["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    if "arguments" in fn and "name" in fn:
-                                        fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools_dict
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                emitted_tool_calls = (
+                                    _merge_streaming_tool_call_fragments(
+                                        buffered_tool_calls, emitted_tool_calls
+                                    )
+                                )
+                                if not output.finished:
+                                    if not emitted_tool_calls and not reasoning:
+                                        continue
+                                else:
+                                    emitted_tool_calls += (
+                                        _finalize_streaming_tool_calls(
+                                            buffered_tool_calls, tools_dict
                                         )
+                                    )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls or None,
                                             # `leading` above already emitted
                                             # this text as its own chunk, so
                                             # repeating it here would double it.
@@ -7177,6 +7570,14 @@ async def stream_chat_completion(
                                 tool_parser, tool_accumulated_text, tool_result
                             )
 
+                        if (
+                            output.finished
+                            and buffer_typed_tool_calls
+                            and buffered_tool_calls
+                            and not (tool_result or {}).get("tool_calls")
+                        ):
+                            tool_result = {**(tool_result or {}), "tool_calls": []}
+
                         if tool_result is None:
                             # Inside tool markup - suppress output
                             continue
@@ -7197,21 +7598,29 @@ async def stream_chat_completion(
 
                             # Emit structured tool calls
                             tool_calls_detected = True
-                            # Coerce arguments against tool schemas
-                            if tools_dict:
-                                for tc in tool_result["tool_calls"]:
-                                    fn = tc.get("function", {})
-                                    if "arguments" in fn and "name" in fn:
-                                        fn["arguments"] = _coerce_tool_arguments(
-                                            fn["arguments"], fn["name"], tools_dict
+                            emitted_tool_calls = tool_result["tool_calls"]
+                            if buffer_typed_tool_calls:
+                                emitted_tool_calls = (
+                                    _merge_streaming_tool_call_fragments(
+                                        buffered_tool_calls, emitted_tool_calls
+                                    )
+                                )
+                                if not output.finished:
+                                    if not emitted_tool_calls:
+                                        continue
+                                else:
+                                    emitted_tool_calls += (
+                                        _finalize_streaming_tool_calls(
+                                            buffered_tool_calls, tools_dict
                                         )
+                                    )
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
-                                            tool_calls=tool_result["tool_calls"],
+                                            tool_calls=emitted_tool_calls or None,
                                             # `leading` above already emitted
                                             # this text as its own chunk, so
                                             # repeating it here would double it.
@@ -7706,7 +8115,8 @@ Examples:
         "--mllm-draft-model",
         type=str,
         default=None,
-        help="Path to an mlx-vlm MLLM draft/assistant model.",
+        help="Local path or Hugging Face repo ID for an mlx-vlm MLLM "
+        "draft/assistant model.",
     )
     parser.add_argument(
         "--mllm-draft-kind",

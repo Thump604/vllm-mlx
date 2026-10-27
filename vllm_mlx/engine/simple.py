@@ -134,6 +134,13 @@ def _processors_retired(processors: list[Any] | None) -> bool:
     )
 
 
+def _mllm_chunk_completion_tokens(chunk: object, chunk_count: int) -> int:
+    reported = getattr(chunk, "completion_tokens", None)
+    if type(reported) is int:
+        return reported
+    return chunk_count
+
+
 # Sentinel for "the generation iterator is exhausted", pulled across the
 # worker-thread boundary where StopIteration cannot travel.
 _STREAM_DONE = object()
@@ -173,12 +180,15 @@ class SimpleEngine(BaseEngine):
         prefix_trie_cache_size: int = 32,
         prefix_trie_cache_memory_mb: int | None = None,
         default_mllm_draft: bool = False,
+        model_path: str | None = None,
     ):
         """
         Initialize the simple engine.
 
         Args:
-            model_name: HuggingFace model name or local path
+            model_name: HuggingFace model name or local path. This is the
+                model's identity: name-based defaults (thinking, Qwen3 EOS)
+                key on it.
             trust_remote_code: Whether to trust remote code
             enable_cache: Enable VLM cache for multimodal models
             force_mllm: Force loading as MLLM even if not auto-detected
@@ -200,12 +210,16 @@ class SimpleEngine(BaseEngine):
             prefix_trie_cache_memory_mb: Optional prompt-cache trie memory cap in MB
             default_mllm_draft: Enable the configured assistant drafter unless a
                 request explicitly sets ``mllm_draft`` to false.
+            model_path: Already-resolved local snapshot to load ``model_name``
+                from. Used only for loading and config.json inspection, never
+                for name heuristics. Defaults to ``model_name``.
         """
         self._model_name = model_name
+        self._model_path = model_path or model_name
         self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
-        self._is_mllm = force_mllm or is_mllm_model(model_name)
+        self._is_mllm = force_mllm or is_mllm_model(self._model_path)
         self._mtp = mtp
         self._mtp_num_draft_tokens = mtp_num_draft_tokens
         self._prefill_step_size = prefill_step_size
@@ -701,7 +715,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded or self._model is None:
             return None
         if self._is_mllm:
-            return getattr(self._model, "processor", None)
+            processor = getattr(self._model, "processor", None)
+            return getattr(processor, "tokenizer", processor)
         return self._model.tokenizer
 
     def _generation_lock_holder_summary(self) -> str:
@@ -776,7 +791,7 @@ class SimpleEngine(BaseEngine):
             from ..models.mllm import MLXMultimodalLM
 
             self._model = MLXMultimodalLM(
-                self._model_name,
+                self._model_path,
                 trust_remote_code=self._trust_remote_code,
                 enable_cache=self._enable_cache,
                 max_kv_size=self._max_kv_size,
@@ -789,7 +804,8 @@ class SimpleEngine(BaseEngine):
             from ..models.llm import MLXLanguageModel
 
             self._model = MLXLanguageModel(
-                self._model_name,
+                self._model_path,
+                model_id=self._model_name,
                 trust_remote_code=self._trust_remote_code,
                 mtp=self._mtp,
                 mtp_num_draft_tokens=self._mtp_num_draft_tokens,
@@ -990,7 +1006,7 @@ class SimpleEngine(BaseEngine):
 
             self._text_model = build_text_model(
                 self._model.model,
-                self._model_name,
+                self._model_path,
                 enable_mtp=self._mtp,
             )
 
@@ -1455,6 +1471,7 @@ class SimpleEngine(BaseEngine):
             async with self._generation_worker_in_use():
                 try:
                     accumulated_text = ""
+                    token_ids: list[int] = []
                     prompt_tokens = 0
                     completion_tokens = 0
                     finished = False
@@ -1496,6 +1513,8 @@ class SimpleEngine(BaseEngine):
                             )
                         new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                         accumulated_text += new_text
+                        if getattr(chunk, "token", None) is not None:
+                            token_ids.append(chunk.token)
 
                         finished = (
                             getattr(chunk, "finished", False)
@@ -1511,9 +1530,12 @@ class SimpleEngine(BaseEngine):
                                     else "stop"
                                 )
 
+                        # Only the final chunk carries the token IDs, so the
+                        # list is copied once rather than on every token.
                         yield GenerationOutput(
                             text=accumulated_text,
                             new_text=new_text,
+                            tokens=list(token_ids) if finished else [],
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             finished=finished,
@@ -1537,6 +1559,7 @@ class SimpleEngine(BaseEngine):
                         yield GenerationOutput(
                             text=accumulated_text,
                             new_text="",
+                            tokens=list(token_ids),
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             finished=True,
@@ -1622,81 +1645,93 @@ class SimpleEngine(BaseEngine):
                 mtp_accepted=final_output.mtp_accepted,
             )
 
-        # mlx-lm non-streaming chat with tools can stall indefinitely on some
-        # local models, while the streaming path completes normally. Reuse the
-        # streaming implementation and aggregate its final state so both chat
-        # APIs share the same tool-capable execution path.
-        if tools and not self._is_mllm:
-            return await aggregate_stream_chat()
+        # Always aggregate the streaming path. The blocking model.chat() call
+        # only returns after the whole completion, so it cannot be cancelled:
+        # a client disconnect would leave it decoding until max_tokens while
+        # holding the serialized generation lock.
+        return await aggregate_stream_chat()
 
-        # Request-local logits processors (response_format / constrained JSON)
-        # need token-boundary progress and cancellation.  The blocking
-        # model.chat() call below only returns after the whole completion, so a
-        # slow constrained decode can look like a no-progress non-stream wedge
-        # and hold the serialized generation lock until max_tokens/timeout.
-        if kwargs.get("logits_processors") and not self._is_mllm:
-            return await aggregate_stream_chat()
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> str:
+        """Render a textual prompt for the server's reasoning probe."""
+        probe_kwargs = dict(chat_template_kwargs or {})
+        # The probe inspects text even when generation consumes token IDs.
+        probe_kwargs.pop("tokenize", None)
+        prompt, _, _ = self._render_chat_prompt(
+            messages, tools, probe_kwargs, enable_thinking
+        )
+        return prompt
 
-        # Text-only requests on MLLM models should always aggregate the
-        # streaming path for non-streaming chat. This keeps one execution seam
-        # and avoids mlx_vlm non-stream thread/stream ownership mismatches.
-        if self._is_mllm and not has_media_content(messages):
-            return await aggregate_stream_chat()
-
-        # Convert tools for template if provided
-        template_tools = convert_tools_for_template(tools) if tools else None
-
-        if self._is_mllm:
-            if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
-            output = await self._run_blocking_serialized(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=template_tools,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            return GenerationOutput(
-                text=text,
-                prompt_tokens=output.prompt_tokens,
-                completion_tokens=output.completion_tokens,
-                finish_reason=output.finish_reason,
-                mtp_drafts=getattr(output, "mtp_drafts", 0),
-                mtp_accepted=getattr(output, "mtp_accepted", 0),
-            )
-        else:
-            output = await self._run_blocking_serialized(
-                self._model.chat,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                tools=template_tools,
-                chat_template_kwargs=chat_template_kwargs,
-                **kwargs,
-            )
-            text = clean_output_text(output.text)
-            # Preserve upstream prompt accounting while routing the blocking
-            # chat call through the cancellation-safe serialized runner.
-            tokenizer = self._model.tokenizer
+    def _render_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any],
+        enable_thinking: bool | None,
+    ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
+        """Return the prompt, template kwargs and normalized messages."""
+        tokenizer = self._model.tokenizer
+        template_kwargs = None
+        safe_messages = None
+        if hasattr(tokenizer, "apply_chat_template"):
+            # Per-request enable_thinking override; default: True unless coder model.
+            if enable_thinking is None:
+                enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
-                "tokenize": True,
+                "tokenize": False,
                 "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
             }
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
             if template_tools:
                 template_kwargs["tools"] = template_tools
-            prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
-            prompt_token_count = len(prompt_ids)
-            return GenerationOutput(
-                text=text,
-                tokens=output.tokens,
-                prompt_tokens=prompt_token_count,
-                completion_tokens=len(output.tokens),
-                finish_reason=output.finish_reason,
-            )
+            safe_messages = normalize_messages_for_chat_template(messages)
+
+            if getattr(self, "use_harmony_rendering", False):
+                # GPT-OSS / harmony-format models: render via openai-harmony
+                # instead of the Jinja chat_template. Bypasses the
+                # ``extract_multimodal_content`` text-flattening upstream
+                # (which drops structural ``tool_calls`` for non-native
+                # parsers) and uses OpenAI's canonical renderer. See #568.
+                from ..utils.harmony_render import (
+                    render_messages as _harmony_render_messages,
+                )
+
+                _reasoning_effort = None
+                if chat_template_kwargs:
+                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
+                prompt = _harmony_render_messages(
+                    safe_messages,
+                    tools=template_tools,
+                    reasoning_effort=_reasoning_effort,
+                )
+            else:
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+                except TypeError:
+                    # Some templates don't support all kwargs
+                    for key in [
+                        "tools",
+                        "enable_thinking",
+                        *chat_template_kwargs.keys(),
+                    ]:
+                        if key in template_kwargs:
+                            del template_kwargs[key]
+                    prompt = tokenizer.apply_chat_template(
+                        safe_messages, **template_kwargs
+                    )
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            prompt += "\nassistant:"
+        return prompt, template_kwargs, safe_messages
 
     async def stream_chat(
         self,
@@ -1814,6 +1849,7 @@ class SimpleEngine(BaseEngine):
             # (e.g. OpenCode sends title + main request simultaneously).
             accumulated_text = ""
             token_count = 0
+            completion_tokens = 0
             request_id = str(kwargs.pop("request_id", "") or f"simple-{id(messages):x}")
             native_video_request = bool(
                 getattr(self._model, "_video_native", False) is True
@@ -1861,7 +1897,7 @@ class SimpleEngine(BaseEngine):
                                     text=accumulated_text,
                                     new_text="",
                                     prompt_tokens=0,
-                                    completion_tokens=token_count,
+                                    completion_tokens=completion_tokens,
                                     finished=True,
                                     finish_reason="abort",
                                 )
@@ -1873,6 +1909,9 @@ class SimpleEngine(BaseEngine):
                                 break
 
                             token_count += 1
+                            completion_tokens = _mllm_chunk_completion_tokens(
+                                chunk, token_count
+                            )
                             new_text = (
                                 chunk.text if hasattr(chunk, "text") else str(chunk)
                             )
@@ -1884,7 +1923,7 @@ class SimpleEngine(BaseEngine):
                                 text=accumulated_text,
                                 new_text=new_text,
                                 prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                                completion_tokens=token_count,
+                                completion_tokens=completion_tokens,
                                 finished=finished,
                                 finish_reason=(
                                     chunk.finish_reason if finished else None
@@ -1929,6 +1968,7 @@ class SimpleEngine(BaseEngine):
             )
             for chunk in chunks:
                 token_count += 1
+                completion_tokens = _mllm_chunk_completion_tokens(chunk, token_count)
                 new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
                 accumulated_text += new_text
                 finished = chunk.finish_reason is not None
@@ -1936,7 +1976,7 @@ class SimpleEngine(BaseEngine):
                     text=accumulated_text,
                     new_text=new_text,
                     prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                    completion_tokens=token_count,
+                    completion_tokens=completion_tokens,
                     finished=finished,
                     finish_reason=chunk.finish_reason if finished else None,
                     mtp_drafts=getattr(chunk, "mtp_drafts", 0),
@@ -1946,61 +1986,12 @@ class SimpleEngine(BaseEngine):
 
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
-        safe_messages: list[dict[str, Any]] | None = None
-        if hasattr(tokenizer, "apply_chat_template"):
-            # Per-request enable_thinking override; default: True unless coder model.
-            enable_thinking = kwargs.pop("enable_thinking", None)
-            if enable_thinking is None:
-                enable_thinking = "coder" not in self._model_name.lower()
-            template_kwargs = {
-                "tokenize": False,
-                "add_generation_prompt": True,
-                "enable_thinking": enable_thinking,
-            }
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
-            if template_tools:
-                template_kwargs["tools"] = template_tools
-            safe_messages = normalize_messages_for_chat_template(messages)
-
-            if getattr(self, "use_harmony_rendering", False):
-                # GPT-OSS / harmony-format models: render via openai-harmony
-                # instead of the Jinja chat_template. Bypasses the
-                # ``extract_multimodal_content`` text-flattening upstream
-                # (which drops structural ``tool_calls`` for non-native
-                # parsers) and uses OpenAI's canonical renderer. See #568.
-                from ..utils.harmony_render import (
-                    render_messages as _harmony_render_messages,
-                )
-
-                _reasoning_effort = None
-                if chat_template_kwargs:
-                    _reasoning_effort = chat_template_kwargs.get("reasoning_effort")
-                prompt = _harmony_render_messages(
-                    safe_messages,
-                    tools=template_tools,
-                    reasoning_effort=_reasoning_effort,
-                )
-            else:
-                try:
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-                except TypeError:
-                    # Some templates don't support all kwargs
-                    for key in [
-                        "tools",
-                        "enable_thinking",
-                        *chat_template_kwargs.keys(),
-                    ]:
-                        if key in template_kwargs:
-                            del template_kwargs[key]
-                    prompt = tokenizer.apply_chat_template(
-                        safe_messages, **template_kwargs
-                    )
-        else:
-            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-            prompt += "\nassistant:"
+        prompt, template_kwargs, safe_messages = self._render_chat_prompt(
+            messages,
+            template_tools,
+            chat_template_kwargs,
+            kwargs.pop("enable_thinking", None),
+        )
 
         # --- System-prompt KV caching on the pure-LLM stream_chat path ---
         # Mirrors the cache in _stream_generate_text. Locates the system prefix
@@ -2352,6 +2343,7 @@ class SimpleEngine(BaseEngine):
             producer_task = asyncio.create_task(_produce_responses())
 
             accumulated_text = ""
+            token_ids: list[int] = []
             token_count = 0
             finished = False
             cache_path_failed_before_first_token = False
@@ -2377,6 +2369,8 @@ class SimpleEngine(BaseEngine):
                     token_count += 1
                     new_text = resp.text if hasattr(resp, "text") else str(resp)
                     accumulated_text += new_text
+                    if getattr(resp, "token", None) is not None:
+                        token_ids.append(resp.token)
                     finish_reason = getattr(resp, "finish_reason", None)
                     finished = finish_reason is not None or token_count >= max_tokens
                     if finish_reason is None and finished:
@@ -2385,6 +2379,7 @@ class SimpleEngine(BaseEngine):
                     yield GenerationOutput(
                         text=accumulated_text,
                         new_text=new_text,
+                        tokens=list(token_ids) if finished else [],
                         prompt_tokens=full_token_count,
                         completion_tokens=token_count,
                         finished=finished,
