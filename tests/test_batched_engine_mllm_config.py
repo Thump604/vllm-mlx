@@ -185,9 +185,7 @@ def _run_start_mllm_with_external_drafter(monkeypatch, loaded_drafter):
         captured["loader_path"] = model_path
         return loaded_drafter
 
-    monkeypatch.setattr(
-        mllm_mod, "load_mtp_drafter", load_drafter_fixture
-    )
+    monkeypatch.setattr(mllm_mod, "load_mtp_drafter", load_drafter_fixture)
 
     class FakeMLXMultimodalLM:
         _load_draft_model = mllm_mod.MLXMultimodalLM._load_draft_model
