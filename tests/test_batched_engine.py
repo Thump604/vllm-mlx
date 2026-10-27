@@ -129,6 +129,82 @@ class TestBatchedEngineCacheRestore:
         prefix_cache.load_from_disk.assert_called_once_with("/tmp/cache")
 
 
+class TestBatchedEngineAnthropicImages:
+    """Anthropic images alongside tool calls must reach generation."""
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("source_type", ["base64", "url"])
+    async def test_image_with_tool_use_reaches_generation(
+        self, monkeypatch, stream, source_type
+    ):
+        from vllm_mlx.api.anthropic_adapter import anthropic_to_openai
+        from vllm_mlx.api.anthropic_models import AnthropicRequest
+        from vllm_mlx.engine.base import GenerationOutput
+        from vllm_mlx.engine.batched import BatchedEngine
+
+        with patch("vllm_mlx.engine.batched.is_mllm_model", return_value=True):
+            engine = BatchedEngine("test-mllm")
+        engine._loaded = True
+
+        source = (
+            {"type": "base64", "media_type": "image/png", "data": "YWJj"}
+            if source_type == "base64"
+            else {"type": "url", "url": "https://example.com/image.png"}
+        )
+        expected_image = (
+            "data:image/png;base64,YWJj"
+            if source_type == "base64"
+            else "https://example.com/image.png"
+        )
+        request = anthropic_to_openai(
+            AnthropicRequest(
+                model="test-mllm",
+                max_tokens=16,
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "image", "source": source},
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "zoom",
+                                "input": {"scale": 2},
+                            },
+                        ],
+                    }
+                ],
+            )
+        )
+        messages = [
+            message.model_dump(exclude_none=True) for message in request.messages
+        ]
+        captured = {}
+
+        def template(_messages, _tools, **kwargs):
+            captured["num_images"] = kwargs["num_images"]
+            return "fixture prompt"
+
+        async def generate(**kwargs):
+            captured["images"] = kwargs["images"]
+            return GenerationOutput(text="ok", finished=True)
+
+        async def stream_generate(**kwargs):
+            yield await generate(**kwargs)
+
+        monkeypatch.setattr(engine, "_apply_chat_template", template)
+        monkeypatch.setattr(engine, "generate", generate)
+        monkeypatch.setattr(engine, "stream_generate", stream_generate)
+        if stream:
+            outputs = [output async for output in engine.stream_chat(messages)]
+        else:
+            outputs = [await engine.chat(messages)]
+
+        assert outputs[0].text == "ok"
+        assert captured == {"num_images": 1, "images": [expected_image]}
+
+
 class TestBatchedEngineMetalCacheLimit:
     def test_prefers_explicit_mlx_buffer_cache_limit(self, monkeypatch):
         from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
@@ -166,6 +242,115 @@ class TestBatchedEngineMetalCacheLimit:
             gpu_memory_utilization=0.5,
         )
 
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    def test_accepts_gigabyte_suffix(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8GB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_accepts_megabyte_suffix(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8192MB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_accepts_suffix_case_insensitive_and_whitespace(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", " 1.5 GB ")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == int(1.5 * 1024**3)
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("256B", 256),
+            ("1024kb", 1024 * 1024),
+            ("512mb", 512 * 1024**2),
+            ("2gb", 2 * 1024**3),
+            ("1TB", 1024**4),
+        ],
+    )
+    def test_accepts_all_supported_suffixes(self, monkeypatch, raw, expected):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", raw)
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == expected
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+    def test_rejects_unknown_suffix_with_fallback(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", "8XB")
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    @pytest.mark.parametrize("raw", ["0", "0GB", "-1GB", "", "  "])
+    def test_rejects_non_positive_and_empty_with_fallback(self, monkeypatch, raw):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", raw)
+
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+
+        assert limit == 8 * 1024**3
+        assert source == "device-scaled"
+
+    def test_huge_digit_string_suffix_overflow_falls_back(self, monkeypatch):
+        from vllm_mlx.engine.batched import _resolve_metal_buffer_cache_limit
+
+        huge = "9" * 400
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", huge)
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
+        assert limit == int(huge)
+        assert source == "MLX_BUFFER_CACHE_LIMIT"
+
+        monkeypatch.setenv("MLX_BUFFER_CACHE_LIMIT", huge + "GB")
+        limit, source = _resolve_metal_buffer_cache_limit(
+            max_recommended=16 * 1024**3,
+            gpu_memory_utilization=0.5,
+        )
         assert limit == 8 * 1024**3
         assert source == "device-scaled"
 
