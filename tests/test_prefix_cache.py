@@ -688,6 +688,7 @@ class TestMLLMCompletionCacheStore:
 
     def test_multimodal_request_is_never_stored_in_token_only_cache(self):
         mx = pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx.nn")
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
