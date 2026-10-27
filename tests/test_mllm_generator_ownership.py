@@ -198,6 +198,44 @@ class TestMLLMGeneratorInsertOwnership:
 
 
 class TestMLLMPrefillAbortPolling:
+    @pytest.mark.parametrize("scheduled", [False, True])
+    def test_scheduler_abort_does_not_poison_reused_external_id(self, scheduled):
+        from collections import deque
+
+        from vllm_mlx.mllm_scheduler import MLLMScheduler
+        from vllm_mlx.request import RequestStatus
+
+        generator = _make_chunked_generator()
+        generator.schedule_removal = MagicMock()
+        request = SimpleNamespace(
+            status=RequestStatus.RUNNING if scheduled else RequestStatus.WAITING,
+            num_output_tokens=0,
+        )
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler.requests = {"same": request}
+        scheduler.batch_generator = generator
+        scheduler.waiting = deque([] if scheduled else [request])
+        scheduler.running = {"same": request} if scheduled else {}
+        scheduler.request_id_to_uid = {"same": 7} if scheduled else {}
+        scheduler.uid_to_request_id = {7: "same"} if scheduled else {}
+        scheduler.finished_req_ids = set()
+        scheduler._detokenizer_pool = {}
+        scheduler.output_queues = {}
+
+        assert scheduler.abort_request("same")
+        assert "same" not in scheduler.requests
+        assert not generator._consume_prefill_abort(
+            SimpleNamespace(request_id="same", uid=8)
+        )
+        assert (
+            generator._consume_prefill_abort(SimpleNamespace(request_id="same", uid=7))
+            is scheduled
+        )
+        if scheduled:
+            generator.schedule_removal.assert_called_once_with([7])
+        else:
+            generator.schedule_removal.assert_not_called()
+
     def test_run_chunked_text_prefill_aborts_before_model_call(self):
         from vllm_mlx.mllm_batch_generator import (
             MLLMBatchRequest,
